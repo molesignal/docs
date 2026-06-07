@@ -1,0 +1,406 @@
+# MoleSignal HTTP API v1
+# OpenAPI 3.0 描述。当前覆盖 ingest / query / streams / alerts / dashboards / 派生查询 /
+# 付费版 (sso/clusters/cipher_keys/connectors/copilot)。
+# 完整 endpoint 索引见各 handler 文件 `crates/api/src/http/routes/*.rs`。
+
+openapi: 3.0.3
+info:
+  title: MoleSignal API
+  version: 1.0.0
+  description: |
+    MoleSignal 是可观测平台核心引擎。所有 endpoint 默认走 `Authorization: Bearer <jwt>` 鉴权；
+    `/api/v1/healthz` / `/api/v1/auth/login` / `/metrics` 在白名单内免鉴权。
+
+    错误统一返 `{ "error": "<message>" }` body；状态码：
+    - 400 invalid argument
+    - 401 unauthorized (token 校验失败)
+    - 403 forbidden (role / license 不足)
+    - 404 not found / 跨 org lookup
+    - 409 conflict (unique 约束 / 状态冲突)
+    - 413 quota exhausted
+    - 429 rate limited
+servers:
+  - url: https://molesignal.example.com
+  - url: http://localhost:5080
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+    IngestResult:
+      type: object
+      properties:
+        accepted: { type: integer }
+        rejected: { type: integer }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              reason: { type: string }
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/healthz:
+    get:
+      summary: Liveness + readiness probe
+      security: []
+      responses:
+        '200': { description: ready }
+        '503': { description: degraded (ingester replay / object_store probe failing) }
+
+  /metrics:
+    get:
+      summary: Prometheus exposition
+      security: []
+      responses:
+        '200':
+          description: text/plain; version=0.0.4
+          content:
+            text/plain: {}
+
+  /api/v1/auth/login:
+    post:
+      summary: Email + password login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string }
+                password: { type: string }
+      responses:
+        '200':
+          description: JWT issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  user_id: { type: string }
+                  org_id: { type: string }
+                  role: { type: string }
+        '401': { $ref: '#/components/schemas/Error' }
+
+  /api/v1/auth/sso/login:
+    get:
+      summary: SSO OIDC login redirect (license-gated)
+      responses:
+        '302': { description: redirect to IdP /authorize }
+        '403': { description: sso feature not licensed }
+
+  /api/v1/auth/sso/callback:
+    get:
+      summary: SSO OIDC callback (license-gated)
+      parameters:
+        - { in: query, name: code, required: true, schema: { type: string } }
+        - { in: query, name: state, schema: { type: string } }
+      responses:
+        '200': { description: JWT issued }
+        '401': { description: IdP error / id_token invalid }
+        '403': { description: sso feature not licensed }
+
+  /api/v1/ingest/logs/{stream}:
+    post:
+      summary: HTTP JSON ingest (logs)
+      parameters:
+        - { in: path, name: stream, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object }
+                - { type: array, items: { type: object } }
+      responses:
+        '200':
+          description: ingest result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestResult' }
+        '413': { description: storage quota exceeded }
+        '429': { description: rate limited }
+
+  /api/v1/ingest/metrics/{stream}: { $ref: '#/paths/~1api~1v1~1ingest~1logs~1{stream}' }
+  /api/v1/ingest/traces/{stream}: { $ref: '#/paths/~1api~1v1~1ingest~1logs~1{stream}' }
+
+  /api/v1/_bulk:
+    post:
+      summary: Elasticsearch _bulk-compatible ingest (NDJSON)
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson: {}
+      responses:
+        '200':
+          description: per-record status array (ES-compatible items[])
+
+  /api/v1/prometheus/api/v1/write:
+    post:
+      summary: Prometheus remote_write (snappy + protobuf)
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf: {}
+      responses:
+        '204': { description: accepted }
+
+  /api/v1/loki/api/v1/push:
+    post:
+      summary: Loki push (snappy-protobuf or JSON)
+      responses:
+        '204': { description: accepted }
+
+  /api/v1/_kinesis_firehose:
+    post:
+      summary: AWS Kinesis Firehose push
+      responses:
+        '200': { description: firehose-compatible ack }
+
+  /api/v1/_cloudflare:
+    post:
+      summary: Cloudflare Logpush push (NDJSON)
+      parameters:
+        - { in: header, name: X-Connector-Token, required: true, schema: { type: string } }
+      responses:
+        '204': { description: accepted }
+
+  /api/v1/_heroku:
+    post:
+      summary: Heroku log drain push (text)
+      parameters:
+        - { in: header, name: X-Connector-Token, required: true, schema: { type: string } }
+      responses:
+        '204': { description: accepted }
+
+  /api/v1/query:
+    post:
+      summary: Execute SQL or PromQL query
+      parameters:
+        - in: header
+          name: Accept
+          description: '`application/x-ndjson` 走 streaming（bypass query_result cache）'
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [org_id, language, statement, time_range]
+              properties:
+                org_id: { type: string }
+                language: { type: string, enum: [sql, promql] }
+                statement: { type: string }
+                time_range:
+                  type: object
+                  properties:
+                    start: { type: integer }
+                    end: { type: integer }
+                stream:
+                  type: object
+                  properties:
+                    name: { type: string }
+                    stream_type: { type: string, enum: [logs, metrics, traces, enrichment] }
+                limit: { type: integer }
+      responses:
+        '200':
+          description: query result (rows + columns + scanned_rows + took_ms + cache_hit)
+
+  /api/v1/query/search_around:
+    post:
+      summary: 前后 N 条上下文（spec §24.1）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event_timestamp_us, stream, stream_type]
+              properties:
+                event_timestamp_us: { type: integer }
+                event_fingerprint: { type: string }
+                stream: { type: string }
+                stream_type: { type: string }
+                before: { type: integer, default: 50 }
+                after: { type: integer, default: 50 }
+      responses:
+        '200': { description: before + after blocks }
+
+  /api/v1/streams:
+    get: { summary: List streams }
+    post:
+      summary: "Create stream (`stream_type: enrichment` 不可作为 pipeline target)"
+
+  /api/v1/streams/{id}:
+    get: { summary: Get one }
+    delete: { summary: Delete }
+  /api/v1/streams/{id}/schema:
+    put: { summary: Edit schema }
+  /api/v1/streams/{id}/retention:
+    put: { summary: Edit retention }
+
+  /api/v1/dashboards: { post: { summary: Create dashboard (native / grafana import) } }
+  /api/v1/folders: { post: { summary: Create folder } }
+
+  /api/v1/alerts/rules:
+    get: { summary: List }
+    post: { summary: "Create alert rule (kind: scheduled | realtime | anomaly)" }
+  /api/v1/alerts/rules/{id}:
+    put: { summary: Update (rule threshold change resets consecutive counter) }
+    delete: { summary: Delete }
+  /api/v1/alerts/escalations: { post: { summary: Create escalation policy } }
+  /api/v1/alerts/channels: { post: { summary: Create notify channel } }
+  /api/v1/alerts/incidents: { get: { summary: List incidents } }
+  /api/v1/alerts/incidents/{id}/ack: { post: { summary: Ack } }
+  /api/v1/alerts/incidents/{id}/resolve: { post: { summary: Resolve } }
+
+  /api/v1/saved_views:
+    get: { summary: List (?pinned=true) }
+    post: { summary: Create }
+  /api/v1/saved_views/{id}/run: { post: { summary: Run saved query } }
+
+  /api/v1/functions:
+    post: { summary: Create function (VRL compile on create) }
+  /api/v1/pipelines:
+    post: { summary: Create pipeline (stream + enabled 唯一约束) }
+  /api/v1/scheduled_pipelines:
+    get: { summary: List }
+    post:
+      summary: "Create scheduled pipeline (cron: `every:Ns/m/h`, DataPlaneAdmin)"
+
+  /api/v1/auth/tokens:
+    post: { summary: "Issue API token (plaintext returned once, `ms_<prefix>_<secret>`)" }
+    get: { summary: List }
+  /api/v1/auth/tokens/{id}:
+    delete: { summary: Revoke }
+
+  /api/v1/auth/jwt/rotate:
+    post: { summary: 'Rotate JWT signing secret (Owner-only; retires current + inserts new; 24h grace for in-flight tokens; auth-hardening §2)' }
+  /api/v1/auth/jwt/secrets:
+    get: { summary: 'List JWT signing secret metadata (Owner-only; never returns secret bytes)' }
+
+  /api/v1/audit:
+    get: { summary: 'Audit log (?from&to&actor&action&page=, Admin+)' }
+
+  /api/v1/orgs/{id}/quota:
+    get: { summary: Read quota (Owner-only) }
+    put: { summary: Set quota }
+
+  /api/v1/traces/service_graph:
+    get:
+      summary: Service graph edges (spec §21.3)
+      parameters:
+        - { in: query, name: from, required: true, schema: { type: integer } }
+        - { in: query, name: to, required: true, schema: { type: integer } }
+        - { in: query, name: service, schema: { type: string } }
+      responses: { '200': { description: "edges[] + count" } }
+
+  /api/v1/rum/v1/sessions:
+    post: { summary: RUM session ingest (Datadog-RUM compat JSON) }
+  /api/v1/rum/v1/actions:
+    post: { summary: RUM action ingest }
+  /api/v1/rum/v1/errors:
+    post: { summary: RUM error ingest }
+  /api/v1/rum/v1/replay:
+    post:
+      summary: RUM replay event upload → object_store + rum_replay_events row
+
+  /api/v1/copilot/stats:
+    get: { summary: Copilot LLM overall stats ( + license-gated) }
+  /api/v1/copilot/top_models:
+    get: { summary: Top models by call count }
+  /api/v1/copilot/top_users:
+    get: { summary: Top users by call count }
+
+  /api/v1/clusters:
+    get: { summary: List remote clusters (Owner-only + federated_search license) }
+    post: { summary: Register remote cluster }
+  /api/v1/clusters/{id}:
+    put: { summary: Update }
+    delete: { summary: Delete }
+
+  /api/v1/cipher_keys:
+    get: { summary: List cipher keys (Owner-only; raw_key never returned) }
+    post: { summary: Create (32-byte base64 raw key) }
+  /api/v1/cipher_keys/{name}:
+    get: { summary: Get latest version }
+    delete: { summary: Delete }
+  /api/v1/cipher_keys/{name}/rotate:
+    post: { summary: "Rotate (inserts new version, keeps prior)" }
+
+  /api/v1/connectors:
+    get: { summary: List connectors (sensitive fields masked) }
+    post: { summary: Create (kind ∈ aws_cloudwatch_logs / aws_kinesis_firehose / cloudflare_logpush / heroku_drain) }
+  /api/v1/connectors/{id}:
+    put: { summary: Update }
+    delete: { summary: Delete }
+
+  # ---- web-investigation-shell (frontend ⌘K / 调查栈 / 跨信号联动) ----
+  /api/v1/web/search:
+    get:
+      summary: Cross-entity ⌘K aggregated search (streams / dashboards / saved_views / alerts / incidents / services)
+      description: |
+        Returns up to `limit` (default 20, max 50) hits ranked by pg_trgm similarity.
+        Requires `Permission::WebSearch` (all authenticated users by default).
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: types, in: query, required: false, schema: { type: string },
+            description: "Comma-separated subset of {stream,dashboard,saved_view,alert,incident,service}" }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 20, maximum: 50 } }
+  /api/v1/web/topology:
+    get:
+      summary: "Aggregate service_graph_edges into nodes / edges within (from, to)"
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: to,   in: query, required: true, schema: { type: string, format: date-time } }
+  /api/v1/web/trace/{trace_id}:
+    get:
+      summary: "Full span tree for a trace_id (≤ 100k spans, 32 MiB hard cap → truncated=true)"
+      parameters:
+        - { name: trace_id, in: path, required: true, schema: { type: string } }
+  /api/v1/web/correlation/{from_kind}/{to_kind}:
+    get:
+      summary: Server-side prefill of filters/time/prefill for metric ↔ trace ↔ log ↔ host jumps
+      parameters:
+        - { name: from_kind, in: path, required: true, schema: { type: string, enum: [trace, metric, log, host] } }
+        - { name: to_kind,   in: path, required: true, schema: { type: string, enum: [trace, metric, log, host] } }
+        - { name: ctx,       in: query, required: true, schema: { type: string },
+            description: "base64-url JSON blob of source signal context" }
+  /api/v1/web/investigation/blob:
+    post:
+      summary: "Store ephemeral investigation-stack payload (returns blob_id, 7d retention)"
+  /api/v1/web/investigation/blob/{id}:
+    get:
+      summary: Fetch ephemeral payload by blob_id
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+
+  /api/v1/query/stream:
+    get:
+      summary: NDJSON streamed query response (chunked; ingress proxy_buffering must be off)
+      parameters:
+        - { name: sql,         in: query, required: true,  schema: { type: string } }
+        - { name: stream,      in: query, required: true,  schema: { type: string } }
+        - { name: stream_type, in: query, required: false, schema: { type: string, enum: [logs, metrics, traces] } }
+        - { name: from,        in: query, required: true,  schema: { type: integer, format: int64, description: "epoch micros" } }
+        - { name: to,          in: query, required: true,  schema: { type: integer, format: int64 } }
+        - { name: limit,       in: query, required: false, schema: { type: integer } }
+    post:
+      summary: Same shape as POST /query but always returns NDJSON chunked response
