@@ -43,9 +43,38 @@ for (const [p, item] of Object.entries(doc.paths)) {
   }
 }
 
-// Ensure every operation has a responses object, and every response a description.
+// Build a JSON example body for a text-only response, so Mintlify renders the
+// response as a JSON code block instead of a bare description line.
+function jsonBodyFor(code, description) {
+  if (/^[45]/.test(code)) {
+    // Error envelope — the API returns `{ "error": "<message>" }`.
+    return {
+      schema: { $ref: '#/components/schemas/Error' },
+      example: { error: description || 'error' },
+    };
+  }
+  // Success / redirect / informational — synthesize a status + message body.
+  return {
+    example: {
+      status: Number(code) || code,
+      message: description || 'OK',
+    },
+  };
+}
+
+// Give a response a JSON code block unless it already carries content.
+function ensureJsonContent(code, resp) {
+  if (!resp || typeof resp !== 'object' || '$ref' in resp) return false;
+  if (resp.content && Object.keys(resp.content).length) return false;
+  resp.content = { 'application/json': jsonBodyFor(code, resp.description) };
+  return true;
+}
+
+// Ensure every operation has a responses object, every response a description,
+// and every text-only response a JSON example body.
 let fixedOps = 0;
 let fixedResp = 0;
+let fixedBodies = 0;
 for (const item of Object.values(doc.paths)) {
   if (!item || typeof item !== 'object') continue;
   for (const m of METHODS) {
@@ -54,13 +83,13 @@ for (const item of Object.values(doc.paths)) {
     if (!op.responses || typeof op.responses !== 'object' || !Object.keys(op.responses).length) {
       op.responses = { '200': { description: 'OK' } };
       fixedOps++;
-      continue;
     }
     for (const [code, resp] of Object.entries(op.responses)) {
       if (resp && typeof resp === 'object' && !('$ref' in resp) && !resp.description) {
         resp.description = code.startsWith('2') ? 'OK' : 'Error';
         fixedResp++;
       }
+      if (ensureJsonContent(code, resp)) fixedBodies++;
     }
   }
 }
@@ -68,5 +97,6 @@ for (const item of Object.values(doc.paths)) {
 writeFileSync(OUT, JSON.stringify(doc, null, 2) + '\n');
 console.log(`wrote ${OUT}`);
 console.log(
-  `paths: ${Object.keys(doc.paths).length}, filled responses on ${fixedOps} ops, descriptions on ${fixedResp} responses`,
+  `paths: ${Object.keys(doc.paths).length}, filled responses on ${fixedOps} ops, ` +
+    `descriptions on ${fixedResp} responses, JSON bodies on ${fixedBodies} responses`,
 );
