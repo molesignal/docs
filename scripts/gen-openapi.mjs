@@ -43,6 +43,27 @@ for (const [p, item] of Object.entries(doc.paths)) {
   }
 }
 
+// Keep sidebar labels short: the sidebar shows each operation's `summary`, so
+// move any trailing parenthetical detail out of the summary and into the
+// description (which renders in the page body, not the nav).
+let shortened = 0;
+for (const item of Object.values(doc.paths)) {
+  if (!item || typeof item !== 'object') continue;
+  for (const m of METHODS) {
+    const op = item[m];
+    if (!op || typeof op !== 'object' || typeof op.summary !== 'string') continue;
+    const idx = op.summary.indexOf(' (');
+    if (idx === -1) continue;
+    const head = op.summary.slice(0, idx).trim();
+    // Strip the outermost surrounding parens from the moved-out note.
+    const note = op.summary.slice(idx + 1).trim().replace(/^\((.*)\)$/s, '$1').trim();
+    if (!head) continue;
+    op.summary = head;
+    op.description = op.description ? `${op.description}\n\n${note}` : note;
+    shortened++;
+  }
+}
+
 // Synthesize a sample value from a JSON Schema so every response renders as a
 // concrete JSON code block (not just a schema table).
 function exampleFromSchema(schema, seen = new Set(), depth = 0) {
@@ -151,6 +172,7 @@ for (const item of Object.values(doc.paths)) {
 writeFileSync(OUT, JSON.stringify(doc, null, 2) + '\n');
 console.log(`wrote ${OUT}`);
 console.log(
-  `paths: ${Object.keys(doc.paths).length}, filled responses on ${fixedOps} ops, ` +
-    `descriptions on ${fixedResp} responses, JSON bodies on ${fixedBodies} responses`,
+  `paths: ${Object.keys(doc.paths).length}, shortened ${shortened} summaries, ` +
+    `filled responses on ${fixedOps} ops, descriptions on ${fixedResp} responses, ` +
+    `JSON bodies on ${fixedBodies} responses`,
 );
