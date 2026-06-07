@@ -1,0 +1,109 @@
+---
+title: "配置"
+description: "一个 TOML 文件，可用 MS_* 环境变量逐字段覆盖。"
+---
+
+MoleSignal 只有一个配置来源：一个 **TOML 文件**，用 `molesignal --config /path/to/config.toml`
+传入。任何字段都可被形如 `MS_<SECTION>.<FIELD>` 的环境变量覆盖 —— 前缀是单下划线，section 与
+field 之间用点连接。
+
+```bash
+# 下面两行等价于设置 [http].port = 5081 和 [store.meta].dsn = ...
+export MS_HTTP.PORT=5081
+export MS_STORE.META.DSN="postgres://user:pass@db:5432/molesignal"
+```
+
+schema 定义在 `crates/config/src/settings.rs`；仓库默认配置是 `conf/config.toml`。
+
+## 节点（node）
+
+```toml
+[node]
+# 可组合角色：standalone / router / ingester / querier / compactor / alert_manager
+# `standalone` 表示同进程内启用全部角色。
+roles = ["standalone"]
+# 节点唯一标识；留空则启动时生成 KSUID。
+id = ""
+```
+
+## HTTP 与 gRPC
+
+```toml
+[http]
+bind = "0.0.0.0"
+port = 5080
+gzip = true              # 反向代理后建议关闭
+
+[grpc]
+bind = "0.0.0.0"
+port = 5082
+max_message_size_mb = 32
+```
+
+### TLS + 自动证书
+
+```toml
+[http.tls]
+enabled = false               # 主开关；false 时仅明文 HTTP
+plain_port = 80               # HTTP-01 challenge + 80→443 重定向
+port = 443                    # rustls 服务端口
+acme_directory = "production" # production | staging | 自定义 CA URL（如 Pebble）
+account_email = ""            # Let's Encrypt 要求
+key_storage_dir = "/var/lib/molesignal/acme"
+```
+
+## 存储（store）
+
+```toml
+[store.meta]
+backend = "postgres"
+dsn = "postgres://molesignal:molesignal@localhost:5432/molesignal"
+max_connections = 16
+
+[store.object]
+# 列式数据落地：local | s3 | azure | gcs
+backend = "local"
+root = "./data/objects"
+# S3 / S3 兼容（MinIO、R2、阿里云 OSS）：
+# bucket = "molesignal"
+# region = "us-east-1"
+# endpoint = ""            # MinIO 填 http://localhost:9000
+# access_key = ""
+# secret_key = ""
+# 凭据解析顺序：env > credentials_file > 内联 TOML。
+# credentials_file = "/etc/molesignal/object-store.toml"
+```
+
+<Note>
+  Azure 走 `AZURE_STORAGE_ACCOUNT` / `AZURE_STORAGE_ACCESS_KEY`；GCS 走
+  `GOOGLE_APPLICATION_CREDENTIALS`。
+</Note>
+
+## 自身遥测（telemetry）
+
+```toml
+[telemetry]
+log_level = "info"
+log_format = "text"        # text | json
+otlp_endpoint = ""         # 留空则不导出 trace
+metrics_enabled = true
+log_output = "console"     # console | file
+# log_directory = "logs"          # 仅当 log_output = "file"
+# log_rotation = "daily"          # minutely | hourly | daily | never
+# log_max_files = 7
+```
+
+## 函数（functions）
+
+```toml
+[functions]
+# 可选的 JavaScript 运行时。还需构建特性
+# `--features molesignal-bootstrap/js-runtime`。
+js_runtime_enabled = false
+```
+
+## 缓存
+
+parquet 磁盘缓存默认启用（`./data/cache/parquet`，10 GB LRU），可经 `[cache.disk_cache]` 调整或
+关闭。FileMeta 冷层溢出会把早于 `[storage.file_meta_dump].cold_after_days`（默认 30）的分区序列化
+到对象存储，使元数据表保持精简。

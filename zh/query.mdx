@@ -1,0 +1,87 @@
+---
+title: "查询"
+description: "一个引擎上的完整 SQL 与 PromQL 子集，横跨三类信号。"
+---
+
+MoleSignal 暴露单一查询端点，底层是 **DataFusion**。你可以运行完整 SQL —— 包括 join、CTE、窗口
+函数 —— 或面向指标的 **PromQL 子集**，都针对同一存储。
+
+## 查询端点
+
+```http
+POST /api/v1/query
+Authorization: Bearer <jwt>
+Content-Type: application/json
+```
+
+### 请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `org_id` | string | ✅ | 你的租户 id（登录获得）。 |
+| `language` | string | ✅ | `sql` 或 `promql`。 |
+| `statement` | string | ✅ | 查询文本。 |
+| `time_range` | object | ✅ | `{ "start": <微秒>, "end": <微秒> }` —— Unix 纪元起微秒。 |
+| `stream` | object | — | `{ "name": "app", "stream_type": "logs" }`。`stream_type` ∈ `logs`/`metrics`/`traces`/`enrichment`。 |
+| `limit` | integer | — | 行数上限。 |
+
+### 响应
+
+响应携带 `rows`、`columns`、`scanned_rows`、`took_ms`、`cache_hit`。
+
+<Note>
+  发送 `Accept: application/x-ndjson` 可逐行流式返回结果。流式会绕过 `query_result` 缓存。
+</Note>
+
+## SQL
+
+```bash
+curl -X POST http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d "{\"org_id\":\"$MS_ORG\",\"language\":\"sql\",
+       \"statement\":\"SELECT level, count(*) FROM app WHERE _timestamp > 0 GROUP BY level\",
+       \"time_range\":{\"start\":0,\"end\":2000000000000000},
+       \"stream\":{\"name\":\"app\",\"stream_type\":\"logs\"}}"
+```
+
+由于日志、指标、追踪同处一个存储，你可以在一条查询里**跨信号 join** —— 例如按 `trace_id` 把错误
+日志和它们的 span 连起来：
+
+```sql
+SELECT l.msg, t.duration_ms
+FROM app AS l
+JOIN spans AS t ON l.trace_id = t.trace_id
+WHERE l.level = 'error'
+```
+
+## PromQL
+
+设 `language: "promql"` 即可对指标流运行 PromQL 子集。当前支持：
+
+- `rate`、`increase`
+- `sum`、`avg`、`min`、`max`、`count` —— 配 `by` / `without`
+- `histogram_quantile`
+
+```json
+{
+  "org_id": "<org>",
+  "language": "promql",
+  "statement": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))",
+  "time_range": { "start": 0, "end": 2000000000000000 }
+}
+```
+
+<Note>
+  PromQL 是一个不断扩展的子集，而非完整语言。当前支持矩阵见仓库内的 `docs/promql_subset.md`。
+</Note>
+
+## 事件上下文（search around）
+
+要拉取某条事件前后各 N 条（日志上下文视图），用 `POST /api/v1/query/search_around`，传
+`event_timestamp_us`、`stream`、`stream_type`，以及可选的 `before` / `after`（各默认 50）。
+
+## 缓存
+
+查询经过三级缓存 —— `file_meta`、`parquet_meta`、`query_result` —— 外加默认启用的 parquet 磁盘缓存
+（`./data/cache/parquet`，10 GB LRU）。响应里的 `cache_hit` 告诉你结果是否来自缓存。

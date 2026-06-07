@@ -1,0 +1,70 @@
+---
+title: "Security & multi-tenancy"
+description: "Planner-level org isolation, API tokens, audit logging, and field-level encryption."
+---
+
+Multi-tenancy and security are built into the data plane, not bolted on at the dashboard.
+
+## Multi-tenant isolation
+
+Every row, query, and resource belongs to exactly one **org**. Isolation is enforced at the
+**query-planner level**: an `org_id` predicate is rewritten into *every* SQL plan before execution.
+A crafted query cannot reach another org's data, because the constraint lives below the query text.
+
+Per-org **quotas** cap ingest QPS, query QPS, and storage. Exceeding them returns `429` (rate) or
+`413` (storage), with an audit entry and an alert.
+
+## Authentication
+
+<CardGroup cols={2}>
+  <Card title="JWT" icon="key">
+    Obtain a JWT from `POST /api/v1/auth/login`. Send it as `Authorization: Bearer <jwt>` on every
+    request. `/api/v1/healthz`, `/api/v1/auth/login`, and `/metrics` are the only unauthenticated
+    routes.
+  </Card>
+  <Card title="API tokens" icon="id-badge">
+    Long-lived tokens shaped `ms_<prefix>_<secret>`, each with a role, expiry, and last-used
+    timestamp. Manage them under `/api/v1/auth/tokens`.
+  </Card>
+</CardGroup>
+
+### JWT signing secret
+
+The JWT signing secret is **auto-bootstrapped to the database** on first start — there is no secret
+in the config file. An Owner can rotate it via `POST /api/v1/auth/jwt/rotate`, with a 24-hour grace
+window so in-flight tokens keep working.
+
+## Audit log
+
+Every mutating operation is recorded. Query the audit trail at `GET /api/v1/audit`.
+
+## Field-level encryption
+
+MoleSignal supports **cipher keys** for encrypting sensitive fields:
+
+- AES-256-GCM with a cipher root-key envelope.
+- The root key comes from `MS_CIPHER_KEY` (32 bytes, base64).
+- VRL `encrypt()` / `decrypt()` builtins let you encrypt on the ingest path and decrypt at query
+  time, per field.
+
+```toml
+# Provide the root key via environment, never in the config file:
+# export MS_CIPHER_KEY="<32-byte base64>"
+```
+
+Manage named keys under `/api/v1/cipher_keys`, with rotation at
+`/api/v1/cipher_keys/{name}/rotate`.
+
+<Warning>
+  Losing `MS_CIPHER_KEY` makes encrypted fields unrecoverable. Store it in a secrets manager and back
+  it up independently of the database.
+</Warning>
+
+## API token format
+
+```text
+ms_<prefix>_<secret>
+   └─ prefix is stored in clear for lookup; the secret is hashed at rest.
+```
+
+Send an API token exactly like a JWT, in the `Authorization: Bearer` header.

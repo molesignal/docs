@@ -1,0 +1,65 @@
+---
+title: "安全与多租户"
+description: "planner 级组织隔离、API token、审计日志、字段级加密。"
+---
+
+多租户与安全是内建在数据平面里的，而非在仪表盘上外挂。
+
+## 多租户隔离
+
+每一行、每次查询、每个资源都恰好属于一个**组织**。隔离在**查询 planner 层**强制：执行前会把
+`org_id` 谓词改写进*每一个* SQL 计划。构造的恶意查询无法触及其他组织的数据，因为该约束位于
+查询文本之下。
+
+每组织的**配额**限制接入 QPS、查询 QPS 与存储。超限返回 `429`（限流）或 `413`（存储），并附审计
+记录与告警。
+
+## 认证
+
+<CardGroup cols={2}>
+  <Card title="JWT" icon="key">
+    从 `POST /api/v1/auth/login` 获取 JWT，并在每个请求上以 `Authorization: Bearer <jwt>` 发送。
+    仅 `/api/v1/healthz`、`/api/v1/auth/login`、`/metrics` 免认证。
+  </Card>
+  <Card title="API token" icon="id-badge">
+    形如 `ms_<prefix>_<secret>` 的长期 token，各自带角色、过期时间、最近使用时间。在
+    `/api/v1/auth/tokens` 下管理。
+  </Card>
+</CardGroup>
+
+### JWT 签名密钥
+
+JWT 签名密钥在首次启动时**自动写入数据库** —— 配置文件里没有密钥。Owner 可通过
+`POST /api/v1/auth/jwt/rotate` 轮换，并有 24 小时宽限期让在途 token 继续可用。
+
+## 审计日志
+
+每个写操作都被记录。在 `GET /api/v1/audit` 查询审计轨迹。
+
+## 字段级加密
+
+MoleSignal 支持用 **cipher keys** 加密敏感字段：
+
+- AES-256-GCM，配 cipher 根密钥信封。
+- 根密钥来自 `MS_CIPHER_KEY`（32 字节，base64）。
+- VRL 的 `encrypt()` / `decrypt()` 内置函数让你在接入路径按字段加密、在查询时解密。
+
+```toml
+# 通过环境变量提供根密钥，切勿写进配置文件：
+# export MS_CIPHER_KEY="<32 字节 base64>"
+```
+
+在 `/api/v1/cipher_keys` 下管理具名密钥，在 `/api/v1/cipher_keys/{name}/rotate` 轮换。
+
+<Warning>
+  丢失 `MS_CIPHER_KEY` 会导致加密字段不可恢复。请用密钥管理器保管，并独立于数据库做备份。
+</Warning>
+
+## API token 格式
+
+```text
+ms_<prefix>_<secret>
+   └─ prefix 明文存储用于查找；secret 落库前哈希。
+```
+
+API token 的发送方式与 JWT 完全一致，放在 `Authorization: Bearer` 头里。

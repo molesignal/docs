@@ -1,0 +1,87 @@
+---
+title: "Core concepts"
+description: "Orgs, streams, signals, and how the three telemetry types share one storage layer."
+---
+
+MoleSignal has a small number of concepts. Understanding them makes the rest of the docs click.
+
+## Signals
+
+A **signal** is one of the three telemetry types MoleSignal handles:
+
+- **Logs** — discrete events with arbitrary fields.
+- **Metrics** — numeric time series.
+- **Traces** — spans tied together by a `trace_id`.
+
+The defining idea: all three land in the **same Parquet files** (different streams, same physical
+storage), share the **same time index**, and the **same tenant scope**. A single SQL query can join
+across them natively — no cross-store federation, no manual `trace_id` reconciliation.
+
+## Streams
+
+A **stream** is the finest-grained unit of data partitioning. Both ingest and query revolve around
+it. Every stream has:
+
+- a **name** (e.g. `app`, `nginx`, `host_cpu`),
+- a **`stream_type`** — one of `logs`, `metrics`, `traces`, or `enrichment`,
+- a **schema** (inferred and evolved as data arrives), and
+- a **retention** policy.
+
+In the query API you reference a stream with `{ "name": "app", "stream_type": "logs" }`.
+
+## Organizations (orgs)
+
+An **org** is the tenant boundary. Every row of data, every query, and every resource belongs to
+exactly one org. MoleSignal enforces this at the **query planner level**: an `org_id` predicate is
+rewritten into every SQL plan, so data cannot leak across orgs even with a crafted query. See
+[Security](/en/security) for details.
+
+## Storage layout
+
+Each Parquet file lands in object storage under a deterministic key:
+
+```
+{org_id}/{stream_type}/{stream}/{YYYY-MM-DD}/{ksuid}.parquet
+```
+
+- `org_id` and `stream` give tenant and stream isolation.
+- `stream_type` is `logs` / `metrics` / `traces`.
+- The date bucket (earliest `_timestamp` in the batch) enables time-range scans and daily compaction.
+- The `ksuid` filename prefix is time-ordered for easy debugging.
+
+Metadata about each file (`FileMeta`: time range, min/max, row count, object key) lives in Postgres.
+At query time MoleSignal **prunes partitions first**, then fetches only the needed data from the
+object store.
+
+## The query engine
+
+One engine — **DataFusion + Arrow** — serves everything:
+
+- Full **SQL** with joins, CTEs, and window functions across logs, metrics, and traces.
+- A **PromQL subset** for metric workloads.
+- **Distributed query** via Arrow Flight: the coordinator shards by consistent hash, peers stream
+  `RecordBatch`es back.
+- A **3-level cache** (`file_meta` / `parquet_meta` / `query_result`) plus a parquet disk cache.
+
+## Correlation
+
+Because the signals share storage, time index, and tenant scope, MoleSignal can **join across them
+server-side**. The correlation API (`/api/v1/web/correlation/{from_kind}/{to_kind}`) returns related
+signals with prefilled filters, so you can drill `metric → trace → log → host` and back without
+losing context. See [Cross-signal correlation](/en/correlation).
+
+## Node roles
+
+A single binary serves all roles, selected by configuration:
+
+| Role | What it runs |
+|---|---|
+| `standalone` | HTTP API + all workers in one process |
+| `router` | Reverse proxy + rate limiting (stateless) |
+| `ingester` | gRPC ingest + WAL + buffer + flush to Parquet |
+| `querier` | Arrow Flight server + DataFusion execution |
+| `compactor` | Periodic Parquet merge + retention cleanup |
+| `alert_manager` | Rule evaluation + escalation dispatch |
+
+Only the ingester holds local state (a WAL within the flush window). See
+[Deployment](/en/deployment).

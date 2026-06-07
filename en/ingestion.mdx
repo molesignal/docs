@@ -1,0 +1,115 @@
+---
+title: "Ingesting data"
+description: "10 drop-in ingest protocols — point your existing agents at MoleSignal with no rewrite."
+---
+
+MoleSignal speaks **10 ingest protocols**, so most existing agents and SDKs work without changes.
+Every endpoint is authenticated with `Authorization: Bearer <jwt>` (or an API token — see
+[Security](/en/security)).
+
+## Supported protocols
+
+| Protocol | Endpoint | Drop-in for |
+|---|---|---|
+| OTLP gRPC | `:5082` | OpenTelemetry SDK / Collector |
+| OTLP HTTP | `POST /api/v1/{logs,metrics,traces}` | OTel HTTP exporter |
+| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus / VictoriaMetrics |
+| Elasticsearch `_bulk` | `POST /api/v1/_bulk` | Filebeat, Vector ES sink, Logstash |
+| Loki push | `POST /api/v1/loki/api/v1/push` | Promtail, Vector Loki sink |
+| Syslog UDP/TCP | `[syslog].udp_bind` / `tcp_bind` | rsyslog, syslog-ng |
+| Kinesis Firehose | `POST /api/v1/_kinesis_firehose` | AWS Firehose |
+| Cloudflare Logpush | `POST /api/v1/_cloudflare` | Cloudflare Logpush |
+| Heroku log drain | `POST /api/v1/_heroku` | Heroku |
+| Native HTTP JSON | `POST /api/v1/ingest/{type}/:stream` | curl / app SDK |
+
+## Native HTTP JSON
+
+The simplest path. POST an array of records to `ingest/{logs,metrics,traces}/{stream}`. Timestamps
+are microseconds since the Unix epoch, in the `_timestamp` field.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/ingest/logs/app \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '[{"_timestamp":1700000000000000,"level":"error","msg":"db pool exhausted","trace_id":"abc123"}]'
+```
+
+The stream is created on first write and its schema evolves as new fields appear.
+
+## OpenTelemetry
+
+<Tabs>
+  <Tab title="OTLP HTTP">
+    Point your OTel HTTP exporter at MoleSignal:
+
+    ```yaml
+    exporters:
+      otlphttp:
+        endpoint: http://localhost:5080/api/v1
+        headers:
+          authorization: "Bearer ${MS_JWT}"
+    ```
+
+    Logs, metrics, and traces post to `/api/v1/logs`, `/api/v1/metrics`, and `/api/v1/traces`.
+  </Tab>
+  <Tab title="OTLP gRPC">
+    The gRPC ingest server listens on port `5082`:
+
+    ```yaml
+    exporters:
+      otlp:
+        endpoint: localhost:5082
+        headers:
+          authorization: "Bearer ${MS_JWT}"
+    ```
+  </Tab>
+</Tabs>
+
+## Prometheus remote_write
+
+Add MoleSignal as a remote write target in `prometheus.yml`:
+
+```yaml
+remote_write:
+  - url: http://localhost:5080/api/v1/prometheus/api/v1/write
+    authorization:
+      credentials: "${MS_JWT}"
+```
+
+## Loki and Elasticsearch
+
+<CodeGroup>
+```text Loki push
+POST /api/v1/loki/api/v1/push
+# Works with Promtail and the Vector Loki sink.
+```
+
+```text Elasticsearch _bulk
+POST /api/v1/_bulk
+# Works with Filebeat, Logstash, and the Vector ES sink.
+```
+</CodeGroup>
+
+## Pipeline functions
+
+You can transform events on the ingest hot path with **pipeline functions** — reusable transforms
+attached to a pipeline step. Two languages are supported:
+
+- **VRL** — always available. Compiled per `(function_id, updated_at)` with the `vrl::compiler`
+  stdlib (`del`, `parse_json`, `to_int`, `match`, `encrypt`/`decrypt`, …).
+- **JavaScript** — opt-in, built on `deno_core` (V8). Disabled by default; enabling it requires both
+  a build feature (`--features molesignal-bootstrap/js-runtime`) and the TOML gate
+  `[functions] js_runtime_enabled = true`.
+
+<Warning>
+  The JS isolate is deliberately minimal: no `fetch`, no `setTimeout`, no `import`, no `npm`. Each
+  event gets a 50 ms wall-clock budget and a 32 MiB heap. Anything beyond a single synchronous pass
+  is unsupported by design.
+</Warning>
+
+```js
+// Lowercase a `severity` field into a new `level` field.
+molesignal.set("level", molesignal.fields.severity.toLowerCase());
+// Drop a sensitive field.
+molesignal.del("pw");
+```
