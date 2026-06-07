@@ -43,6 +43,48 @@ for (const [p, item] of Object.entries(doc.paths)) {
   }
 }
 
+// Synthesize a sample value from a JSON Schema so every response renders as a
+// concrete JSON code block (not just a schema table).
+function exampleFromSchema(schema, seen = new Set(), depth = 0) {
+  if (!schema || typeof schema !== 'object' || depth > 6) return null;
+  if (schema.example !== undefined) return schema.example;
+  if (schema.$ref) {
+    if (seen.has(schema.$ref)) return null;
+    seen.add(schema.$ref);
+    return exampleFromSchema(resolvePointer(doc, schema.$ref), seen, depth + 1);
+  }
+  if (schema.oneOf || schema.anyOf) {
+    return exampleFromSchema((schema.oneOf || schema.anyOf)[0], seen, depth + 1);
+  }
+  if (schema.allOf) {
+    return schema.allOf.reduce(
+      (acc, s) => Object.assign(acc, exampleFromSchema(s, seen, depth + 1) || {}),
+      {},
+    );
+  }
+  if (schema.enum) return schema.enum[0];
+  switch (schema.type) {
+    case 'object': {
+      const out = {};
+      for (const [k, v] of Object.entries(schema.properties || {})) {
+        out[k] = exampleFromSchema(v, seen, depth + 1);
+      }
+      return out;
+    }
+    case 'array':
+      return [exampleFromSchema(schema.items, seen, depth + 1)].filter((x) => x !== null);
+    case 'integer':
+    case 'number':
+      return 0;
+    case 'boolean':
+      return true;
+    case 'string':
+      return schema.format === 'date-time' ? '1970-01-01T00:00:00Z' : 'string';
+    default:
+      return schema.properties ? exampleFromSchema({ ...schema, type: 'object' }, seen, depth + 1) : null;
+  }
+}
+
 // Build a JSON example body for a text-only response, so Mintlify renders the
 // response as a JSON code block instead of a bare description line.
 function jsonBodyFor(code, description) {
@@ -62,12 +104,24 @@ function jsonBodyFor(code, description) {
   };
 }
 
-// Give a response a JSON code block unless it already carries content.
+// Give every response a JSON code block. If it has no content, synthesize a
+// body from the description; if it has a JSON schema but no example, synthesize
+// an example from the schema.
 function ensureJsonContent(code, resp) {
   if (!resp || typeof resp !== 'object' || '$ref' in resp) return false;
-  if (resp.content && Object.keys(resp.content).length) return false;
-  resp.content = { 'application/json': jsonBodyFor(code, resp.description) };
-  return true;
+  const json = resp.content && resp.content['application/json'];
+  if (!resp.content || !Object.keys(resp.content).length) {
+    resp.content = { 'application/json': jsonBodyFor(code, resp.description) };
+    return true;
+  }
+  if (json && json.example === undefined && json.schema) {
+    const ex = exampleFromSchema(json.schema);
+    if (ex !== null) {
+      json.example = ex;
+      return true;
+    }
+  }
+  return false;
 }
 
 // Ensure every operation has a responses object, every response a description,
