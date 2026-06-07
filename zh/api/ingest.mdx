@@ -1,0 +1,77 @@
+---
+title: "数据接入"
+description: "原生 JSON 接入、OTLP，以及 Prometheus、Loki、Elasticsearch 等的直接替代端点。"
+---
+
+MoleSignal 支持 10 种接入协议。每个接入端点都需认证。时间戳为 Unix 纪元起的微秒（`_timestamp`）。
+概念指南见 [数据接入](/zh/ingestion)。
+
+## 原生 JSON 接入
+
+```http
+POST /api/v1/ingest/{type}/{stream}
+```
+
+`{type}` 为 `logs`、`metrics` 或 `traces`。POST 单条记录对象或对象数组。流在首次写入时创建，schema
+随字段出现自动演进。
+
+**路径参数**
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | `logs` / `metrics` / `traces` |
+| `stream` | string | 流名，如 `app` |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/ingest/logs/app \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '[{"_timestamp":1700000000000000,"level":"error","msg":"db pool exhausted","trace_id":"abc123"}]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "accepted": 1, "rejected": 0, "errors": [] }
+```
+</ResponseExample>
+
+`413` 表示存储配额耗尽；`429` 表示触发接入限流。
+
+## OpenTelemetry
+
+| 传输 | 端点 |
+|---|---|
+| OTLP HTTP | `POST /api/v1/logs`、`/api/v1/metrics`、`/api/v1/traces` |
+| OTLP gRPC | `:5082` |
+
+## 直接替代端点
+
+这些端点接收各自的原生格式，现有 agent 无需改动。
+
+| 端点 | 直接替代 | 成功码 |
+|---|---|---|
+| `POST /api/v1/prometheus/api/v1/write` | Prometheus / VictoriaMetrics remote_write（snappy + protobuf） | `204` |
+| `POST /api/v1/_bulk` | Elasticsearch `_bulk`（NDJSON） | `200` items[] |
+| `POST /api/v1/loki/api/v1/push` | Loki push（snappy-protobuf 或 JSON） | `204` |
+| `POST /api/v1/_kinesis_firehose` | AWS Kinesis Firehose | `200` ack |
+| `POST /api/v1/_cloudflare` | Cloudflare Logpush（NDJSON） | `204` |
+| `POST /api/v1/_heroku` | Heroku log drain（text） | `204` |
+
+<Note>
+  `/api/v1/_cloudflare` 与 `/api/v1/_heroku` 用 `X-Connector-Token` 头认证，而非 bearer token。
+</Note>
+
+## 管道函数
+
+挂在接入热路径上的可复用变换。
+
+```http
+POST /api/v1/functions          # 创建函数（VRL 在创建时编译）
+POST /api/v1/pipelines          # 创建管道（stream + enabled 唯一）
+GET  /api/v1/scheduled_pipelines
+POST /api/v1/scheduled_pipelines # cron：`every:Ns/m/h`（DataPlaneAdmin）
+```
+
+VRL/JS 细节见 [数据接入 → 管道函数](/zh/ingestion#管道函数pipeline-functions)。
