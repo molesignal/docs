@@ -1,67 +1,95 @@
 ---
-title: "API 参考"
-description: "MoleSignal HTTP API v1 —— 认证、约定与端点索引。"
+title: "简介"
+description: "MoleSignal HTTP API 的工作方式 —— base URL、认证、请求/响应约定。"
 ---
 
-MoleSignal 暴露单一 HTTP API，版本为 `v1`。除下方白名单外，每个端点都需
-`Authorization: Bearer <jwt>`（或 API token）认证。
+MoleSignal 暴露单一带版本的 HTTP API（`v1`）。本页介绍适用于**每个**端点的通用约定。具体端点 ——
+含请求/响应 schema 与在线调试台 —— 列在左侧边栏。
 
-## 约定
+## Base URL
 
-- **认证：** `Authorization: Bearer <jwt>`。免认证路由：`/api/v1/healthz`、`/api/v1/auth/login`、
-  `/metrics`。
-- **错误：** 统一 body `{ "error": "<message>" }`。
-- **时间戳：** Unix 纪元起微秒（`_timestamp`、`time_range.start/end`）。
+所有端点都在 `/api/v1` 之下。沙箱里是：
+
+```
+http://localhost:5080/api/v1
+```
+
+生产环境替换为你自己的域名（例如 `https://molesignal.example.com/api/v1`）。
+
+## 认证
+
+除特别说明外，每个端点都需要 **bearer token**：
+
+```http
+Authorization: Bearer <token>
+```
+
+token 可以是：
+
+- 从 `POST /api/v1/auth/login` 获取的 **JWT**，或
+- 形如 `ms_<prefix>_<secret>` 的 **API token**（见 [安全](/zh/security)）。
+
+<Note>
+  仅三个路由免认证：`/api/v1/healthz`、`/api/v1/auth/login`、`/metrics`。
+</Note>
+
+## 请求
+
+- 请求体为 **JSON**（`Content-Type: application/json`），但模拟其他协议的接入端点除外
+  （Elasticsearch `_bulk`、Loki、Prometheus remote_write 使用各自的原生格式）。
+- **时间戳为微秒** —— Unix 纪元起算，接入记录（`_timestamp`）与查询时间范围
+  （`time_range.start` / `time_range.end`）都是。
+- 租户隔离：每个请求都限定在你的 `org_id` 下。服务端会把 `org_id` 谓词改写进每个查询计划，
+  数据不会跨组织。
+
+## 成功响应
+
+`2xx` 响应返回 JSON，具体结构因端点而异（各端点页单独说明）。例如查询端点返回：
+
+```json
+{
+  "rows": [{ "level": "error", "count": 12 }],
+  "columns": ["level", "count"],
+  "scanned_rows": 10432,
+  "took_ms": 18,
+  "cache_hit": false
+}
+```
+
+部分端点在你发送 `Accept: application/x-ndjson` 时以 **NDJSON** 流式返回；流式会绕过
+`query_result` 缓存。
+
+## 错误响应
+
+错误返回统一的 JSON 信封，只含一个 `error` 字段：
+
+```json
+{
+  "error": "invalid argument: time_range.start must be < end"
+}
+```
 
 ### 状态码
 
 | 码 | 含义 |
 |---|---|
+| `200` | 成功 |
 | `400` | 参数非法 |
-| `401` | 未授权（token 校验失败） |
-| `403` | 禁止（角色 / license 不足） |
-| `404` | 未找到 / 跨组织查找 |
-| `409` | 冲突（唯一约束 / 状态冲突） |
-| `413` | 配额耗尽 |
-| `429` | 限流 |
+| `401` | 未授权 —— token 缺失或无效 |
+| `403` | 禁止 —— 角色或 license 不足 |
+| `404` | 未找到，或跨组织查找 |
+| `409` | 冲突 —— 唯一约束或状态冲突 |
+| `413` | 配额耗尽（存储上限） |
+| `429` | 限流（接入/查询 QPS 配额） |
 
-## 端点索引
+## 限流与配额
 
-### 认证与身份
-`POST /api/v1/auth/login` · `POST /api/v1/auth/tokens` · `GET/DELETE /api/v1/auth/tokens/{id}` ·
-`POST /api/v1/auth/jwt/rotate` · `GET /api/v1/audit` · `GET/PUT /api/v1/orgs/{id}/quota`
+每个组织都有租户级配额：接入 QPS、查询 QPS、存储。超限返回 `429`（限流）或 `413`（存储），
+并附审计记录与告警。见 [安全](/zh/security)。
 
-### 接入
-`POST /api/v1/ingest/{logs,metrics,traces}/{stream}` · `POST /api/v1/{logs,metrics,traces}`（OTLP HTTP）·
-OTLP gRPC `:5082` · `POST /api/v1/prometheus/api/v1/write` · `POST /api/v1/_bulk` ·
-`POST /api/v1/loki/api/v1/push` · `POST /api/v1/_kinesis_firehose` · `POST /api/v1/_cloudflare` ·
-`POST /api/v1/_heroku`
+## 规格
 
-### 查询
-`POST /api/v1/query` · `POST /api/v1/query/search_around`
-
-### 流、仪表盘、保存的视图
-`GET/POST /api/v1/streams` · `/api/v1/streams/{id}`（+ `/schema`、`/retention`）·
-`POST /api/v1/dashboards` · `POST /api/v1/folders` · `/api/v1/saved_views`（+ `/{id}/run`）
-
-### 告警
-`/api/v1/alerts/rules`（+ `/{id}`）· `POST /api/v1/alerts/escalations` ·
-`POST /api/v1/alerts/channels` · `GET /api/v1/alerts/incidents` ·
-`POST /api/v1/alerts/incidents/{id}/ack` · `POST /api/v1/alerts/incidents/{id}/resolve`
-
-### 管道与函数
-`/api/v1/functions` · `/api/v1/pipelines` · `/api/v1/scheduled_pipelines`
-
-### 关联与 Web shell
-`GET /api/v1/web/search` · `GET /api/v1/web/topology` · `GET /api/v1/web/trace/{trace_id}` ·
-`GET /api/v1/web/correlation/{from_kind}/{to_kind}` · `POST /api/v1/web/investigation/blob` ·
-`GET /api/v1/traces/service_graph`
-
-### 安全（cipher keys）
-`/api/v1/cipher_keys` · `/api/v1/cipher_keys/{name}` · `POST /api/v1/cipher_keys/{name}/rotate`
-
-<Note>
-  完整的机器可读规格见仓库内
-  [`docs/api/openapi.yaml`](https://github.com/molesignal/molesignal/blob/main/docs/api/openapi.yaml)。
-  部分端点（SSO、clusters、connectors、copilot、RUM）位于付费/特性构建之后。
-</Note>
+驱动这些页面的机器可读 OpenAPI 规格是 docs 仓库里的
+[`api-reference/openapi.json`](https://github.com/molesignal/docs/blob/main/api-reference/openapi.json)，
+由后端 `openapi.yaml` 生成。部分端点（SSO、clusters、connectors、copilot、RUM）位于付费/特性
+构建之后。

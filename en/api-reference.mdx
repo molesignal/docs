@@ -1,68 +1,99 @@
 ---
-title: "API reference"
-description: "The MoleSignal HTTP API v1 — authentication, conventions, and endpoint index."
+title: "Introduction"
+description: "How the MoleSignal HTTP API works — base URLs, authentication, and the request/response contract."
 ---
 
-MoleSignal exposes a single HTTP API, `v1`. Every endpoint is authenticated with
-`Authorization: Bearer <jwt>` (or an API token) except the whitelist below.
+MoleSignal exposes a single versioned HTTP API (`v1`). This page covers the conventions that apply
+to **every** endpoint. The individual endpoints — with request/response schemas and a live
+playground — are listed in the sidebar.
 
-## Conventions
+## Base URL
 
-- **Auth:** `Authorization: Bearer <jwt>`. Unauthenticated routes: `/api/v1/healthz`,
-  `/api/v1/auth/login`, `/metrics`.
-- **Errors:** a uniform body `{ "error": "<message>" }`.
-- **Timestamps:** microseconds since the Unix epoch (`_timestamp`, `time_range.start/end`).
+All endpoints are served under `/api/v1`. In the sandbox that is:
+
+```
+http://localhost:5080/api/v1
+```
+
+In production, swap in your own host (for example `https://molesignal.example.com/api/v1`).
+
+## Authentication
+
+Every endpoint requires a **bearer token** unless noted otherwise:
+
+```http
+Authorization: Bearer <token>
+```
+
+The token can be either:
+
+- a **JWT** obtained from `POST /api/v1/auth/login`, or
+- an **API token** shaped `ms_<prefix>_<secret>` (see [Security](/en/security)).
+
+<Note>
+  Only three routes are unauthenticated: `/api/v1/healthz`, `/api/v1/auth/login`, and `/metrics`.
+</Note>
+
+## Requests
+
+- Request bodies are **JSON** (`Content-Type: application/json`), except the ingest endpoints that
+  emulate other protocols (Elasticsearch `_bulk`, Loki, Prometheus remote_write), which take their
+  native formats.
+- **Timestamps are microseconds** since the Unix epoch — both in ingested records (`_timestamp`) and
+  in query time ranges (`time_range.start` / `time_range.end`).
+- Tenancy: every request is scoped to your `org_id`. The server rewrites an `org_id` predicate into
+  every query plan, so data never crosses orgs.
+
+## Successful responses
+
+`2xx` responses return JSON. The shape depends on the endpoint (each is documented on its own page).
+For example, the query endpoint returns:
+
+```json
+{
+  "rows": [{ "level": "error", "count": 12 }],
+  "columns": ["level", "count"],
+  "scanned_rows": 10432,
+  "took_ms": 18,
+  "cache_hit": false
+}
+```
+
+Some endpoints stream results as **NDJSON** when you send `Accept: application/x-ndjson`; streaming
+bypasses the `query_result` cache.
+
+## Error responses
+
+Errors return a uniform JSON envelope with a single `error` message:
+
+```json
+{
+  "error": "invalid argument: time_range.start must be < end"
+}
+```
 
 ### Status codes
 
 | Code | Meaning |
 |---|---|
+| `200` | Success |
 | `400` | Invalid argument |
-| `401` | Unauthorized (token validation failed) |
-| `403` | Forbidden (insufficient role / license) |
-| `404` | Not found / cross-org lookup |
-| `409` | Conflict (unique constraint / state conflict) |
-| `413` | Quota exhausted |
-| `429` | Rate limited |
+| `401` | Unauthorized — token missing or invalid |
+| `403` | Forbidden — insufficient role or license |
+| `404` | Not found, or a cross-org lookup |
+| `409` | Conflict — unique constraint or state conflict |
+| `413` | Quota exhausted (storage cap) |
+| `429` | Rate limited (ingest/query QPS quota) |
 
-## Endpoint index
+## Rate limits & quotas
 
-### Auth & identity
-`POST /api/v1/auth/login` · `POST /api/v1/auth/tokens` · `GET/DELETE /api/v1/auth/tokens/{id}` ·
-`POST /api/v1/auth/jwt/rotate` · `GET /api/v1/audit` · `GET/PUT /api/v1/orgs/{id}/quota`
+Each org has per-tenant quotas on ingest QPS, query QPS, and storage. Exceeding them returns `429`
+(rate) or `413` (storage), each accompanied by an audit entry and an alert. See
+[Security](/en/security#multi-tenant-isolation).
 
-### Ingest
-`POST /api/v1/ingest/{logs,metrics,traces}/{stream}` · `POST /api/v1/{logs,metrics,traces}` (OTLP HTTP) ·
-OTLP gRPC `:5082` · `POST /api/v1/prometheus/api/v1/write` · `POST /api/v1/_bulk` ·
-`POST /api/v1/loki/api/v1/push` · `POST /api/v1/_kinesis_firehose` · `POST /api/v1/_cloudflare` ·
-`POST /api/v1/_heroku`
+## Spec
 
-### Query
-`POST /api/v1/query` · `POST /api/v1/query/search_around`
-
-### Streams, dashboards, saved views
-`GET/POST /api/v1/streams` · `/api/v1/streams/{id}` (+ `/schema`, `/retention`) ·
-`POST /api/v1/dashboards` · `POST /api/v1/folders` · `/api/v1/saved_views` (+ `/{id}/run`)
-
-### Alerting
-`/api/v1/alerts/rules` (+ `/{id}`) · `POST /api/v1/alerts/escalations` ·
-`POST /api/v1/alerts/channels` · `GET /api/v1/alerts/incidents` ·
-`POST /api/v1/alerts/incidents/{id}/ack` · `POST /api/v1/alerts/incidents/{id}/resolve`
-
-### Pipelines & functions
-`/api/v1/functions` · `/api/v1/pipelines` · `/api/v1/scheduled_pipelines`
-
-### Correlation & web shell
-`GET /api/v1/web/search` · `GET /api/v1/web/topology` · `GET /api/v1/web/trace/{trace_id}` ·
-`GET /api/v1/web/correlation/{from_kind}/{to_kind}` · `POST /api/v1/web/investigation/blob` ·
-`GET /api/v1/traces/service_graph`
-
-### Security (cipher keys)
-`/api/v1/cipher_keys` · `/api/v1/cipher_keys/{name}` · `POST /api/v1/cipher_keys/{name}/rotate`
-
-<Note>
-  The full machine-readable spec lives at
-  [`docs/api/openapi.yaml`](https://github.com/molesignal/molesignal/blob/main/docs/api/openapi.yaml)
-  in the repo. Some endpoints (SSO, clusters, connectors, copilot, RUM) are gated behind paid/feature
-  builds.
-</Note>
+The machine-readable OpenAPI spec powering these pages is
+[`api-reference/openapi.json`](https://github.com/molesignal/docs/blob/main/api-reference/openapi.json)
+in the docs repo, generated from the backend's `openapi.yaml`. Some endpoints (SSO, clusters,
+connectors, copilot, RUM) are gated behind paid/feature builds.
