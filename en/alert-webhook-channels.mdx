@@ -1,0 +1,143 @@
+---
+title: "Webhook alert channels"
+description: "Configure common robot webhooks such as Lark, DingTalk, and WeCom with backend-managed signing."
+---
+
+MoleSignal webhook alert channels can target generic HTTP endpoints and common chat robot webhooks.
+The backend builds the provider-specific request body, resolves secret references, and applies the
+provider signing algorithm before sending the notification.
+
+## Channel model
+
+```json
+{
+  "name": "ops robot",
+  "enabled": true,
+  "kind": {
+    "type": "webhook",
+    "provider": "lark",
+    "url": "https://open.larksuite.com/open-apis/bot/v2/hook/xxxxxxxx",
+    "security": {
+      "type": "lark_signature",
+      "secret_ref": "env:LARK_BOT_SECRET"
+    },
+    "headers": []
+  }
+}
+```
+
+## Providers
+
+| Provider | Target | Body format | Security |
+| --- | --- | --- | --- |
+| `custom` | Any HTTP endpoint | Raw incident JSON | `none` |
+| `lark` | Lark / Feishu custom bot | `msg_type: text` | `none` or `lark_signature` |
+| `feishu` | Compatibility alias for older Feishu configs | `msg_type: text` | `none` or `feishu_signature` |
+| `wecom` | WeCom group robot | `msgtype: markdown` | `none` |
+| `dingtalk` | DingTalk custom robot | `msgtype: text` | `none` or `dingtalk_signature` |
+
+## Security types
+
+```json
+{ "type": "none" }
+{ "type": "lark_signature", "secret_ref": "env:LARK_BOT_SECRET" }
+{ "type": "feishu_signature", "secret_ref": "env:FEISHU_BOT_SECRET" }
+{ "type": "dingtalk_signature", "secret_ref": "cipher_keys:dingtalk-bot-secret" }
+```
+
+Use `secret_ref` instead of plaintext secrets. Supported secret reference prefixes:
+
+| Prefix | Resolution |
+| --- | --- |
+| `env:` | Backend environment variable |
+| `cipher_keys:` | Cluster secret repository |
+
+## Lark / Feishu signing
+
+Lark and Feishu custom bot signing uses a Unix timestamp in seconds. MoleSignal builds:
+
+```text
+timestamp + "\n" + secret
+```
+
+It then computes HMAC-SHA256 over an empty message using that string as the key, Base64-encodes the
+digest, and adds both fields to the JSON body:
+
+```json
+{
+  "timestamp": "1599360473",
+  "sign": "base64-signature",
+  "msg_type": "text",
+  "content": {
+    "text": "[Critical] checkout error rate high"
+  }
+}
+```
+
+## WeCom group robots
+
+The common WeCom group robot webhook authenticates through the `key` embedded in the URL:
+
+```text
+https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx
+```
+
+MoleSignal sends a markdown payload:
+
+```json
+{
+  "msgtype": "markdown",
+  "markdown": {
+    "content": "**[Critical] checkout error rate high**\n> status: Open"
+  }
+}
+```
+
+Treat the full URL as a secret because it includes the robot credential.
+
+## DingTalk signing
+
+DingTalk custom robot signing uses a Unix timestamp in milliseconds. MoleSignal builds:
+
+```text
+timestamp + "\n" + secret
+```
+
+It computes HMAC-SHA256 using the secret as the key, Base64-encodes the digest, and appends the
+result to the webhook URL:
+
+```text
+https://oapi.dingtalk.com/robot/send?access_token=xxx&timestamp=1599360473000&sign=...
+```
+
+The request body remains a text payload:
+
+```json
+{
+  "msgtype": "text",
+  "text": {
+    "content": "[Critical] checkout error rate high"
+  }
+}
+```
+
+## Headers
+
+Headers are optional key/value rows. Header values can be plaintext or secret references:
+
+```json
+{
+  "key": "Authorization",
+  "value": {
+    "type": "secret_ref",
+    "secret_ref": "env:ALERT_WEBHOOK_TOKEN"
+  }
+}
+```
+
+Use custom headers only when the target endpoint requires them. Lark, WeCom, and DingTalk robot
+webhooks normally rely on their webhook URL and optional platform signing secret.
+
+<Note>
+  Keep server time synchronized. Lark / Feishu and DingTalk reject stale timestamps.
+</Note>

@@ -1,0 +1,140 @@
+---
+title: "Webhook 告警通道"
+description: "配置 Lark、钉钉、企业微信等常见机器人 Webhook，并由后端负责签名。"
+---
+
+MoleSignal 的 Webhook 告警通道支持通用 HTTP 端点，也支持常见聊天机器人 Webhook。
+后端负责生成对端平台需要的请求体、解析密钥引用，并在发送前执行对应签名算法。
+
+## 通道模型
+
+```json
+{
+  "name": "ops robot",
+  "enabled": true,
+  "kind": {
+    "type": "webhook",
+    "provider": "lark",
+    "url": "https://open.larksuite.com/open-apis/bot/v2/hook/xxxxxxxx",
+    "security": {
+      "type": "lark_signature",
+      "secret_ref": "env:LARK_BOT_SECRET"
+    },
+    "headers": []
+  }
+}
+```
+
+## 对端类型
+
+| Provider | 对端 | 请求体 | 加密 / 签名 |
+| --- | --- | --- | --- |
+| `custom` | 任意 HTTP 端点 | 原始 incident JSON | `none` |
+| `lark` | Lark / 飞书自定义机器人 | `msg_type: text` | `none` 或 `lark_signature` |
+| `feishu` | 旧飞书配置兼容别名 | `msg_type: text` | `none` 或 `feishu_signature` |
+| `wecom` | 企业微信群机器人 | `msgtype: markdown` | `none` |
+| `dingtalk` | 钉钉自定义机器人 | `msgtype: text` | `none` 或 `dingtalk_signature` |
+
+## 加密类型
+
+```json
+{ "type": "none" }
+{ "type": "lark_signature", "secret_ref": "env:LARK_BOT_SECRET" }
+{ "type": "feishu_signature", "secret_ref": "env:FEISHU_BOT_SECRET" }
+{ "type": "dingtalk_signature", "secret_ref": "cipher_keys:dingtalk-bot-secret" }
+```
+
+密钥不要明文写进通道配置，统一使用 `secret_ref`：
+
+| 前缀 | 解析方式 |
+| --- | --- |
+| `env:` | 后端环境变量 |
+| `cipher_keys:` | 集群密钥仓库 |
+
+## Lark / 飞书签名
+
+Lark / 飞书自定义机器人签名使用秒级 Unix 时间戳。MoleSignal 拼接：
+
+```text
+timestamp + "\n" + secret
+```
+
+随后用该字符串作为 HMAC-SHA256 的 key，对空消息计算签名，Base64 编码后写入请求体：
+
+```json
+{
+  "timestamp": "1599360473",
+  "sign": "base64-signature",
+  "msg_type": "text",
+  "content": {
+    "text": "[Critical] checkout error rate high"
+  }
+}
+```
+
+## 企业微信群机器人
+
+企业微信群机器人常见 Webhook 通过 URL 内的 `key` 鉴权：
+
+```text
+https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx
+```
+
+MoleSignal 会发送 markdown 请求体：
+
+```json
+{
+  "msgtype": "markdown",
+  "markdown": {
+    "content": "**[Critical] checkout error rate high**\n> status: Open"
+  }
+}
+```
+
+因为 URL 内包含机器人凭证，完整 URL 也应按密钥处理。
+
+## 钉钉签名
+
+钉钉自定义机器人签名使用毫秒级 Unix 时间戳。MoleSignal 拼接：
+
+```text
+timestamp + "\n" + secret
+```
+
+然后用 secret 作为 HMAC-SHA256 的 key 计算签名，Base64 编码后追加到 URL 查询参数：
+
+```text
+https://oapi.dingtalk.com/robot/send?access_token=xxx&timestamp=1599360473000&sign=...
+```
+
+请求体仍是文本消息：
+
+```json
+{
+  "msgtype": "text",
+  "text": {
+    "content": "[Critical] checkout error rate high"
+  }
+}
+```
+
+## Headers
+
+Headers 是可选的 key/value 行。Header value 可以是明文，也可以是密钥引用：
+
+```json
+{
+  "key": "Authorization",
+  "value": {
+    "type": "secret_ref",
+    "secret_ref": "env:ALERT_WEBHOOK_TOKEN"
+  }
+}
+```
+
+仅在对端确实需要时配置自定义 Header。Lark、企业微信、钉钉机器人通常依赖 Webhook URL
+和平台签名密钥。
+
+<Note>
+  保持服务器时间同步。Lark / 飞书与钉钉都会拒绝过期时间戳。
+</Note>
