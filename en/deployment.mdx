@@ -8,28 +8,33 @@ That makes it equally comfortable as a one-command sandbox or a horizontally-sca
 
 ## Architecture
 
-```
-                          ┌──────────┐
-   OTel / Vector / ...  ─►│  router  │─► consistent hash(org, stream) ─► ingester(s)
-                          └──────────┘                                      │
-                               │                                            ▼
-                               ▼                                       WAL + Arrow buffer
-                       /api/v1/{ingest,query,...}                           │
-                               │                                  flush → Parquet + Tantivy
-                               ▼                                  upload to object store
-                       ┌──────────────┐                                     │
-                       │ web shell    │                                     ▼
-                       │ (⌘K + stack) │             ┌────────────────────────────┐
-                       └──────┬───────┘             │ FileMeta in Postgres       │
-                              │ /query              │ objects in S3/GCS/Azure/…   │
-                              ▼                     └────────────────────────────┘
-                       ┌──────────────┐                          ▲
-                       │  querier(s)  │── Arrow Flight do_get ───┘
-                       └──────────────┘    (distributed scan by hash shard)
+```mermaid
+flowchart LR
+  subgraph ingest [Ingest]
+    A["Agents / collectors<br/>OTel · Vector · …"] -->|HTTP / gRPC| R["Router<br/>routing + rate limit"]
+    R -->|"consistent hashing (org, stream)"| I["Ingester"]
+    I --> WB["Durable log<br/>+ in-memory buffer"]
+    WB -->|periodic flush| CF["Columnar files<br/>+ search index"]
+  end
+
+  subgraph storage [Shared storage]
+    OS[("Object storage")]
+    MS[("Metadata store")]
+  end
+
+  subgraph query [Query]
+    UI["Web console / API"] -->|query| Q["Querier"]
+    Q -->|distributed scan across peers| QP["Querier peers"]
+  end
+
+  CF --> OS
+  CF -. partition metadata .-> MS
+  QP --> OS
+  Q -. partition pruning .-> MS
 ```
 
-The crucial point: logs, metrics, and traces land in the **same** Parquet files (different streams,
-same physical storage), so a SQL query joins across them natively — no cross-store federation.
+The crucial point: logs, metrics, and traces land in the **same** columnar files (different streams,
+one physical store), so a single query joins across them natively — no cross-store federation.
 
 ## Node roles
 
@@ -37,9 +42,9 @@ same physical storage), so a SQL query joins across them natively — no cross-s
 |---|---|---|
 | `standalone` | HTTP API + all workers in one process | — |
 | `router` | Reverse proxy + rate limiting | stateless |
-| `ingester` | gRPC ingest + WAL + buffer + flush to Parquet | local WAL (≤ flush window) |
-| `querier` | Arrow Flight server + DataFusion execution | stateless |
-| `compactor` | Periodic Parquet merge + retention cleanup | stateless |
+| `ingester` | Data ingest + durable write-ahead log + buffer + periodic flush to columnar files | local log (≤ flush window) |
+| `querier` | Distributed scan endpoint + query execution | stateless |
+| `compactor` | Periodic file merge + retention cleanup | stateless |
 | `alert_manager` | Rule evaluation + escalation dispatch | stateless |
 
 Roles are selected with the `[node].roles` config (or `MS_NODE.ROLES`). Only the ingester holds

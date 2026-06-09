@@ -53,15 +53,15 @@ Role enum values use **snake_case** in TOML / environment variables (`standalone
 
 | Role | Foreground exposure | Stateful / stateless | Scaling characteristics |
 | --- | --- | --- | --- |
-| `standalone` | HTTP (axum) + gRPC (tonic), running every internal responsibility in-process | Stateful (embeds an Ingester) | Single instance for evaluation; not suitable as a horizontal scaling unit |
+| `standalone` | HTTP + gRPC, running every internal responsibility in-process | Stateful (embeds an Ingester) | Single instance for evaluation; not suitable as a horizontal scaling unit |
 | `router` | HTTP reverse proxy + rate limiting; **does not directly expose internal services beyond the business HTTP listener** | Stateless (the rate limiter is in-process and ephemeral) | Scales horizontally; just put an L4/L7 LB in front |
 | `ingester` | Carries WAL replay + buffering + periodic flush (the actual work is pre-spawned at process startup) | **Stateful** (WAL, in-memory buffer, file_meta cache) | Sharded via consistent hashing; scaling must account for the WAL persistent volume and rebalancing |
-| `querier` | Designed to be the Arrow Flight distributed scan endpoint | Stateless | Scales horizontally |
+| `querier` | Designed to be the distributed scan endpoint | Stateless | Scales horizontally |
 | `compactor` | Background tick loop (pre-spawned); the role body itself idles | Stateless (processes tick by tick) | **Single instance recommended** (see the high-availability section) |
 | `alert_manager` | Two pre-spawned background loops: evaluation + dispatch; the role body itself idles | Stateful (evaluation state and incident state are in-process) | Single instance recommended |
 
 <Warning>
-**The Querier role is currently a placeholder / incomplete.** The role dispatch function currently only logs a single "querier role started (stub)" line and idles; the standalone Arrow Flight query server implementation has not yet been wired up. The fan-out protocol for distributed queries (see the data flow section) exists in the code and is invoked by the coordinator, but the layer that serves Flight `do_get` as a standalone `querier` process is not yet complete. The currently usable form of distributed query is the engine composition inside a `standalone` process.
+**The Querier role is currently a placeholder / incomplete.** The role dispatch function currently only logs a single "querier role started (stub)" line and idles; the standalone distributed-scan server implementation has not yet been wired up. The fan-out protocol for distributed queries (see the data flow section) exists in the code and is invoked by the coordinator, but the layer that serves the scan RPC as a standalone `querier` process is not yet complete. The currently usable form of distributed query is the engine composition inside a `standalone` process.
 </Warning>
 
 ### Which role carries which background worker
@@ -91,7 +91,7 @@ One key fact: **nearly all background workers are spawned unconditionally during
 
 ## How to select roles
 
-Roles are configured via `[node].roles`; they can be overridden with environment variables. Environment variables share the `MS_` prefix, with **section and field separated by a `.` (dot)** (parsed by figment `Env::prefixed("MS_").split(".")`). For example: `MS_NODE.ROLES`, `MS_STORE.META.DSN`, `MS_HTTP.PORT`.
+Roles are configured via `[node].roles`; they can be overridden with environment variables. Environment variables share the `MS_` prefix, with **section and field separated by a `.` (dot)** (the `MS_` prefix is stripped and the remaining key is split on `.`). For example: `MS_NODE.ROLES`, `MS_STORE.META.DSN`, `MS_HTTP.PORT`.
 
 <Tabs>
   <Tab title="TOML">
@@ -151,24 +151,24 @@ A few bootstrap / secret variables are **flat single-underscore** and live outsi
 
 ### Ingest path
 
-The entry point lands on some Ingester via the Router (rate limiting + consistent hashing); the Ingester first writes the WAL (durably persisted to disk), then writes the in-memory Arrow buffer; a background flush loop encodes the buffer into Parquet + a Tantivy index by time window or size threshold and uploads it to the object store, finally landing the FileMeta in Postgres and truncating the flushed WAL segments.
+The entry point lands on some Ingester via the Router (rate limiting + consistent hashing); the Ingester first writes the WAL (durably persisted to disk), then writes the in-memory buffer; a background flush loop encodes the buffer into columnar files + a search index by time window or size threshold and uploads it to the object store, finally landing the FileMeta in Postgres and truncating the flushed WAL segments.
 
 ```
-                 X-Org-Id            FNV-1a( org_id|stream )
+                 X-Org-Id            consistent hash( org_id|stream )
  client ──HTTP/gRPC──► Router ──consistent hashing──► Ingester (stateful)
  :5080/:5082          (stateless, rate limit)         │
                        │ 429 + Retry-After             │ 1) write WAL (to disk, configurable fsync strategy)
-                       │ when over org QPS             │ 2) write in-memory Arrow buffer (accumulated by seq)
+                       │ when over org QPS             │ 2) write in-memory buffer (accumulated by seq)
                                                ▼
                               background flush loop (triggered by flush_interval_secs / buffer threshold)
                                                │
-                          snapshot → Parquet(SNAPPY) + Tantivy sidecar
+                          snapshot → columnar files + search-index sidecar
                                                │ upload
                           ┌────────────────────┴────────────────────┐
                           ▼                                          ▼
                   object store (local / s3 / azure / gcs)        Postgres: FileMeta
-                  {org}/{type}/{stream}/{date}/{ksuid}.parquet  (time_range, rows,
-                  …{ksuid}.parquet.tantivy.tar.zst              min/max, object_key)
+                  {org}/{type}/{stream}/{date}/{file-id}  (time_range, rows,
+                  …a search-index sidecar per file              min/max, object_key)
                                                │
                           after a successful flush, seal + truncate the flushed WAL segments
 ```
@@ -181,7 +181,7 @@ The Router rate limits at `(org_id, route_class)` granularity, returning `429` w
 
 ### Query path
 
-The query entry point is on a node that exposes HTTP. The engine is wrapped layer by layer according to cluster size: local DataFusion engine → (with ≥2 querier peers) distributed engine → (when a remote cluster is specified) federated engine.
+The query entry point is on a node that exposes HTTP. The engine is wrapped layer by layer according to cluster size: local query engine → (with ≥2 querier peers) distributed engine → (when a remote cluster is specified) federated engine.
 
 ```
  client ──POST /api/v1/query──► QueryService
@@ -190,24 +190,24 @@ The query entry point is on a node that exposes HTTP. The engine is wrapped laye
                           ┌────────┴─────────┐
                        synchronous execution   async → create a search_jobs row, return 202 + job_id
                           │
-       engine composition: DataFusion(local) → Distributed(≥2 querier) → Federated(remote cluster)
+       engine composition: query engine (local) → distributed (≥2 querier) → federated (remote cluster)
                           │
-            FileMeta partition pruning (org/stream/stream_type/time_range) + Tantivy MATCH pruning
+            FileMeta partition pruning (org/stream/stream_type/time_range) + full-text (MATCH) pruning
                           │
-      distributed sharding: fxhash(object_key) % peer_count → each shard encoded as a QueryShard(Ticket)
-                          │  Arrow Flight do_get (:5082)
+      distributed sharding: hash(object_key) % peer_count → each shard encoded as a scan request (ticket)
+                          │  internal scan RPC (:5082)
             ┌─────────────┼─────────────┐
             ▼             ▼             ▼
-        Querier peer   Querier peer   …(each reads Parquet, SELECT * scan, returns RecordBatch)
+        Querier peer   Querier peer   …(each reads columnar files, SELECT * scan, returns result batches)
             └─────────────┼─────────────┘
                           ▼
-        coordinator UNION ALL → register MemTable → execute the full user SQL (aggregation/filter/projection)
+        coordinator UNION ALL → register an in-memory table → execute the full user SQL (aggregation/filter/projection)
                           ▼
                    QueryResult (columns, rows, scanned_rows, took_ms)
 ```
 
 <Note>
-Distributed query shards are fanned out to peers via `fxhash(object_key)`; the shard SQL only performs a scan (`SELECT * FROM <stream>`), while the full aggregation runs on the coordinator to avoid partial/final aggregation inconsistencies. The distributed path is taken only when the cluster has ≥2 querier peers; otherwise it falls back to the local engine with no network hop.
+Distributed query shards are fanned out to peers via a hash of `object_key`; the shard SQL only performs a scan (`SELECT * FROM <stream>`), while the full aggregation runs on the coordinator to avoid partial/final aggregation inconsistencies. The distributed path is taken only when the cluster has ≥2 querier peers; otherwise it falls back to the local engine with no network hop.
 </Note>
 
 ### Async search job pipeline
@@ -238,7 +238,7 @@ The `FOR UPDATE SKIP LOCKED` claim semantics are safe across multiple workers / 
 
 ### Federated / multi-cluster query
 
-Target clusters are specified via `?clusters=local,sf,nyc`. After scanning locally, the coordinator issues one Arrow Flight `do_get` (with a Bearer token) to each enabled remote cluster, then UNION ALLs the batches each cluster returns with the local data and executes the full SQL.
+Target clusters are specified via `?clusters=local,sf,nyc`. After scanning locally, the coordinator issues one internal scan RPC (with a Bearer token) to each enabled remote cluster, then UNION ALLs the batches each cluster returns with the local data and executes the full SQL.
 
 ```
  POST /api/v1/query?clusters=local,sf,nyc
@@ -274,15 +274,15 @@ Target clusters are specified via `?clusters=local,sf,nyc`. After scanning local
     There is no gossip / consensus; in distributed mode each role queries the `cluster_nodes` table directly and filters live peers by role. `standalone` mode skips the entire discovery flow, returning only itself and never touching `cluster_nodes`.
   </Step>
   <Step title="Placement algorithm">
-    Router selecting an Ingester: applies FNV-1a consistent hashing over `org_id|stream_name` then mods, landing deterministically on a particular Ingester. Router selecting a Querier: naive round-robin (`now_ns % peer_count`), not full consistent hashing. Distributed query sharding: `fxhash` over `object_key` then mods, fanning out to querier peers.
+    Router selecting an Ingester: applies consistent hashing over `org_id|stream_name` then mods, landing deterministically on a particular Ingester. Router selecting a Querier: naive round-robin (`now_ns % peer_count`), not full consistent hashing. Distributed query sharding: a hash over `object_key` then mods, fanning out to querier peers.
   </Step>
-  <Step title="Arrow Flight">
-    The coordinator prost-encodes a `QueryShard` (containing org/stream/sql/file_metas/time_range) into a `Ticket` and sends it to peers via Flight `do_get`; the peer reads Parquet, registers a MemTable, runs the shard SQL, and returns a `FlightData` stream. Flight shares the same port (default 5082) with the gRPC NodeService and IngestGrpc.
+  <Step title="Distributed scan RPC">
+    The coordinator encodes a scan request (org/stream/sql/file_metas/time_range) into a ticket and sends it to peers over the internal scan RPC; the peer reads columnar files, registers an in-memory table, runs the shard SQL, and returns a result stream. This RPC shares the same port (default 5082) with the gRPC node service and ingest service.
   </Step>
 </Steps>
 
 <Info>
-Local Flight calls within the cluster are unauthenticated; only federated / remote-cluster calls use an optional Bearer token.
+Local scan-RPC calls within the cluster are unauthenticated; only federated / remote-cluster calls use an optional Bearer token.
 </Info>
 
 `cluster_nodes` table schema: `node_id VARCHAR(64) PK`, `role VARCHAR(32)`, `advertise_addr VARCHAR(255)`, `started_at_micros BIGINT`, `last_heartbeat_at_micros BIGINT`, with indexes on `role` and `last_heartbeat_at_micros`.
@@ -294,10 +294,10 @@ Local Flight calls within the cluster are unauthenticated; only federated / remo
     The metadata database: FileMeta, streams, rules, incidents, users, orgs, audit, quotas, certificates, `cluster_nodes`, `search_jobs`, `remote_clusters`, and more. `[store.meta]`: `backend` (default `sqlite`; set to `postgres` for production), `dsn`, `max_connections` (default 16). Migrations are embedded at compile time.
   </Card>
   <Card title="Object store" icon="cloud">
-    Parquet + Tantivy sidecars. `[store.object].backend`: `local` (default, `root=./data/objects`) / `s3` (including MinIO, R2, Alibaba Cloud OSS, overridden via `endpoint`) / `azure` / `gcs`. Credential precedence: env vars > credential file > inline TOML.
+    Columnar files + search-index sidecars. `[store.object].backend`: `local` (default, `root=./data/objects`) / `s3` (including MinIO, R2, Alibaba Cloud OSS, overridden via `endpoint`) / `azure` / `gcs`. Credential precedence: env vars > credential file > inline TOML.
   </Card>
   <Card title="No external cache / consensus" icon="memory">
-    Only in-process moka LRU+TTL caches, the governor rate limiter, and the tokio runtime. No Redis / Memcached, no external consensus component.
+    Only in-process LRU+TTL caches, the rate limiter, and the async runtime. No Redis / Memcached, no external consensus component.
   </Card>
   <Card title="Rendering dependency (optional)" icon="image">
     PNG/PDF rendering for scheduled reports requires headless Chromium and is feature-gated; OSS builds always fall back to an SVG placeholder. The image's runtime layer already ships with chromium.
@@ -308,10 +308,10 @@ Local Flight calls within the cluster are unauthenticated; only federated / remo
 
 | Port | Protocol / service | Config key | Notes |
 | --- | --- | --- | --- |
-| 5080 | HTTP (axum) | `[http].bind` (default `0.0.0.0`), `[http].port` | `/api/v1/*`, `/metrics`, `/healthz`, `/readyz`, `/.well-known/acme-challenge/`, etc. |
-| 5082 | gRPC (tonic) | `[grpc].bind`, `[grpc].port`, `max_message_size_mb` (default 32MB) | IngestGrpc + Arrow Flight `do_get` + Cluster heartbeat, three services sharing one port |
+| 5080 | HTTP | `[http].bind` (default `0.0.0.0`), `[http].port` | `/api/v1/*`, `/metrics`, `/healthz`, `/readyz`, `/.well-known/acme-challenge/`, etc. |
+| 5082 | gRPC | `[grpc].bind`, `[grpc].port`, `max_message_size_mb` (default 32MB) | Ingest + scan RPC + cluster heartbeat, three services sharing one port |
 | 80 | Plaintext HTTP in TLS mode | `[http.tls].plain_port` | Health checks + ACME HTTP-01 challenge + 301 redirect to HTTPS |
-| 443 | HTTPS in TLS mode (rustls + SNI) | `[http.tls].port` | Full routing; requires the `domain-acme-tls` feature |
+| 443 | HTTPS in TLS mode (SNI) | `[http.tls].port` | Full routing; requires the `domain-acme-tls` feature |
 
 <Note>
 **`/metrics`** (GET, Prometheus text 0.0.4) is controlled by `[telemetry].metrics_enabled` (default true) and exposes metrics such as cache hits / invalidations, `object_store_*`, `wal_*`, `file_meta_dump_*`, `tantivy_pruned_files_total`, `alert_rule_eval_timeout_total`.
@@ -405,7 +405,7 @@ All topologies share the same image (e.g. `molesignal:dev`), distinguished by `M
     | --- | --- | --- | --- | --- |
     | `30-router.yaml` | Deployment | 2 | `router` | Stateless; 5080/http + 5082/grpc; ClusterIP; `readinessProbe GET /api/v1/healthz` |
     | `40-ingester.yaml` | **StatefulSet** | 2 | `ingester` | `volumeClaimTemplate` data 20Gi RWO/replica mounted at `/data` (WAL); headless Service (`clusterIP: None`); readiness probe with 10s initial delay (leaving a replay window) |
-    | `50-querier.yaml` | Deployment | 2 | `querier` | Stateless; 5080 + 5082 (Arrow Flight); ClusterIP; readiness probe 5s |
+    | `50-querier.yaml` | Deployment | 2 | `querier` | Stateless; 5080 + 5082 (scan RPC); ClusterIP; readiness probe 5s |
     | `60-compactor.yaml` | Deployment | **1** | `compactor` | Stateless; single instance to avoid merge conflicts (a lease-table lock is planned for the future); ClusterIP |
     | `70-alert-manager.yaml` | Deployment | 1 | `alert_manager` | Carries alert evaluation + scheduled reports (PNG/PDF needs chromium, annotated `molesignal.io/scheduled-reports-renderer: requires-chromium`); ClusterIP |
     | `90-connector.yaml` | Deployment | 1 | `connector` | Drives pull / receive-push connectors; only 5080/http (no grpc); ClusterIP |
@@ -429,7 +429,7 @@ All topologies share the same image (e.g. `molesignal:dev`), distinguished by `M
     Stateless; scale replicas with entry traffic. The rate limiter is in-process and ephemeral: under multiple replicas each replica counts independently, so the effective org QPS ceiling is roughly `configured value × replica count`. When needed, move rate limiting up to a unified gateway or lower the per-replica threshold.
   </Card>
   <Card title="Querier — scales horizontally" icon="magnifying-glass">
-    Stateless. Distributed scans only trigger with ≥2 peers. Note: the standalone querier's Flight server is currently a placeholder, so the fully landed form of distributed query is the in-process engine of standalone. The bottleneck is Parquet reads + DataFusion memory.
+    Stateless. Distributed scans only trigger with ≥2 peers. Note: the standalone querier's scan-RPC server is currently a placeholder, so the fully landed form of distributed query is the in-process engine of standalone. The bottleneck is columnar-file reads + query-engine memory.
   </Card>
   <Card title="Ingester — stateful" icon="database">
     Use a StatefulSet + a per-replica PVC for a persistent WAL. The Router places via consistent hashing over `org|stream`; scaling changes the mod result and causes rebalancing, so ensure the WAL is flushed before scaling down. Leave enough of a replay window for the readiness probe (the manifest sets a 10s initial delay).
@@ -468,5 +468,5 @@ Recommended metrics to monitor: for the write path, watch `wal_append_lock_wait_
 </Steps>
 
 <Warning>
-Before going live, be clear about the following "current state" boundaries: the standalone `querier` role is a placeholder (the distributed Flight server is incomplete); a multi-role array only takes effect for the first element; ACME issuance/renewal is a placeholder and not spawned; the distributed consensus WAL term source is still a static placeholder (multi-node consensus is not implemented); federated query and SSO (OIDC only; SAML is not implemented), among others, are license/feature-gated.
+Before going live, be clear about the following "current state" boundaries: the standalone `querier` role is a placeholder (the distributed scan-RPC server is incomplete); a multi-role array only takes effect for the first element; ACME issuance/renewal is a placeholder and not spawned; the distributed consensus WAL term source is still a static placeholder (multi-node consensus is not implemented); federated query and SSO (OIDC only; SAML is not implemented), among others, are license/feature-gated.
 </Warning>

@@ -53,15 +53,15 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
 
 | 角色 | 前台暴露 | 有/无状态 | 扩缩特性 |
 | --- | --- | --- | --- |
-| `standalone` | HTTP（axum）+ gRPC（tonic），并在进程内运行全部内部职责 | 含状态（内含 Ingester） | 评估用单实例；不适合作为横向扩展单元 |
+| `standalone` | HTTP + gRPC，并在进程内运行全部内部职责 | 含状态（内含 Ingester） | 评估用单实例；不适合作为横向扩展单元 |
 | `router` | HTTP 反向代理 + 限流；**不直接暴露业务 HTTP listener 之外的内部服务** | 无状态（限流器为进程内、临时） | 可水平扩，前置一个 L4/L7 LB 即可 |
 | `ingester` | 承载 WAL 重放 + 缓冲 + 周期 flush（实际工作在进程启动时预拉起） | **有状态**（WAL、内存缓冲、file_meta 缓存） | 一致性哈希分片；扩缩需考虑 WAL 持久卷与再平衡 |
-| `querier` | 设计上为 Arrow Flight 分布式扫描端 | 无状态 | 可水平扩 |
+| `querier` | 设计上为分布式扫描端 | 无状态 | 可水平扩 |
 | `compactor` | 后台 tick 循环（预拉起），角色本体空转 | 无状态（逐 tick 处理） | **建议单实例**（见高可用一节） |
 | `alert_manager` | 后台评估 + 派发两条循环（预拉起），角色本体空转 | 有状态（评估状态、事件状态在进程内） | 建议单实例 |
 
 <Warning>
-**Querier 角色当前为占位 / 未完成。** 角色分发函数目前只记录一条 "querier role started (stub)" 日志并空转，独立的 Arrow Flight 查询服务端实现尚未接线。分布式查询的散播协议（见数据流章节）在代码中存在并被协调端调用，但作为独立 `querier` 进程对外提供 Flight `do_get` 的那一层尚未完成。当前分布式查询的可用形态是 `standalone` 进程内的引擎组合。
+**Querier 角色当前为占位 / 未完成。** 角色分发函数目前只记录一条 "querier role started (stub)" 日志并空转，独立的分布式扫描服务端实现尚未接线。分布式查询的散播协议（见数据流章节）在代码中存在并被协调端调用，但作为独立 `querier` 进程对外提供扫描 RPC 的那一层尚未完成。当前分布式查询的可用形态是 `standalone` 进程内的引擎组合。
 </Warning>
 
 ### 后台 worker 由哪个角色承载
@@ -91,7 +91,7 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
 
 ## 如何选择角色
 
-角色通过 `[node].roles` 配置；可用环境变量覆盖。环境变量统一前缀 `MS_`，**section 与 field 之间用 `.`（点）分隔**（由 figment `Env::prefixed("MS_").split(".")` 解析）。例如 `MS_NODE.ROLES`、`MS_STORE.META.DSN`、`MS_HTTP.PORT`。
+角色通过 `[node].roles` 配置；可用环境变量覆盖。环境变量统一前缀 `MS_`，**section 与 field 之间用 `.`（点）分隔**（去掉 `MS_` 前缀后，其余按 `.` 切分）。例如 `MS_NODE.ROLES`、`MS_STORE.META.DSN`、`MS_HTTP.PORT`。
 
 <Tabs>
   <Tab title="TOML">
@@ -151,24 +151,24 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
 
 ### 写入路径
 
-入口经 Router（限流 + 一致性哈希）落到某个 Ingester；Ingester 先写 WAL（落盘持久），再写内存 Arrow 缓冲；后台 flush 循环按时间窗或大小阈值把缓冲编码成 Parquet + Tantivy 索引上传对象存储，最后把 FileMeta 落 Postgres，并截断已 flush 的 WAL 段。
+入口经 Router（限流 + 一致性哈希）落到某个 Ingester；Ingester 先写 WAL（落盘持久），再写内存缓冲；后台 flush 循环按时间窗或大小阈值把缓冲编码成列式文件 + 检索索引上传对象存储，最后把 FileMeta 落 Postgres，并截断已 flush 的 WAL 段。
 
 ```
-                 X-Org-Id            FNV-1a( org_id|stream )
+                 X-Org-Id            一致性哈希( org_id|stream )
  client ──HTTP/gRPC──► Router ──一致性哈希──► Ingester (有状态)
  :5080/:5082          (无状态,限流)            │
                        │ 429 + Retry-After     │ 1) 写 WAL（落盘, 可配 fsync 策略）
-                       │ 超过 org QPS 时        │ 2) 写内存 Arrow 缓冲（按 seq 累积）
+                       │ 超过 org QPS 时        │ 2) 写内存缓冲（按 seq 累积）
                                                ▼
                               后台 flush 循环（flush_interval_secs / 缓冲阈值触发）
                                                │
-                          snapshot → Parquet(SNAPPY) + Tantivy 侧车
+                          snapshot → 列式文件 + 检索索引侧车
                                                │ 上传
                           ┌────────────────────┴────────────────────┐
                           ▼                                          ▼
                   对象存储（local / s3 / azure / gcs）        Postgres：FileMeta
-                  {org}/{type}/{stream}/{date}/{ksuid}.parquet  (time_range, rows,
-                  …{ksuid}.parquet.tantivy.tar.zst              min/max, object_key)
+                  {org}/{type}/{stream}/{date}/{file-id}  (time_range, rows,
+                  …每个文件一个检索索引侧车              min/max, object_key)
                                                │
                           flush 成功后 seal + 截断已落盘的 WAL 段
 ```
@@ -181,7 +181,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 
 ### 查询路径
 
-查询入口在暴露 HTTP 的节点上。引擎按集群规模逐层包装：本地 DataFusion 引擎 →（≥2 个 querier 对等节点时）分布式引擎 →（指定了远程集群时）联邦引擎。
+查询入口在暴露 HTTP 的节点上。引擎按集群规模逐层包装：本地查询引擎 →（≥2 个 querier 对等节点时）分布式引擎 →（指定了远程集群时）联邦引擎。
 
 ```
  client ──POST /api/v1/query──► QueryService
@@ -190,24 +190,24 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
                           ┌────────┴─────────┐
                        同步执行            异步 → 建 search_jobs 行，返回 202 + job_id
                           │
-       引擎组合：DataFusion(本地) → Distributed(≥2 querier) → Federated(远程集群)
+       引擎组合：查询引擎(本地) → 分布式(≥2 querier) → 联邦(远程集群)
                           │
-            FileMeta 分区裁剪（org/stream/stream_type/time_range）+ Tantivy MATCH 裁剪
+            FileMeta 分区裁剪（org/stream/stream_type/time_range）+ 全文 (MATCH) 裁剪
                           │
-      分布式分片：fxhash(object_key) % peer_count → 每片编码为 QueryShard(Ticket)
-                          │  Arrow Flight do_get（:5082）
+      分布式分片：hash(object_key) % peer_count → 每片编码为扫描请求(ticket)
+                          │  内部扫描 RPC（:5082）
             ┌─────────────┼─────────────┐
             ▼             ▼             ▼
-        Querier 对等   Querier 对等   …（各自读 Parquet, SELECT * 扫描, 回传 RecordBatch）
+        Querier 对等   Querier 对等   …（各自读列式文件, SELECT * 扫描, 回传结果批次）
             └─────────────┼─────────────┘
                           ▼
-        协调端 UNION ALL → 注册 MemTable → 执行完整用户 SQL（聚合/过滤/投影）
+        协调端 UNION ALL → 注册内存表 → 执行完整用户 SQL（聚合/过滤/投影）
                           ▼
                    QueryResult（columns, rows, scanned_rows, took_ms）
 ```
 
 <Note>
-分布式查询的分片用 `fxhash(object_key)` 散到对等节点；分片 SQL 仅做扫描（`SELECT * FROM <stream>`），完整聚合在协调端执行以避免部分/最终聚合不一致。仅当集群中有 ≥2 个 querier 对等节点时才走分布式；否则回退到本地引擎，无网络跳。
+分布式查询的分片对 `object_key` 取哈希散到对等节点；分片 SQL 仅做扫描（`SELECT * FROM <stream>`），完整聚合在协调端执行以避免部分/最终聚合不一致。仅当集群中有 ≥2 个 querier 对等节点时才走分布式；否则回退到本地引擎，无网络跳。
 </Note>
 
 ### 异步搜索作业管线
@@ -238,7 +238,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 
 ### 联邦 / 多集群查询
 
-通过 `?clusters=local,sf,nyc` 指定目标集群。协调端本地扫描后，对每个启用的远程集群发起一次 Arrow Flight `do_get`（带 Bearer token），把各集群回传的批次与本地 UNION ALL 后执行完整 SQL。
+通过 `?clusters=local,sf,nyc` 指定目标集群。协调端本地扫描后，对每个启用的远程集群发起一次内部扫描 RPC（带 Bearer token），把各集群回传的批次与本地 UNION ALL 后执行完整 SQL。
 
 ```
  POST /api/v1/query?clusters=local,sf,nyc
@@ -274,15 +274,15 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     没有 gossip / 共识；分布式模式下各角色直接查 `cluster_nodes` 表按角色筛选存活对等节点。`standalone` 模式跳过整套发现，只返回自身、永不触达 `cluster_nodes`。
   </Step>
   <Step title="选址算法">
-    Router 选 Ingester：对 `org_id|stream_name` 做 FNV-1a 一致性哈希后取模，确定性落到某个 Ingester。Router 选 Querier：朴素轮询（`now_ns % peer_count`），不是完整一致性哈希。分布式查询分片：对 `object_key` 做 `fxhash` 取模散到 querier 对等节点。
+    Router 选 Ingester：对 `org_id|stream_name` 做一致性哈希后取模，确定性落到某个 Ingester。Router 选 Querier：朴素轮询（`now_ns % peer_count`），不是完整一致性哈希。分布式查询分片：对 `object_key` 取哈希取模散到 querier 对等节点。
   </Step>
-  <Step title="Arrow Flight">
-    协调端把 `QueryShard`（含 org/stream/sql/file_metas/time_range）prost 编码进 `Ticket`，经 Flight `do_get` 发到对等节点；对等节点读 Parquet、注册 MemTable、跑分片 SQL、回传 `FlightData` 流。Flight 与 gRPC NodeService、IngestGrpc 共用同一端口（默认 5082）。
+  <Step title="分布式扫描 RPC">
+    协调端把扫描请求（含 org/stream/sql/file_metas/time_range）编码成 ticket，经内部扫描 RPC 发到对等节点；对等节点读列式文件、注册内存表、跑分片 SQL、回传结果流。该 RPC 与 gRPC 节点服务、数据接入服务共用同一端口（默认 5082）。
   </Step>
 </Steps>
 
 <Info>
-集群内部的本地 Flight 调用不带鉴权；只有联邦 / 远程集群调用使用可选的 Bearer token。
+集群内部的本地扫描 RPC 调用不带鉴权；只有联邦 / 远程集群调用使用可选的 Bearer token。
 </Info>
 
 `cluster_nodes` 表结构：`node_id VARCHAR(64) PK`、`role VARCHAR(32)`、`advertise_addr VARCHAR(255)`、`started_at_micros BIGINT`、`last_heartbeat_at_micros BIGINT`，在 `role` 与 `last_heartbeat_at_micros` 上建索引。
@@ -294,10 +294,10 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     元数据库：FileMeta、streams、rules、incidents、users、orgs、audit、quotas、证书、`cluster_nodes`、`search_jobs`、`remote_clusters` 等。`[store.meta]`：`backend`（默认 `sqlite`，生产请置 `postgres`）、`dsn`、`max_connections`（默认 16）。迁移在编译期内嵌。
   </Card>
   <Card title="对象存储" icon="cloud">
-    Parquet + Tantivy 侧车。`[store.object].backend`：`local`（默认，`root=./data/objects`）/ `s3`（含 MinIO、R2、阿里云 OSS，用 `endpoint` 覆盖）/ `azure` / `gcs`。凭据优先级：环境变量 > 凭据文件 > 内联 TOML。
+    列式文件 + 检索索引侧车。`[store.object].backend`：`local`（默认，`root=./data/objects`）/ `s3`（含 MinIO、R2、阿里云 OSS，用 `endpoint` 覆盖）/ `azure` / `gcs`。凭据优先级：环境变量 > 凭据文件 > 内联 TOML。
   </Card>
   <Card title="无外部缓存 / 共识" icon="memory">
-    仅进程内 moka LRU+TTL 缓存、governor 限流、tokio 运行时。无 Redis / Memcached，无外部共识组件。
+    仅进程内 LRU+TTL 缓存、限流器、异步运行时。无 Redis / Memcached，无外部共识组件。
   </Card>
   <Card title="渲染依赖（可选）" icon="image">
     定时报表的 PNG/PDF 渲染需 headless Chromium，为 feature 门控；OSS 构建一律回退 SVG 占位。镜像运行层已带 chromium。
@@ -308,10 +308,10 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 
 | 端口 | 协议 / 服务 | 配置键 | 说明 |
 | --- | --- | --- | --- |
-| 5080 | HTTP（axum） | `[http].bind`（默认 `0.0.0.0`）、`[http].port` | `/api/v1/*`、`/metrics`、`/healthz`、`/readyz`、`/.well-known/acme-challenge/` 等 |
-| 5082 | gRPC（tonic） | `[grpc].bind`、`[grpc].port`、`max_message_size_mb`（默认 32MB） | IngestGrpc + Arrow Flight `do_get` + Cluster 心跳，三服务共用 |
+| 5080 | HTTP | `[http].bind`（默认 `0.0.0.0`）、`[http].port` | `/api/v1/*`、`/metrics`、`/healthz`、`/readyz`、`/.well-known/acme-challenge/` 等 |
+| 5082 | gRPC | `[grpc].bind`、`[grpc].port`、`max_message_size_mb`（默认 32MB） | 数据接入 + 扫描 RPC + 集群心跳，三服务共用 |
 | 80 | TLS 模式下的明文 HTTP | `[http.tls].plain_port` | 健康检查 + ACME HTTP-01 挑战 + 301 跳转 HTTPS |
-| 443 | TLS 模式下的 HTTPS（rustls + SNI） | `[http.tls].port` | 完整路由；需 `domain-acme-tls` feature |
+| 443 | TLS 模式下的 HTTPS（SNI） | `[http.tls].port` | 完整路由；需 `domain-acme-tls` feature |
 
 <Note>
 **`/metrics`**（GET，Prometheus 文本 0.0.4）由 `[telemetry].metrics_enabled`（默认 true）控制，暴露缓存命中 / 失效、`object_store_*`、`wal_*`、`file_meta_dump_*`、`tantivy_pruned_files_total`、`alert_rule_eval_timeout_total` 等指标。
@@ -405,7 +405,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     | --- | --- | --- | --- | --- |
     | `30-router.yaml` | Deployment | 2 | `router` | 无状态；5080/http + 5082/grpc；ClusterIP；`readinessProbe GET /api/v1/healthz` |
     | `40-ingester.yaml` | **StatefulSet** | 2 | `ingester` | `volumeClaimTemplate` data 20Gi RWO/副本 挂 `/data`（WAL）；headless Service（`clusterIP: None`）；就绪探针 10s 初始延迟（留重放窗口） |
-    | `50-querier.yaml` | Deployment | 2 | `querier` | 无状态；5080 + 5082（Arrow Flight）；ClusterIP；就绪探针 5s |
+    | `50-querier.yaml` | Deployment | 2 | `querier` | 无状态；5080 + 5082（扫描 RPC）；ClusterIP；就绪探针 5s |
     | `60-compactor.yaml` | Deployment | **1** | `compactor` | 无状态；单实例避免合并冲突（未来计划 lease 表加锁）；ClusterIP |
     | `70-alert-manager.yaml` | Deployment | 1 | `alert_manager` | 承载告警评估 + 定时报表（PNG/PDF 需 chromium，带注解 `molesignal.io/scheduled-reports-renderer: requires-chromium`）；ClusterIP |
     | `90-connector.yaml` | Deployment | 1 | `connector` | 驱动拉 / 收推连接器；仅 5080/http（无 grpc）；ClusterIP |
@@ -429,7 +429,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     无状态，副本数随入口流量扩。限流器是进程内、临时的：多副本下每副本各自计数，实际 org QPS 上限约为 `配置值 × 副本数`，需要时把限流前置到统一网关或下调单副本阈值。
   </Card>
   <Card title="Querier — 可水平扩" icon="magnifying-glass">
-    无状态。≥2 个对等节点才触发分布式扫描。注意：独立 querier 的 Flight 服务端当前为占位，分布式查询的完整落地形态以 standalone 内引擎为准。瓶颈在 Parquet 读取 + DataFusion 内存。
+    无状态。≥2 个对等节点才触发分布式扫描。注意：独立 querier 的扫描 RPC 服务端当前为占位，分布式查询的完整落地形态以 standalone 内引擎为准。瓶颈在列式文件读取 + 查询引擎内存。
   </Card>
   <Card title="Ingester — 有状态" icon="database">
     用 StatefulSet + 每副本 PVC 持久 WAL。Router 按 `org|stream` 一致性哈希落点，扩缩会改变取模结果导致再平衡；缩容前应确保 WAL 已 flush。就绪探针留足重放窗口（清单设 10s 初始延迟）。
@@ -468,5 +468,5 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 </Steps>
 
 <Warning>
-落地前请明确以下"现状"边界：`querier` 独立角色为占位（分布式 Flight 服务端未完成）；多角色数组仅首元素生效；ACME 签发/续期为占位且未拉起；分布式共识 WAL term source 仍为静态占位（多节点共识未实现）；联邦查询与 SSO（仅 OIDC，SAML 未实现）等为 license/feature 门控。
+落地前请明确以下"现状"边界：`querier` 独立角色为占位（分布式扫描 RPC 服务端未完成）；多角色数组仅首元素生效；ACME 签发/续期为占位且未拉起；分布式共识 WAL term source 仍为静态占位（多节点共识未实现）；联邦查询与 SSO（仅 OIDC，SAML 未实现）等为 license/feature 门控。
 </Warning>
