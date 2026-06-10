@@ -1,0 +1,92 @@
+---
+title: "PromQL 支持矩阵"
+description: "MoleSignal 引擎支持的 PromQL 函数、运算符与修饰符，以及已知差异。"
+---
+
+MoleSignal 用自研 evaluator（`promql-parser` + Arrow/DataFusion）在 metric 流上跑 PromQL。
+instant 与 range 查询均支持——range 查询按 `[start, end]` 步进、输出 matrix。本页是权威支持矩阵。
+
+## 已支持
+
+### Range 向量函数（输入 `metric[range]`）
+
+`rate`、`irate`、`increase`、`delta`、`idelta`、`deriv`、`predict_linear`、`resets`、
+`changes`、`holt_winters`（别名 `double_exponential_smoothing`），以及全部 `*_over_time`：
+`avg_over_time` / `min_over_time` / `max_over_time` / `sum_over_time` / `count_over_time` /
+`quantile_over_time` / `stddev_over_time` / `stdvar_over_time` / `last_over_time` /
+`present_over_time` / `mad_over_time`。
+
+### 聚合算子（含 `by()` / `without()`）
+
+`sum`、`avg`、`min`、`max`、`count`、`stddev`、`stdvar`、`quantile`、`group`、
+`count_values`、`topk`、`bottomk`、`limitk`、`limit_ratio`。
+
+### Histogram
+
+`histogram_quantile(q, sum by(le)(rate(metric_bucket[range])))`：对 classic `le` bucket 线性插值。
+
+### Label / 排序
+
+`label_replace`、`label_join`、`sort`、`sort_desc`、`sort_by_label`、`sort_by_label_desc`。
+
+### 时间
+
+`time`、`timestamp`、`minute`、`hour`、`day_of_week`、`day_of_month`、`day_of_year`、
+`days_in_month`、`month`、`year`（全部 UTC；日期类函数默认作用于 `vector(time())`）。
+
+### 类型 / 缺失
+
+`vector`、`scalar`、`absent`、`absent_over_time`。
+
+### 数学 / 取整 / 三角
+
+`abs`、`ceil`、`floor`、`round`、`exp`、`ln`、`log2`、`log10`、`sqrt`、`sgn`、
+`clamp` / `clamp_min` / `clamp_max`、`sin` / `cos` / `tan` / `asin` / `acos` / `atan` / `sinh` /
+`cosh` / `tanh` / `asinh` / `acosh` / `atanh`、`pi`、`deg`、`rad`。
+
+### 运算符
+
+算术 `+ - * / % ^`、比较 `== != > < >= <=`（含 `bool`）、集合 `and` / `or` / `unless`、
+向量匹配 `on(...)` / `ignoring(...)` 配 `group_left` / `group_right`、一元负号。
+
+### 修饰符 / 查询结构
+
+选择器 `@`（`start()` / `end()` / `<ts>`）与 `offset`（含 matrix selector 上的）；
+子查询 `inner[range:step]`。
+
+## 未实装 / 已知差异
+
+| 功能 | 状态 | 说明 |
+|---|---|---|
+| native-histogram 函数 `histogram_count` / `histogram_sum` / `histogram_avg` / `histogram_fraction` / `histogram_stddev` / `histogram_stdvar` | ❌ → 400 | classic `le` bucket 模型下不适用；分位数走 `histogram_quantile` |
+| 二元 `default` 填充 | ❌ → 400 | — |
+| range 查询里的子查询 | ⚠️ | 回退到 instant 求值（不做外层步进 × 内层步进的双重扫描）；instant / 告警路径精确 |
+| `timestamp()` | ⚠️ | instant 路径返回求值时刻；range 路径返回各点自身时间戳 |
+| 标量函数参数（`predict_linear` 的 `t`、`holt_winters` 的 `sf`/`tf`、各 `quantile`） | ⚠️ | 仅接受数字字面量 |
+
+未支持的函数 / 语法返 `Error::Invalid("promql function not yet supported: <name>")`，
+HTTP `POST /api/v1/query`（`language: "promql"`）映射到 `400`。
+
+<Note>
+  recording / alerting rules **不走 PromQL**，而是 MoleSignal 自己的 `AlertRule` 模型，
+  与 Prometheus rule format 不互通。见 [告警](/zh/alerting)。
+</Note>
+
+## 标签匹配
+
+`=` / `!=` / `=~` / `!~`（正则走 RE2，与 Prometheus PCRE 行为略有差异）。`__name__` 固定为
+metric stream 名，不可重命名。
+
+## 内部数据布局
+
+metric 流的 schema 把 label 存为**独立列**（不是 JSON 串）：
+
+```
+_timestamp  Timestamp(Microsecond)  NOT NULL   # 时间
+value       Float64                 NOT NULL   # 度量值（Int64 等数值也接受、cast 到 f64）
+<label_x>   Utf8 …                             # 其余非保留列即 label
+```
+
+求值时引擎按候选 `FileMeta` 的时间范围直接拉 parquet（`batches_to_series`）构造
+`(labels, samples)` series，标签匹配（`=`/`!=`/`=~`/`!~`）在代码端套用；`@` / `offset` 由
+`load_matrix` 解析成生效求值时刻。

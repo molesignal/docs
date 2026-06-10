@@ -47,26 +47,26 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
 
 `[node].roles` 是一个数组（`Vec<Role>`），合法取值：`standalone`、`router`、`ingester`、`querier`、`compactor`、`alert_manager`。默认 `["standalone"]`。
 
-<Warning>
-**当前实现只取数组的第一个角色用于前台分发与集群心跳的 PeerRole 标注。** 形如 `[node].roles = ["ingester", "compactor"]` 的多角色写法可以被解析，但目前仅第一个元素生效，"单进程同时承担多个前台角色" 属于尚未落地的设计意图，请勿在生产里依赖。如需多职责合一，请使用 `standalone`。
-</Warning>
+<Note>
+**多角色可在一个进程内组合。** 形如 `[node].roles = ["ingester", "querier"]` 会启动各角色所需的去重后前台 server（此例为同时承载 ingest + 扫描的 gRPC server），按角色 gate 对应后台循环，并把节点的**全部**角色登记进 `cluster_nodes`——于是对等节点能按它承担的每个角色发现它。`standalone` 是"全部角色合一进程"的简写。
+</Note>
 
 | 角色 | 前台暴露 | 有/无状态 | 扩缩特性 |
 | --- | --- | --- | --- |
 | `standalone` | HTTP + gRPC，并在进程内运行全部内部职责 | 含状态（内含 Ingester） | 评估用单实例；不适合作为横向扩展单元 |
 | `router` | HTTP 反向代理 + 限流；**不直接暴露业务 HTTP listener 之外的内部服务** | 无状态（限流器为进程内、临时） | 可水平扩，前置一个 L4/L7 LB 即可 |
-| `ingester` | 承载 WAL 重放 + 缓冲 + 周期 flush（实际工作在进程启动时预拉起） | **有状态**（WAL、内存缓冲、file_meta 缓存） | 一致性哈希分片；扩缩需考虑 WAL 持久卷与再平衡 |
-| `querier` | 设计上为分布式扫描端 | 无状态 | 可水平扩 |
-| `compactor` | 后台 tick 循环（预拉起），角色本体空转 | 无状态（逐 tick 处理） | **建议单实例**（见高可用一节） |
-| `alert_manager` | 后台评估 + 派发两条循环（预拉起），角色本体空转 | 有状态（评估状态、事件状态在进程内） | 建议单实例 |
+| `ingester` | 承载 WAL 重放 + 缓冲 + 周期 flush（flush 循环在配置了该角色时于启动期 spawn） | **有状态**（WAL、内存缓冲、file_meta 缓存） | 一致性哈希分片；扩缩需考虑 WAL 持久卷与再平衡 |
+| `querier` | gRPC 上的分布式扫描端（Arrow Flight `do_get`）：读列式文件、跑 shard SQL、流式返回结果批 | 无状态 | 可水平扩 |
+| `compactor` | 运行压实 + retention tick 循环（仅当配置了该角色才 spawn） | 无状态（逐 tick 处理） | **建议单实例**（见高可用一节） |
+| `alert_manager` | 运行评估 + 派发 tick 循环（仅当配置了该角色才 spawn） | 有状态（评估状态、事件状态在进程内） | 建议单实例 |
 
-<Warning>
-**Querier 角色当前为占位 / 未完成。** 角色分发函数目前只记录一条 "querier role started (stub)" 日志并空转，独立的分布式扫描服务端实现尚未接线。分布式查询的散播协议（见数据流章节）在代码中存在并被协调端调用，但作为独立 `querier` 进程对外提供扫描 RPC 的那一层尚未完成。当前分布式查询的可用形态是 `standalone` 进程内的引擎组合。
-</Warning>
+<Note>
+独立 `querier`（或任何含 `querier` / `ingester` 的角色集）会启动 gRPC server，其中承载 Arrow Flight 扫描服务。协调端经 `list_role(querier)` 发现各 querier 并向其散播分片。单进程 `standalone` 仍如常工作；分布式散播需 ≥2 个 querier 对等节点。
+</Note>
 
 ### 后台 worker 由哪个角色承载
 
-一个关键事实：**几乎所有后台 worker 都在进程启动的统一装配阶段被无条件拉起，而不是在各角色的分发函数里。** 它们通过 feature flag 或配置自我门控（gating）。这意味着：在 `standalone` 进程里，它们全部运行；在分角色镜像里，是否真正"干活"取决于该角色是否被注入了对应依赖与配置。下表给出建议的承载角色与周期。
+角色相关的循环（ingester flush、compaction + file_meta_dumper、告警评估/派发）**只有在配置了其归属角色时才 spawn**（`standalone` 视为全部角色）。少数常驻 worker（心跳、sweeper、对象存储探针、MMDB 刷新、search_jobs、scheduled_reports）在每个节点都运行。下表给出归属角色与周期。
 
 | 后台 worker | 建议承载角色 | 周期 | 配置键 | 现状 |
 | --- | --- | --- | --- | --- |
@@ -79,14 +79,10 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
 | file_meta_dumper（冷分区落盘） | `compactor`（与 compaction 同进程） | `interval_secs`，默认 3600s（1h） | `[storage.file_meta_dump].interval_secs`，`enabled=false` 可关闭 | 已接线 |
 | scheduled_reports（定时报表） | `alert_manager`（需渲染依赖见下） | 固定 60s tick；report 自身 cron 决定是否到期 | report 的 `cron`（tick 间隔不可配） | 已接线 |
 | search_jobs（异步搜索池） | 承载 `AppState` 的角色（通常 `standalone` / 暴露查询的节点） | 空闲轮询 `idle_poll_secs`，默认 2s；清理 `cleanup_interval_secs`，默认 3600s | `[search_jobs].workers`（默认 2）等 | 已接线 |
-| ACME 签发 / 续期 | `router`（TLS 入口） | 签发 `issue_poll_secs`（默认 60s）；续期 `renewal_retry_secs`（默认 21600s/6h） | `[http.tls].issue_poll_secs` / `renewal_retry_secs` | **当前为占位 / 未启用** |
-
-<Warning>
-**ACME 签发 / 续期循环当前为占位（stub），且未在装配阶段拉起。** 循环的间隔字段、每域名冷却、单次签发方法都已具备，但扫描待处理域名与续期域名的函数目前直接返回成功、不做任何处理，也没有任何地方把该 runner spawn 起来。结论：自动证书签发 / 续期尚未生效。TLS 本身还要求以 `domain-acme-tls` feature 编译；OSS 构建不支持 TLS。
-</Warning>
+| ACME 签发 / 续期 | 承担 TLS 终结的 HTTP server（`router` / `standalone`） | 签发 `issue_poll_secs`（默认 60s）；续期 `renewal_retry_secs`（默认 21600s/6h） | `[http.tls].issue_poll_secs` / `renewal_retry_secs` | 已接线（`[http.tls].enabled = true` 时生效） |
 
 <Note>
-**compactor 与 alert_manager 的循环属于"预拉起"模式：** 它们在统一装配阶段就以独立后台任务运行，而 `compactor::run()` / `alert_manager::run()` 这两个角色本体函数只是空转占位。因此把进程的 `[node].roles` 设为 `compactor` 或 `alert_manager`，效果是"该进程的角色本体空转 + 后台循环照常跑"。
+ACME 签发 / 续期已实现：签发循环扫 `pending` 域名、续期循环对进入 30 天窗口的 `active` 证书续签，二者都走单次签发路径并带每域名冷却。runner 由承担 TLS 终结的 HTTP server 在 `[http.tls].enabled = true` 时拉起。TLS/ACME 编入所有构建（无 feature 门），纯由 `[http.tls].enabled` 运行期开关。
 </Note>
 
 ## 如何选择角色
@@ -99,7 +95,7 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
     [node]
     # 节点唯一标识，留空则由进程生成
     id = "ingester-a1"
-    # 角色数组；当前仅第一个元素生效
+    # 角色数组；多角色可在一个进程内组合
     roles = ["ingester"]
 
     [cluster]
@@ -262,7 +258,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 
 <Steps>
   <Step title="节点注册">
-    心跳任务周期性 upsert `(node_id, role, advertise_addr, last_heartbeat_at_micros)` 到 Postgres `cluster_nodes` 表（主键 `node_id`，`ON CONFLICT DO UPDATE`）。首次心跳立即发出，之后按间隔。
+    心跳任务周期性 upsert `(node_id, roles, advertise_addr, last_heartbeat_at_micros)` 到 Postgres `cluster_nodes` 表（主键 `node_id`，`ON CONFLICT DO UPDATE`）。节点的完整角色集以逗号拼接存一行，故多角色节点是一行、可按它承担的每个角色被发现。首次心跳立即发出，之后按间隔。
   </Step>
   <Step title="心跳间隔">
     `[cluster].heartbeat_interval_secs`，默认 5s。`advertise_addr` 默认 `127.0.0.1:5082`，即对等节点用来互联的 gRPC 地址（host:port）。
@@ -271,7 +267,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     存活窗口由 `[cluster].peer_timeout_secs` 控制，默认 15s：注册表只返回 `last_heartbeat_at >= now - peer_timeout` 的节点。另有 sweeper 每 60s 删除超过 5 分钟未心跳的 `cluster_nodes` 行。
   </Step>
   <Step title="发现对等节点">
-    没有 gossip / 共识；分布式模式下各角色直接查 `cluster_nodes` 表按角色筛选存活对等节点。`standalone` 模式跳过整套发现，只返回自身、永不触达 `cluster_nodes`。
+    没有 gossip / 共识；分布式模式下各角色直接查 `cluster_nodes` 表，按**角色成员**筛选存活对等节点（节点的角色集包含所求角色即命中）。`standalone` 模式跳过整套发现，只返回自身。
   </Step>
   <Step title="选址算法">
     Router 选 Ingester：对 `org_id|stream_name` 做一致性哈希后取模，确定性落到某个 Ingester。Router 选 Querier：朴素轮询（`now_ns % peer_count`），不是完整一致性哈希。分布式查询分片：对 `object_key` 取哈希取模散到 querier 对等节点。
@@ -285,7 +281,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 集群内部的本地扫描 RPC 调用不带鉴权；只有联邦 / 远程集群调用使用可选的 Bearer token。
 </Info>
 
-`cluster_nodes` 表结构：`node_id VARCHAR(64) PK`、`role VARCHAR(32)`、`advertise_addr VARCHAR(255)`、`started_at_micros BIGINT`、`last_heartbeat_at_micros BIGINT`，在 `role` 与 `last_heartbeat_at_micros` 上建索引。
+`cluster_nodes` 表结构：`node_id VARCHAR(64) PK`、`role VARCHAR(128)`（逗号拼接的角色集）、`advertise_addr VARCHAR(255)`、`started_at_micros BIGINT`、`last_heartbeat_at_micros BIGINT`。`list_role` 扫活跃行后在代码里按成员匹配，故角色查找不依赖该列建索引。
 
 ## 外部依赖与端口
 
@@ -311,7 +307,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 | 5080 | HTTP | `[http].bind`（默认 `0.0.0.0`）、`[http].port` | `/api/v1/*`、`/metrics`、`/healthz`、`/readyz`、`/.well-known/acme-challenge/` 等 |
 | 5082 | gRPC | `[grpc].bind`、`[grpc].port`、`max_message_size_mb`（默认 32MB） | 数据接入 + 扫描 RPC + 集群心跳，三服务共用 |
 | 80 | TLS 模式下的明文 HTTP | `[http.tls].plain_port` | 健康检查 + ACME HTTP-01 挑战 + 301 跳转 HTTPS |
-| 443 | TLS 模式下的 HTTPS（SNI） | `[http.tls].port` | 完整路由；需 `domain-acme-tls` feature |
+| 443 | TLS 模式下的 HTTPS（SNI） | `[http.tls].port` | 完整路由；由 `[http.tls].enabled` 运行期开启（编入所有构建，无 feature 门） |
 
 <Note>
 **`/metrics`**（GET，Prometheus 文本 0.0.4）由 `[telemetry].metrics_enabled`（默认 true）控制，暴露缓存命中 / 失效、`object_store_*`、`wal_*`、`file_meta_dump_*`、`tantivy_pruned_files_total`、`alert_rule_eval_timeout_total` 等指标。
@@ -429,7 +425,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     无状态，副本数随入口流量扩。限流器是进程内、临时的：多副本下每副本各自计数，实际 org QPS 上限约为 `配置值 × 副本数`，需要时把限流前置到统一网关或下调单副本阈值。
   </Card>
   <Card title="Querier — 可水平扩" icon="magnifying-glass">
-    无状态。≥2 个对等节点才触发分布式扫描。注意：独立 querier 的扫描 RPC 服务端当前为占位，分布式查询的完整落地形态以 standalone 内引擎为准。瓶颈在列式文件读取 + 查询引擎内存。
+    无状态。querier 进程经 gRPC 提供扫描 RPC；≥2 个 querier 对等节点才触发分布式扫描，否则协调端回退到进程内引擎、无网络跳。瓶颈在列式文件读取 + 查询引擎内存。
   </Card>
   <Card title="Ingester — 有状态" icon="database">
     用 StatefulSet + 每副本 PVC 持久 WAL。Router 按 `org|stream` 一致性哈希落点，扩缩会改变取模结果导致再平衡；缩容前应确保 WAL 已 flush。就绪探针留足重放窗口（清单设 10s 初始延迟）。
@@ -448,7 +444,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     Postgres 可达、`[store.meta].backend = "postgres"` 且 `dsn` 正确；对象存储后端选 `s3`/`azure`/`gcs`（非 `local`），凭据按"环境变量 > 凭据文件 > 内联"优先级注入。
   </Step>
   <Step title="角色与互联地址">
-    每个进程 `MS_NODE.ROLES` 明确；`MS_CLUSTER.ADVERTISE_ADDR` 设为对等节点可达的 `host:5082`（K8s 用 `$(POD_IP):5082`）。确认仅设单一前台角色（多角色数组只取首元素）。
+    每个进程 `MS_NODE.ROLES` 明确；`MS_CLUSTER.ADVERTISE_ADDR` 设为对等节点可达的 `host:5082`（K8s 用 `$(POD_IP):5082`）。一个进程可同时承担多个角色（如 `["ingester","querier"]`），会起去重后的 server 集并以全部角色登记。
   </Step>
   <Step title="Ingester 持久化">
     Ingester 用 StatefulSet + PVC 挂 WAL 目录；`[wal].flush_strategy` / `sync_level` 按持久性要求设置；就绪探针留足重放延迟。
@@ -463,10 +459,10 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     `/metrics` 接入 Prometheus；K8s 探针指向 `/api/v1/healthz`（liveness）与 `/readyz`（readiness）。确认对象存储启动探测能通过（否则进程不启动）。
   </Step>
   <Step title="安全与 license">
-    需要固定 JWT 密钥时设 `MS_AUTH_JWT_SECRET_OVERRIDE`，否则由 DB 自动 bootstrap。注入 cipher key（生产勿用 dev 全零值）。联邦查询需 `federated_search` license 特性；OSS 不支持 TLS/ACME（需 `domain-acme-tls` feature 编译），证书自动签发/续期当前为占位、未启用。
+    需要固定 JWT 密钥时设 `MS_AUTH_JWT_SECRET_OVERRIDE`，否则由 DB 自动 bootstrap。注入 cipher key（生产勿用 dev 全零值）。联邦查询需 `federated_search` license 特性。TLS + 证书自动签发/续期编入所有构建（无 feature 门），由 `[http.tls].enabled` 运行期开关。
   </Step>
 </Steps>
 
 <Warning>
-落地前请明确以下"现状"边界：`querier` 独立角色为占位（分布式扫描 RPC 服务端未完成）；多角色数组仅首元素生效；ACME 签发/续期为占位且未拉起；分布式共识 WAL term source 仍为静态占位（多节点共识未实现）；联邦查询与 SSO（仅 OIDC，SAML 未实现）等为 license/feature 门控。
+落地前请明确以下"现状"边界：分布式共识 WAL term source 仍为静态占位（多节点共识未实现）；联邦查询与 SSO（仅 OIDC，SAML 未实现）等为 license/feature 门控；以及更改 `[node].roles` 需重启进程（无热重载）。
 </Warning>
