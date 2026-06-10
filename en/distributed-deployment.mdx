@@ -47,26 +47,26 @@ Role enum values use **snake_case** in TOML / environment variables (`standalone
 
 `[node].roles` is an array (`Vec<Role>`), with valid values: `standalone`, `router`, `ingester`, `querier`, `compactor`, `alert_manager`. The default is `["standalone"]`.
 
-<Warning>
-**The current implementation only uses the first role in the array for foreground dispatch and the PeerRole annotation on cluster heartbeats.** A multi-role form like `[node].roles = ["ingester", "compactor"]` parses successfully, but only the first element currently takes effect. "A single process carrying multiple foreground roles at once" is a design intent that has not yet landed, so do not rely on it in production. If you need to combine responsibilities, use `standalone`.
-</Warning>
+<Note>
+**Multiple roles compose in one process.** A form like `[node].roles = ["ingester", "querier"]` starts the de-duplicated set of foreground servers each role needs (here: the gRPC server serving ingest + scan), gates the matching background loops, and registers the node under **all** its roles in `cluster_nodes` — so peers discover it under each role it carries. `standalone` is shorthand for "every role in one process".
+</Note>
 
 | Role | Foreground exposure | Stateful / stateless | Scaling characteristics |
 | --- | --- | --- | --- |
 | `standalone` | HTTP + gRPC, running every internal responsibility in-process | Stateful (embeds an Ingester) | Single instance for evaluation; not suitable as a horizontal scaling unit |
 | `router` | HTTP reverse proxy + rate limiting; **does not directly expose internal services beyond the business HTTP listener** | Stateless (the rate limiter is in-process and ephemeral) | Scales horizontally; just put an L4/L7 LB in front |
-| `ingester` | Carries WAL replay + buffering + periodic flush (the actual work is pre-spawned at process startup) | **Stateful** (WAL, in-memory buffer, file_meta cache) | Sharded via consistent hashing; scaling must account for the WAL persistent volume and rebalancing |
-| `querier` | Designed to be the distributed scan endpoint | Stateless | Scales horizontally |
-| `compactor` | Background tick loop (pre-spawned); the role body itself idles | Stateless (processes tick by tick) | **Single instance recommended** (see the high-availability section) |
-| `alert_manager` | Two pre-spawned background loops: evaluation + dispatch; the role body itself idles | Stateful (evaluation state and incident state are in-process) | Single instance recommended |
+| `ingester` | Carries WAL replay + buffering + periodic flush (the flush loop is spawned at startup when the role is configured) | **Stateful** (WAL, in-memory buffer, file_meta cache) | Sharded via consistent hashing; scaling must account for the WAL persistent volume and rebalancing |
+| `querier` | gRPC distributed-scan endpoint (Arrow Flight `do_get`): reads columnar files, runs the shard SQL, streams result batches | Stateless | Scales horizontally |
+| `compactor` | Runs the compaction + retention tick loop (spawned only when the role is configured) | Stateless (processes tick by tick) | **Single instance recommended** (see the high-availability section) |
+| `alert_manager` | Runs the evaluation + dispatch tick loops (spawned only when the role is configured) | Stateful (evaluation state and incident state are in-process) | Single instance recommended |
 
-<Warning>
-**The Querier role is currently a placeholder / incomplete.** The role dispatch function currently only logs a single "querier role started (stub)" line and idles; the standalone distributed-scan server implementation has not yet been wired up. The fan-out protocol for distributed queries (see the data flow section) exists in the code and is invoked by the coordinator, but the layer that serves the scan RPC as a standalone `querier` process is not yet complete. The currently usable form of distributed query is the engine composition inside a `standalone` process.
-</Warning>
+<Note>
+A standalone `querier` (or any role set containing `querier` / `ingester`) starts the gRPC server, which carries the Arrow Flight scan service. The coordinator discovers queriers via `list_role(querier)` and fans shards out to them over that RPC. A single-process `standalone` still works as before; distributed scan-out requires ≥2 querier peers.
+</Note>
 
 ### Which role carries which background worker
 
-One key fact: **nearly all background workers are spawned unconditionally during the unified assembly phase at process startup, not inside each role's dispatch function.** They self-gate via feature flags or configuration. This means: in a `standalone` process, they all run; in a role-split image, whether they actually "do work" depends on whether that role was injected with the corresponding dependencies and configuration. The table below gives the recommended carrying role and interval.
+Role-specific loops (ingester flush, compaction + file_meta_dumper, alert evaluation/dispatch) are **spawned only when the owning role is configured** (`standalone` counts as all roles). A handful of always-on workers (heartbeat, sweeper, object-store probe, MMDB refresh, search-jobs, scheduled-reports) run on every node. The table below gives the owning role and interval.
 
 | Background worker | Recommended carrying role | Interval | Config key | Status |
 | --- | --- | --- | --- | --- |
@@ -79,14 +79,10 @@ One key fact: **nearly all background workers are spawned unconditionally during
 | file_meta_dumper (cold partition flush to storage) | `compactor` (same process as compaction) | `interval_secs`, default 3600s (1h) | `[storage.file_meta_dump].interval_secs`; set `enabled=false` to disable | Wired up |
 | scheduled_reports | `alert_manager` (needs rendering dependencies, see below) | Fixed 60s tick; each report's own cron decides whether it is due | the report's `cron` (the tick interval is not configurable) | Wired up |
 | search_jobs (async search pool) | The role carrying `AppState` (typically `standalone` / a node exposing query) | Idle poll `idle_poll_secs`, default 2s; cleanup `cleanup_interval_secs`, default 3600s | `[search_jobs].workers` (default 2), etc. | Wired up |
-| ACME issuance / renewal | `router` (TLS entry point) | Issuance `issue_poll_secs` (default 60s); renewal `renewal_retry_secs` (default 21600s / 6h) | `[http.tls].issue_poll_secs` / `renewal_retry_secs` | **Currently a placeholder / not enabled** |
-
-<Warning>
-**The ACME issuance / renewal loops are currently a stub and are not spawned during the assembly phase.** The loop interval fields, per-domain cooldown, and single-issuance method are all present, but the functions that scan for pending domains and renewal domains currently just return success without doing anything, and nothing spawns the runner anywhere. Conclusion: automatic certificate issuance / renewal is not yet in effect. TLS itself additionally requires building with the `domain-acme-tls` feature; OSS builds do not support TLS.
-</Warning>
+| ACME issuance / renewal | the TLS-terminating HTTP server (`router` / `standalone`) | Issuance `issue_poll_secs` (default 60s); renewal `renewal_retry_secs` (default 21600s / 6h) | `[http.tls].issue_poll_secs` / `renewal_retry_secs` | Wired up (active when `[http.tls].enabled = true`) |
 
 <Note>
-**The compactor and alert_manager loops follow a "pre-spawned" model:** they run as independent background tasks during the unified assembly phase, while the role body functions `compactor::run()` / `alert_manager::run()` are merely idle placeholders. So setting a process's `[node].roles` to `compactor` or `alert_manager` results in "that process's role body idling + the background loops running as usual."
+ACME issuance / renewal is implemented: the issue loop scans `pending` domains and the renewal loop renews `active` certs within their 30-day window, both via the single-issuance path with a per-domain cooldown. The runner is started by the TLS-terminating HTTP server when `[http.tls].enabled = true`. TLS/ACME are compiled into every build (no feature flag) and are purely runtime-gated by `[http.tls].enabled`.
 </Note>
 
 ## How to select roles
@@ -99,7 +95,7 @@ Roles are configured via `[node].roles`; they can be overridden with environment
     [node]
     # Unique node identifier; leave empty to have the process generate one
     id = "ingester-a1"
-    # Role array; only the first element currently takes effect
+    # Role array; multiple roles compose in one process
     roles = ["ingester"]
 
     [cluster]
@@ -262,7 +258,7 @@ Target clusters are specified via `?clusters=local,sf,nyc`. After scanning local
 
 <Steps>
   <Step title="Node registration">
-    The heartbeat task periodically upserts `(node_id, role, advertise_addr, last_heartbeat_at_micros)` into the Postgres `cluster_nodes` table (primary key `node_id`, `ON CONFLICT DO UPDATE`). The first heartbeat fires immediately, subsequent ones at the configured interval.
+    The heartbeat task periodically upserts `(node_id, roles, advertise_addr, last_heartbeat_at_micros)` into the Postgres `cluster_nodes` table (primary key `node_id`, `ON CONFLICT DO UPDATE`). The node's full role set is stored comma-joined, so a multi-role node is one row discoverable under each of its roles. The first heartbeat fires immediately, subsequent ones at the configured interval.
   </Step>
   <Step title="Heartbeat interval">
     `[cluster].heartbeat_interval_secs`, default 5s. `advertise_addr` defaults to `127.0.0.1:5082`, i.e. the gRPC address (host:port) peers use to interconnect.
@@ -271,7 +267,7 @@ Target clusters are specified via `?clusters=local,sf,nyc`. After scanning local
     The liveness window is controlled by `[cluster].peer_timeout_secs`, default 15s: the registry only returns nodes with `last_heartbeat_at >= now - peer_timeout`. Additionally, a sweeper deletes `cluster_nodes` rows that have not heartbeated for over 5 minutes every 60s.
   </Step>
   <Step title="Peer discovery">
-    There is no gossip / consensus; in distributed mode each role queries the `cluster_nodes` table directly and filters live peers by role. `standalone` mode skips the entire discovery flow, returning only itself and never touching `cluster_nodes`.
+    There is no gossip / consensus; in distributed mode each role queries the `cluster_nodes` table directly and filters live peers by **role membership** (a node matches if its role set contains the requested role). `standalone` mode skips the entire discovery flow, returning only itself.
   </Step>
   <Step title="Placement algorithm">
     Router selecting an Ingester: applies consistent hashing over `org_id|stream_name` then mods, landing deterministically on a particular Ingester. Router selecting a Querier: naive round-robin (`now_ns % peer_count`), not full consistent hashing. Distributed query sharding: a hash over `object_key` then mods, fanning out to querier peers.
@@ -285,7 +281,7 @@ Target clusters are specified via `?clusters=local,sf,nyc`. After scanning local
 Local scan-RPC calls within the cluster are unauthenticated; only federated / remote-cluster calls use an optional Bearer token.
 </Info>
 
-`cluster_nodes` table schema: `node_id VARCHAR(64) PK`, `role VARCHAR(32)`, `advertise_addr VARCHAR(255)`, `started_at_micros BIGINT`, `last_heartbeat_at_micros BIGINT`, with indexes on `role` and `last_heartbeat_at_micros`.
+`cluster_nodes` table schema: `node_id VARCHAR(64) PK`, `role VARCHAR(128)` (the comma-joined role set), `advertise_addr VARCHAR(255)`, `started_at_micros BIGINT`, `last_heartbeat_at_micros BIGINT`. `list_role` scans alive rows and matches membership in code, so role lookups don't depend on the column being indexed.
 
 ## External dependencies and ports
 
@@ -311,7 +307,7 @@ Local scan-RPC calls within the cluster are unauthenticated; only federated / re
 | 5080 | HTTP | `[http].bind` (default `0.0.0.0`), `[http].port` | `/api/v1/*`, `/metrics`, `/healthz`, `/readyz`, `/.well-known/acme-challenge/`, etc. |
 | 5082 | gRPC | `[grpc].bind`, `[grpc].port`, `max_message_size_mb` (default 32MB) | Ingest + scan RPC + cluster heartbeat, three services sharing one port |
 | 80 | Plaintext HTTP in TLS mode | `[http.tls].plain_port` | Health checks + ACME HTTP-01 challenge + 301 redirect to HTTPS |
-| 443 | HTTPS in TLS mode (SNI) | `[http.tls].port` | Full routing; requires the `domain-acme-tls` feature |
+| 443 | HTTPS in TLS mode (SNI) | `[http.tls].port` | Full routing; enabled at runtime by `[http.tls].enabled` (compiled into every build) |
 
 <Note>
 **`/metrics`** (GET, Prometheus text 0.0.4) is controlled by `[telemetry].metrics_enabled` (default true) and exposes metrics such as cache hits / invalidations, `object_store_*`, `wal_*`, `file_meta_dump_*`, `tantivy_pruned_files_total`, `alert_rule_eval_timeout_total`.
@@ -429,7 +425,7 @@ All topologies share the same image (e.g. `molesignal:dev`), distinguished by `M
     Stateless; scale replicas with entry traffic. The rate limiter is in-process and ephemeral: under multiple replicas each replica counts independently, so the effective org QPS ceiling is roughly `configured value × replica count`. When needed, move rate limiting up to a unified gateway or lower the per-replica threshold.
   </Card>
   <Card title="Querier — scales horizontally" icon="magnifying-glass">
-    Stateless. Distributed scans only trigger with ≥2 peers. Note: the standalone querier's scan-RPC server is currently a placeholder, so the fully landed form of distributed query is the in-process engine of standalone. The bottleneck is columnar-file reads + query-engine memory.
+    Stateless. A querier process serves the scan RPC over gRPC; distributed scans only trigger with ≥2 querier peers, otherwise the coordinator falls back to the in-process engine with no network hop. The bottleneck is columnar-file reads + query-engine memory.
   </Card>
   <Card title="Ingester — stateful" icon="database">
     Use a StatefulSet + a per-replica PVC for a persistent WAL. The Router places via consistent hashing over `org|stream`; scaling changes the mod result and causes rebalancing, so ensure the WAL is flushed before scaling down. Leave enough of a replay window for the readiness probe (the manifest sets a 10s initial delay).
@@ -448,7 +444,7 @@ Recommended metrics to monitor: for the write path, watch `wal_append_lock_wait_
     Postgres reachable, `[store.meta].backend = "postgres"` with a correct `dsn`; choose an object store backend of `s3`/`azure`/`gcs` (not `local`), with credentials injected in the precedence order "env vars > credential file > inline".
   </Step>
   <Step title="Roles and interconnect addresses">
-    Each process has an explicit `MS_NODE.ROLES`; set `MS_CLUSTER.ADVERTISE_ADDR` to a peer-reachable `host:5082` (K8s uses `$(POD_IP):5082`). Confirm only a single foreground role is set (a multi-role array only takes the first element).
+    Each process has an explicit `MS_NODE.ROLES`; set `MS_CLUSTER.ADVERTISE_ADDR` to a peer-reachable `host:5082` (K8s uses `$(POD_IP):5082`). A process may carry several roles at once (e.g. `["ingester","querier"]`); it will start the de-duplicated server set and register under all of them.
   </Step>
   <Step title="Ingester persistence">
     Run the Ingester as a StatefulSet + PVC mounting the WAL directory; set `[wal].flush_strategy` / `sync_level` according to durability requirements; leave enough replay delay for the readiness probe.
@@ -463,10 +459,10 @@ Recommended metrics to monitor: for the write path, watch `wal_append_lock_wait_
     Wire `/metrics` into Prometheus; point K8s probes at `/api/v1/healthz` (liveness) and `/readyz` (readiness). Confirm the object store startup probe passes (otherwise the process will not start).
   </Step>
   <Step title="Security and license">
-    Set `MS_AUTH_JWT_SECRET_OVERRIDE` when you need a fixed JWT secret; otherwise it is auto-bootstrapped by the DB. Inject a cipher key (do not use the dev all-zeros value in production). Federated query requires the `federated_search` license feature; OSS does not support TLS/ACME (which requires building with the `domain-acme-tls` feature), and automatic certificate issuance/renewal is currently a placeholder and not enabled.
+    Set `MS_AUTH_JWT_SECRET_OVERRIDE` when you need a fixed JWT secret; otherwise it is auto-bootstrapped by the DB. Inject a cipher key (do not use the dev all-zeros value in production). Federated query requires the `federated_search` license feature. TLS + automatic certificate issuance/renewal are available in every build (no feature flag) and switch on at runtime via `[http.tls].enabled`.
   </Step>
 </Steps>
 
 <Warning>
-Before going live, be clear about the following "current state" boundaries: the standalone `querier` role is a placeholder (the distributed scan-RPC server is incomplete); a multi-role array only takes effect for the first element; ACME issuance/renewal is a placeholder and not spawned; the distributed consensus WAL term source is still a static placeholder (multi-node consensus is not implemented); federated query and SSO (OIDC only; SAML is not implemented), among others, are license/feature-gated.
+Before going live, be clear about the following "current state" boundaries: the distributed-consensus WAL term source is still a static placeholder (multi-node consensus is not implemented); federated query and SSO (OIDC only; SAML is not implemented), among others, are license/feature-gated; and changing `[node].roles` requires a process restart (no hot reload).
 </Warning>
