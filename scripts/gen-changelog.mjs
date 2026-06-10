@@ -3,8 +3,8 @@
  * Generate the changelog pages from GitHub Releases.
  *
  * Pulls releases from the MoleSignal repo and rewrites the block between the
- * `BEGIN GENERATED` / `END GENERATED` markers in en/changelog.mdx and
- * zh/changelog.mdx as a list of Mintlify <Update> components.
+ * `BEGIN GENERATED` / `END GENERATED` markers in en-US/changelog.mdx and
+ * zh-Hans/changelog.mdx as a list of Mintlify <Update> components.
  *
  * Usage:
  *   node scripts/gen-changelog.mjs
@@ -66,7 +66,7 @@ function formatDate(iso) {
 
 function renderUpdates(releases, lang) {
   if (!releases.length) {
-    return lang === 'zh'
+    return lang.startsWith('zh')
       ? `<Update label="未发布" description="pre-1.0">\n  尚无打标签的正式发布。关注 [GitHub Releases](https://github.com/${REPO}/releases)。\n</Update>`
       : `<Update label="Unreleased" description="pre-1.0">\n  No tagged release yet. Follow [GitHub Releases](https://github.com/${REPO}/releases).\n</Update>`;
   }
@@ -79,7 +79,7 @@ function renderUpdates(releases, lang) {
       const label = formatDate(r.published_at) || r.tag_name;
       const desc = r.tag_name || r.name || '';
       const tags = r.prerelease ? ` tags={["pre-release"]}` : '';
-      const body = escapeMdx(r.body) || (lang === 'zh' ? '_无说明。_' : '_No release notes._');
+      const body = escapeMdx(r.body) || (lang.startsWith('zh') ? '_无说明。_' : '_No release notes._');
       const indented = body
         .split('\n')
         .map((l) => (l ? `  ${l}` : ''))
@@ -105,5 +105,5 @@ function rewrite(lang) {
 }
 
 const releases = fetchReleases();
-rewrite('en');
-rewrite('zh');
+rewrite('en-US');
+rewrite('zh-Hans');

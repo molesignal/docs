@@ -1,0 +1,80 @@
+---
+title: "核心概念"
+description: "组织、流、信号，以及三类遥测如何共享同一存储层。"
+---
+
+MoleSignal 的概念不多。理解它们之后，其余文档就豁然开朗了。
+
+## 信号（Signal）
+
+**信号**是 MoleSignal 处理的三类遥测之一：
+
+- **日志（Logs）** —— 带任意字段的离散事件。
+- **指标（Metrics）** —— 数值型时间序列。
+- **追踪（Traces）** —— 由 `trace_id` 串起来的 span。
+
+核心理念：三类信号都落进**同一批 Parquet 文件**（不同的流、同一物理存储），共享**同一时间索引**和
+**同一租户范围**。一条 SQL 查询可以原生地在它们之间 join —— 没有跨存储联邦，也无需手工对齐 `trace_id`。
+
+## 流（Stream）
+
+**流**是数据分区的最细粒度单元，接入与查询都围绕它展开。每个流有：
+
+- 一个**名称**（如 `app`、`nginx`、`host_cpu`），
+- 一个 **`stream_type`** —— `logs`、`metrics`、`traces` 或 `enrichment` 之一，
+- 一个**schema**（随数据到达推断并演进），
+- 一条**保留**策略。
+
+在查询 API 里，用 `{ "name": "app", "stream_type": "logs" }` 引用一个流。
+
+## 组织（Org）
+
+**组织**是租户边界。每一行数据、每一次查询、每一个资源都恰好属于一个组织。MoleSignal 在**查询
+planner 层**强制隔离：会把 `org_id` 谓词改写进每一个 SQL 计划，因此即便构造恶意查询也无法跨组织
+泄露数据。详见 [安全](/zh-Hans/security)。
+
+## 存储布局
+
+每个 Parquet 文件按确定的 key 落到对象存储：
+
+```
+{org_id}/{stream_type}/{stream}/{YYYY-MM-DD}/{ksuid}.parquet
+```
+
+- `org_id` 与 `stream` 提供租户与流隔离。
+- `stream_type` 为 `logs` / `metrics` / `traces`。
+- 日期分桶（取该批次最早的 `_timestamp`）便于按时间扫描与按天合并。
+- `ksuid` 文件名前缀有时序，便于排查。
+
+每个文件的元数据（`FileMeta`：时间范围、min/max、行数、对象 key）存在 Postgres。查询时 MoleSignal
+**先做分区裁剪**，再从对象存储只拉取需要的数据。
+
+## 查询引擎
+
+一个引擎 —— **DataFusion + Arrow** —— 服务一切：
+
+- 横跨日志、指标、追踪的完整 **SQL**（join、CTE、窗口函数）。
+- 面向指标的 **PromQL 子集**。
+- 经 Arrow Flight 的**分布式查询**：协调者按一致性哈希分片，对等节点流式回传 `RecordBatch`。
+- **三级缓存**（`file_meta` / `parquet_meta` / `query_result`）外加 parquet 磁盘缓存。
+
+## 关联（Correlation）
+
+由于信号共享存储、时间索引与租户范围，MoleSignal 可以**在服务端跨信号 join**。关联 API
+（`/api/v1/web/correlation/{from_kind}/{to_kind}`）返回带预填过滤条件的相关信号，让你在
+`指标 → 追踪 → 日志 → 主机` 间来回下钻而不丢上下文。详见 [跨信号关联](/zh-Hans/correlation)。
+
+## 节点角色
+
+单一二进制服务所有角色，由配置选择：
+
+| 角色 | 启动什么 |
+|---|---|
+| `standalone` | 同进程内 HTTP API + 所有 worker |
+| `router` | 反向代理 + 限流（无状态） |
+| `ingester` | gRPC 接入 + WAL + buffer + flush 到 Parquet |
+| `querier` | Arrow Flight server + DataFusion 执行 |
+| `compactor` | 周期合并 Parquet + 清理过期数据 |
+| `alert_manager` | 规则评估 + 升级派发 |
+
+只有 ingester 持有本地状态（flush 窗口内的 WAL）。详见 [部署](/zh-Hans/deployment)。

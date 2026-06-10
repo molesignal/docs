@@ -1,0 +1,112 @@
+---
+title: "数据接入"
+description: "10 种即插即用接入协议 —— 把现有 agent 指向 MoleSignal，无需改造。"
+---
+
+MoleSignal 支持 **10 种接入协议**，因此大多数现有 agent 与 SDK 无需改动即可工作。每个接入端点都需
+`Authorization: Bearer <jwt>` 认证（或使用 API token，见 [安全](/zh-Hans/security)）。
+
+## 支持的协议
+
+| 协议 | 端点 | 直接替代 |
+|---|---|---|
+| OTLP gRPC | `:5082` | OpenTelemetry SDK / Collector |
+| OTLP HTTP | `POST /api/v1/{logs,metrics,traces}` | OTel HTTP exporter |
+| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus / VictoriaMetrics |
+| Elasticsearch `_bulk` | `POST /api/v1/_bulk` | Filebeat、Vector ES sink、Logstash |
+| Loki push | `POST /api/v1/loki/api/v1/push` | Promtail、Vector Loki sink |
+| Syslog UDP/TCP | `[syslog].udp_bind` / `tcp_bind` | rsyslog、syslog-ng |
+| Kinesis Firehose | `POST /api/v1/_kinesis_firehose` | AWS Firehose |
+| Cloudflare Logpush | `POST /api/v1/_cloudflare` | Cloudflare Logpush |
+| Heroku log drain | `POST /api/v1/_heroku` | Heroku |
+| 原生 HTTP JSON | `POST /api/v1/ingest/{type}/:stream` | curl / 应用 SDK |
+
+## 原生 HTTP JSON
+
+最简单的方式。把一个记录数组 POST 到 `ingest/{logs,metrics,traces}/{stream}`。时间戳为 Unix 纪元起
+的微秒数，放在 `_timestamp` 字段。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/ingest/logs/app \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '[{"_timestamp":1700000000000000,"level":"error","msg":"db pool exhausted","trace_id":"abc123"}]'
+```
+
+流在首次写入时创建，schema 随新字段出现自动演进。
+
+## OpenTelemetry
+
+<Tabs>
+  <Tab title="OTLP HTTP">
+    把 OTel HTTP exporter 指向 MoleSignal：
+
+    ```yaml
+    exporters:
+      otlphttp:
+        endpoint: http://localhost:5080/api/v1
+        headers:
+          authorization: "Bearer ${MS_JWT}"
+    ```
+
+    日志、指标、追踪分别 POST 到 `/api/v1/logs`、`/api/v1/metrics`、`/api/v1/traces`。
+  </Tab>
+  <Tab title="OTLP gRPC">
+    gRPC 接入服务监听 `5082` 端口：
+
+    ```yaml
+    exporters:
+      otlp:
+        endpoint: localhost:5082
+        headers:
+          authorization: "Bearer ${MS_JWT}"
+    ```
+  </Tab>
+</Tabs>
+
+## Prometheus remote_write
+
+在 `prometheus.yml` 中把 MoleSignal 加为远程写入目标：
+
+```yaml
+remote_write:
+  - url: http://localhost:5080/api/v1/prometheus/api/v1/write
+    authorization:
+      credentials: "${MS_JWT}"
+```
+
+## Loki 与 Elasticsearch
+
+<CodeGroup>
+```text Loki push
+POST /api/v1/loki/api/v1/push
+# 适配 Promtail 与 Vector Loki sink。
+```
+
+```text Elasticsearch _bulk
+POST /api/v1/_bulk
+# 适配 Filebeat、Logstash 与 Vector ES sink。
+```
+</CodeGroup>
+
+## 管道函数（Pipeline functions）
+
+你可以在接入热路径上用**管道函数**转换事件 —— 它是挂在管道步骤上的可复用变换。支持两种语言：
+
+- **VRL** —— 始终可用。按 `(function_id, updated_at)` 编译，使用 `vrl::compiler` 标准库
+  （`del`、`parse_json`、`to_int`、`match`、`encrypt`/`decrypt` 等）。
+- **JavaScript** —— 可选，基于 `deno_core`（V8）。默认关闭；启用需同时具备构建特性
+  （`--features molesignal-bootstrap/js-runtime`）与 TOML 开关
+  `[functions] js_runtime_enabled = true`。
+
+<Warning>
+  JS isolate 刻意做得极简：没有 `fetch`、`setTimeout`、`import`、`npm`。每个事件有 50 ms 墙钟预算与
+  32 MiB 堆。任何超出单次同步执行的逻辑在设计上都不支持。
+</Warning>
+
+```js
+// 把 `severity` 字段小写化，写入新的 `level` 字段。
+molesignal.set("level", molesignal.fields.severity.toLowerCase());
+// 删除一个敏感字段。
+molesignal.del("pw");
+```

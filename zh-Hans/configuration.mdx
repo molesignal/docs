@@ -1,0 +1,465 @@
+---
+title: "配置"
+description: "一个 TOML 文件，可用 MS_* 环境变量逐字段覆盖。"
+---
+
+MoleSignal 只有一个配置来源：一个 **TOML 文件**，用 `molesignal --config /path/to/config.toml`
+传入。任何字段都可被形如 `MS_<SECTION>.<FIELD>` 的环境变量覆盖 —— 前缀是单下划线，section 与
+field 之间用点连接。
+
+```bash
+# 下面两行等价于设置 [http].port = 5081 和 [store.meta].dsn = ...
+export MS_HTTP.PORT=5081
+export MS_STORE.META.DSN="postgres://user:pass@db:5432/molesignal"
+```
+
+schema 定义在 `crates/config/src/settings/mod.rs`；仓库默认配置是 `conf/config.toml`。
+下面每一段都**完整**列出该 section 的全部字段及其与代码一致的默认值；以 `#` 注释掉的行是默认关闭/留空的可选或后端特定字段。
+
+<Note>
+有几个密钥**只能**通过环境变量提供（不进 TOML）：`MS_AUTH_JWT_SECRET_OVERRIDE`（固定 JWT 签名密钥）、
+`MS_CIPHER_KEY`（cipher-key 存储）、`MS_COPILOT_<PROVIDER>_API_KEY` / `_BASE_URL`（Copilot provider）。
+</Note>
+
+## 节点
+
+标识本进程在集群中的身份，并决定它承担哪些角色。
+
+```toml
+[node]
+roles = ["standalone"]  # 本节点承担的角色。可选值：standalone | router | ingester | querier | compactor | alert_manager。standalone 表示单进程承担全部角色。
+id = ""  # 稳定节点标识；留空时启动期自动派生/生成。
+```
+
+## HTTP 服务
+
+HTTP API / UI 监听器配置。
+
+```toml
+[http]
+bind = "0.0.0.0"  # 监听地址。
+port = 5080
+gzip = true  # 启用 gzip 响应压缩。
+external_url = ""  # 对外访问 URL（如反代后的 https://obs.example.com）。留空时前端按当前访问来源 window.location.origin 推导。env 覆盖：MS_HTTP.EXTERNAL_URL。
+```
+
+### HTTP TLS（ACME）
+
+ACME + rustls 服务端 TLS，自动签发/续期证书。仅在启用 TLS feature 的构建中生效。
+
+```toml
+[http.tls]
+enabled = false  # 主开关；false 时其他字段全部忽略。
+plain_port = 80  # 用于 ACME HTTP-01 challenge 与跳转 HTTPS 的明文端口（80 端口替代）。
+port = 443  # TLS 端口（rustls + SNI cert），443 端口替代。
+acme_directory = "production"  # ACME directory：production | staging | 任意 URL（如测试用 Pebble）。staging rate limit 更宽松。
+account_email = ""  # ACME 账户邮箱（Let's Encrypt 要求；TOS 通知发到这里）。
+key_storage_dir = "/var/lib/molesignal/acme"  # ACME account key 与每域 *.key.pem 落盘目录。
+issue_poll_secs = 60  # acme_runner 扫 pending 签发的间隔（秒）。
+renewal_retry_secs = 21600  # 续期重试 / 临期扫描间隔（秒）。默认 6 小时。
+```
+
+<Note>
+enabled = false（默认）时整段忽略，等价于纯 plain HTTP。OSS / 不需要 TLS 的部署不受影响。
+</Note>
+
+## gRPC 服务
+
+用于节点间互联的内部 gRPC / Flight 监听器。
+
+```toml
+[grpc]
+bind = "0.0.0.0"  # 监听地址。
+port = 5082
+max_message_size_mb = 32  # gRPC 单条消息大小上限（MB）。
+```
+
+## 元数据库
+
+承载 schema、文件元数据、告警、用户等控制面状态的关系型元数据库。
+
+```toml
+[store.meta]
+backend = "sqlite"  # 元数据后端："sqlite" | "postgres" | "mysql"。
+dsn = "sqlite://./data/meta.db?mode=rwc"  # 连接 DSN，需与所选 backend 匹配。
+max_connections = 16  # 连接池大小。
+```
+
+## 对象存储
+
+用于 Parquet 数据文件、WAL 落盘、索引与 dump 的对象存储后端。默认使用本地文件系统目录；下面的 S3 兼容字段仅在远端后端时生效。
+
+```toml
+[store.object]
+backend = "local"  # 对象存储后端："local" | "s3" | "gcs" | "azblob"（及其他 OpenDAL 支持的方案）。
+root = "./data/objects"  # 后端内的根路径/前缀（local 为目录，远端为 key 前缀）。
+# bucket = ""  # 桶名（仅远端后端）。
+# region = ""  # 区域（仅远端后端）。
+# endpoint = ""  # 自定义 endpoint URL，例如 MinIO / S3 兼容存储。
+# access_key = ""  # 访问密钥（优先用环境变量或 credentials_file，避免写入 inline）。
+# secret_key = ""  # 私有密钥（优先用环境变量或 credentials_file，避免写入 inline）。
+# credentials_file = ""  # 可选凭据文件路径；留空/不设则不启用。
+multipart_threshold_mb = 32  # 大于该阈值的对象走分片上传（MB）。
+multipart_part_size_mb = 8  # 每个分片的大小（MB）。
+range_threshold_mb = 16  # 大于该阈值的对象走 range GET 读取（MB）。
+range_chunk_mb = 8  # 每个 range 读取块的大小（MB）。
+max_concurrency = 8  # 单次请求内分片/range 操作的最大并发数。
+op_timeout_secs = 30  # 单次操作超时（秒）。
+health_probe_interval_secs = 30  # 后端健康探测间隔（秒）。
+```
+
+<Note>
+凭据来源优先级：环境变量 > credentials_file > inline TOML。
+Azure 读取 `AZURE_STORAGE_ACCOUNT` / `AZURE_STORAGE_ACCESS_KEY`；GCS 读取 `GOOGLE_APPLICATION_CREDENTIALS`。
+</Note>
+
+### 对象存储重试
+
+对象存储瞬时错误的指数退避重试策略。
+
+```toml
+[store.object.retry]
+max_attempts = 4  # 包含首次尝试在内的总尝试次数。
+base_backoff_ms = 100  # 初始退避延迟（毫秒）。
+max_backoff_ms = 5000  # 退避延迟上限（毫秒）。
+jitter_ratio = 0.2  # 退避时长的随机抖动比例（0.0-1.0）。
+```
+
+## 预写日志 (WAL)
+
+摄取写入预写日志的持久化与 fsync 行为。
+
+```toml
+[wal]
+dir = "./data/wal"  # WAL 段文件目录。
+segment_size_mb = 256  # 单个 WAL 段的轮转大小（MB）。
+flush_strategy = "batch"  # fsync 触发模式："none"（仅 page cache，永不 sync）| "every_write"（每条记录都 sync）| "batch"（攒批，达到 batch_max_pending 或 batch_max_delay_ms 时 sync）。
+sync_level = "data"  # sync_file 深度："none"（不调用 sync）| "data"（sync_data）| "all"（sync_all + 父目录 sync_all）。
+batch_max_pending = 64  # Batch 模式下触发 sync 前的最大攒批条数。
+batch_max_delay_ms = 50  # Batch 模式下两次 sync 的最大间隔（毫秒）。兼容旧别名 sync_interval_ms。
+```
+
+## Ingester（写入摄取）
+
+Ingester 角色的内存写入缓冲区与刷盘行为。
+
+```toml
+[ingester]
+buffer_max_mb = 256  # 触发强制刷盘前的内存写入缓冲上限（MB）。
+flush_interval_secs = 30  # 基于时间的刷盘间隔（秒）。
+flush_parallelism = 4  # 并发刷盘 worker 数量。
+```
+
+## Querier（查询）
+
+查询执行并发度、扫描上限以及自动转 async search-job 的阈值。
+
+```toml
+[querier]
+concurrency = 0  # 查询执行并发度；0 表示自动（按可用 CPU 推导）。
+max_scan_rows = 100000000  # 单次查询可扫描的最大行数硬上限。
+auto_async_threshold_rows = 50000000  # 估算行数超过该阈值时强制转 async search-job；0 表示禁用自动转 async。
+estimate_throughput_per_sec = 1000  # 保守的单位时间窗（每秒）平均行数，用于估算扫描行数（estimated_rows ≈ window_secs * 该值）。
+```
+
+## Compactor（合并压缩）
+
+后台 compaction 调度、目标文件大小与默认保留期。
+
+```toml
+[compactor]
+interval_secs = 300  # compaction 扫描/执行间隔（秒）。
+target_mb = 512  # compaction 后目标文件大小（MB）。兼容旧 alias：target_file_size_mb。
+max_concurrent_groups = 4  # 并发执行的 compaction group 上限。
+retention_days = 30  # 流未显式设置保留期时使用的全局默认保留期（天）。
+```
+
+## Storage — FileMeta 冷分区下沉
+
+把冷分区的 FileMeta 从元数据库下沉到对象存储。[storage] 段与 [store] 解耦：[store] 负责底层元/对象存储凭据，[storage] 负责上层 capability 行为；file_meta_dump 目前是其唯一子段。
+
+```toml
+[storage.file_meta_dump]
+enabled = true  # 总开关；false 时完全禁用 dump worker。
+cold_after_days = 30  # 超过该天数的分区被视为冷分区，可被 dump。
+interval_secs = 3600  # dump worker 扫描间隔（秒）。
+max_partitions_per_tick = 100  # 每个 worker tick 最多 dump 的分区数。
+partition_level = "daily"  # dump 分区粒度："daily"（默认）或 "hourly"。同一 stream 允许混合粒度共存。
+```
+
+<Note>
+enabled = false 时 dump worker 不启动、查询路径回退到只读主表；已 dump 的对象与索引行保留不动，重新置为 enabled = true 时无需任何手工迁移。
+</Note>
+
+## 告警管理器
+
+alert-manager 角色的后台循环：规则评估与通知分发的节奏。仅在 roles 含 `alert_manager`（或 `standalone`）的节点上生效。
+
+```toml
+[alert_manager]
+eval_interval_secs = 30  # 规则评估器扫描并执行告警规则的间隔（秒）。
+dispatch_interval_secs = 10  # 分发器消费通知队列的间隔（秒）。
+eval_timeout_secs = 10  # 单条规则评估的墙钟超时（秒）。
+default_ack_timeout_secs = 300  # 未确认告警重新升级前的默认 ACK 超时（秒）。
+```
+
+## 通知
+
+对外通知渠道。`[notify]` 段本身没有标量字段，所有配置都在 `[notify.smtp]` 子段下。
+
+
+### SMTP
+
+邮件通知所用的 SMTP 中继。默认 `enabled = false` 会完全禁用邮件发送，其余字段随之被忽略。
+
+```toml
+[notify.smtp]
+enabled = false  # 总开关；为 false 时禁用邮件通知，其余字段被忽略。
+# host = "smtp.example.com"  # SMTP 服务器主机名。默认值为空；启用时必填。
+# port = 587  # SMTP 服务器端口。默认值 0；按 tls 模式设置（如 587 STARTTLS、465 TLS、25 明文）。
+username = ""  # SMTP 认证用户名；为空表示不认证。
+password = ""  # SMTP 认证密码；为空表示不认证。
+# from = "alerts@example.com"  # 发件 From 地址。默认值为空；启用时必填。
+tls = "starttls"  # 传输加密："none" | "starttls" | "tls"。默认 "starttls"。
+timeout_secs = 10  # 连接/发送超时（秒）。
+```
+
+## 认证
+
+JWT 签发与初始 root 账号引导。
+
+```toml
+[auth]
+# jwt_secret = ""  # 已废弃的旧字段（结构体字段 `deprecated_jwt_secret` 的 serde alias）。仅用于打废弃警告，不参与签名。请移除。
+token_ttl_secs = 86400  # 签发 JWT 的有效期（秒）；默认 24 小时。
+issuer = "molesignal"  # JWT 的 `iss` claim。
+allow_signup = false  # 是否允许开放自助注册；默认 false（仅管理员开通）。
+# root_email = ""  # 引导 root 账号的邮箱；为空则不自动创建 root 账号。
+# root_password = ""  # 引导 root 账号的密码；为空则不自动创建 root 账号。建议用环境变量注入。
+```
+
+<Note>
+JWT 签名密钥不再在此配置：首次启动时自动写入 `signing_secrets` 表。如需固定某个密钥，请设置环境变量 `MS_AUTH_JWT_SECRET_OVERRIDE`。旧的 `jwt_secret` 字段（结构体字段为 `deprecated_jwt_secret`，并以 `jwt_secret` 作为 serde alias）为向后兼容会被容忍但忽略——非空时会打印 deprecation 警告。
+</Note>
+
+## 可观测性 (Telemetry)
+
+日志、指标与 OTLP trace 导出配置。
+
+```toml
+[telemetry]
+log_level = "info"  # 日志级别：trace|debug|info|warn|error（也接受 RUST_LOG 风格的过滤指令）。
+log_format = "text"  # 输出格式：text（人类可读）或 json（结构化）。
+otlp_endpoint = ""  # OTLP/gRPC trace 导出端点；为空则不导出 trace。
+metrics_enabled = true  # 是否暴露 Prometheus /metrics 端点。
+log_output = "console"  # 日志输出目标：console（标准输出）或 file（需配 log_directory）。
+# log_directory = ""  # 文件日志目录；仅在 log_output = "file" 时使用。可选（Option<String>，默认不设置）。
+# log_file_prefix = ""  # 滚动日志文件名前缀。可选（Option<String>，默认不设置）。
+# log_rotation = ""  # 日志滚动周期（如 daily|hourly|never）。可选（Option<String>，默认不设置）。
+# log_max_files = 0  # 保留的滚动日志文件最大数量。可选（Option<usize>，默认不设置）。
+```
+
+## 集群 (Cluster)
+
+节点间 gRPC 互联与心跳存活探测配置。
+
+```toml
+[cluster]
+advertise_addr = "127.0.0.1:5082"  # 本节点对外宣告的 gRPC 互联地址；写入 cluster_nodes 表供对端发现。
+heartbeat_interval_secs = 5  # 心跳写入间隔（秒）。
+peer_timeout_secs = 15  # 对端超过该秒数无心跳即视为失联。
+```
+
+## 路由器限流 (Router Rate Limit)
+
+由 router 角色施加的每组织（per-org）令牌桶限流。[router] 本身没有标量字段，全部配置位于 [router.rate_limit]。
+
+```toml
+[router.rate_limit]
+ingest_qps = 1000  # 每组织每秒 ingest 请求上限；0 = 不限。
+query_qps = 100  # 每组织每秒查询请求上限；0 = 不限。
+burst_multiplier = 2  # 令牌桶突发容量倍数；实际容量 = qps * burst_multiplier。
+```
+
+## 缓存
+
+MoleSignal 维护若干彼此独立的进程内 LRU 缓存，外加一层 Parquet 本地磁盘缓存。每层各自配置容量，可通过把 `capacity`（或 `max_size_gb`）设为 `0` 关闭。
+
+### 文件元数据层
+
+进程内缓存，key = (org, stream, stream_type, time_bucket_hour)，value = Vec&lt;FileMeta>。
+
+```toml
+[cache.file_meta]
+capacity = 100000  # 最大缓存条目数。
+ttl_secs = 60  # 条目存活时间（秒）。
+```
+
+### Parquet 元数据层
+
+进程内缓存，key = object_key，value = Arc&lt;ParquetMetaData>（含复用的 Tantivy IndexHandle）。
+
+```toml
+[cache.parquet_meta]
+capacity = 10000  # 最大缓存条目数。
+ttl_secs = 600  # 条目存活时间（秒）。
+```
+
+### 查询结果层
+
+进程内缓存，key = blake3(stmt + org + time_range + role)，value = QueryResult。
+
+```toml
+[cache.query_result]
+capacity = 1000  # 最大缓存条目数。
+ttl_secs = 60  # 条目存活时间（秒）。
+```
+
+### Parquet 磁盘缓存
+
+Parquet 文件的本地 NVMe 二级缓存。
+
+```toml
+[cache.disk_cache]
+enabled = true  # 磁盘缓存层主开关。
+dir = "./data/cache/parquet"  # 本地磁盘缓存目录（PathBuf）。
+max_size_gb = 10  # 占盘容量上限（GB）；为 0 时关闭该层。
+```
+
+<Note>
+enabled = false 或 max_size_gb = 0 时整层关闭（is_effectively_enabled）：bootstrap 不实例化 ParquetDiskCache，缓存目录也不会被创建。
+</Note>
+
+### Tantivy 谓词结果
+
+谓词计数缓存，key = (index_object_key, field, term)，value = count: u64；命中即跳过 IndexHandle::count_term。
+
+```toml
+[cache.tantivy_result]
+capacity = 1000000  # 最大缓存条目数；为 0 时关闭该层。
+ttl_secs = 600  # 条目存活时间（秒）。
+```
+
+<Note>
+capacity = 0 时整层关闭：TantivyPruner::prune 不查也不写 cache，直接走 tantivy。
+</Note>
+
+### Tantivy Footer
+
+tantivy 归档 footer 缓存，key = index_object_key，value = Arc&lt;TantivyFooter>（puffin 元数据 + footer payload + 解析后 schema）；IndexHandle 过期后短路对象存储 GET。
+
+```toml
+[cache.tantivy_footer]
+capacity = 100000  # 最大缓存条目数；为 0 时关闭该层。
+ttl_secs = 3600  # 条目存活时间（秒）。
+```
+
+<Note>
+capacity = 0 时整层关闭：archive 重新打开时永远走对象存储 GET。
+</Note>
+
+### 冷分区 FileMeta Dump
+
+冷分区 dump parquet 解析结果的进程内缓存，key = (org, stream, stream_type, partition_level, partition_key)，value = Arc&lt;Vec&lt;FileMeta>>。
+
+```toml
+[cache.file_meta_dump]
+capacity = 10000  # 最大缓存条目数；为 0 时关闭该层。
+ttl_secs = 600  # 条目存活时间（秒）。
+```
+
+<Note>
+capacity = 0 时整层关闭：每次冷查都重新 GET + parse dump parquet。
+</Note>
+
+## 单点登录 (SSO)
+
+单点登录（spec §22）。可选；留空或省略本段即表示禁用 SSO。OIDC 与 SAML 各自的连接参数在下方子表中配置。
+
+```toml
+[sso]
+enabled = false  # 总开关；false 时整段 [sso] 被忽略。
+provider = "oidc"  # 启用的协议："oidc" | "saml"。
+role_mapping = []  # IdP group 到 MoleSignal Role 的映射；为 { group, role } 内联表数组。role 取 owner/admin/editor/viewer 之一。留空表示不做基于 group 的角色映射。
+```
+
+### OIDC 提供方
+
+OpenID Connect 提供方参数；当 [sso].provider = "oidc" 时生效。所有字段默认为空，启用 OIDC 时必须填写。
+
+```toml
+[sso.oidc]
+issuer = ""  # OIDC issuer URL。
+authorize_url = ""  # 授权端点 URL。
+token_url = ""  # Token 端点 URL。
+# userinfo_url = ""  # UserInfo 端点（可选，Option<String>）；不填则不调用 userinfo。
+client_id = ""
+client_secret = ""
+redirect_uri = ""  # 在 IdP 处登记的 OAuth2 回调 URL。
+scopes = []  # 请求的 OIDC scope，例如 ["openid", "profile", "email"]。
+```
+
+### SAML 提供方
+
+SAML 2.0 提供方参数；当 [sso].provider = "saml" 时生效。所有字段默认为空。
+
+```toml
+[sso.saml]
+sp_entity_id = ""  # Service Provider 的 entity ID。
+idp_metadata_url = ""  # IdP 元数据 URL。
+# cert_pem_file = ""  # IdP 签名证书（PEM，Option<String>）文件路径，可选；不填则跳过。
+```
+
+## MMDB (GeoIP)
+
+MaxMind GeoLite2 数据库（spec §9）：geoip_lookup 函数的数据源。
+
+```toml
+[mmdb]
+license_key = ""  # MaxMind GeoLite2 license key；为空时不下载。若 db_path 文件已随包存在，GeoIP 仍可用。
+db_path = "/usr/share/molesignal/mmdb/GeoLite2-City.mmdb"  # 本地 mmdb 文件路径。
+refresh_interval_secs = 604800  # 周期 refresh 间隔（秒）；默认 7 天（7*24*3600）。
+```
+
+## 异步搜索任务 (search_jobs)
+
+异步 SearchJob worker 池（spec §6）。
+
+```toml
+[search_jobs]
+workers = 2  # search-job worker 数量。
+idle_poll_secs = 2  # 队列空闲时的轮询间隔（秒）。
+cleanup_interval_secs = 3600  # 清理已完成/过期任务的间隔（秒）。
+```
+
+## 函数运行时 (functions)
+
+函数运行时。VRL 永远可用；JS 需 --features js-runtime 编译并打开本开关。
+
+```toml
+[functions]
+js_runtime_enabled = false  # 仅在 --features js-runtime 编译时有意义；即便 feature 开启，本字段为 false 时 JS 函数也会报 "js runtime disabled"。默认 false，需运维显式开启 V8。
+```
+
+## 定时报表 — 渲染器
+
+定时报表的 headless Chrome PDF/PNG 渲染器（change scheduled-reports-headless）。需带 feature 编译且镜像内有 Chromium；OSS 永不启用。[scheduled_reports] 表本身无直接字段，仅含本 renderer 子表。
+
+```toml
+[scheduled_reports.renderer]
+enabled = false  # 即便编译时带 feature 且镜像内有 Chromium，也可用本开关一键关闭渲染。
+concurrent_renders = 2  # Chrome 实例池大小；硬上限 4（crate 内 clamp）。
+render_timeout_secs = 30  # 单次 render 的 wall-clock 上限；硬上限 60s。
+viewport_width = 1280  # Viewport 宽（像素）。
+viewport_height = 800  # Viewport 高（像素）。
+```
+
+## Copilot 聊天 (copilot)
+
+Copilot 聊天（change copilot-provider-adapter）：仅含 enabled 开关与默认 provider 提示。API key / base URL 走环境变量（MS_COPILOT_&lt;PROVIDER>_API_KEY / _BASE_URL），不进 TOML。仅在带 license 的构建中生效；OSS 编译时不读取这些字段。
+
+```toml
+[copilot]
+enabled = false  # 仅在带 license 的构建中真正生效；OSS 编译时本字段不被读取。
+default_provider = "openai"  # session.provider 为空时的 fallback；当前仅文档化，暂未实际使用。
+```
