@@ -1,0 +1,123 @@
+---
+title: "用数据库客户端连接"
+description: "通过 Arrow Flight SQL 在 DBeaver、JDBC、ADBC 中直接查询 MoleSignal。"
+---
+
+MoleSignal 提供 **Arrow Flight SQL** 端点，标准数据库工具可以直接连接并对遥测数据执行只读
+SQL —— 不需要再写 HTTP 胶水代码。结果以 Arrow record batch 传输，大结果集下明显快于 JSON。
+
+<Note>
+Flight SQL 是基于 gRPC 的协议。只支持 PostgreSQL / MySQL 线协议的工具（`psql`、`mysql`
+CLI、Navicat）无法连接；请使用 DBeaver、Arrow Flight SQL JDBC 驱动或任意 ADBC 客户端。
+</Note>
+
+## 开启端点
+
+监听器**默认关闭**。在 `config.toml` 中开启后重启：
+
+```toml
+[flight_sql]
+enabled = true
+bind = "0.0.0.0"
+port = 5083
+# SQL 未携带裁剪信息时的缺省时间窗（见下文）
+default_lookback_hours = 24
+```
+
+Flight SQL 端口与内部 gRPC 端口（5082）相互独立：只把 5083 暴露给客户端网络，5082 保持在
+集群内网。TLS 建议在支持 gRPC 的 ingress 上终结。
+
+## 鉴权
+
+Flight SQL 直接接入 MoleSignal 既有认证体系，标准 basic auth 握手接受两种凭据：
+
+| | Username | Password | 适用场景 |
+|---|---|---|---|
+| **账号登录** | 你的邮箱 | 账号密码 | 人交互（DBeaver、临时查询） |
+| **API token** | 任意（建议 `token`） | `ms_...` token | 自动化、脚本、BI 服务 |
+
+账号登录与 Web 登录走同一套校验，服务端签发短期会话 token（JWT）；API token 则直接使用
+token 本身。不走 basic auth、直接携带 bearer 头的客户端同样支持。两种方式的访问范围都限定
+在单个组织内——只能看到所属 org 的 stream 与数据。
+
+**多 org 用户选择组织**：默认进入第一个组织（与 Web 登录一致）。要切换，在 username 末尾
+追加 `@<org>`，例如 `alice@example.com@acme`，其中 `acme` 为 org 的 name、slug 或 id。
+
+<Warning>
+数据库客户端会把密码持久化在连接配置、JDBC URL 和脚本里，泄露面远大于受限 token。
+**账号密码只用于人交互场景；一切自动化请使用 `ms_` API token**——它可吊销、可设过期、
+且范围限定单个 org。在 **设置 → API Tokens** 或
+[`POST /api/v1/auth/tokens`](/zh-Hans/api/auth/issue-token) 创建。
+</Warning>
+
+另外两点需要知道：
+
+- **SSO 用户**：通过 OIDC/SAML 登录的用户没有本地密码，账号登录方式必然失败，请使用
+  API token。
+- **会话过期**：账号登录签发的 JWT 受服务端 `token_ttl_secs` 限制，过期后请求返回
+  `UNAUTHENTICATED`；DBeaver 会用保存的凭据自动重连，交互场景基本无感。长时间运行的
+  ADBC 脚本请改用不过期的 API token。
+
+## DBeaver
+
+DBeaver Community 不内置 Flight SQL 驱动，需要手动注册一次 Arrow Flight SQL JDBC 驱动
+（约一分钟）：
+
+1. **数据库 → 驱动管理器 → 新建**
+2. 切到 **库（Libraries）** 标签，点 **添加 Artifact**，粘贴
+   `org.apache.arrow:flight-sql-jdbc-driver:RELEASE`，再点 **下载/更新**
+   （也可用 **添加文件** 指向本地下载好的驱动 jar）
+3. 回到 **设置** 标签：驱动名 `Arrow Flight SQL`，类名
+   `org.apache.arrow.driver.jdbc.ArrowFlightJdbcDriver`，URL 模板
+   `jdbc:arrow-flight-sql://{host}:{port}/?useEncryption=false`
+4. **新建连接** → 选刚建的驱动 → Host 填服务器地址，Port 填 `5083`
+5. Username 填邮箱（可写 `email@org` 选组织）、Password 填账号密码；或 Username 填
+   `token`、Password 填 `ms_...`
+
+导航树会显示单个 catalog（`molesignal`）、四个 schema（`logs`、`metrics`、`traces`、
+`extend`），以及当前 org 的 stream 列表（作为表）。
+
+## JDBC
+
+```text
+jdbc:arrow-flight-sql://your-host:5083/?useEncryption=false&user=token&password=ms_...
+```
+
+驱动坐标：`org.apache.arrow:flight-sql-jdbc-driver`。
+
+## Python（ADBC）
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+conn = flightsql.connect(
+    "grpc://your-host:5083",
+    db_kwargs={"username": "token", "password": "ms_..."},
+)
+cur = conn.cursor()
+cur.execute("SELECT level, count(*) AS n FROM logs.nginx GROUP BY level")
+print(cur.fetch_arrow_table())   # 也可 fetchall() / .fetch_df()
+```
+
+## 查询写法
+
+- **表名用 stream 类型限定**：`logs.nginx`、`metrics.cpu_usage`、`traces.checkout`、
+  `extend.lookup_table`。不限定时默认按 `logs` 处理。带 catalog 的全限定名
+  （`molesignal.logs.nginx`，DBeaver 浏览表数据时生成的写法）同样支持。
+- **只读**：`INSERT` / `UPDATE` / `DELETE` / DDL 一律拒绝。
+- **时间窗**：Flight SQL 协议没有时间范围参数，服务端按最近 `default_lookback_hours`
+  （默认 24h）做分区裁剪；`WHERE` 里的 `_timestamp` 条件在该窗口内仍然生效。要查更久的
+  数据，调大 `default_lookback_hours`，或改用支持显式时间范围的
+  [HTTP 查询 API](/zh-Hans/api/query/execute)。
+- `_timestamp` 列以微秒精度的 timestamp 类型返回。
+
+## 限制
+
+- 支持 prepared statement，但**不支持参数绑定** —— 请内联字面量。
+- 无事务（只读引擎）。
+- Flight SQL 上不提供 PromQL；PromQL 请走 HTTP API。
+- `FlightInfo` 中的结果 schema 为空，客户端以数据流自带的 schema 为准（DBeaver 与 ADBC
+  都会透明处理）。
+
+执行中的 Flight SQL 查询与 HTTP 查询一样出现在 `GET /api/v1/query/running`，可用
+`POST /api/v1/query/{id}/cancel` 取消。

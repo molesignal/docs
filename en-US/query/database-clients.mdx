@@ -1,0 +1,132 @@
+---
+title: "Connect with a database client"
+description: "Query MoleSignal from DBeaver, JDBC, and ADBC over Arrow Flight SQL."
+---
+
+MoleSignal exposes an **Arrow Flight SQL** endpoint so standard database tools can connect
+directly and run read-only SQL against your telemetry — no HTTP glue code required. Results
+travel as Arrow record batches, which is significantly faster than JSON for large result sets.
+
+<Note>
+Flight SQL is a gRPC-based protocol. Tools that only speak the PostgreSQL or MySQL wire
+protocol (`psql`, `mysql` CLI, Navicat) cannot connect. Use DBeaver, the Arrow Flight SQL
+JDBC driver, or any ADBC client instead.
+</Note>
+
+## Enable the endpoint
+
+The listener is **disabled by default**. Turn it on in `config.toml` and restart:
+
+```toml
+[flight_sql]
+enabled = true
+bind = "0.0.0.0"
+port = 5083
+# Default time window when the SQL carries no pruning hint (see below)
+default_lookback_hours = 24
+```
+
+The Flight SQL port is separate from the internal gRPC port (5082). Only expose 5083 to
+client networks; keep 5082 inside the cluster. For TLS, terminate at a gRPC-aware ingress.
+
+## Authentication
+
+Flight SQL plugs into MoleSignal's existing auth system. Two credential styles are accepted
+in the standard basic-auth handshake:
+
+| | Username | Password | Best for |
+|---|---|---|---|
+| **Account login** | your email | your account password | interactive use (DBeaver, ad-hoc) |
+| **API token** | anything (use `token`) | `ms_...` token | automation, scripts, BI services |
+
+With account login, the server authenticates you exactly like the web UI login and issues a
+short-lived session token (JWT). With an API token, the token itself is used directly. Clients
+that send a bearer header instead of basic auth are also accepted. Either way, access is scoped
+to one organization — you only see that org's streams and data.
+
+**Choosing an organization** (multi-org users): by default you land in your first organization,
+same as web login. To pick another, append `@<org>` to the username — e.g.
+`alice@example.com@acme` where `acme` is the org's name, slug, or id.
+
+<Warning>
+Database clients persist passwords in connection profiles, JDBC URLs, and scripts — a much
+larger exposure surface than a scoped token. **Use your account password only for interactive
+sessions. For anything automated, always use an `ms_` API token**: it is revocable, can carry
+an expiry, and is limited to one org. Create one under **Settings → API Tokens** or via
+[`POST /api/v1/auth/tokens`](/en-US/api/auth/issue-token).
+</Warning>
+
+Two more things to know:
+
+- **SSO users**: if you sign in through OIDC/SAML you have no local password, so account login
+  cannot work. Use an API token instead.
+- **Session expiry**: the JWT issued by account login expires after the server's
+  `token_ttl_secs`. Requests then fail with `UNAUTHENTICATED`; DBeaver silently reconnects with
+  your saved credentials, so interactive use is unaffected. Long-running ADBC scripts should
+  use a non-expiring API token instead.
+
+## DBeaver
+
+DBeaver Community does not bundle a Flight SQL driver — register the Arrow Flight SQL JDBC
+driver once (about a minute):
+
+1. **Database → Driver Manager → New**
+2. On the **Libraries** tab, click **Add Artifact** and paste
+   `org.apache.arrow:flight-sql-jdbc-driver:RELEASE`, then **Download/Update**
+   (or **Add File** with a locally downloaded driver jar)
+3. Back on **Settings**: Driver Name `Arrow Flight SQL`, Class Name
+   `org.apache.arrow.driver.jdbc.ArrowFlightJdbcDriver`, URL Template
+   `jdbc:arrow-flight-sql://{host}:{port}/?useEncryption=false`
+4. **New Connection** → pick the driver you just created → Host: your server, Port: `5083`
+5. Username: your email (optionally `email@org`), Password: your account password — or
+   Username `token` / Password `ms_...`
+
+The navigator shows one catalog (`molesignal`), four schemas (`logs`, `metrics`, `traces`,
+`extend`), and your org's streams as tables.
+
+## JDBC
+
+```text
+jdbc:arrow-flight-sql://your-host:5083/?useEncryption=false&user=token&password=ms_...
+```
+
+Driver artifact: `org.apache.arrow:flight-sql-jdbc-driver`.
+
+## Python (ADBC)
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+conn = flightsql.connect(
+    "grpc://your-host:5083",
+    db_kwargs={"username": "token", "password": "ms_..."},
+)
+cur = conn.cursor()
+cur.execute("SELECT level, count(*) AS n FROM logs.nginx GROUP BY level")
+print(cur.fetch_arrow_table())   # or fetchall() / .fetch_df()
+```
+
+## Writing queries
+
+- **Qualify tables with the stream type**: `logs.nginx`, `metrics.cpu_usage`,
+  `traces.checkout`, `extend.lookup_table`. An unqualified name defaults to `logs`. Fully
+  qualified names including the catalog (`molesignal.logs.nginx` — what DBeaver generates
+  when you browse a table) work too.
+- **Read-only**: `INSERT` / `UPDATE` / `DELETE` / DDL are rejected.
+- **Time window**: Flight SQL has no time-range parameter, so the server scans the last
+  `default_lookback_hours` (24h by default) for partition pruning. A `_timestamp` filter in
+  your `WHERE` clause still applies within that window. To query further back, raise
+  `default_lookback_hours`, or use the [HTTP query API](/en-US/api/query/execute) which takes
+  an explicit time range.
+- `_timestamp` is returned as a microsecond-precision timestamp column.
+
+## Limitations
+
+- Prepared statements work, but **parameter binding does not** — inline literals instead.
+- No transactions (read-only engine).
+- PromQL is not available over Flight SQL; use the HTTP API for PromQL.
+- Result schema in `FlightInfo` is empty; clients read the schema from the data stream
+  (DBeaver and ADBC handle this transparently).
+
+Running Flight SQL queries appear in `GET /api/v1/query/running` and can be cancelled with
+`POST /api/v1/query/{id}/cancel`, like any HTTP query.
