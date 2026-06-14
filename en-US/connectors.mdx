@@ -1,0 +1,132 @@
+---
+title: "Connectors"
+sidebarTitle: "Connectors"
+description: "Receive logs straight from Kinesis Firehose, Cloudflare Logpush, and Heroku — and fan pipeline output out to S3 or Kafka."
+---
+
+A **connector** is a managed integration with an external platform. Connectors work in two
+directions:
+
+- **Ingest sources** — a platform pushes data **into** MoleSignal (Kinesis Firehose, Cloudflare
+  Logpush, Heroku log drains).
+- **Egress sinks** — a [pipeline](/en-US/pipelines) fans its output **out** to S3 or Kafka.
+
+## Configure a connector
+
+Create connectors under **Pipelines → Connectors**, or over the API. Each has a `kind` and a
+`config_json` whose shape depends on the kind. Sensitive fields (`push_token`, `access_key`,
+`secret_key`, …) are masked in API responses.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "cf-prod",
+        "kind": "cloudflare_logpush",
+        "config_json": { "push_token": "ms_cf_9f3c…", "target_stream": "cloudflare" }
+      }'
+```
+
+## Ingest sources (push)
+
+The three push sources share one model: you create a connector with a **`push_token`** and a
+**`target_stream`**, then point the platform at the matching endpoint. These endpoints don't use your
+JWT — the request authenticates with the connector token, supplied whichever way the platform allows:
+
+| Method | Used by |
+|---|---|
+| `X-Connector-Token` header | Platforms with configurable headers (e.g. Cloudflare) |
+| `X-Amz-Firehose-Access-Key` header | Kinesis Firehose (sent automatically) |
+| `?token=` query parameter | Platforms that can't set headers (e.g. Heroku) |
+
+Bodies sent with `Content-Encoding: gzip` are decompressed automatically. Events flow through the
+same ingest path as everything else — schema-on-write, [pipelines](/en-US/pipelines), and
+[masking](/en-US/security) all apply.
+
+<Tabs>
+  <Tab title="Kinesis Firehose">
+    Create the connector with `kind: "aws_kinesis_firehose"`, then add an **HTTP endpoint**
+    destination to your Firehose delivery stream:
+
+    - **URL** — `https://<your-host>/api/v1/_kinesis_firehose`
+    - **Access key** — the connector's `push_token` (Firehose sends it as `X-Amz-Firehose-Access-Key`)
+
+    MoleSignal base64-decodes each record, splits it on newlines, and parses each line as JSON
+    (falling back to a `message` field for plain text). It returns the `200` ACK Firehose expects.
+  </Tab>
+  <Tab title="Cloudflare Logpush">
+    Create the connector with `kind: "cloudflare_logpush"`, then create a Logpush job whose
+    destination is:
+
+    - **URL** — `https://<your-host>/api/v1/_cloudflare`
+    - **Header** — `X-Connector-Token: <push_token>`
+
+    Cloudflare ships gzip-compressed NDJSON; each line becomes one event. The endpoint replies
+    `204 No Content`.
+  </Tab>
+  <Tab title="Heroku">
+    Create the connector with `kind: "heroku_drain"`, then add the drain — Heroku can't set custom
+    headers, so the token rides in the URL:
+
+    ```bash
+    heroku drains:add "https://<your-host>/api/v1/_heroku?token=<push_token>"
+    ```
+
+    Each log line becomes an event with `message` and `source: "heroku"`. The endpoint replies
+    `204 No Content`.
+  </Tab>
+</Tabs>
+
+<Tip>
+  The `target_stream` is created on first delivery and its schema evolves as new fields appear — same
+  as any other stream. Leave it out to fall back to a per-source default (`kinesis`, `cloudflare`,
+  `heroku`).
+</Tip>
+
+## Pull sources
+
+CloudWatch Logs is a **pull** source: MoleSignal polls the AWS API on a schedule instead of receiving
+a push. Create a connector and MoleSignal periodically calls `FilterLogEvents` (signed with SigV4 — no
+AWS SDK needed), advancing a per-connector checkpoint so each run reads only new events.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "cw-prod",
+        "kind": "aws_cloudwatch_logs",
+        "config_json": {
+          "region": "us-east-1",
+          "log_group": "/aws/lambda/checkout",
+          "access_key": "AKIA…",
+          "secret_key": "…",
+          "target_stream": "cloudwatch"
+        }
+      }'
+```
+
+| Field | Notes |
+|---|---|
+| `region` / `log_group` | Required — the CloudWatch region and log group to read. |
+| `access_key` / `secret_key` | IAM credentials with `logs:FilterLogEvents`. |
+| `session_token` | Optional, for temporary STS credentials. |
+| `target_stream` | Destination stream (default `default`). |
+
+The poller runs as a **singleton** (on the alert-manager / standalone node), so exactly one node polls
+regardless of cluster size. Each event becomes a log with `message`, `log_stream`, and `log_group`.
+
+## Egress sinks
+
+S3 and Kafka connectors are **sinks**: select them in a [pipeline](/en-US/pipelines#sinks-and-connector-egress)
+to fan transformed events out as the pipeline runs.
+
+| Kind | Payload |
+|---|---|
+| `s3` | Batched JSON Lines `PUT` to `s3://<bucket>/<prefix><id>.jsonl`. |
+| `kafka` | One JSON record produced per event to the configured topic. |
+
+<Card title="Ingest API" icon="plug" href="/en-US/api/ingest/kinesis">
+  Endpoint details for the Kinesis, Cloudflare, and Heroku push receivers.
+</Card>

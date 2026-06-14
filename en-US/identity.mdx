@@ -1,0 +1,161 @@
+---
+title: "Identity & access"
+sidebarTitle: "Identity & access"
+description: "Organizations, users, roles, invitations, SSO, service accounts, and email-domain control."
+---
+
+MoleSignal is multi-tenant. Every stream, dashboard, alert, and saved view belongs to an
+**organization**, and what each person can do inside an org is governed by their **role**. A single
+user can belong to several orgs with a different role in each.
+
+## Organizations
+
+The first user to sign up creates an org and becomes its **Owner**. From there you can create more
+orgs, switch between them, and manage members.
+
+| Action | Endpoint | Who |
+|---|---|---|
+| List your orgs | `GET /api/v1/orgs` | Any member |
+| Create an org | `POST /api/v1/orgs` | Org admin |
+| Rename an org | `PATCH /api/v1/orgs/{id}` | Org admin |
+| Switch active org | `POST /api/v1/orgs/{id}/select` | Member |
+| Add / change a member | `POST /api/v1/orgs/{id}/members` | Org admin |
+| Remove a member | `DELETE /api/v1/orgs/{id}/members/{user_id}` | Org admin |
+| Delete an org | `DELETE /api/v1/orgs/{id}` | Org admin |
+
+<Note>
+  Switching orgs issues a **new JWT** carrying your role for that org. You can't delete the org
+  you're currently in, and every user must keep at least one org.
+</Note>
+
+## Users
+
+You add people two ways: an admin **invites** them, or they **sign up** themselves (when self-service
+signup is enabled for the instance).
+
+- **Invitations** — the admin chooses the email and role; the invitee joins on first login.
+- **Self-service signup** — controlled by two instance settings: whether signup is open at all, and
+  whether new accounts need approval. When approval is required, a new account is **pending** until
+  an Owner or Admin approves it.
+
+Admins can list, approve, disable, and delete users. A user's email is their identity and can't be
+changed after the account is created.
+
+## Roles & permissions
+
+Four built-in roles cover the common cases:
+
+| Role | What it can do |
+|---|---|
+| **Owner** | Everything, including organization administration. Assigned to the org creator. |
+| **Admin** | Everything, including organization administration and audit access. |
+| **Editor** | Read **and write** data — streams, dashboards, alerts, schedules, saved views — but not org administration or audit. |
+| **Viewer** | Read-only across data, plus web search and correlation. |
+
+Need something more specific? Define **custom roles** scoped to your org with their own permission
+set. Built-in roles are read-only.
+
+| Action | Endpoint |
+|---|---|
+| List roles | `GET /api/v1/roles` |
+| Create a custom role | `POST /api/v1/roles` |
+| Update a custom role | `PATCH /api/v1/roles/{id}` |
+| Delete a custom role | `DELETE /api/v1/roles/{id}` |
+
+## Teams
+
+Group members into **teams** so you can target them as a unit — for example, as the recipients of an
+[alert escalation](/en-US/alerting). Manage teams under settings, or over the API:
+
+```bash
+curl -X POST http://localhost:5080/api/v1/teams \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{"name":"on-call","member_ids":["usr_abc","usr_def"]}'
+```
+
+Every member of a team must belong to the same org.
+
+## Invitations
+
+Invite someone by email and assign their role up front:
+
+```bash
+curl -X POST http://localhost:5080/api/v1/invitations \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{"email":"alice@example.com","role":"editor"}'
+```
+
+You can **resend** (`POST /api/v1/invitations/{id}/resend`) or **revoke**
+(`POST /api/v1/invitations/{id}/revoke`) a pending invitation. Invited addresses must pass the
+org's email-domain allowlist.
+
+## Email-domain allowlist
+
+Restrict who can join an org by allowing specific email domains. An **empty list means no
+restriction**.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/orgs/email-domains \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{"domain":"example.com"}'
+```
+
+Matching includes subdomains — `ci@eu.example.com` is allowed by `example.com`. Remove a domain with
+`DELETE /api/v1/orgs/email-domains/{domain}`. The allowlist is enforced on both invitations and
+self-service / SSO sign-up.
+
+## Service accounts (API tokens)
+
+For agents, CI, and data sources that can't log in interactively, issue a long-lived **API token**.
+Tokens are prefixed `ms_` and carry their own role.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/auth/tokens \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{"name":"otel-collector","role":"editor","expires_in_days":365}'
+```
+
+| Field | Notes |
+|---|---|
+| `role` | Defaults to your own role; can't exceed it. |
+| `expires_in_days` | Optional. Omit for a non-expiring token. |
+
+<Warning>
+  The token's secret is shown **once**, at creation. Store it securely — you can't retrieve it later,
+  only revoke it (`DELETE /api/v1/auth/tokens/{id}`).
+</Warning>
+
+Use a token exactly like a login JWT — `Authorization: Bearer ms_…`. For a quick start, every user
+has a reusable **default ingest token** at `GET /api/v1/auth/tokens/default`.
+
+## Single sign-on (SSO)
+
+Connect an external identity provider so people sign in with your IdP. Both **OIDC** and **SAML 2.0**
+(SP-initiated) are supported. Providers are configured per org and stored in the database — no
+restart needed.
+
+| Action | Endpoint |
+|---|---|
+| List / create providers | `GET` / `POST /api/v1/sso/providers` |
+| Update / delete a provider | `PUT` / `DELETE /api/v1/sso/providers/{id}` |
+| Enable / disable a provider | `POST /api/v1/sso/providers/{id}/enable` · `/disable` |
+
+For **OIDC**, supply a discovery URL (or explicit authorize/token/JWKS endpoints), client
+credentials, and scopes. Map IdP groups to MoleSignal roles with a **group → role** table and a
+**default role** for unmatched users. The login flow runs through `GET /api/v1/auth/sso/login` and
+the provider callback; new users are auto-provisioned into the provider's org with their mapped role.
+
+<Note>
+  SSO requires a license with the `sso` feature. SAML assertions are verified with real XMLDSig —
+  enveloped signature, RSA-SHA256, and the embedded certificate is checked against the configured IdP
+  cert. Verification targets the deterministic output of mainstream IdPs (Azure AD, Okta, Keycloak,
+  ADFS); it does not implement exclusive XML canonicalization, so a non-canonical response is rejected.
+</Note>
+
+<Card title="Authentication API" icon="key" href="/en-US/api/auth/login">
+  Sign in, issue and revoke tokens, and rotate signing secrets over the HTTP API.
+</Card>

@@ -1,0 +1,151 @@
+---
+title: "身份与访问"
+sidebarTitle: "身份与访问"
+description: "组织、用户、角色、邀请、SSO、服务账号与邮箱域控制。"
+---
+
+MoleSignal 是多租户的。每条流、仪表板、告警和保存的视图都归属某个**组织**，每个人在组织内能做
+什么由其**角色**决定。同一用户可同时属于多个组织，在各组织里角色不同。
+
+## 组织
+
+首位注册的用户会创建一个组织并成为它的 **Owner**。之后你可以创建更多组织、在它们之间切换、并管理
+成员。
+
+| 操作 | 端点 | 谁可以 |
+|---|---|---|
+| 列出你的组织 | `GET /api/v1/orgs` | 任意成员 |
+| 创建组织 | `POST /api/v1/orgs` | 组织管理员 |
+| 重命名组织 | `PATCH /api/v1/orgs/{id}` | 组织管理员 |
+| 切换当前组织 | `POST /api/v1/orgs/{id}/select` | 成员 |
+| 添加 / 变更成员 | `POST /api/v1/orgs/{id}/members` | 组织管理员 |
+| 移除成员 | `DELETE /api/v1/orgs/{id}/members/{user_id}` | 组织管理员 |
+| 删除组织 | `DELETE /api/v1/orgs/{id}` | 组织管理员 |
+
+<Note>
+  切换组织会签发一个**新的 JWT**，携带你在该组织的角色。你不能删除当前所在的组织，且每个用户至少要
+  保留一个组织。
+</Note>
+
+## 用户
+
+加人有两种方式：管理员**邀请**，或用户自行**注册**（当实例开启自助注册时）。
+
+- **邀请** —— 管理员指定邮箱和角色，被邀请者首次登录即加入。
+- **自助注册** —— 由两个实例设置控制：是否开放注册，以及新账号是否需要审批。需要审批时，新账号处于
+  **pending** 状态，直到 Owner 或 Admin 通过。
+
+管理员可以列出、审批、停用和删除用户。用户的邮箱即其身份，账号创建后不可更改。
+
+## 角色与权限
+
+四个内置角色覆盖常见场景：
+
+| 角色 | 可做什么 |
+|---|---|
+| **Owner** | 一切，包括组织管理。分配给组织创建者。 |
+| **Admin** | 一切，包括组织管理与审计访问。 |
+| **Editor** | 读**和写**数据——流、仪表板、告警、计划任务、保存的视图——但不含组织管理与审计。 |
+| **Viewer** | 跨数据只读，外加 web 检索与关联。 |
+
+需要更细的控制？可以定义组织范围内的**自定义角色**，赋予各自的权限集。内置角色只读、不可编辑。
+
+| 操作 | 端点 |
+|---|---|
+| 列出角色 | `GET /api/v1/roles` |
+| 创建自定义角色 | `POST /api/v1/roles` |
+| 更新自定义角色 | `PATCH /api/v1/roles/{id}` |
+| 删除自定义角色 | `DELETE /api/v1/roles/{id}` |
+
+## 团队
+
+把成员编成**团队**，即可作为一个整体来指定——例如作为[告警升级](/zh-Hans/alerting)的接收方。在设置中
+管理团队，或通过 API：
+
+```bash
+curl -X POST http://localhost:5080/api/v1/teams \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{"name":"on-call","member_ids":["usr_abc","usr_def"]}'
+```
+
+团队的每个成员都必须属于同一组织。
+
+## 邀请
+
+按邮箱邀请并预先指定角色：
+
+```bash
+curl -X POST http://localhost:5080/api/v1/invitations \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{"email":"alice@example.com","role":"editor"}'
+```
+
+可以**重发**（`POST /api/v1/invitations/{id}/resend`）或**撤销**（`POST /api/v1/invitations/{id}/revoke`）
+一个待处理的邀请。被邀请的邮箱必须通过该组织的邮箱域白名单。
+
+## 邮箱域白名单
+
+通过允许特定邮箱域来限制谁能加入组织。**空名单 = 不限制**。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/orgs/email-domains \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{"domain":"example.com"}'
+```
+
+匹配包含子域——`ci@eu.example.com` 会被 `example.com` 放行。用
+`DELETE /api/v1/orgs/email-domains/{domain}` 移除某个域。白名单对邀请和自助 / SSO 注册都生效。
+
+## 服务账号（API token）
+
+对于无法交互式登录的 agent、CI 和数据源，签发一个长期 **API token**。token 以 `ms_` 为前缀、携带
+自己的角色。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/auth/tokens \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{"name":"otel-collector","role":"editor","expires_in_days":365}'
+```
+
+| 字段 | 说明 |
+|---|---|
+| `role` | 缺省为你自己的角色；不能超过它。 |
+| `expires_in_days` | 可选。省略则为永不过期的 token。 |
+
+<Warning>
+  token 的密文只在**创建时显示一次**。请妥善保存——之后无法找回，只能撤销
+  （`DELETE /api/v1/auth/tokens/{id}`）。
+</Warning>
+
+像登录 JWT 一样使用 token——`Authorization: Bearer ms_…`。想快速上手的话，每个用户都有一个可复用的
+**默认接入 token**，位于 `GET /api/v1/auth/tokens/default`。
+
+## 单点登录（SSO）
+
+接入外部身份提供方，让用户用你的 IdP 登录。同时支持 **OIDC** 与 **SAML 2.0**（SP 发起）。Provider 按
+组织配置、存于数据库——无需重启。
+
+| 操作 | 端点 |
+|---|---|
+| 列出 / 创建 provider | `GET` / `POST /api/v1/sso/providers` |
+| 更新 / 删除 provider | `PUT` / `DELETE /api/v1/sso/providers/{id}` |
+| 启用 / 禁用 provider | `POST /api/v1/sso/providers/{id}/enable` · `/disable` |
+
+**OIDC** 需提供 discovery URL（或显式的 authorize/token/JWKS 端点）、客户端凭据和 scopes。用
+**group → role** 映射表把 IdP 用户组映射到 MoleSignal 角色，并为未匹配用户设一个**默认角色**。登录
+流程经 `GET /api/v1/auth/sso/login` 与 provider 回调；新用户会自动开户到该 provider 所属组织、并赋予
+映射出的角色。
+
+<Note>
+  SSO 需要带 `sso` feature 的 license。SAML assertion 经真实 XMLDSig 校验——enveloped signature、
+  RSA-SHA256，并校验内嵌证书与配置的 IdP 证书为同一公钥。验签面向主流 IdP（Azure AD、Okta、
+  Keycloak、ADFS）的 deterministic 输出，未实现 exclusive XML 规范化，非规范化的 Response 会被拒。
+</Note>
+
+<Card title="认证 API" icon="key" href="/zh-Hans/api/auth/login">
+  通过 HTTP API 登录、签发与撤销 token、轮换签名密钥。
+</Card>

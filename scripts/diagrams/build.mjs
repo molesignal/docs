@@ -218,6 +218,40 @@ const DIAGRAMS = {
   sql --> resp`,
     },
   },
+
+  pipeline: {
+    title: { en: 'Scheduled pipeline', 'zh-Hans': '调度流水线' },
+    mermaid: {
+      en: `flowchart TD
+  trigger["cron tick / backfill<br/>over [from, to]"]
+  src[("source stream")]
+  read["read window<br/>SELECT * over range"]
+  steps["VRL transform chain<br/>function_steps · in order"]
+  ext[("extend tables<br/>join lookups")]
+  target[("target stream<br/>standard ingest")]
+  egress["connectors<br/>S3 / Kafka egress"]
+  trigger --> read
+  src --> read
+  read --> steps
+  ext -. "lookup" .-> steps
+  steps -->|"write"| target
+  steps -. "optional" .-> egress`,
+      'zh-Hans': `flowchart TD
+  trigger["cron tick / 回填<br/>窗口 [from, to]"]
+  src[("源数据流")]
+  read["读窗口<br/>SELECT * over range"]
+  steps["VRL 转换链<br/>function_steps · 按序"]
+  ext[("扩展表<br/>join 查找")]
+  target[("目标数据流<br/>标准 ingest")]
+  egress["connector<br/>S3 / Kafka egress"]
+  trigger --> read
+  src --> read
+  read --> steps
+  ext -. "查找" .-> steps
+  steps -->|"写入"| target
+  steps -. "可选" .-> egress`,
+    },
+  },
 };
 
 // --- Render one mermaid string to an SVG string, in light or dark -----------

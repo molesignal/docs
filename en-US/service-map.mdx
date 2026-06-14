@@ -1,0 +1,96 @@
+---
+title: "Service map & APM"
+sidebarTitle: "Service map"
+description: "A live topology of your services with RED metrics, derived automatically from trace spans."
+---
+
+The **service map** shows how your services call each other and how healthy each call is — request
+rate, error rate, and latency (the **RED** metrics). It's built automatically from the traces you
+already send; there's nothing extra to instrument beyond normal tracing.
+
+## How it's built
+
+As trace spans arrive, MoleSignal pairs each span with its parent. When a span and its parent belong
+to **different services**, that's a call edge — *parent service → child service* — and the edge takes
+the child (callee) span's duration and error status. Same-service parent/child spans are internal and
+aren't drawn as edges.
+
+Edges are accumulated into **one-minute buckets** per service pair and flushed to storage in the
+background, so the map reflects recent traffic within roughly half a minute.
+
+### In-memory vs storage mode
+
+By default (`ingest` mode) pairing happens **in-memory** on the node that ingests the spans — low
+latency. In a multi-node deployment, spans for one call that land on different nodes can't be paired
+in memory, so the map may undercount those edges (it never invents one).
+
+To get a complete map across nodes, switch **Settings → General → Service map data source** to
+**storage** mode. A single node then periodically rebuilds the graph from **stored traces** — seeing
+every span regardless of which node ingested it — at the cost of a 1–2 minute delay. The setting is
+stored in the database and takes effect at runtime; no restart needed.
+
+## What you need to send
+
+The map needs traces with:
+
+- a **`service.name`** resource attribute on every span (the OTLP exporters set this for you), and
+- **parent/child span relationships** that cross service boundaries — i.e. a client span in one
+  service whose child server span runs in another.
+
+Standard OpenTelemetry instrumentation produces both. Point your tracer at any of the
+[trace ingest endpoints](/en-US/ingestion) and the map populates on its own.
+
+## Topology
+
+The topology endpoint aggregates a time window into nodes (services) and edges (calls):
+
+```http
+GET /api/v1/web/topology?from=2026-06-14T00:00:00Z&to=2026-06-14T01:00:00Z
+Authorization: Bearer <jwt>
+```
+
+```json
+{
+  "nodes": [
+    { "id": "checkout", "name": "checkout", "rps": 42.0, "error_rate": 0.01, "p95_ms": 120.0, "span_count": 151200 }
+  ],
+  "edges": [
+    { "source": "checkout", "target": "payments", "rps": 41.0, "err_rate": 0.02, "p95_ms": 95.0 }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `rps` | Requests per second over the window. |
+| `error_rate` / `err_rate` | Fraction of requests with an `ERROR` status (0–1). |
+| `p95_ms` | 95th-percentile latency, in milliseconds. |
+| `span_count` | Total spans seen for the node in the window. |
+
+## Raw service graph
+
+For the underlying minute-by-minute edge snapshots — useful for charting a single dependency over
+time — query the service graph directly:
+
+```http
+GET /api/v1/traces/service_graph?from=1717200000000000&to=1717286400000000&service=checkout
+Authorization: Bearer <jwt>
+```
+
+`from` and `to` are microseconds since the Unix epoch. The optional `service` filter returns edges
+where it appears as either side of the call. Each row carries `request_count`, `error_count`, and
+`p50_us` / `p95_us` / `p99_us` for one service pair in one minute.
+
+## In the UI
+
+- The **Services** page lists every service with its rate, error rate, and p95, ordered by traffic.
+- Open a service to see its upstream callers and downstream dependencies.
+- The **topology** view draws the live graph — edge thickness follows traffic, and color follows the
+  error rate.
+
+From any service or edge you can pivot straight into the underlying traces and logs through
+[cross-signal correlation](/en-US/correlation).
+
+<Card title="Topology & service-graph API" icon="diagram-project" href="/en-US/api/web/topology">
+  Query the topology and raw service-graph endpoints over HTTP.
+</Card>
