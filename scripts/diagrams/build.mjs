@@ -19,8 +19,7 @@
 // Chromium via Playwright and load the libraries from esm.sh.
 //
 // Usage:  node scripts/diagrams/build.mjs [key ...]      (default: all keys)
-// Requires Playwright on disk and `rsvg-convert` (librsvg) on PATH — both
-// dev-only, not used by mint at serve time.
+// Requires Playwright available on disk (dev-only dependency, not used by mint).
 
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
