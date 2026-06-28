@@ -1,20 +1,25 @@
 // Build Excalidraw architecture diagrams for the docs.
 //
 // Pipeline: mermaid flowchart  →  @excalidraw/mermaid-to-excalidraw (skeleton)
-//           →  convertToExcalidrawElements  →  exportToSvg  (light + dark).
+//           →  convertToExcalidrawElements  →  exportToSvg  →  rsvg-convert PNG
+//           (light + dark).
 //
 // Why a build step: Mintlify cannot embed live Excalidraw, so each diagram is
-// rendered to a static SVG that we commit and <img> into the .mdx. The mermaid
-// string is the maintainable source of truth; the .excalidraw scene is written
-// alongside so the diagram can still be hand-edited on excalidraw.com.
+// rendered to a static PNG that we commit and <img> into the .mdx. We emit PNG
+// rather than SVG because Mintlify's image pipeline rejects these complex
+// excalidraw SVGs (mask/filter) and never uploads them to its CDN (403). The
+// mermaid string is the maintainable source of truth; the .excalidraw scene is
+// written alongside so the diagram can still be hand-edited on excalidraw.com.
 //
 // Excalidraw's exporters need a real DOM, so we drive them inside a headless
 // Chromium via Playwright and load the libraries from esm.sh.
 //
 // Usage:  node scripts/diagrams/build.mjs [key ...]      (default: all keys)
-// Requires Playwright available on disk (dev-only dependency, not used by mint).
+// Requires Playwright on disk and `rsvg-convert` (librsvg) on PATH — both
+// dev-only, not used by mint at serve time.
 
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, unlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
@@ -297,14 +302,23 @@ for (const key of keys) {
   for (const lang of ['en', 'zh-Hans']) {
     for (const theme of ['light', 'dark']) {
       const { svg } = await renderInPage(page, d.mermaid[lang], theme === 'dark');
-      // Excalidraw embeds @font-face blocks pointing at unpkg with an unresolved
-      // version (`@excalidraw/excalidraw@undefined`). That external url() trips
-      // the SVG sanitizer used when serving images, so the diagram fails to load.
-      // Drop the block — text already falls back to "Virgil, Segoe UI Emoji".
+      // Drop the excalidraw @font-face block (it points at unpkg with an
+      // unresolved `@excalidraw/excalidraw@undefined` version); text falls back
+      // to "Virgil, Segoe UI Emoji" -> system fonts.
       const cleaned = svg.replace(/\s*<style class="style-fonts">[\s\S]*?<\/style>/g, '');
-      const out = resolve(IMG_DIR, `${key}.${lang}.${theme}.svg`);
-      writeFileSync(out, cleaned, 'utf8');
-      console.log(`wrote ${out.replace(DOCS_ROOT + '/', '')}  (${cleaned.length} bytes)`);
+      // Serve PNG, not SVG: Mintlify's image pipeline rejects these complex
+      // excalidraw SVGs (mask/filter) and never uploads them to its CDN (403).
+      // Render the SVG to a 2x transparent PNG via librsvg, which honours the
+      // dark-mode invert filter. Requires `rsvg-convert` on PATH (dev-only).
+      const out = resolve(IMG_DIR, `${key}.${lang}.${theme}.png`);
+      const tmp = resolve(IMG_DIR, `.${key}.${lang}.${theme}.svg.tmp`);
+      writeFileSync(tmp, cleaned, 'utf8');
+      try {
+        execFileSync('rsvg-convert', ['-z', '2', tmp, '-o', out]);
+      } finally {
+        unlinkSync(tmp);
+      }
+      console.log(`wrote ${out.replace(DOCS_ROOT + '/', '')}`);
     }
     // editable scene source (theme-neutral, light export elements)
     const { elements } = await renderInPage(page, d.mermaid[lang], false);
