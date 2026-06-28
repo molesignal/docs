@@ -29,10 +29,11 @@ import { createRequire } from 'node:module';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DOCS_ROOT = resolve(__dirname, '..', '..');
-// Serve diagrams from `public/` (static passthrough at the site root, referenced
-// as `/diagrams/...`). Mintlify's `images/` asset pipeline did not upload these
-// files to its CDN (they 403'd), so we bypass it via public/.
-const IMG_DIR = resolve(DOCS_ROOT, 'public', 'diagrams');
+// Rendered diagram PNGs. Deliberately NOT under any `diagrams/`-named directory:
+// .mintignore's `diagrams/` entry matches that name at any depth (it does not
+// honour leading-slash anchoring), which silently excluded images/diagrams/ and
+// public/diagrams/ from the deploy — so the embedded images 403'd on the CDN.
+const IMG_DIR = resolve(DOCS_ROOT, 'images', 'architecture');
 const SRC_DIR = resolve(DOCS_ROOT, 'diagrams');
 
 // Resolve Playwright from wherever it is installed (npx cache or global).
