@@ -310,8 +310,11 @@ for (const key of keys) {
       // excalidraw SVGs (mask/filter) and never uploads them to its CDN (403).
       // Render the SVG to a 2x transparent PNG via librsvg, which honours the
       // dark-mode invert filter. Requires `rsvg-convert` on PATH (dev-only).
-      const out = resolve(IMG_DIR, `${key}.${lang}.${theme}.png`);
-      const tmp = resolve(IMG_DIR, `.${key}.${lang}.${theme}.svg.tmp`);
+      // Single dot before the extension: Mintlify's asset pipeline does not
+      // upload multi-dot filenames like `pipeline.en.dark.png` (they 403 on its
+      // CDN), so separate the name/lang/theme segments with underscores.
+      const out = resolve(IMG_DIR, `${key}_${lang}_${theme}.png`);
+      const tmp = resolve(IMG_DIR, `.${key}_${lang}_${theme}.svg.tmp`);
       writeFileSync(tmp, cleaned, 'utf8');
       try {
         execFileSync('rsvg-convert', ['-z', '2', tmp, '-o', out]);
