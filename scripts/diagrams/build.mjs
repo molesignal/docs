@@ -297,9 +297,14 @@ for (const key of keys) {
   for (const lang of ['en', 'zh-Hans']) {
     for (const theme of ['light', 'dark']) {
       const { svg } = await renderInPage(page, d.mermaid[lang], theme === 'dark');
+      // Excalidraw embeds @font-face blocks pointing at unpkg with an unresolved
+      // version (`@excalidraw/excalidraw@undefined`). That external url() trips
+      // the SVG sanitizer used when serving images, so the diagram fails to load.
+      // Drop the block — text already falls back to "Virgil, Segoe UI Emoji".
+      const cleaned = svg.replace(/\s*<style class="style-fonts">[\s\S]*?<\/style>/g, '');
       const out = resolve(IMG_DIR, `${key}.${lang}.${theme}.svg`);
-      writeFileSync(out, svg, 'utf8');
-      console.log(`wrote ${out.replace(DOCS_ROOT + '/', '')}  (${svg.length} bytes)`);
+      writeFileSync(out, cleaned, 'utf8');
+      console.log(`wrote ${out.replace(DOCS_ROOT + '/', '')}  (${cleaned.length} bytes)`);
     }
     // editable scene source (theme-neutral, light export elements)
     const { elements } = await renderInPage(page, d.mermaid[lang], false);
