@@ -26,7 +26,10 @@ import { createRequire } from 'node:module';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DOCS_ROOT = resolve(__dirname, '..', '..');
-const IMG_DIR = resolve(DOCS_ROOT, 'images', 'diagrams');
+// Serve diagrams from `public/` (static passthrough at the site root, referenced
+// as `/diagrams/...`). Mintlify's `images/` asset pipeline did not upload these
+// files to its CDN (they 403'd), so we bypass it via public/.
+const IMG_DIR = resolve(DOCS_ROOT, 'public', 'diagrams');
 const SRC_DIR = resolve(DOCS_ROOT, 'diagrams');
 
 // Resolve Playwright from wherever it is installed (npx cache or global).
