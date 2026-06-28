@@ -1,15 +1,18 @@
 // Build Excalidraw architecture diagrams for the docs.
 //
 // Pipeline: mermaid flowchart  →  @excalidraw/mermaid-to-excalidraw (skeleton)
-//           →  convertToExcalidrawElements  →  exportToSvg  →  rsvg-convert PNG
-//           (light + dark).
+//           →  convertToExcalidrawElements  →  exportToSvg  →  rsvg-convert
+//           white-background PNG (one per language).
 //
 // Why a build step: Mintlify cannot embed live Excalidraw, so each diagram is
-// rendered to a static PNG that we commit and <img> into the .mdx. We emit PNG
-// rather than SVG because Mintlify's image pipeline rejects these complex
-// excalidraw SVGs (mask/filter) and never uploads them to its CDN (403). The
-// mermaid string is the maintainable source of truth; the .excalidraw scene is
-// written alongside so the diagram can still be hand-edited on excalidraw.com.
+// rendered to a static PNG that we commit and reference via Markdown ![]() in the
+// .mdx. Two hard-won constraints: (1) Mintlify only uploads images referenced via
+// Markdown ![]() (or declared assets) — raw <img src> refs are rewritten to its
+// CDN but never uploaded (403), so we cannot use <img> light/dark switching;
+// (2) the single image therefore renders on a white background so it reads on
+// both light and dark docs themes. The mermaid string is the maintainable source
+// of truth; the .excalidraw scene is written alongside so the diagram can still
+// be hand-edited on excalidraw.com.
 //
 // Excalidraw's exporters need a real DOM, so we drive them inside a headless
 // Chromium via Playwright and load the libraries from esm.sh.
@@ -303,29 +306,24 @@ for (const key of keys) {
   const d = DIAGRAMS[key];
   if (!d) { console.error(`unknown diagram: ${key}`); continue; }
   for (const lang of ['en', 'zh-Hans']) {
-    for (const theme of ['light', 'dark']) {
-      const { svg } = await renderInPage(page, d.mermaid[lang], theme === 'dark');
-      // Drop the excalidraw @font-face block (it points at unpkg with an
-      // unresolved `@excalidraw/excalidraw@undefined` version); text falls back
-      // to "Virgil, Segoe UI Emoji" -> system fonts.
-      const cleaned = svg.replace(/\s*<style class="style-fonts">[\s\S]*?<\/style>/g, '');
-      // Serve PNG, not SVG: Mintlify's image pipeline rejects these complex
-      // excalidraw SVGs (mask/filter) and never uploads them to its CDN (403).
-      // Render the SVG to a 2x transparent PNG via librsvg, which honours the
-      // dark-mode invert filter. Requires `rsvg-convert` on PATH (dev-only).
-      // Single dot before the extension: Mintlify's asset pipeline does not
-      // upload multi-dot filenames like `pipeline.en.dark.png` (they 403 on its
-      // CDN), so separate the name/lang/theme segments with underscores.
-      const out = resolve(IMG_DIR, `${key}_${lang}_${theme}.png`);
-      const tmp = resolve(IMG_DIR, `.${key}_${lang}_${theme}.svg.tmp`);
-      writeFileSync(tmp, cleaned, 'utf8');
-      try {
-        execFileSync('rsvg-convert', ['-z', '2', tmp, '-o', out]);
-      } finally {
-        unlinkSync(tmp);
-      }
-      console.log(`wrote ${out.replace(DOCS_ROOT + '/', '')}`);
+    // One PNG per (key, lang): render the light scene on a WHITE background so a
+    // single image reads on both light and dark docs themes. It is referenced via
+    // Markdown ![]() (which Mintlify uploads to its CDN) — raw <img src> refs under
+    // /images or /public get rewritten to the CDN but are never uploaded (403).
+    const { svg } = await renderInPage(page, d.mermaid[lang], false);
+    // Drop the excalidraw @font-face block (points at unpkg with an unresolved
+    // version); text falls back to "Virgil, Segoe UI Emoji" -> system fonts.
+    const cleaned = svg.replace(/\s*<style class="style-fonts">[\s\S]*?<\/style>/g, '');
+    const out = resolve(IMG_DIR, `${key}_${lang}.png`);
+    const tmp = resolve(IMG_DIR, `.${key}_${lang}.svg.tmp`);
+    writeFileSync(tmp, cleaned, 'utf8');
+    try {
+      // 2x white-background PNG via librsvg (requires rsvg-convert on PATH, dev-only).
+      execFileSync('rsvg-convert', ['-z', '2', '-b', 'white', tmp, '-o', out]);
+    } finally {
+      unlinkSync(tmp);
     }
+    console.log(`wrote ${out.replace(DOCS_ROOT + '/', '')}`);
     // editable scene source (theme-neutral, light export elements)
     const { elements } = await renderInPage(page, d.mermaid[lang], false);
     const scene = { type: 'excalidraw', version: 2, source: 'molesignal-docs', elements: JSON.parse(elements), appState: { viewBackgroundColor: 'transparent' }, files: {} };
