@@ -1,18 +1,19 @@
 // Build Excalidraw architecture diagrams for the docs.
 //
 // Pipeline: mermaid flowchart  →  @excalidraw/mermaid-to-excalidraw (skeleton)
-//           →  convertToExcalidrawElements  →  exportToSvg  →  rsvg-convert
-//           white-background PNG (one per language).
+//           →  convertToExcalidrawElements  →  exportToSvg  (light + dark).
 //
 // Why a build step: Mintlify cannot embed live Excalidraw, so each diagram is
-// rendered to a static PNG that we commit and reference via Markdown ![]() in the
-// .mdx. Two hard-won constraints: (1) Mintlify only uploads images referenced via
-// Markdown ![]() (or declared assets) — raw <img src> refs are rewritten to its
-// CDN but never uploaded (403), so we cannot use <img> light/dark switching;
-// (2) the single image therefore renders on a white background so it reads on
-// both light and dark docs themes. The mermaid string is the maintainable source
-// of truth; the .excalidraw scene is written alongside so the diagram can still
-// be hand-edited on excalidraw.com.
+// rendered to a static SVG that we commit and <img> into the .mdx (light/dark
+// variants via `className="block dark:hidden"` / `"hidden dark:block"`). The
+// mermaid string is the maintainable source of truth; the .excalidraw scene is
+// written alongside so the diagram can still be hand-edited on excalidraw.com.
+//
+// IMPORTANT: the rendered images must NOT live under any `diagrams/`-named
+// directory. .mintignore ignores `diagrams/` and matches that name at ANY depth
+// (it does not honour a leading-slash anchor), which silently excluded the images
+// from the deploy and made every diagram 403 on the CDN. They live in
+// images/architecture/ instead.
 //
 // Excalidraw's exporters need a real DOM, so we drive them inside a headless
 // Chromium via Playwright and load the libraries from esm.sh.
@@ -21,18 +22,15 @@
 // Requires Playwright on disk and `rsvg-convert` (librsvg) on PATH — both
 // dev-only, not used by mint at serve time.
 
-import { writeFileSync, unlinkSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DOCS_ROOT = resolve(__dirname, '..', '..');
-// Rendered diagram PNGs. Deliberately NOT under any `diagrams/`-named directory:
-// .mintignore's `diagrams/` entry matches that name at any depth (it does not
-// honour leading-slash anchoring), which silently excluded images/diagrams/ and
-// public/diagrams/ from the deploy — so the embedded images 403'd on the CDN.
+// Rendered diagram SVGs — under images/architecture/, NOT any `diagrams/` dir
+// (see the .mintignore note in the header comment).
 const IMG_DIR = resolve(DOCS_ROOT, 'images', 'architecture');
 const SRC_DIR = resolve(DOCS_ROOT, 'diagrams');
 
@@ -307,24 +305,16 @@ for (const key of keys) {
   const d = DIAGRAMS[key];
   if (!d) { console.error(`unknown diagram: ${key}`); continue; }
   for (const lang of ['en', 'zh-Hans']) {
-    // One PNG per (key, lang): render the light scene on a WHITE background so a
-    // single image reads on both light and dark docs themes. It is referenced via
-    // Markdown ![]() (which Mintlify uploads to its CDN) — raw <img src> refs under
-    // /images or /public get rewritten to the CDN but are never uploaded (403).
-    const { svg } = await renderInPage(page, d.mermaid[lang], false);
-    // Drop the excalidraw @font-face block (points at unpkg with an unresolved
-    // version); text falls back to "Virgil, Segoe UI Emoji" -> system fonts.
-    const cleaned = svg.replace(/\s*<style class="style-fonts">[\s\S]*?<\/style>/g, '');
-    const out = resolve(IMG_DIR, `${key}_${lang}.png`);
-    const tmp = resolve(IMG_DIR, `.${key}_${lang}.svg.tmp`);
-    writeFileSync(tmp, cleaned, 'utf8');
-    try {
-      // 2x white-background PNG via librsvg (requires rsvg-convert on PATH, dev-only).
-      execFileSync('rsvg-convert', ['-z', '2', '-b', 'white', tmp, '-o', out]);
-    } finally {
-      unlinkSync(tmp);
+    for (const theme of ['light', 'dark']) {
+      const { svg } = await renderInPage(page, d.mermaid[lang], theme === 'dark');
+      // Drop the excalidraw @font-face block: it points at unpkg with an unresolved
+      // `@excalidraw/excalidraw@undefined` version (an external url()); text falls
+      // back to "Virgil, Segoe UI Emoji" -> system fonts.
+      const cleaned = svg.replace(/\s*<style class="style-fonts">[\s\S]*?<\/style>/g, '');
+      const out = resolve(IMG_DIR, `${key}_${lang}_${theme}.svg`);
+      writeFileSync(out, cleaned, 'utf8');
+      console.log(`wrote ${out.replace(DOCS_ROOT + '/', '')}`);
     }
-    console.log(`wrote ${out.replace(DOCS_ROOT + '/', '')}`);
     // editable scene source (theme-neutral, light export elements)
     const { elements } = await renderInPage(page, d.mermaid[lang], false);
     const scene = { type: 'excalidraw', version: 2, source: 'molesignal-docs', elements: JSON.parse(elements), appState: { viewBackgroundColor: 'transparent' }, files: {} };
