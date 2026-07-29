@@ -1,151 +1,114 @@
 ---
 title: "身份与访问"
 sidebarTitle: "身份与访问"
-description: "组织、用户、角色、邀请、SSO、服务账号与邮箱域控制。"
+description: "数据库权限目录、角色、用户、服务账户、邀请、SSO 与跨工作区访问。"
 ---
 
-MoleSignal 是多租户的。每条流、仪表板、告警和保存的视图都归属某个**组织**，每个人在组织内能做
-什么由其**角色**决定。同一用户可同时属于多个组织，在各组织里角色不同。
+MoleSignal 使用访问能力标识授权操作，而不是比较展示角色。同一个用户可以属于多个组织，并在每个组织中获得不同权限。
 
-## 组织
+## 授权工作方式
 
-首位注册的用户会创建一个组织并成为它的 **Owner**。之后可创建更多组织、在它们之间切换、并管理
-成员。
+对于已通过身份验证的请求，MoleSignal 会解析：
 
-| 操作 | 端点 | 谁可以 |
-|---|---|---|
-| 列出所属组织 | `GET /api/v1/orgs` | 任意成员 |
-| 创建组织 | `POST /api/v1/orgs` | 组织管理员 |
-| 重命名组织 | `PATCH /api/v1/orgs/{id}` | 组织管理员 |
-| 切换当前组织 | `POST /api/v1/orgs/{id}/select` | 成员 |
-| 添加 / 变更成员 | `POST /api/v1/orgs/{id}/members` | 组织管理员 |
-| 移除成员 | `DELETE /api/v1/orgs/{id}/members/{user_id}` | 组织管理员 |
-| 删除组织 | `DELETE /api/v1/orgs/{id}` | 组织管理员 |
+1. 主体：用户、服务账户或 API Token；
+2. 当前组织或受保护的平台范围；
+3. 角色分配与显式 IAM 绑定；
+4. 资源关系与批准的跨组织授权；
+5. 必需的许可证功能；
+6. 路由与目标资源要求的权限。
 
-<Note>
-  切换组织会签发一个**新的 JWT**，携带在该组织的角色。不能删除当前所在的组织，且每个用户至少要
-  保留一个组织。
-</Note>
-
-## 用户
-
-加人有两种方式：管理员**邀请**，或用户自行**注册**（当实例开启自助注册时）。
-
-- **邀请** —— 管理员指定邮箱和角色，被邀请者首次登录即加入。
-- **自助注册** —— 由两个实例设置控制：是否开放注册，以及新账号是否需要审批。需要审批时，新账号处于
-  **pending** 状态，直到 Owner 或 Admin 通过。
-
-管理员可以列出、审批、停用和删除用户。用户的邮箱即其身份，账号创建后不可更改。
-
-## 角色与权限
-
-四个内置角色覆盖常见场景：
-
-| 角色 | 可做什么 |
-|---|---|
-| **Owner** | 一切，包括组织管理。分配给组织创建者。 |
-| **Admin** | 一切，包括组织管理与审计访问。 |
-| **Editor** | 读**和写**数据——流、仪表板、告警、计划任务、保存的视图——但不含组织管理与审计。 |
-| **Viewer** | 跨数据只读，外加 web 检索与关联。 |
-
-需要更细的控制？可以定义组织范围内的**自定义角色**，赋予各自的权限集。内置角色只读、不可编辑。
-
-| 操作 | 端点 |
-|---|---|
-| 列出角色 | `GET /api/v1/roles` |
-| 创建自定义角色 | `POST /api/v1/roles` |
-| 更新自定义角色 | `PATCH /api/v1/roles/{id}` |
-| 删除自定义角色 | `DELETE /api/v1/roles/{id}` |
-
-## 团队
-
-把成员编成**团队**，即可作为一个整体来指定——例如作为[告警升级](/zh-Hans/alerting)的接收方。在设置中
-管理团队，或通过 API：
-
-```bash
-curl -X POST http://localhost:5080/api/v1/teams \
-  -H "authorization: Bearer $MS_JWT" \
-  -H 'content-type: application/json' \
-  -d '{"name":"on-call","member_ids":["usr_abc","usr_def"]}'
-```
-
-团队的每个成员都必须属于同一组织。
-
-## 邀请
-
-按邮箱邀请并预先指定角色：
-
-```bash
-curl -X POST http://localhost:5080/api/v1/invitations \
-  -H "authorization: Bearer $MS_JWT" \
-  -H 'content-type: application/json' \
-  -d '{"email":"alice@example.com","role":"editor"}'
-```
-
-可以**重发**（`POST /api/v1/invitations/{id}/resend`）或**撤销**（`POST /api/v1/invitations/{id}/revoke`）
-一个待处理的邀请。被邀请的邮箱必须通过该组织的邮箱域白名单。
-
-## 邮箱域白名单
-
-通过允许特定邮箱域来限制谁能加入组织。**空名单 = 不限制**。
-
-```bash
-curl -X POST http://localhost:5080/api/v1/orgs/email-domains \
-  -H "authorization: Bearer $MS_JWT" \
-  -H 'content-type: application/json' \
-  -d '{"domain":"example.com"}'
-```
-
-匹配包含子域——`ci@eu.example.com` 会被 `example.com` 放行。用
-`DELETE /api/v1/orgs/email-domains/{domain}` 移除某个域。白名单对邀请和自助 / SSO 注册都生效。
-
-## 服务账号（API token）
-
-对于无法交互式登录的 agent、CI 和数据源，签发一个长期 **API token**。token 以 `ms_` 为前缀、携带
-自己的角色。
-
-```bash
-curl -X POST http://localhost:5080/api/v1/auth/tokens \
-  -H "authorization: Bearer $MS_JWT" \
-  -H 'content-type: application/json' \
-  -d '{"name":"otel-collector","role":"editor","expires_in_days":365}'
-```
-
-| 字段 | 说明 |
-|---|---|
-| `role` | 缺省为当前用户的角色；不能超过它。 |
-| `expires_in_days` | 可选。省略则为永不过期的 token。 |
+运行时权限目录、内置角色映射与权限包都保存在 PostgreSQL 中。`GET /api/v1/iam/capabilities` 返回 Web 应用使用的实际生效访问能力快照。
 
 <Warning>
-  token 的密文只在**创建时显示一次**。请妥善保存——之后无法找回，只能撤销
-  （`DELETE /api/v1/auth/tokens/{id}`）。
+  页面可见或角色名称都不等于授权。后端会为每个受保护操作重新检查准确权限与资源所有权。
 </Warning>
 
-像登录 JWT 一样使用 token——`Authorization: Bearer ms_…`。想快速上手的话，每个用户都有一个可复用的
-**默认接入 token**，位于 `GET /api/v1/auth/tokens/default`。
+## 权限作用域
 
-## 单点登录（SSO）
+组织权限只覆盖一个工作区，例如：
 
-接入外部身份提供方，让用户用所配置的 IdP 登录。同时支持 **OIDC** 与 **SAML 2.0**（SP 发起）。Provider 按
-组织配置、存于数据库——无需重启。
+- `org.settings.read` 与 `org.settings.manage`；
+- `org.members.read` 与 `org.members.manage`；
+- `iam.roles.read`、`iam.roles.manage`、`iam.policies.read` 与 `iam.policies.manage`；
+- 细分的数据流、仪表盘、告警、值班计划、保存视图、数据管道、函数、报告、审计与 Intelligence 权限。
 
-| 操作 | 端点 |
-|---|---|
-| 列出 / 创建 provider | `GET` / `POST /api/v1/sso/providers` |
-| 更新 / 删除 provider | `PUT` / `DELETE /api/v1/sso/providers/{id}` |
-| 启用 / 禁用 provider | `POST /api/v1/sso/providers/{id}/enable` · `/disable` |
+平台权限以 `sys.` 开头，并且只在 `_sys` 范围生效。它们控制全局组织、许可证版本、系统遥测、链路调试、平台管理员与平台设置。
 
-**OIDC** 需提供 discovery URL（或显式的 authorize/token/JWKS 端点）、客户端凭据和 scopes。用
-**group → role** 映射表把 IdP 用户组映射到 MoleSignal 角色，并为未匹配用户设一个**默认角色**。登录
-流程经 `GET /api/v1/auth/sso/login` 与 provider 回调；新用户会自动开户到该 provider 所属组织、并赋予
-映射出的角色。
+## 角色与权限包
 
-<Note>
-  SSO 需要带 `sso` feature 的 license。SAML assertion 经真实 XMLDSig 校验——enveloped signature、
-  RSA-SHA256，并校验内嵌证书与配置的 IdP 证书为同一公钥。验签面向主流 IdP（Azure AD、Okta、
-  Keycloak、ADFS）的 deterministic 输出，未实现 exclusive XML 规范化，非规范化的 Response 会被拒。
-</Note>
+内置组织角色包括 Owner、Admin、Editor 与 Viewer。Platform Administrator 是独立的平台角色。内置角色由权限目录维护，不能编辑。
 
-<Card title="认证 API" icon="key" href="/zh-Hans/api/auth/login">
-  通过 HTTP API 登录、签发与撤销 token、轮换签名密钥。
-</Card>
+如果用户只需要更窄的职责，请创建自定义角色。界面提供只读观察者、数据分析师、数据管道开发者、告警管理员和组织管理员等权限包作为起点。保存前请检查最终权限清单。
+
+| 操作 | 端点 | 权限 |
+|---|---|---|
+| 列出角色 | `GET /api/v1/roles` | `iam.roles.read` |
+| 创建自定义角色 | `POST /api/v1/roles` | `iam.roles.manage` |
+| 更新自定义角色 | `PATCH /api/v1/roles/{id}` | `iam.roles.manage` |
+| 删除未使用的自定义角色 | `DELETE /api/v1/roles/{id}` | `iam.roles.manage` |
+
+仍被成员关系、Token、邀请或绑定引用的角色不能删除。
+
+## 用户、审批与邀请
+
+打开 **IAM → 用户**查看组织成员。如果自助注册要求审批，请在 **IAM → 审批**中批准或拒绝待处理账户。
+
+使用 **IAM → 邀请**按邮箱邀请用户并指定初始角色。你可以重发或撤销待处理邀请。邮箱域策略同时约束邀请、自助注册与 SSO 自动开户。
+
+常用成员权限包括：
+
+- `org.members.read` 用于列出成员；
+- `org.members.manage` 用于创建、批准、禁用、修改或移除成员。
+
+切换工作区会签发新的限定范围 JWT。组织 ID 与 Slug 是稳定标识；修改展示名称不会改变这两个值。
+
+## 用户组与团队
+
+用户组用于组织身份并分配策略。团队用于告警值班与升级目标等产品工作流。每个直接团队成员必须属于同一个组织。
+
+如果访问权应跟随用户组、团队、资源或特定主体，请使用角色绑定和关系策略，不要扩大内置角色。
+
+## 服务账户与 API Token
+
+为 Agent、CI、Collector 和集成使用 **IAM → 服务账户**。只分配该工作负载真正需要的角色或权限。
+
+API Token 格式如下：
+
+```text
+ms_<prefix>_<secret>
+```
+
+前缀用于查找，Secret 以哈希形式保存。完整 Token 只返回一次。它与登录 JWT 使用相同请求头：
+
+```http
+Authorization: Bearer ms_…
+```
+
+`api_tokens.read` 用于列出 Token 元数据，`api_tokens.manage` 用于创建或撤销 Token。
+
+## 跨工作区访问
+
+显式授权可以将一个组织中的主体与另一个组织中的资源关联。服务器会同时检查该关系与资源权限；授权不会把目标组织变成主体的当前工作区。
+
+仪表盘和报告请使用专用的[资源共享模型](/zh-Hans/resource-sharing)。公开共享获得的是受约束的共享会话，不是组织成员关系。
+
+## 单点登录
+
+打开 **IAM → SSO** 配置 OIDC 或 SAML 2.0 供应商。供应商配置保存在数据库中，无需重启进程即可生效。
+
+配置发现地址或协议端点、客户端凭据或 IdP 证书材料、默认角色，以及可选的 IdP 用户组映射。新身份通过邮箱域与注册策略检查后，可以自动加入供应商所属组织。
+
+SSO 需要 `sso` 许可证功能。管理供应商还需要组织设置权限。
+
+## 平台管理
+
+`_sys` 范围与组织 IAM 相互隔离。租户 JWT 与 `ms_*` Token 无法枚举系统遥测、许可证历史或平台管理员。请使用具备相应 `sys.*` 权限的系统范围会话。
+
+<CardGroup cols={2}>
+  <Card title="管理概览" icon="shield" href="/zh-Hans/administration">
+    了解个人、组织与平台管理。
+  </Card>
+  <Card title="安全" icon="lock" href="/zh-Hans/security">
+    了解租户隔离、密钥、审计、共享与字段加密。
+  </Card>
+</CardGroup>

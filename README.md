@@ -1,55 +1,57 @@
-# Mintlify Starter Kit
+# MoleSignal documentation
 
-Use the starter kit to get your docs deployed and ready to customize.
+This repository contains the bilingual MoleSignal documentation site built with
+[Mintlify](https://mintlify.com).
 
-Click the green **Use this template** button at the top of this repo to copy the Mintlify starter kit. The starter kit contains examples with
+## Structure
 
-- Guide pages
-- Navigation
-- Customizations
-- API reference pages
-- Use of popular components
+- `en-US/` — English product guides and API reference
+- `zh-Hans/` — Simplified Chinese product guides and API reference
+- `docs.json` — navigation, branding, and site configuration
+- `diagrams/` — editable Excalidraw architecture sources
+- `images/architecture/` — rendered light and dark architecture diagrams
 
-**[Follow the full quickstart guide](https://starter.mintlify.com/quickstart)**
+Keep English and Chinese navigation in parity. When you add or rename a public
+page, update both language trees and `docs.json` in the same change.
 
-## AI-assisted writing
+## Local development
 
-Set up your AI coding tool to work with Mintlify:
+Install the Mintlify CLI, then start the preview from this directory:
 
 ```bash
-npx skills add https://mintlify.com/docs
-```
-
-This command installs Mintlify's documentation skill for your configured AI tools like Claude Code, Cursor, Windsurf, and others. The skill includes component reference, writing standards, and workflow guidance.
-
-See the [AI tools guides](/ai-tools) for tool-specific setup.
-
-## Development
-
-Install the [Mintlify CLI](https://www.npmjs.com/package/mint) to preview your documentation changes locally. To install, use the following command:
-
-```
-npm i -g mint
-```
-
-Run the following command at the root of your documentation, where your `docs.json` is located:
-
-```
+npm install -g mint
 mint dev
 ```
 
-View your local preview at `http://localhost:3000`.
+The preview is available at `http://localhost:3000`.
 
-## Publishing changes
+## Validation
 
-Install our GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app) to propagate changes from your repo to your deployment. Changes are deployed to production automatically after pushing to the default branch.
+Run these checks before publishing:
 
-## Need help?
+```bash
+mint broken-links
+mint a11y
+node -e "JSON.parse(require('fs').readFileSync('docs.json', 'utf8'))"
+```
 
-### Troubleshooting
+API behavior must match the current MoleSignal source:
 
-- If your dev environment isn't running: Run `mint update` to ensure you have the most recent version of the CLI.
-- If a page loads as a 404: Make sure you are running in a folder with a valid `docs.json`.
+- HTTP routes: `molesignal/src/api/http/routes/`
+- Web routes and feature access: `molesignal/web/src/routes/` and
+  `molesignal/web/src/product/`
+- Runtime configuration: `molesignal/conf/config.toml` and
+  `molesignal/src/config/`
+- OpenAPI source: `molesignal/docs/api/openapi.yaml`
 
-### Resources
-- [Mintlify documentation](https://mintlify.com/docs)
+## Writing conventions
+
+- Use **workspace** for an organization in end-user UI instructions. Use
+  **organization** for API and IAM boundary names.
+- Use **Mole Intelligence** for the product area and **Mole Agent** for the
+  assistant.
+- Use **OpenSource Edition** and **Enterprise Edition** in user-facing copy.
+- Name exact permissions, such as `streams.query`, instead of assuming a
+  display role.
+- Put UI labels in bold and paths, commands, fields, and permission keys in
+  code formatting.

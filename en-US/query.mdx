@@ -1,7 +1,7 @@
 ---
 title: "Querying"
 sidebarTitle: "Overview"
-description: "Full SQL and a PromQL subset over one engine, across all three signals."
+description: "Run SQL, PromQL-compatible metric queries, streaming searches, and asynchronous jobs over organization streams."
 ---
 
 MoleSignal exposes a single query endpoint backed by **DataFusion**. You can run full SQL — including
@@ -19,20 +19,21 @@ Content-Type: application/json
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `org_id` | string | ✅ | Your tenant id (from login). |
+| `org_id` | string | ✅ | Retained in the body for compatibility; the authenticated organization is authoritative. |
 | `language` | string | ✅ | `sql` or `promql`. |
 | `statement` | string | ✅ | The query text. |
 | `time_range` | object | ✅ | `{ "start": <us>, "end": <us> }` — microseconds since epoch. |
-| `stream` | object | — | `{ "name": "app", "stream_type": "logs" }`. `stream_type` ∈ `logs`/`metrics`/`traces`/`enrichment`. |
+| `stream` | object | — | `{ "name": "app", "stream_type": "logs" }`; queryable signal types are `logs`, `metrics`, `traces`, and `profiles`. |
 | `limit` | integer | — | Row cap. |
 
 ### Response
 
-The response carries `rows`, `columns`, `scanned_rows`, `took_ms`, and `cache_hit`.
+The response carries `columns`, array-shaped `rows`, `scanned_rows`, and `took_ms`. Federated
+responses may also carry federation metadata.
 
 <Note>
-  Send `Accept: application/x-ndjson` to stream results row-by-row. Streaming bypasses the
-  `query_result` cache.
+  Send `Accept: application/x-ndjson` to stream objects row-by-row, followed by a `__meta__`
+  record. Streaming bypasses the result cache.
 </Note>
 
 ## SQL
@@ -86,8 +87,28 @@ To pull the N events immediately before and after a given one (log context view)
 `POST /api/v1/query/search_around` with `event_timestamp_us`, `stream`, `stream_type`, and optional
 `before` / `after` counts (default 50 each).
 
+## Async, inspection, and cancellation
+
+- Add `Prefer: respond-async` to `POST /api/v1/query`, or submit directly to
+  `POST /api/v1/query/jobs`, for a durable search job.
+- `GET /api/v1/query/jobs/{id}` reports state; `/results` returns completed output.
+- `POST /api/v1/query/inspect` plans without executing and returns query metadata and the available
+  logical plan.
+- `POST /api/v1/query/recommendations` analyzes a query profile without executing it.
+- `GET /api/v1/query/running` and `POST /api/v1/query/{id}/cancel` let organization administrators
+  inspect and cancel active work.
+
+Standard queries require `streams.query`. Active-query administration requires
+`org.settings.read` or `org.settings.manage`.
+
+## Federated search
+
+Enterprise Edition can add `?clusters=local,cluster-name` to the query endpoint. Any non-local
+target requires the `federated_search` entitlement. Unreachable remotes are represented as degraded
+clusters in federation metadata instead of silently becoming local data.
+
 ## Caching
 
 Queries flow through a 3-level cache — `file_meta`, `parquet_meta`, and `query_result` — plus a
-parquet disk cache enabled by default (`./data/cache/parquet`, 10 GB LRU). The `cache_hit` field in
-the response tells you whether the result came from cache.
+parquet disk cache enabled by default (`./data/cache/parquet`, 10 GB LRU). Caching is transparent
+to the response contract; use server metrics to measure cache behavior.

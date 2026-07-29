@@ -1,27 +1,28 @@
 ---
 title: "Ingesting data"
-description: "Drop-in ingest protocols — point your existing agents at MoleSignal with no rewrite."
+description: "Native and protocol-compatible ingest for OpenTelemetry, Prometheus, logs, cloud senders, and application events."
 ---
 
-MoleSignal speaks a broad set of **drop-in ingest protocols**, so most existing agents and SDKs work
-without changes. Every endpoint is authenticated with `Authorization: Bearer <jwt>` (or an API token
+MoleSignal supports native and protocol-compatible ingest, so many existing agents and SDKs can
+send data with little or no adaptation. Every endpoint is authenticated with
+`Authorization: Bearer <jwt>` (or an API token
 — see [Security](/en-US/security)), except the push [connectors](/en-US/connectors), which use a
 connector token.
 
 ## Supported protocols
 
-| Protocol | Endpoint | Drop-in for |
+| Protocol | Endpoint | Compatible sender |
 |---|---|---|
-| OTLP gRPC | `:5082` | OpenTelemetry SDK / Collector |
-| OTLP HTTP | `POST /api/v1/{logs,metrics,traces}` | OTel HTTP exporter |
+| OTLP gRPC | `:4317` | OpenTelemetry SDK / Collector |
+| OTLP HTTP | `POST /api/v1/logs`, `/metrics`, `/traces` | OTel HTTP exporter |
 | Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus / VictoriaMetrics |
 | Elasticsearch `_bulk` | `POST /api/v1/_bulk` | Filebeat, Vector ES sink, Logstash |
-| Loki push | `POST /api/v1/loki/api/v1/push` | Promtail, Vector Loki sink |
+| Loki JSON push | `POST /api/v1/loki/api/v1/push` | Clients that can send the Loki JSON request shape |
 | Syslog UDP/TCP | `[syslog]` udp/tcp bind | rsyslog, syslog-ng |
 | Kinesis Firehose | `POST /api/v1/_kinesis_firehose` | AWS Firehose |
 | Cloudflare Logpush | `POST /api/v1/_cloudflare` | Cloudflare Logpush |
 | Heroku log drain | `POST /api/v1/_heroku` | Heroku |
-| Native HTTP JSON | `POST /api/v1/ingest/{type}/:stream` | curl / app SDK |
+| Native HTTP JSON | `POST /api/v1/ingest/{type}/{stream}` | curl / app SDK |
 
 <Note>
   Syslog has no authentication or org context, so it's bound to a single org and stream through
@@ -77,15 +78,18 @@ The stream is created on first write and its schema evolves as new fields appear
     Logs, metrics, and traces post to `/api/v1/logs`, `/api/v1/metrics`, and `/api/v1/traces`.
   </Tab>
   <Tab title="OTLP gRPC">
-    The gRPC ingest server listens on port `5082`:
+    The external standard OTLP gRPC receiver listens on port `4317` by default:
 
     ```yaml
     exporters:
       otlp:
-        endpoint: localhost:5082
+        endpoint: localhost:4317
         headers:
           authorization: "Bearer ${MS_JWT}"
     ```
+
+    Port `5082` is reserved for trusted internal cluster gRPC and must not be used as the public
+    OTLP endpoint.
   </Tab>
 </Tabs>
 
@@ -105,7 +109,7 @@ remote_write:
 <CodeGroup>
 ```text Loki push
 POST /api/v1/loki/api/v1/push
-# Works with Promtail and the Vector Loki sink.
+# JSON request shape only; snappy-protobuf is not decoded.
 ```
 
 ```text Elasticsearch _bulk
@@ -114,16 +118,22 @@ POST /api/v1/_bulk
 ```
 </CodeGroup>
 
+The Loki endpoint accepts `{"streams":[{"stream":{...},"values":[["<unix_nano>","<line>"]]}]}`.
+Set `stream-name` to choose the MoleSignal log stream. Configure senders for JSON rather than the
+default Loki snappy-protobuf encoding.
+
 ## Pipeline functions
 
 You can transform events on the ingest hot path with **pipeline functions** — reusable transforms
-attached to a pipeline step. Two languages are supported:
+attached to a pipeline step. The runtime supports:
 
 - **VRL** — always available. Compiled per `(function_id, updated_at)` with the `vrl::compiler`
   stdlib (`del`, `parse_json`, `to_int`, `match`, `encrypt`/`decrypt`, …).
-- **JavaScript** — opt-in, built on `deno_core` (V8). Disabled by default; enabling it requires both
-  a build feature (`--features molesignal-bootstrap/js-runtime`) and the TOML gate
-  `[functions] js_runtime_enabled = true`.
+- **JavaScript** — opt-in, built on `deno_core` (V8). It is available only when the binary is built
+  with `--features js-runtime`; there is no runtime TOML switch.
+- **LLM evaluation** — API-configurable for low-throughput pipelines when
+  `[functions].llm_eval_enabled = true` and the organization has an enabled model provider. Each
+  event triggers a model request.
 
 <Warning>
   The JS isolate is deliberately minimal: no `fetch`, no `setTimeout`, no `import`, no `npm`. Each

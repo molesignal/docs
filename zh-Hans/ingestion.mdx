@@ -1,26 +1,26 @@
 ---
 title: "数据接入"
-description: "即插即用的接入协议 —— 把现有 agent 指向 MoleSignal，无需改造。"
+description: "面向 OpenTelemetry、Prometheus、日志、云发送端与应用事件的原生及协议兼容采集。"
 ---
 
-MoleSignal 支持**一系列即插即用接入协议**，因此大多数现有 agent 与 SDK 无需改动即可工作。除推送型
+MoleSignal 支持原生及协议兼容采集，因此许多现有 Agent 与 SDK 只需少量配置即可发送数据。除推送型
 [connector](/zh-Hans/connectors)（用 connector token）外，每个接入端点都需 `Authorization: Bearer <jwt>`
 认证（或使用 API token，见 [安全](/zh-Hans/security)）。
 
 ## 支持的协议
 
-| 协议 | 端点 | 直接替代 |
+| 协议 | 端点 | 兼容发送端 |
 |---|---|---|
-| OTLP gRPC | `:5082` | OpenTelemetry SDK / Collector |
-| OTLP HTTP | `POST /api/v1/{logs,metrics,traces}` | OTel HTTP exporter |
+| OTLP gRPC | `:4317` | OpenTelemetry SDK / Collector |
+| OTLP HTTP | `POST /api/v1/logs`、`/metrics`、`/traces` | OTel HTTP exporter |
 | Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus / VictoriaMetrics |
 | Elasticsearch `_bulk` | `POST /api/v1/_bulk` | Filebeat、Vector ES sink、Logstash |
-| Loki push | `POST /api/v1/loki/api/v1/push` | Promtail、Vector Loki sink |
+| Loki JSON push | `POST /api/v1/loki/api/v1/push` | 能发送 Loki JSON 请求结构的客户端 |
 | Syslog UDP/TCP | `[syslog]` udp/tcp bind | rsyslog、syslog-ng |
 | Kinesis Firehose | `POST /api/v1/_kinesis_firehose` | AWS Firehose |
 | Cloudflare Logpush | `POST /api/v1/_cloudflare` | Cloudflare Logpush |
 | Heroku log drain | `POST /api/v1/_heroku` | Heroku |
-| 原生 HTTP JSON | `POST /api/v1/ingest/{type}/:stream` | curl / 应用 SDK |
+| 原生 HTTP JSON | `POST /api/v1/ingest/{type}/{stream}` | curl / 应用 SDK |
 
 <Note>
   Syslog 无鉴权、无 org 上下文，因此通过 `[syslog]` 配置绑定到单一 org 与 stream
@@ -76,15 +76,17 @@ curl -X POST http://localhost:5080/api/v1/ingest/logs/app \
     日志、指标、追踪分别 POST 到 `/api/v1/logs`、`/api/v1/metrics`、`/api/v1/traces`。
   </Tab>
   <Tab title="OTLP gRPC">
-    gRPC 接入服务监听 `5082` 端口：
+    对外标准 OTLP gRPC Receiver 默认监听 `4317` 端口：
 
     ```yaml
     exporters:
       otlp:
-        endpoint: localhost:5082
+        endpoint: localhost:4317
         headers:
           authorization: "Bearer ${MS_JWT}"
     ```
+
+    `5082` 端口保留给可信内部集群 gRPC，不应作为公开 OTLP 端点。
   </Tab>
 </Tabs>
 
@@ -104,7 +106,7 @@ remote_write:
 <CodeGroup>
 ```text Loki push
 POST /api/v1/loki/api/v1/push
-# 适配 Promtail 与 Vector Loki sink。
+# 只接受 JSON 请求结构，不解析 snappy-protobuf。
 ```
 
 ```text Elasticsearch _bulk
@@ -113,15 +115,20 @@ POST /api/v1/_bulk
 ```
 </CodeGroup>
 
+Loki 端点接受 `{"streams":[{"stream":{...},"values":[["<unix_nano>","<line>"]]}]}`。
+通过 `stream-name` 选择 MoleSignal 日志流。请把发送端配置为 JSON，而不是 Loki 默认的
+snappy-protobuf 编码。
+
 ## 管道函数（Pipeline functions）
 
-可在接入热路径上用**管道函数**转换事件 —— 它是挂在管道步骤上的可复用变换。支持两种语言：
+可在接入热路径上用**管道函数**转换事件 —— 它是挂在管道步骤上的可复用变换。运行时支持：
 
 - **VRL** —— 始终可用。按 `(function_id, updated_at)` 编译，使用 `vrl::compiler` 标准库
   （`del`、`parse_json`、`to_int`、`match`、`encrypt`/`decrypt` 等）。
-- **JavaScript** —— 可选，基于 `deno_core`（V8）。默认关闭；启用需同时具备构建特性
-  （`--features molesignal-bootstrap/js-runtime`）与 TOML 开关
-  `[functions] js_runtime_enabled = true`。
+- **JavaScript** —— 可选，基于 `deno_core`（V8）。只有二进制使用 `--features js-runtime`
+  构建时可用，没有运行时 TOML 开关。
+- **LLM 评估** —— 适合低吞吐流水线；需设置 `[functions].llm_eval_enabled = true`，且组织内有已
+  启用的模型供应商。每条事件都会触发一次模型请求。
 
 <Warning>
   JS isolate 刻意做得极简：没有 `fetch`、`setTimeout`、`import`、`npm`。每个事件有 50 ms 墙钟预算与

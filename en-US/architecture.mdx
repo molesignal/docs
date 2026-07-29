@@ -1,0 +1,99 @@
+---
+title: "Architecture"
+description: "How MoleSignal's single Rust crate, adapters, data plane, storage, workers, and web application fit together."
+---
+
+MoleSignal ships as one Rust service with role-based composition and one React web application.
+The Rust code remains a single crate while enforcing module boundaries.
+
+## Layering
+
+| Layer | Responsibility |
+|---|---|
+| `domain` | Entities, policies, value objects, and repository/service ports. |
+| `app` | Use cases and orchestration that depend on domain ports. |
+| `infra` | Postgres, object storage, query, runtime, notification, and external adapters. |
+| `api` | HTTP/gRPC protocols, authentication, authorization, and DTO conversion. |
+| `bootstrap` | Role startup and dependency composition. |
+| `shared` | Stable cross-cutting contracts such as IDs, time, health, tracing, and license gates. |
+| `web` | Capability-aware product routes, query workspaces, administration, and visualization. |
+
+Infrastructure depends inward on domain and application contracts. Domain code does not depend on
+Axum, SQLx, object-store clients, or web DTOs.
+
+## Composition
+
+`src/bootstrap/bootstrap.rs` owns the `build_state` orchestration entry point. Cohesive builders
+remain directly under `src/bootstrap/`—`core`, `storage`, `query`, `iam`, `alerting`,
+`intelligence`, `tracing`, and `platform`—while role lifecycle and worker startup live in their
+dedicated `roles/` and `workers/` modules.
+
+The top-level `AppState` exposes the core application services and grouped feature states:
+alerting, IAM, telemetry, storage, cluster, platform, and Intelligence. This keeps route access
+feature-oriented instead of flattening every infrastructure repository into one global container.
+
+## Runtime roles
+
+The `[node].roles` setting composes one or more roles into the process:
+
+| Role | Main responsibility |
+|---|---|
+| `standalone` | All APIs and workers for a compact deployment. |
+| `router` | Entry routing, rate limiting, and cluster-aware forwarding. |
+| `ingester` | Ingest validation, pipeline, masking, WAL, buffers, and Parquet flush. |
+| `querier` | DataFusion, PromQL, search jobs, and distributed query. |
+| `compactor` | File compaction, retention, and cold metadata maintenance. |
+| `alert_manager` | Rule evaluation, schedules, escalation, and delivery dispatch. |
+
+The same binary and configuration model serve every role. Changing roles requires restart.
+
+## Data path
+
+```text
+sender
+  -> protocol receiver
+  -> auth + IAM + quota
+  -> schema / masking / pipeline
+  -> WAL + Arrow buffer
+  -> Parquet + Tantivy metadata
+  -> object storage
+
+query
+  -> planner + organization rewrite
+  -> metadata and index pruning
+  -> DataFusion / PromQL
+  -> local or Flight-distributed execution
+  -> rows / NDJSON / async search job
+```
+
+Postgres stores metadata and product resources. Object storage holds Parquet, profile blobs,
+exports, and large Intelligence evidence. Local disk is used for the WAL and optional caches.
+
+## Control and worker planes
+
+Background workers handle compaction, alert evaluation, pipeline runs, search jobs, reports,
+service-graph aggregation, trials, ACME, and telemetry maintenance. Ownership follows the selected
+role so duplicate processes do not all perform the same job.
+
+## Authorization
+
+Authentication produces an IAM context. Authorization reads database-backed permissions, roles,
+resource relationships, and explicit cross-organization grants. Resource handlers load the target,
+verify organization ownership, and authorize the requested action before mutation.
+
+## Web architecture
+
+The React router defines every product route. Product IA metadata and the capability snapshot
+control discovery. A hidden route is still protected by the backend permission check.
+
+Query pages share time context and correlation contracts. Settings and IAM use separate
+organization and system scopes.
+
+<CardGroup cols={2}>
+  <Card title="Core concepts" icon="diagram-project" href="/en-US/concepts">
+    Learn signals, streams, organizations, and storage.
+  </Card>
+  <Card title="Distributed deployment" icon="server" href="/en-US/distributed-deployment">
+    Deploy roles across Docker Compose or Kubernetes.
+  </Card>
+</CardGroup>

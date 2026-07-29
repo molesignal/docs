@@ -1,0 +1,93 @@
+---
+title: "自身可观测性"
+description: "运维 MoleSignal 自身的日志、指标、链路、性能剖析、健康状态与节点本地诊断。"
+---
+
+MoleSignal 可以将自身遥测写入受保护的 `_sys` 组织。每类信号都使用准确名称 `_molesignal`，并通过数据流类型区分。
+
+| 信号 | 类型化数据流 | 内容 |
+|---|---|---|
+| 日志 | `logs/_molesignal` | 结构化进程事件与链路上下文。 |
+| 指标 | `metrics/_molesignal` | 计数器、仪表、直方图与摘要。 |
+| 链路 | `traces/_molesignal` | 尾采样后完成的规范 Span。 |
+| 性能剖析 | `profiles/_molesignal` | 与对象存储 pprof 文件关联的剖析元数据。 |
+
+只有具备 `sys.telemetry.read` 的系统范围会话才能查询这些数据流。
+
+## 启用自身采集
+
+```toml
+[telemetry.self_ingest]
+enabled = true
+retention_days = 7
+logs_enabled = true
+metrics_enabled = true
+traces_enabled = true
+profiles_enabled = false
+metrics_interval_secs = 15
+queue_capacity = 8192
+batch_max_events = 256
+batch_max_delay_ms = 1000
+flush_timeout_secs = 5
+profile_kinds = ["cpu"]
+profile_interval_secs = 600
+profile_duration_secs = 10
+```
+
+目标组织不能修改为租户组织。公开采集、数据流修改和数据管道都不能创建、覆盖或删除 `_molesignal`。
+
+在角色拆分部署中，非 ingester 节点会将自身遥测转发给健康的 ingester。请在所有角色上设置相同的 `MS_SELF_TELEMETRY_CLUSTER_TOKEN`。
+
+## 后端分布式链路追踪
+
+MoleSignal 会为 HTTP、gRPC、Flight SQL、数据库、对象存储、采集、查询、后台 Worker 与 Intelligence 阶段创建链路。
+
+入站 W3C 上下文会被验证，无效上下文会被替换。外部 Baggage 不能授权组织。Span 不会记录敏感请求体、SQL 值、凭据、提示词、模型输出和工具参数。
+
+尾采样器按以下顺序保留链路：
+
+1. 部署或运行时禁用；
+2. 可信调试强制保留；
+3. 错误；
+4. 慢链路；
+5. 有序策略规则；
+6. 确定性的普通采样率。
+
+采样器和自身采集/导出队列都有容量上限，并对业务流量保持故障开放。你可以在 `/metrics` 查看固定基数指标，并通过 `GET /api/v1/system/telemetry` 查看详细健康状态。
+
+## 节点本地 pprof
+
+诊断监听器默认禁用：
+
+```toml
+[profiling]
+enabled = true
+bind = "127.0.0.1"
+port = 5084
+allow_remote = false
+```
+
+采集性能剖析：
+
+```bash
+curl --fail --output cpu.pb.gz \
+  'http://127.0.0.1:5084/debug/pprof/profile?seconds=30'
+
+curl --fail --output heap.pb.gz \
+  'http://127.0.0.1:5084/debug/pprof/heap'
+```
+
+请将监听器保留在回环地址，并通过 SSH 隧道访问。远程暴露要求 `allow_remote = true`、网络控制、监听器前置 TLS，以及管理 Bearer 凭据。
+
+## 健康状态与上线
+
+- `/api/v1/healthz` 报告进程存活状态。
+- `/api/v1/readyz` 报告流量就绪状态。
+- `/metrics` 暴露不含租户标签的 Prometheus 指标。
+- `X-Request-Id` 和 `X-Trace-Id` 用于将请求关联到已保留链路。
+
+首次上线分布式链路追踪时，先设置 `telemetry.trace.force_disabled = true`，验证系统资源与隐私，然后启用灰度节点，最后逐步扩大持久化运行策略。
+
+<Card title="配置" icon="sliders" href="/zh-Hans/configuration">
+  查看全部遥测、链路追踪、导出器与性能剖析设置。
+</Card>

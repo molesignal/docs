@@ -1,53 +1,86 @@
 ---
-title: "告警"
-description: "scheduled、realtime、anomaly 三类规则，配 PagerDuty 风格的升级策略。"
+title: "告警与事件响应"
+description: "规则、事件、异常检测、模板、值班计划、升级、静默、订阅与洞察。"
 ---
 
-MoleSignal 自带完整告警引擎：三类规则、多级升级策略、轮值排班、通知渠道。
+打开**告警**，完成从检测到确认、升级与解决的完整流程。
+
+## 告警中心
+
+| 分区 | 可以完成的工作 |
+|---|---|
+| **事件** | 分诊活动事件、检查上下文、确认、解决、静默或发起 RCA。 |
+| **规则** | 创建定时、实时或异常规则及严重度阈值。 |
+| **渠道** | 配置邮件、Slack 与安全 Webhook 投递。 |
+| **模板** | 复用通知标题、正文与变量，并发送测试消息。 |
+| **历史** | 回顾过去的事件与规则活动。 |
+| **洞察** | 检查数量、解决时长、快速解决比例与按小时活动。 |
+| **升级** | 定义有序目标与确认超时。 |
+| **值班计划** | 构建感知时区的轮值与临时覆盖。 |
+| **静默** | 在受控时间范围内抑制匹配通知。 |
+| **订阅** | 按标签匹配与最低严重度增加通知。 |
+| **语义分组** | 将标签标准化为可复用的事件分组语义。 |
 
 ## 规则类型
 
 <CardGroup cols={3}>
-  <Card title="scheduled" icon="clock">
-    周期性 SQL 评估。规则的查询按间隔运行，触发条件决定是否告警。
+  <Card title="定时" icon="clock">
+    按时间间隔运行 SQL 或指标查询，并评估触发条件与严重度阈值。
   </Card>
-  <Card title="realtime" icon="bolt">
-    接入内谓词匹配。数据落地即评估，因此**亚秒级**触发 —— 比任何 scrape/eval 间隔方案都快。
+  <Card title="实时" icon="bolt">
+    记录 `real_time` 规则意图。当前后端仍通过定时评估器执行，采集热路径 matcher 尚未启用。
   </Card>
-  <Card title="anomaly" icon="wave-square">
-    用 MAD（中位数绝对偏差）建立基线，外加 3σ 带。序列偏离学习到的基线时触发。
+  <Card title="异常" icon="wave-square">
+    将当前值与历史 MAD 或 EWMA 基线比较，并可启用周季节性。
   </Card>
 </CardGroup>
 
-## 升级策略
+在规则工作台中选择数据流、查询、评估范围、阈值、标签、注解、模板与升级策略。启用规则前请测试查询。
 
-**升级策略**是挂在规则上的多步计划，由 `alert_manager` 角色驱动：
+异常规则允许 1–30 天回看、正数偏差倍数，以及 `mad` 或 `ewma` 算法。EWMA 还需要 `(0, 1]` 范围内的 Alpha。
 
-1. 每次 tick 扫描未关闭的 incident。
-2. 若当前 step 尚未派发，则解析该 step 的 targets 与 on-call，通过对应渠道发送。
-3. 若在 `ack_timeout` 前未收到确认，则前进到下一 step 再次派发。
-4. 重复直到 incident 被确认或解决，或所有 step 走完。
+## 事件生命周期
 
-策略支持**轮值排班**（含时区感知的排班）与**覆盖（override）**。
+事件以活动状态开始。响应人员可以确认事件、静默匹配投递，并在恢复后解决事件。事件详情会保留规则上下文、Trace ID、标签、投递状态，以及可用的 RCA。
 
-## 渠道
+语义分组会合并标准化指纹相同的事件。确认或解决分组时，操作会级联到成员事件。
 
-通知通过 **Slack**、**webhook**、**email** 发出，配 PagerDuty 风格的升级与模板变量。incident 携带
-`step`、`acknowledged_at`、`resolved_at`，对应 PagerDuty 的 incident 生命周期。
+Mole Agent RCA 需要 `intelligence` 功能与 Intelligence 权限。它会将有证据支持的结果保存到事件，而不会替代事件生命周期。
 
-## 通过 API 管理告警
+## 升级与值班
 
-| 端点 | 用途 |
+`alert_manager` 角色负责评估规则并推进升级：
+
+1. 解析当前步骤的用户、团队、值班计划与渠道；
+2. 向每个目标投递并记录独立结果；
+3. 在 `ack_timeout_secs` 内等待确认；
+4. 未确认时推进到下一步，直到事件被确认、解决或步骤耗尽。
+
+值班计划使用明确时区、轮值与有日期范围的覆盖。将计划用于生产升级前，请先预览当班人员。
+
+## 渠道与模板
+
+邮件使用部署级 SMTP 设置。Slack 与通用 Webhook 作为组织资源配置。Webhook Secret 与敏感请求头不会以明文返回。
+
+模板可以引用事件、规则、标签与组织字段。将模板绑定到活动规则前，请使用**发送测试**。
+
+## 静默与订阅
+
+静默规则在固定时间范围内匹配标签并暂停投递，但不会修改告警规则。静默单个活动事件时，可以生成相应的匹配静默规则。
+
+订阅在标签匹配器与最低严重度命中时增加渠道或用户接收方。它会补充升级目标，不会替代升级目标。
+
+## 权限
+
+| 权限 | 能力 |
 |---|---|
-| `POST /api/v1/alerts/rules` | 创建规则 |
-| `GET` / `PATCH` `/api/v1/alerts/rules/{id}` | 读取 / 更新规则 |
-| `POST /api/v1/alerts/escalations` | 创建升级策略 |
-| `POST /api/v1/alerts/channels` | 创建通知渠道 |
-| `GET /api/v1/alerts/incidents` | 列出 incident |
-| `POST /api/v1/alerts/incidents/{id}/ack` | 确认 incident |
-| `POST /api/v1/alerts/incidents/{id}/resolve` | 解决 incident |
+| `alerts.read` | 读取规则、事件、模板、洞察、分组、订阅与静默。 |
+| `alerts.manage` | 创建和修改规则、渠道、模板、升级、分组与订阅。 |
+| `alerts.acknowledge` | 确认和解决事件或事件分组。 |
+| `alerts.silence` | 创建、修改和移除静默。 |
+| `schedules.read` | 读取值班计划与当班结果。 |
+| `schedules.manage` | 创建值班计划、轮值与覆盖。 |
 
-<Note>
-  告警逻辑已完成，需要生产环境的实战时长。若实时规则漏掉事件或升级行为异常，请带上规则定义提
-  issue。
-</Note>
+<Card title="Webhook 渠道" icon="webhook" href="/zh-Hans/alert-webhook-channels">
+  配置告警 Webhook 的身份验证、签名、重试与传输安全。
+</Card>

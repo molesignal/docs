@@ -1,65 +1,78 @@
 ---
 title: "安全与多租户"
-description: "planner 级组织隔离、API token、审计日志、字段级加密。"
+description: "租户隔离、访问能力授权、平台范围、Token、审计、共享、Secret 与字段加密。"
 ---
 
-多租户与安全是内建在数据平面里的，而非在仪表盘上外挂。
+MoleSignal 在 API 与数据平面执行租户和授权控制，位置低于 Web 导航。
 
-## 多租户隔离
+## 租户隔离
 
-每一行、每次查询、每个资源都恰好属于一个**组织**。隔离在**查询 planner 层**强制：执行前会把
-`org_id` 谓词改写进*每一个* SQL 计划。构造的恶意查询无法触及其他组织的数据，因为该约束位于
-查询文本之下。
+每个组织数据流与产品资源都有所属 `org_id`。查询规划会在执行前注入已授权组织边界。资源 Handler 也会在读取或修改前加载目标并验证其组织。
 
-每组织的**配额**限制接入 QPS、查询 QPS 与存储。超限返回 `429`（限流）或 `413`（存储），并附审计
-记录与告警。
+跨工作区访问必须使用显式 IAM 授权或支持的资源共享。资源不匹配时，系统不会静默切换组织。
 
-## 认证
+`_sys` 组织是受保护的平台范围。租户 JWT 与 `ms_*` API Token 无法用它枚举许可证、平台管理员或 MoleSignal 自身遥测。
 
-<CardGroup cols={2}>
-  <Card title="JWT" icon="key">
-    从 `POST /api/v1/auth/login` 获取 JWT，并在每个请求上以 `Authorization: Bearer <jwt>` 发送。
-    仅 `/api/v1/healthz`、`/api/v1/auth/login`、`/metrics` 免认证。
-  </Card>
-  <Card title="API token" icon="id-badge">
-    形如 `ms_<prefix>_<secret>` 的长期 token，各自带角色、过期时间、最近使用时间。在
-    `/api/v1/auth/tokens` 下管理。
-  </Card>
-</CardGroup>
+## 身份验证与授权
 
-### JWT 签名密钥
+MoleSignal 接受：
 
-JWT 签名密钥在首次启动时**自动写入数据库** —— 配置文件里没有密钥。Owner 可通过
-`POST /api/v1/auth/jwt/rotate` 轮换，并有 24 小时宽限期让在途 token 继续可用。
+- 登录 JWT，包括切换工作区后新签发的限定范围 JWT；
+- 形如 `ms_<prefix>_<secret>` 的 API Token；
+- 用于窄范围公开或集成路由的专用自验证 Token。
 
-## 审计日志
+API Token 前缀用于查找，Secret 以哈希形式保存。完整 Token 只在创建时显示。
 
-每个写操作都被记录。在 `GET /api/v1/audit` 查询审计轨迹。
+身份验证后，服务器会解析数据库中的权限、角色、绑定、资源关系、许可证功能与目标所有权。详见[身份与访问](/zh-Hans/identity)。
+
+## JWT 签名密钥
+
+JWT 签名密钥会引导写入数据库。元数据端点不会返回原始密钥字节。
+
+列出或轮换签名密钥需要平台权限 `sys.settings.manage`：
+
+```text
+GET  /api/v1/auth/jwt/secrets
+POST /api/v1/auth/jwt/rotate
+```
+
+只有部署策略要求固定引导密钥时，才使用 `MS_AUTH_JWT_SECRET_OVERRIDE`。
+
+## 审计
+
+安全相关与产品修改路径会记录操作者、组织、操作、目标、时间与安全元数据。具备 `audit.read` 后，可在**设置 → 审计**查询组织事件。
+
+许可证包、凭据、模型密钥、敏感 Webhook 请求头与原始签名材料不会写入审计负载。
+
+## 资源共享
+
+公开仪表盘和报告链接属于 Bearer 凭据，但不会变成组织 Token。MoleSignal 会将链接交换为短期 HttpOnly 共享会话，并把访问限制到一个已保存资源。
+
+公开仪表盘面板只能通过受限代理执行服务器已保存查询。共享可以过期、要求密码、限制最大查看次数、禁用下载，并支持撤销或轮换。详见[资源共享](/zh-Hans/resource-sharing)。
 
 ## 字段级加密
 
-MoleSignal 支持用 **cipher keys** 加密敏感字段：
+组织加密密钥支持 AES-256-GCM 字段加密。加密根密钥来自 `MS_CIPHER_KEY`；具名密钥材料创建后不会返回。
 
-- AES-256-GCM，配 cipher 根密钥信封。
-- 根密钥来自 `MS_CIPHER_KEY`（32 字节，base64）。
-- VRL 的 `encrypt()` / `decrypt()` 内置函数可在接入路径按字段加密、在查询时解密。
-
-```toml
-# 通过环境变量提供根密钥，切勿写进配置文件：
-# export MS_CIPHER_KEY="<32 字节 base64>"
-```
-
-在 `/api/v1/cipher_keys` 下管理具名密钥，在 `/api/v1/cipher_keys/{name}/rotate` 轮换。
+在采集阶段使用 VRL 加密函数，并在已授权查询路径中进行匹配解密。读取密钥元数据需要 `org.settings.read`；创建、轮换或删除密钥需要 `org.settings.manage`。
 
 <Warning>
-  丢失 `MS_CIPHER_KEY` 会导致加密字段不可恢复。请用密钥管理器保管，并独立于数据库做备份。
+  丢失 `MS_CIPHER_KEY` 可能导致加密字段无法恢复。请使用密钥管理器保存，并独立于 PostgreSQL 与对象存储备份。
 </Warning>
 
-## API token 格式
+## Secret 与遥测卫生
 
-```text
-ms_<prefix>_<secret>
-   └─ prefix 明文存储用于查找；secret 落库前哈希。
-```
+- 将数据库、对象存储、SMTP、SSO、模型供应商与 Webhook 凭据存入密钥管理器。
+- 外部链路导出的敏感请求头使用 `env:` 或 `secret:` 引用。
+- 将内部 gRPC `5082` 保留在可信网络；该端口包含集群协议。
+- 为外部 HTTP、OTLP gRPC `4317` 与 Flight SQL `5083` 配置 TLS。
+- 除非远程诊断受到明确保护，否则让 pprof Listener 只绑定回环地址。
+- 后端链路不会记录请求体、SQL 值、凭据、提示词、模型输出与工具参数。
 
-API token 的发送方式与 JWT 完全一致，放在 `Authorization: Bearer` 头里。
+## 限流与服务控制
+
+Router 对每个组织执行采集与查询令牌桶。存储与每日采集限额也可以来自部署或许可证策略。订阅暂停可以返回 `402`；限流返回 `429`；超大或受存储限额约束的写入可以返回 `413`。
+
+<Card title="自身可观测性" icon="heart-pulse" href="/zh-Hans/self-observability">
+  配置受保护的 `_sys` 遥测、尾采样与节点本地诊断。
+</Card>

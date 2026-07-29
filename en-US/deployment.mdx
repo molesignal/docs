@@ -33,8 +33,8 @@ flowchart LR
   Q -. partition pruning .-> MS
 ```
 
-The crucial point: logs, metrics, and traces land in the **same** columnar files (different streams,
-one physical store), so a single query joins across them natively — no cross-store federation.
+Logs, metrics, and traces use typed Parquet streams in the same object-storage data plane. Profile
+metadata uses the same organization and query model while pprof blobs remain in object storage.
 
 ## Node roles
 
@@ -45,7 +45,7 @@ one physical store), so a single query joins across them natively — no cross-s
 | `ingester` | Data ingest + durable write-ahead log + buffer + periodic flush to columnar files | local log (≤ flush window) |
 | `querier` | Distributed scan endpoint + query execution | stateless |
 | `compactor` | Periodic file merge + retention cleanup | stateless |
-| `alert_manager` | Rule evaluation + escalation dispatch | stateless |
+| `alert_manager` | Rule evaluation, escalation, reports, RCA maintenance, and connector runners | stateless |
 
 Roles are selected with the `[node].roles` config (or `MS_NODE.ROLES`). Only the ingester holds
 local state — a WAL within the flush window — so every other role scales freely.
@@ -63,6 +63,15 @@ local state — a WAL within the flush window — so every other role scales fre
     # Separate roles — closer to production
     docker compose -f deploy/docker/docker-compose.yaml --profile multirole up
     ```
+
+    The checked-in Compose file publishes `5080` and internal `5082`, but not external OTLP gRPC
+    `4317`. To send OTLP gRPC from the host, add a `4317:4317` mapping to the standalone or
+    ingester service. Do not use `5082` as a substitute.
+
+    <Warning>
+      `connector` is not a current runtime role. If your checkout still contains a legacy
+      `molesignal-connector` service, remove it; connector runners are owned by `alert_manager`.
+    </Warning>
   </Tab>
   <Tab title="Kubernetes">
     Manifests live in [`deploy/k8s/`](https://github.com/molesignal/molesignal/tree/main/deploy/k8s).
@@ -73,14 +82,18 @@ local state — a WAL within the flush window — so every other role scales fre
 
 ## Dependencies
 
-- **Postgres** — metadata (`FileMeta`, streams, alerts, identity).
+- **Postgres** — metadata, IAM, streams, alerts, reports, Intelligence resources, and cluster state.
 - **Object store** — `local`, `s3` (and S3-compatible: MinIO, R2, Aliyun OSS), `azure`, or `gcs`.
 
 ## Operations
 
 - **Single binary**, same image for all roles.
-- **Prometheus `/metrics`** with rich cache / object_store / ingester / compactor metrics.
-- **Health probes** — readiness is gated by ingester WAL replay plus an object-store round-trip probe.
+- **Prometheus `/metrics`** with fixed-cardinality cache, object-store, ingest, query, alerting, and
+  self-observability metrics.
+- **Health probes** — `/api/v1/readyz` gates traffic on WAL replay; `/api/v1/healthz` separately
+  reports subsystem degradation, including object-storage probes.
 - **TLS + ACME** — optional automatic certificates via `[http.tls]` (HTTP-01 challenge, Let's Encrypt).
+- **External protocols** — HTTP `5080`, OTLP gRPC `4317`, optional Flight SQL `5083`; keep internal
+  gRPC `5082` private.
 
 See [Configuration](/en-US/configuration) for the full settings reference.

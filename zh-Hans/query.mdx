@@ -1,7 +1,7 @@
 ---
 title: "查询"
 sidebarTitle: "概览"
-description: "一个引擎上的完整 SQL 与 PromQL 子集，横跨三类信号。"
+description: "在组织数据流上运行 SQL、兼容 PromQL 的指标查询、流式搜索与异步任务。"
 ---
 
 MoleSignal 暴露单一查询端点，底层是 **DataFusion**。可运行完整 SQL —— 包括 join、CTE、窗口
@@ -19,19 +19,21 @@ Content-Type: application/json
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `org_id` | string | ✅ | 所属租户 id（登录获得）。 |
+| `org_id` | string | ✅ | 为请求兼容保留；实际以认证上下文中的组织为准。 |
 | `language` | string | ✅ | `sql` 或 `promql`。 |
 | `statement` | string | ✅ | 查询文本。 |
 | `time_range` | object | ✅ | `{ "start": <微秒>, "end": <微秒> }` —— Unix 纪元起微秒。 |
-| `stream` | object | — | `{ "name": "app", "stream_type": "logs" }`。`stream_type` ∈ `logs`/`metrics`/`traces`/`enrichment`。 |
+| `stream` | object | — | `{ "name": "app", "stream_type": "logs" }`；可查询信号类型为 `logs`、`metrics`、`traces` 和 `profiles`。 |
 | `limit` | integer | — | 行数上限。 |
 
 ### 响应
 
-响应携带 `rows`、`columns`、`scanned_rows`、`took_ms`、`cache_hit`。
+响应包含 `columns`、数组形态的 `rows`、`scanned_rows` 与 `took_ms`。联邦查询响应还可能包含
+federation 元数据。
 
 <Note>
-  发送 `Accept: application/x-ndjson` 可逐行流式返回结果。流式会绕过 `query_result` 缓存。
+  发送 `Accept: application/x-ndjson` 可逐行返回对象，并在最后附上 `__meta__` 记录。流式会绕过
+  结果缓存。
 </Note>
 
 ## SQL
@@ -82,7 +84,25 @@ WHERE l.level = 'error'
 要拉取某条事件前后各 N 条（日志上下文视图），用 `POST /api/v1/query/search_around`，传
 `event_timestamp_us`、`stream`、`stream_type`，以及可选的 `before` / `after`（各默认 50）。
 
+## 异步、检查与取消
+
+- 给 `POST /api/v1/query` 加 `Prefer: respond-async`，或直接提交到
+  `POST /api/v1/query/jobs`，可创建持久化搜索任务。
+- `GET /api/v1/query/jobs/{id}` 返回状态，`/results` 返回完成后的结果。
+- `POST /api/v1/query/inspect` 只做规划不执行，返回查询元数据与当前可用的逻辑计划。
+- `POST /api/v1/query/recommendations` 不执行查询，只分析查询画像。
+- `GET /api/v1/query/running` 与 `POST /api/v1/query/{id}/cancel` 供组织管理员查看和取消活动查询。
+
+普通查询需要 `streams.query`；活动查询管理分别需要 `org.settings.read` 或
+`org.settings.manage`。
+
+## 联邦搜索
+
+Enterprise Edition 可给查询端点添加 `?clusters=local,cluster-name`。只要包含非本地目标，就需要
+`federated_search` 授权。无法访问的远端会在 federation 元数据中标为 degraded，不会被静默当成本地
+数据。
+
 ## 缓存
 
 查询经过三级缓存 —— `file_meta`、`parquet_meta`、`query_result` —— 外加默认启用的 parquet 磁盘缓存
-（`./data/cache/parquet`，10 GB LRU）。响应里的 `cache_hit` 表明结果是否来自缓存。
+（`./data/cache/parquet`，10 GB LRU）。缓存对响应契约透明，请通过服务器指标观察缓存行为。

@@ -1,0 +1,90 @@
+---
+title: "架构"
+description: "了解 MoleSignal 单一 Rust Crate、适配器、数据平面、存储、Worker 与 Web 应用之间的关系。"
+---
+
+MoleSignal 以一个支持角色组合的 Rust 服务和一个 React Web 应用交付。Rust 代码保持单一 Crate，同时执行清晰的模块边界。
+
+## 分层
+
+| 层 | 职责 |
+|---|---|
+| `domain` | 实体、策略、值对象与 Repository/Service 端口。 |
+| `app` | 依赖领域端口的用例与编排。 |
+| `infra` | PostgreSQL、对象存储、查询、运行时、通知与外部适配器。 |
+| `api` | HTTP/gRPC 协议、身份验证、授权与 DTO 转换。 |
+| `bootstrap` | 角色启动与依赖装配。 |
+| `shared` | ID、时间、健康、链路与许可证门控等稳定横切契约。 |
+| `web` | 感知访问能力的产品路由、查询工作区、管理与可视化。 |
+
+基础设施通过领域和应用契约向内依赖。领域代码不依赖 Axum、SQLx、对象存储客户端或 Web DTO。
+
+## 装配
+
+`src/bootstrap/bootstrap.rs` 是 `build_state` 总编排入口。内聚的 builder 直接放在
+`src/bootstrap/` 下，包括 `core`、`storage`、`query`、`iam`、`alerting`、
+`intelligence`、`tracing` 与 `platform`；角色生命周期和 Worker 启动分别归入专属的
+`roles/` 与 `workers/` 模块。
+
+顶层 `AppState` 暴露核心应用服务，以及 alerting、IAM、telemetry、storage、cluster、
+platform 和 Intelligence 等功能状态分组。Handler 因此按功能访问依赖，不再把每个基础设施
+Repository 平铺成一个全局容器。
+
+## 运行角色
+
+`[node].roles` 设置会在进程中组合一个或多个角色：
+
+| 角色 | 主要职责 |
+|---|---|
+| `standalone` | 为紧凑部署提供全部 API 与 Worker。 |
+| `router` | 入口路由、限流与集群感知转发。 |
+| `ingester` | 采集验证、数据管道、脱敏、WAL、缓冲与 Parquet 刷写。 |
+| `querier` | DataFusion、PromQL、搜索任务与分布式查询。 |
+| `compactor` | 文件压缩、数据保留与冷元数据维护。 |
+| `alert_manager` | 规则评估、值班计划、升级与通知投递。 |
+
+所有角色使用同一个二进制与配置模型。修改角色后需要重启。
+
+## 数据路径
+
+```text
+发送端
+  -> 协议接收器
+  -> 身份验证 + IAM + 配额
+  -> 数据结构 / 脱敏 / 数据管道
+  -> WAL + Arrow 缓冲
+  -> Parquet + Tantivy 元数据
+  -> 对象存储
+
+查询
+  -> 规划器 + 组织重写
+  -> 元数据与索引裁剪
+  -> DataFusion / PromQL
+  -> 本地或基于 Flight 的分布式执行
+  -> 行 / NDJSON / 异步搜索任务
+```
+
+PostgreSQL 保存元数据与产品资源。对象存储保存 Parquet、性能剖析文件、导出文件与大型 Intelligence 证据。本地磁盘用于 WAL 与可选缓存。
+
+## 控制平面与 Worker 平面
+
+后台 Worker 负责压缩、告警评估、数据管道运行、搜索任务、报告、服务图聚合、试用、ACME 与遥测维护。任务所有权由所选角色决定，避免所有重复进程执行同一工作。
+
+## 授权
+
+身份验证生成 IAM 上下文。授权读取数据库中的权限、角色、资源关系与显式跨组织授权。资源 Handler 在变更前先加载目标、验证组织所有权，并授权所请求操作。
+
+## Web 架构
+
+React Router 定义所有产品路由。产品信息架构元数据与访问能力快照共同控制导航发现。路由即使被隐藏，后端权限检查仍然有效。
+
+查询页面共享时间上下文和信号关联契约。设置与 IAM 分别使用组织范围和系统范围。
+
+<CardGroup cols={2}>
+  <Card title="核心概念" icon="diagram-project" href="/zh-Hans/concepts">
+    了解信号、数据流、组织与存储。
+  </Card>
+  <Card title="分布式部署" icon="server" href="/zh-Hans/distributed-deployment">
+    使用 Docker Compose 或 Kubernetes 部署不同角色。
+  </Card>
+</CardGroup>

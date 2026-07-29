@@ -140,7 +140,7 @@ ACME 签发 / 续期已实现：签发循环扫 `pending` 域名、续期循环�
 </Tabs>
 
 <Info>
-少数 bootstrap / 密钥类变量是**扁平单下划线**且不进 `Settings`，直接从环境读取：`MS_CIPHER_KEY`、`MS_AUTH_JWT_SECRET_OVERRIDE`、`MS_LICENSE_FILE`、`MS_COPILOT_<PROVIDER>_API_KEY` 等。其余结构化字段一律走 `MS_<SECTION>.<FIELD>` 点分形式，docker-compose 与 k8s 清单中即如此（如 `MS_NODE.ROLES`、`MS_STORE.META.DSN`、`MS_CLUSTER.ADVERTISE_ADDR`）。
+少数 bootstrap / 密钥类变量是**扁平单下划线**且不进 `Settings`，直接从环境读取：`MS_CIPHER_KEY`、`MS_AUTH_JWT_SECRET_OVERRIDE`、`MS_LICENSE_FILE`、`MS_SELF_TELEMETRY_CLUSTER_TOKEN`，以及仅开发回退使用的 `MS_INTELLIGENCE_<PROVIDER>_*`。其余结构化字段一律走 `MS_<SECTION>.<FIELD>` 点分形式，例如 `MS_NODE.ROLES`、`MS_STORE.META.DSN` 与 `MS_CLUSTER.ADVERTISE_ADDR`。
 </Info>
 
 ## 数据流
@@ -196,7 +196,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 </Frame>
 
 <Warning>
-**联邦查询受 license 门控：** 只要 `clusters` 含非 `local` 目标且当前 license 不含 `federated_search` 特性，HTTP 层直接返回 `403`。OSS / 社区版会回退到单集群。远程集群定义存于 Postgres `remote_clusters` 表（`advertise_addr`、`token_secret_ref`、`tls_verify`、`enabled`），`enabled=false` 的集群在 fan-out 时跳过。当前远程鉴权仅支持 Bearer token；`tls_verify=false` 映射为 `http://`（而非"https 跳过校验"）。
+**联邦查询受许可证门控：** 只要 `clusters` 含非 `local` 目标且当前许可证不含 `federated_search` 功能，HTTP 层直接返回 `403`。OpenSource Edition 保持单集群。远程集群定义存于 Postgres `remote_clusters` 表（`advertise_addr`、`token_secret_ref`、`tls_verify`、`enabled`），`enabled=false` 的集群在 Fan-out 时跳过。当前远程身份验证仅支持 Bearer Token；`tls_verify=false` 映射为 `http://`，而不是“HTTPS 跳过验证”。
 </Warning>
 
 ## 集群成员与发现
@@ -241,7 +241,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     仅进程内 LRU+TTL 缓存、限流器、异步运行时。无 Redis / Memcached，无外部共识组件。
   </Card>
   <Card title="渲染依赖（可选）" icon="image">
-    定时报表的 PNG/PDF 渲染需 headless Chromium，为 feature 门控；OSS 构建一律回退 SVG 占位。镜像运行层已带 chromium。
+    定时报告的 PNG/PDF 渲染需要 Headless Chromium、启用的 Renderer 与可访问的 Web `base_url`。渲染不可用时，请求会返回明确错误，不会生成占位文件。
   </Card>
 </CardGroup>
 
@@ -249,21 +249,24 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 
 | 端口 | 协议 / 服务 | 配置键 | 说明 |
 | --- | --- | --- | --- |
-| 5080 | HTTP | `[http].bind`（默认 `0.0.0.0`）、`[http].port` | `/api/v1/*`、`/metrics`、`/healthz`、`/readyz`、`/.well-known/acme-challenge/` 等 |
-| 5082 | gRPC | `[grpc].bind`、`[grpc].port`、`max_message_size_mb`（默认 32MB） | 数据接入 + 扫描 RPC + 集群心跳，三服务共用 |
+| 5080 | HTTP | `[http].bind`（默认 `0.0.0.0`）、`[http].port` | `/api/v1/*`、`/metrics`、`/api/v1/healthz`、`/api/v1/readyz`、`/.well-known/acme-challenge/` 等 |
+| 5082 | 内部 gRPC | `[grpc].bind`、`[grpc].port`、`max_message_size_mb`（默认 32MB） | 可信节点、扫描与私有集群采集协议 |
+| 4317 | OTLP gRPC | `[otlp_grpc]` | 对外标准日志、指标、链路与性能剖析 Receiver；Standalone 与 Ingester 默认启用 |
+| 5083 | Flight SQL | `[flight_sql]` | 对外需 Bearer 身份验证的 SQL Listener；Standalone 与 Querier 默认关闭 |
+| 5084 | pprof HTTP | `[profiling]` | 节点诊断；默认关闭且只绑定回环 |
 | 80 | TLS 模式下的明文 HTTP | `[http.tls].plain_port` | 健康检查 + ACME HTTP-01 挑战 + 301 跳转 HTTPS |
 | 443 | TLS 模式下的 HTTPS（SNI） | `[http.tls].port` | 完整路由；由 `[http.tls].enabled` 运行期开启（编入所有构建，无 feature 门） |
 
 <Note>
-**`/metrics`**（GET，Prometheus 文本 0.0.4）由 `[telemetry].metrics_enabled`（默认 true）控制，暴露缓存命中 / 失效、`object_store_*`、`wal_*`、`file_meta_dump_*`、`tantivy_pruned_files_total`、`alert_rule_eval_timeout_total` 等指标。
+**`/metrics`**（GET，Prometheus 文本 0.0.4）始终装配。请在反向代理或网络边界限制访问。它会暴露固定基数的缓存、对象存储、WAL、查询、告警与自身可观测性指标。
 </Note>
 
 ### 健康 / 就绪探针语义
 
 | 探针 | 路径 | 200 条件 | 503 条件 | 用途 |
 | --- | --- | --- | --- | --- |
-| Liveness | `GET /healthz` | WAL 重放完成（仅 Ingester 相关；其他角色绕过）**且**对象存储未降级 | 重放进行中 **或** 对象存储连接丢失 | 进程存活与依赖健康 |
-| Readiness | `GET /readyz` | `replay_done = true`（即使对象存储已降级） | 重放仍在进行中 | 允许 K8s 在写路径降级时仍放读流量进来 |
+| Liveness | `GET /api/v1/healthz` | WAL 重放完成（仅 Ingester 相关；其他角色绕过）**且**对象存储未降级 | 重放进行中 **或** 对象存储连接丢失 | 进程存活与依赖健康 |
+| Readiness | `GET /api/v1/readyz` | `replay_done = true`（即使对象存储已降级） | 重放仍在进行中 | 允许 K8s 在写路径降级时仍放读流量进来 |
 
 <Steps>
   <Step title="启动时对象存储探测（阻塞）">
@@ -273,7 +276,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     每 `[store.object].health_probe_interval_secs`（默认 30s）做一次同样的往返；**连续 3 次失败**才置 `object_store_degraded=true`，成功则计数归零。
   </Step>
   <Step title="Ingester WAL 重放">
-    Ingester 启动时扫描 `[wal].dir` 下的段文件，按 `(org, stream_type, stream)` 重放进内存缓冲，全部载入后强制 flush 一次，再置 `replay_done=true`。重放未完成前 `/readyz` 返回 503。
+    Ingester 启动时扫描 `[wal].dir` 下的段文件，按 `(org, stream_type, stream)` 重放进内存缓冲，全部载入后强制 flush 一次，再置 `replay_done=true`。重放未完成前 `/api/v1/readyz` 返回 503。
   </Step>
 </Steps>
 
@@ -318,17 +321,20 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
   <Tab title="Docker Compose">
     Compose 文件位于 `deploy/docker/docker-compose.yaml`，依赖 `postgres:5432`（带健康检查）与 `minio:9000`，配置从 `../../conf/config.toml` 挂载（只读）。镜像由 `deploy/docker/Dockerfile` 三阶段构建（前端 pnpm → Rust release → bookworm-slim 运行层带 chromium）。
 
-    **默认 standalone profile：**
+    **standalone profile：**
     ```bash
-    docker compose up
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
     # 单个 molesignal 容器，MS_NODE.ROLES=["standalone"]
     # 暴露 5080(HTTP) / 5082(gRPC)，挂 obs-wal:/data/wal
     ```
 
-    **multirole profile（六个角色分离容器）：**
+    当前服务没有发布对外 OTLP gRPC `4317`；如需从宿主机访问该 Receiver，请增加
+    `4317:4317` 映射。
+
+    **multirole profile（先移除旧 Connector 服务）：**
     ```bash
-    docker compose --profile multirole up
-    # router / ingester / querier / compactor / alert-manager / connector
+    docker compose -f deploy/docker/docker-compose.yaml --profile multirole up
+    # router / ingester / querier / compactor / alert-manager
     ```
     - `molesignal-router`：暴露 5080，入口。
     - `molesignal-ingester`：挂 `obs-wal:/data/wal` 持久 WAL；其余角色无状态。
@@ -349,12 +355,12 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     | `50-querier.yaml` | Deployment | 2 | `querier` | 无状态；5080 + 5082（扫描 RPC）；ClusterIP；就绪探针 5s |
     | `60-compactor.yaml` | Deployment | **1** | `compactor` | 无状态；单实例避免合并冲突（未来计划 lease 表加锁）；ClusterIP |
     | `70-alert-manager.yaml` | Deployment | 1 | `alert_manager` | 承载告警评估 + 定时报表（PNG/PDF 需 chromium，带注解 `molesignal.io/scheduled-reports-renderer: requires-chromium`）；ClusterIP |
-    | `90-connector.yaml` | Deployment | 1 | `connector` | 驱动拉 / 收推连接器；仅 5080/http（无 grpc）；ClusterIP |
     | `80-web.yaml` | Deployment | 2 | — | `molesignal-web:dev` nginx，`MS_BACKEND=router:5080`，8080→Service 80；含 Ingress（host `molesignal.local`） |
     | `95-ingress.yaml` | Ingress | — | — | `molesignal-router`，host `molesignal.local`，对 `/api/v1/query/stream` 关闭缓冲 |
 
     <Warning>
-    `connector` 出现在 Compose multirole profile 与 k8s 清单中，但它不在 `[node].roles` 的六个角色枚举里——这是部署层另行约定的职责进程，请按现有清单使用，不要将其与 `[node].roles` 枚举混淆。
+    `connector` 不是有效的 `[node].roles` 值。当前服务由 `alert_manager` 持有 Connector Runner。
+    复制旧清单时请移除独立 Connector 进程，不要使用 `["connector"]` 启动二进制。
     </Warning>
 
     <Warning>
@@ -380,7 +386,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
   </Card>
 </CardGroup>
 
-监控建议指标：写路径看 `wal_append_lock_wait_seconds`、`wal_append_inflight`、`wal_fsync_errors_total`、`file_meta_dump_*`；对象存储看 `object_store_operations_total`、`object_store_errors_total`、`object_store_op_duration_seconds`、`object_store_probe_*`；查询看缓存命中率 `cache_*`、`tantivy_pruned_files_total`；告警看 `alert_rule_eval_timeout_total`。配合 `/healthz`、`/readyz` 与 `cluster_nodes` 表观察成员存活。
+监控建议指标：写路径看 `wal_append_lock_wait_seconds`、`wal_append_inflight`、`wal_fsync_errors_total`、`file_meta_dump_*`；对象存储看 `object_store_operations_total`、`object_store_errors_total`、`object_store_op_duration_seconds`、`object_store_probe_*`；查询看缓存命中率 `cache_*`、`tantivy_pruned_files_total`；告警看 `alert_rule_eval_timeout_total`。配合 `/api/v1/healthz`、`/api/v1/readyz` 与 `cluster_nodes` 表观察成员存活。
 
 ## 最小生产清单 / 校验清单
 
@@ -401,7 +407,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     Router 前置 LB；按 org 设 `[router.rate_limit].ingest_qps` / `query_qps`；注意多副本下限流为近似值。Ingress 对 `/api/v1/query/stream` 关闭缓冲。
   </Step>
   <Step title="可观测与探针">
-    `/metrics` 接入 Prometheus；K8s 探针指向 `/api/v1/healthz`（liveness）与 `/readyz`（readiness）。确认对象存储启动探测能通过（否则进程不启动）。
+    `/metrics` 接入 Prometheus；K8s 探针指向 `/api/v1/healthz`（liveness）与 `/api/v1/readyz`（readiness）。确认对象存储启动探测能通过（否则进程不启动）。
   </Step>
   <Step title="安全与 license">
     需要固定 JWT 密钥时设 `MS_AUTH_JWT_SECRET_OVERRIDE`，否则由 DB 自动 bootstrap。注入 cipher key（生产勿用 dev 全零值）。联邦查询需 `federated_search` license 特性。TLS + 证书自动签发/续期编入所有构建（无 feature 门），由 `[http.tls].enabled` 运行期开关。
@@ -409,5 +415,5 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 </Steps>
 
 <Warning>
-落地前请明确以下"现状"边界：分布式共识 WAL term source 仍为静态占位（多节点共识未实现）；联邦查询与 SSO（仅 OIDC，SAML 未实现）等为 license/feature 门控；以及更改 `[node].roles` 需重启进程（无热重载）。
+落地前请明确当前边界：分布式共识 WAL Term Source 仍是静态值（多节点共识未实现）；联邦查询与 OIDC/SAML SSO 需要相应许可证功能；更改 `[node].roles` 需要重启进程。
 </Warning>

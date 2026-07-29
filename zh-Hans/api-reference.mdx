@@ -1,105 +1,106 @@
 ---
-title: "简介"
-description: "MoleSignal HTTP API 的工作方式 —— base URL、认证、请求/响应约定。"
+title: "API 入门"
+description: "基础 URL、身份验证、权限、请求约定、流式响应与错误处理。"
 ---
 
-MoleSignal 暴露单一带版本的 HTTP API（`v1`）。本页介绍适用于**每个**端点的通用约定。具体端点 ——
-含请求/响应 schema 与在线调试台 —— 列在左侧边栏。
+MoleSignal 提供带版本的 HTTP API。产品端点通常使用 `/api/v1`；探针、Prometheus 指标、公开共享链接和部分兼容协议也会使用顶层路径。
 
-## Base URL
+## 基础 URL
 
-所有端点都在 `/api/v1` 之下。沙箱里是：
+本地实例：
 
-```
+```text
 http://localhost:5080/api/v1
 ```
 
-生产环境替换为自有域名（例如 `https://molesignal.example.com/api/v1`）。
+生产环境请将主机替换为部署配置的外部可访问 URL。
 
-## 认证
+## Bearer 身份验证
 
-除特别说明外，每个端点都需要 **bearer token**：
+受保护端点接受登录 JWT 或 API Token：
 
 ```http
 Authorization: Bearer <token>
 ```
 
-token 可以是：
+API Token 格式为 `ms_<prefix>_<secret>`。身份验证会生成包含主体、当前组织或平台范围，以及实际生效权限的 IAM 上下文。
 
-- 从 `POST /api/v1/auth/login` 获取的 **JWT**，或
-- 形如 `ms_<prefix>_<secret>` 的 **API token**（见 [安全](/zh-Hans/security)）。
+## 公开与自验证路由
 
-<Note>
-  仅三个路由免认证：`/api/v1/healthz`、`/api/v1/auth/login`、`/metrics`。
-</Note>
+无法使用普通组织 Bearer Token 的路由会验证自己的窄范围凭据或策略。目前包括：
+
+- 登录、注册策略与密码重置；
+- 健康状态与 Prometheus 指标；
+- 公开资源共享交换与共享会话请求；
+- 签名文件下载与公开头像；
+- Stripe 与推送型 Connector Webhook。
+
+不要把公开路由理解为无限制访问。其 Handler 会验证注册策略、共享 Token、下载 Token、签名或 Connector 凭据。
+
+## 授权
+
+受保护端点可以同时要求：
+
+- `streams.query` 等组织权限；
+- `sys.licenses.read` 等平台权限；
+- `intelligence` 等功能授权；
+- 所有权、资源关系或跨组织授权；
+- 活动组织或有效计费状态。
+
+使用 `GET /api/v1/iam/capabilities` 检查当前主体的实际生效快照。不要根据角色名称或隐藏导航项推断访问权。
 
 ## 请求
 
-- 请求体为 **JSON**（`Content-Type: application/json`），但模拟其他协议的接入端点除外
-  （Elasticsearch `_bulk`、Loki、Prometheus remote_write 使用各自的原生格式）。
-- **时间戳为微秒** —— Unix 纪元起算，接入记录（`_timestamp`）与查询时间范围
-  （`time_range.start` / `time_range.end`）都是。
-- 租户隔离：每个请求都限定在所属 `org_id` 下。服务端会把 `org_id` 谓词改写进每个查询计划，
-  数据不会跨组织。
+- 大多数请求体使用 JSON 与 `Content-Type: application/json`。
+- 兼容采集端点使用各自原生负载，包括 Protobuf、NDJSON 或压缩请求体。
+- 以 `_micros` 结尾的字段使用 Unix 微秒时间。
+- 原生遥测记录使用 `_timestamp`；转换 SDK 时间时请遵循具体端点结构。
+- 将路径 ID 或数据流名称插入 URL 时必须进行 URL 编码。
+- 组织范围来自已通过身份验证的 IAM 上下文，而不是模型或浏览器提供的组织 ID。
 
-## 成功响应
+## 查询与长时间响应
 
-`2xx` 响应返回 JSON，具体结构因端点而异（各端点页单独说明）。例如查询端点返回：
+查询家族支持普通 JSON、NDJSON 流式响应、运行中查询控制与异步搜索任务。流式调用方应处理网络分段交付与客户端取消。
 
-```json
-{
-  "rows": [{ "level": "error", "count": 12 }],
-  "columns": ["level", "count"],
-  "scanned_rows": 10432,
-  "took_ms": 18,
-  "cache_hit": false
-}
-```
+大型 Intelligence 证据、生成报告、性能剖析文件与导出内容可以保存为文件，并通过限定范围 Token 下载，而不是嵌入 JSON。
 
-部分端点在发送 `Accept: application/x-ndjson` 时以 **NDJSON** 流式返回；流式会绕过
-`query_result` 缓存。
+## 错误
 
-## 错误响应
+API 错误使用 HTTP 状态码与 JSON 错误消息。常见状态包括：
 
-错误返回统一的 JSON 信封，只含一个 `error` 字段：
-
-```json
-{
-  "error": "invalid argument: time_range.start must be < end"
-}
-```
-
-### 状态码
-
-| 码 | 含义 |
+| 状态 | 含义 |
 |---|---|
-| `200` | 成功 |
-| `400` | 参数非法 |
-| `401` | 未授权 —— token 缺失或无效 |
-| `403` | 禁止 —— 角色或 license 不足 |
-| `404` | 未找到，或跨组织查找 |
-| `409` | 冲突 —— 唯一约束或状态冲突 |
-| `413` | 配额耗尽（存储上限） |
-| `429` | 限流（接入/查询 QPS 配额） |
+| `400` | 请求无效或参数不受支持。 |
+| `401` | 凭据缺失、无效、过期或未通过路由专用验证。 |
+| `402` | 组织服务因计费或试用策略暂停。 |
+| `403` | 缺少权限、资源关系、作用域或许可证功能。 |
+| `404` | 资源不存在，或在已授权范围中不可见。 |
+| `409` | 状态或唯一性冲突。 |
+| `413` | 负载或存储超过限制。 |
+| `429` | 超过限流。 |
+| `500` | 内部失败；使用请求 ID 与 Trace ID 进行关联。 |
 
-## 限流与配额
+响应可以包含 `X-Request-Id` 与 `X-Trace-Id`。报告服务端失败时请附上这些值。
 
-每个组织都有租户级配额：接入 QPS、查询 QPS、存储。超限返回 `429`（限流）或 `413`（存储），
-并附审计记录与告警。见 [安全](/zh-Hans/security)。
-
-## 端点
-
-端点在侧边栏中分组：
+## 浏览 API
 
 <CardGroup cols={2}>
-  <Card title="认证" icon="key" href="/zh-Hans/api/auth/login" />
-  <Card title="数据接入" icon="inbox" href="/zh-Hans/api/ingest/native-json" />
-  <Card title="查询" icon="magnifying-glass" href="/zh-Hans/api/query/execute" />
-  <Card title="流" icon="layer-group" href="/zh-Hans/api/streams/list" />
-  <Card title="告警" icon="bell" href="/zh-Hans/api/alerting/list-rules" />
-  <Card title="关联与 Web" icon="link" href="/zh-Hans/api/web/correlation" />
-  <Card title="管理" icon="gear" href="/zh-Hans/api/admin/audit" />
+  <Card title="当前 API 目录" icon="list" href="/zh-Hans/api/catalog">
+    将路由家族映射到产品能力与授权。
+  </Card>
+  <Card title="身份验证示例" icon="key" href="/zh-Hans/api/auth/login">
+    登录并管理 API Token。
+  </Card>
+  <Card title="采集示例" icon="inbox" href="/zh-Hans/api/ingest/native-json">
+    发送原生 JSON 与协议兼容遥测。
+  </Card>
+  <Card title="查询示例" icon="magnifying-glass" href="/zh-Hans/api/query/execute">
+    运行 SQL、兼容 PromQL、流式与保存查询。
+  </Card>
+  <Card title="告警示例" icon="bell" href="/zh-Hans/api/alerting/list-rules">
+    管理规则、事件、渠道与升级。
+  </Card>
+  <Card title="Enterprise 能力" icon="key" href="/zh-Hans/api/admin/paid-edition">
+    了解功能授权与受保护的系统许可证 API。
+  </Card>
 </CardGroup>
-
-部分端点（SSO、clusters、connectors、copilot、RUM）位于付费/特性构建之后 —— 见
-[付费版端点](/zh-Hans/api/admin/paid-edition)。
