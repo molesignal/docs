@@ -1,65 +1,71 @@
 ---
-title: "Webhook 告警通道"
-description: "配置 Lark、钉钉、企业微信等常见机器人 Webhook，并由后端负责签名。"
+title: "Webhook 通知连接器"
+description: "配置 Slack、飞书和通用 Webhook 投递，包括目标覆盖、签名与凭证加密。"
 ---
 
-MoleSignal 的 Webhook 告警通道支持通用 HTTP 端点，也支持常见聊天机器人 Webhook。
-后端负责生成对端平台需要的请求体、解析密钥引用，并在发送前执行对应签名算法。
+MoleSignal 当前提供三种 Webhook 连接器：Slack Webhook、飞书 Webhook 和通用 JSON Webhook。
+在**设置 → 通知管理 → 企业连接器**中创建。
 
-## 通道模型
+如果还需要绑定用户、创建策略、配置兜底路由或查看投递历史，请先阅读
+[通知渠道与投递](/zh-Hans/notification-channels)。
+
+## Webhook 类型对比
+
+| 连接器 | 请求格式 | 身份验证 | 目标类型 |
+|---|---|---|---|
+| `slack_webhook` | `{ "text": "..." }` | 凭证包含在 Webhook URL 中 | `fixed_group`、`webhook` |
+| `lark_webhook` | 飞书 `msg_type: text` | URL 凭证和可选签名 | `fixed_group`、`webhook` |
+| `webhook` | MoleSignal 目标与消息 Envelope | 自定义 JSON Header | 所有目标类型 |
+
+`fixed_group` 使用连接器中配置的 URL。`webhook` 要求目标值为绝对 URL，并用目标值覆盖本次投递的已配置
+URL。
+
+## Slack Webhook
+
+配置 Incoming Webhook 地址和 1 到 60 秒的超时：
 
 ```json
 {
-  "name": "ops robot",
-  "enabled": true,
-  "kind": {
-    "type": "webhook",
-    "provider": "lark",
-    "url": "https://open.larksuite.com/open-apis/bot/v2/hook/xxxxxxxx",
-    "security": {
-      "type": "lark_signature",
-      "secret_ref": "env:LARK_BOT_SECRET"
-    },
-    "headers": []
+  "webhook_url": "https://hooks.slack.com/services/T000/B000/secret",
+  "timeout_secs": 10
+}
+```
+
+MoleSignal 会拼接消息标题与 Markdown 正文，并发送：
+
+```json
+{
+  "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
+}
+```
+
+2xx HTTP 响应表示成功；其他响应或超时都会将投递标记为失败。
+
+## 飞书 Webhook
+
+配置飞书自定义机器人地址。只有机器人启用签名校验时才需要填写签名密钥：
+
+```json
+{
+  "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
+  "secret": "replace-with-signing-secret",
+  "timeout_secs": 10
+}
+```
+
+不填写签名密钥时，MoleSignal 发送：
+
+```json
+{
+  "msg_type": "text",
+  "content": {
+    "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
   }
 }
 ```
 
-## 对端类型
-
-| Provider | 对端 | 请求体 | 加密 / 签名 |
-| --- | --- | --- | --- |
-| `custom` | 任意 HTTP 端点 | 原始 incident JSON | `none` |
-| `lark` | Lark / 飞书自定义机器人 | `msg_type: text` | `none` 或 `lark_signature` |
-| `feishu` | 旧飞书配置兼容别名 | `msg_type: text` | `none` 或 `feishu_signature` |
-| `wecom` | 企业微信群机器人 | `msgtype: markdown` | `none` |
-| `dingtalk` | 钉钉自定义机器人 | `msgtype: text` | `none` 或 `dingtalk_signature` |
-
-## 加密类型
-
-```json
-{ "type": "none" }
-{ "type": "lark_signature", "secret_ref": "env:LARK_BOT_SECRET" }
-{ "type": "feishu_signature", "secret_ref": "env:FEISHU_BOT_SECRET" }
-{ "type": "dingtalk_signature", "secret_ref": "cipher_keys:dingtalk-bot-secret" }
-```
-
-密钥不要明文写进通道配置，统一使用 `secret_ref`：
-
-| 前缀 | 解析方式 |
-| --- | --- |
-| `env:` | 后端环境变量 |
-| `cipher_keys:` | 集群密钥仓库 |
-
-## Lark / 飞书签名
-
-Lark / 飞书自定义机器人签名使用秒级 Unix 时间戳。MoleSignal 拼接：
-
-```text
-timestamp + "\n" + secret
-```
-
-随后用该字符串作为 HMAC-SHA256 的 key，对空消息计算签名，Base64 编码后写入请求体：
+填写签名密钥后，MoleSignal 生成秒级 Unix 时间戳，拼接 `timestamp + "\n" + secret`，使用该值作为
+HMAC-SHA256 Key 对空消息计算签名，再对结果做 Base64 编码。请求中会增加：
 
 ```json
 {
@@ -67,74 +73,105 @@ timestamp + "\n" + secret
   "sign": "base64-signature",
   "msg_type": "text",
   "content": {
-    "text": "[Critical] checkout error rate high"
+    "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
   }
 }
 ```
 
-## 企业微信群机器人
-
-企业微信群机器人常见 Webhook 通过 URL 内的 `key` 鉴权：
-
-```text
-https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx
-```
-
-MoleSignal 会发送 markdown 请求体：
-
-```json
-{
-  "msgtype": "markdown",
-  "markdown": {
-    "content": "**[Critical] checkout error rate high**\n> status: Open"
-  }
-}
-```
-
-因为 URL 内包含机器人凭证，完整 URL 也应按密钥处理。
-
-## 钉钉签名
-
-钉钉自定义机器人签名使用毫秒级 Unix 时间戳。MoleSignal 拼接：
-
-```text
-timestamp + "\n" + secret
-```
-
-然后用 secret 作为 HMAC-SHA256 的 key 计算签名，Base64 编码后追加到 URL 查询参数：
-
-```text
-https://oapi.dingtalk.com/robot/send?access_token=xxx&timestamp=1599360473000&sign=...
-```
-
-请求体仍是文本消息：
-
-```json
-{
-  "msgtype": "text",
-  "text": {
-    "content": "[Critical] checkout error rate high"
-  }
-}
-```
-
-## Headers
-
-Headers 是可选的 key/value 行。Header value 可以是明文，也可以是密钥引用：
-
-```json
-{
-  "key": "Authorization",
-  "value": {
-    "type": "secret_ref",
-    "secret_ref": "env:ALERT_WEBHOOK_TOKEN"
-  }
-}
-```
-
-仅在对端确实需要时配置自定义 Header。Lark、企业微信、钉钉机器人通常依赖 Webhook URL
-和平台签名密钥。
+飞书投递不仅要求 HTTP 状态成功，还要求响应中的 `code` 或 `status_code` 为零。
 
 <Note>
-  保持服务器时间同步。Lark / 飞书与钉钉都会拒绝过期时间戳。
+  保持 MoleSignal 服务器时间同步。飞书会拒绝过期的签名请求。
 </Note>
+
+## 通用 Webhook
+
+配置默认地址、方法、Header 和超时：
+
+```json
+{
+  "url": "https://notify.example.com/molesignal",
+  "method": "post",
+  "headers": {
+    "Authorization": "Bearer <token>",
+    "X-Environment": "production"
+  },
+  "timeout_secs": 10
+}
+```
+
+方法可以是 `post`、`put` 或 `patch`。Header 名称和值必须符合 HTTP 语法。MoleSignal 发送以下
+Envelope：
+
+```json
+{
+  "target": {
+    "type": "fixed_group",
+    "value": "platform-oncall",
+    "metadata": {}
+  },
+  "message": {
+    "title": "Checkout error rate is high",
+    "text": "The error rate exceeded 5%.",
+    "markdown": "**Checkout** error rate exceeded 5%.",
+    "html": null,
+    "metadata": {}
+  }
+}
+```
+
+任意 2xx 响应都表示成功。响应包含 `X-Request-ID` 时，MoleSignal 会把 Header 值记录为服务商消息 ID。
+
+## 通过 API 创建和测试
+
+创建通用 Webhook 连接器：
+
+```bash
+curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors" \
+  -H "Authorization: Bearer $MS_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "platform webhook",
+    "connector_type": "webhook",
+    "enabled": true,
+    "config": {
+      "url": "https://notify.example.com/molesignal",
+      "method": "post",
+      "headers": {"Authorization": "Bearer <token>"},
+      "timeout_secs": 10
+    }
+  }'
+```
+
+保存返回的连接器 `id`，再发送测试：
+
+```bash
+curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors/$CONNECTOR_ID/test" \
+  -H "Authorization: Bearer $MS_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target_type": "fixed_group",
+    "target": "platform-oncall",
+    "message": {
+      "title": "MoleSignal connector test",
+      "text": "Webhook delivery is working."
+    }
+  }'
+```
+
+列出、读取、创建和更新连接器时，API 都会把敏感配置返回为 `***`。更新已有连接器时，原样提交
+`***` 即可保留已保存的密钥。
+
+## 安全与限制
+
+- MoleSignal 会加密保存完整连接器配置；
+- API 响应会掩码 `url`、`webhook_url`、`headers`、`secret`、Token 和密码；
+- 即使没有单独配置密钥，也要把 Webhook URL 当作凭证；
+- 优先使用 `https`，只在可信网络内使用 `http`；
+- 将 MoleSignal 的出向访问限制到连接器确实需要的目标；
+- 已停用的连接器不能发送测试或通知。
+
+<Warning>
+  当前连接器注册表没有原生钉钉或企业微信 Adapter。只有对端能接收 MoleSignal Envelope 时，才能直接
+  使用通用 Webhook；否则请在服务商端点前增加转换 Relay。
+</Warning>

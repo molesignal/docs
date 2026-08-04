@@ -3,7 +3,7 @@ title: "分布式与分角色部署"
 description: "节点角色矩阵、后台 worker 归属、数据流、集群发现，以及单机 / Docker Compose / Kubernetes 三种部署拓扑。"
 ---
 
-MoleSignal 是一个**单一二进制（single binary）**：同一份可执行文件（同一个镜像）服务所有角色，可自行选择某个进程运行哪些角色。这让它既能当作一条命令启动的沙箱，也能横向扩展成多角色集群。
+MoleSignal 是一个**单一二进制（single binary）**：同一份可执行文件和镜像服务所有角色，进程配置决定运行角色。同一个二进制既能作为一条命令启动的沙箱，也能横向扩展成多角色集群。
 
 本篇面向运维 / SRE，系统说明角色划分、后台 worker 归属、数据流、集群发现、外部依赖与端口，以及单机 / Docker Compose / Kubernetes 三种部署拓扑。
 
@@ -20,7 +20,7 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
     元数据落 Postgres，数据落对象存储。除 Ingester 的 WAL/缓冲外，大多数角色是无状态的，可水平扩。
   </Card>
   <Card title="发现走 Postgres" icon="network-wired">
-    没有独立的 gossip / 共识组件。节点通过心跳把自己写进 `cluster_nodes` 表，其他节点直接查表发现存活对等节点。
+    没有独立的 gossip 或共识组件。每个节点通过心跳写入 `cluster_nodes` 表，其他节点直接查表发现存活对等节点。
   </Card>
 </CardGroup>
 
@@ -48,7 +48,7 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
 `[node].roles` 是一个数组（`Vec<Role>`），合法取值：`standalone`、`router`、`ingester`、`querier`、`compactor`、`alert_manager`。默认 `["standalone"]`。
 
 <Note>
-**多角色可在一个进程内组合。** 形如 `[node].roles = ["ingester", "querier"]` 会启动各角色所需的去重后前台 server（此例为同时承载 ingest + 扫描的 gRPC server），按角色 gate 对应后台循环，并把节点的**全部**角色登记进 `cluster_nodes`——于是对等节点能按它承担的每个角色发现它。`standalone` 是"全部角色合一进程"的简写。
+**多角色可在一个进程内组合。** 形如 `[node].roles = ["ingester", "querier"]` 会启动各角色所需的去重后前台 server（此例为同时承载 ingest + 扫描的 gRPC server），按角色 gate 对应后台循环，并把节点的**全部**角色登记进 `cluster_nodes`。对等节点可以按任一已登记角色完成发现。`standalone` 是“全部角色合一进程”的简写。
 </Note>
 
 | 角色 | 前台暴露 | 有/无状态 | 扩缩特性 |
@@ -61,12 +61,12 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
 | `alert_manager` | 运行评估 + 派发 tick 循环（仅当配置了该角色才 spawn） | 有状态（评估状态、事件状态在进程内） | 建议单实例 |
 
 <Note>
-独立 `querier`（或任何含 `querier` / `ingester` 的角色集）会启动 gRPC server，其中承载 Arrow Flight 扫描服务。协调端经 `list_role(querier)` 发现各 querier 并向其散播分片。单进程 `standalone` 仍如常工作；分布式散播需 ≥2 个 querier 对等节点。
+独立 `querier`（或任何含 `querier` / `ingester` 的角色集）会启动承载 Arrow Flight 扫描服务的 gRPC server。协调端经 `list_role(querier)` 发现各 querier 并向对等节点散播分片。单进程 `standalone` 仍如常工作；分布式散播需 ≥2 个 querier 对等节点。
 </Note>
 
 ### 后台 worker 由哪个角色承载
 
-角色相关的循环（ingester flush、compaction + file_meta_dumper、告警评估/派发）**只有在配置了其归属角色时才 spawn**（`standalone` 视为全部角色）。少数常驻 worker（心跳、sweeper、对象存储探针、MMDB 刷新、search_jobs、scheduled_reports）在每个节点都运行。下表给出归属角色与周期。
+角色相关的循环（ingester flush、compaction + file_meta_dumper、告警评估/派发）**只有在配置归属角色时才 spawn**（`standalone` 视为全部角色）。少数常驻 worker（心跳、sweeper、对象存储探针、MMDB 刷新、search_jobs、scheduled_reports）在每个节点都运行。下表给出归属角色与周期。
 
 | 后台 worker | 建议承载角色 | 周期 | 配置键 | 现状 |
 | --- | --- | --- | --- | --- |
@@ -77,7 +77,7 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
 | 告警派发（dispatcher） | `alert_manager` | `dispatch_interval_secs`，默认 10s | `[alert_manager].dispatch_interval_secs` | 已接线 |
 | 压实（compaction） | `compactor` | `interval_secs`，默认 300s（5min） | `[compactor].interval_secs` | 已接线 |
 | file_meta_dumper（冷分区落盘） | `compactor`（与 compaction 同进程） | `interval_secs`，默认 3600s（1h） | `[storage.file_meta_dump].interval_secs`，`enabled=false` 可关闭 | 已接线 |
-| scheduled_reports（定时报表） | `alert_manager`（需渲染依赖见下） | 固定 60s tick；report 自身 cron 决定是否到期 | report 的 `cron`（tick 间隔不可配） | 已接线 |
+| scheduled_reports（定时报表） | `alert_manager`（需渲染依赖见下） | 固定 60s tick；report cron 决定是否到期 | report 的 `cron`（tick 间隔不可配） | 已接线 |
 | search_jobs（异步搜索池） | 承载 `AppState` 的角色（通常 `standalone` / 暴露查询的节点） | 空闲轮询 `idle_poll_secs`，默认 2s；清理 `cleanup_interval_secs`，默认 3600s | `[search_jobs].workers`（默认 2）等 | 已接线 |
 | ACME 签发 / 续期 | 承担 TLS 终结的 HTTP server（`router` / `standalone`） | 签发 `issue_poll_secs`（默认 60s）；续期 `renewal_retry_secs`（默认 21600s/6h） | `[http.tls].issue_poll_secs` / `renewal_retry_secs` | 已接线（`[http.tls].enabled = true` 时生效） |
 
@@ -87,7 +87,7 @@ ACME 签发 / 续期已实现：签发循环扫 `pending` 域名、续期循环�
 
 ## 如何选择角色
 
-角色通过 `[node].roles` 配置；可用环境变量覆盖。环境变量统一前缀 `MS_`，**section 与 field 之间用 `.`（点）分隔**（去掉 `MS_` 前缀后，其余按 `.` 切分）。例如 `MS_NODE.ROLES`、`MS_STORE.META.DSN`、`MS_HTTP.PORT`。
+角色通过 `[node].roles` 配置；可用环境变量覆盖。环境变量统一前缀 `MS_`，**section 与 field 之间用 `.`（点）分隔**（去掉 `MS_` 前缀后，剩余部分按 `.` 切分）。例如 `MS_NODE.ROLES`、`MS_STORE.META.DSN`、`MS_HTTP.PORT`。
 
 <Tabs>
   <Tab title="TOML">
@@ -140,7 +140,7 @@ ACME 签发 / 续期已实现：签发循环扫 `pending` 域名、续期循环�
 </Tabs>
 
 <Info>
-少数 bootstrap / 密钥类变量是**扁平单下划线**且不进 `Settings`，直接从环境读取：`MS_CIPHER_KEY`、`MS_AUTH_JWT_SECRET_OVERRIDE`、`MS_LICENSE_FILE`、`MS_SELF_TELEMETRY_CLUSTER_TOKEN`，以及仅开发回退使用的 `MS_INTELLIGENCE_<PROVIDER>_*`。其余结构化字段一律走 `MS_<SECTION>.<FIELD>` 点分形式，例如 `MS_NODE.ROLES`、`MS_STORE.META.DSN` 与 `MS_CLUSTER.ADVERTISE_ADDR`。
+少数 bootstrap / 密钥类变量是**扁平单下划线**且不进 `Settings`，直接从环境读取：`MS_CIPHER_KEY`、`MS_AUTH_JWT_SECRET_OVERRIDE`、`MS_LICENSE_FILE`、`MS_SELF_TELEMETRY_CLUSTER_TOKEN`，以及仅开发回退使用的 `MS_INTELLIGENCE_<PROVIDER>_*`。剩余结构化字段一律走 `MS_<SECTION>.<FIELD>` 点分形式，例如 `MS_NODE.ROLES`、`MS_STORE.META.DSN` 与 `MS_CLUSTER.ADVERTISE_ADDR`。
 </Info>
 
 ## 数据流
@@ -203,7 +203,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 
 <Steps>
   <Step title="节点注册">
-    心跳任务周期性 upsert `(node_id, roles, advertise_addr, last_heartbeat_at_micros)` 到 Postgres `cluster_nodes` 表（主键 `node_id`，`ON CONFLICT DO UPDATE`）。节点的完整角色集以逗号拼接存一行，故多角色节点是一行、可按它承担的每个角色被发现。首次心跳立即发出，之后按间隔。
+    心跳任务周期性 upsert `(node_id, roles, advertise_addr, last_heartbeat_at_micros)` 到 Postgres `cluster_nodes` 表（主键 `node_id`，`ON CONFLICT DO UPDATE`）。节点的完整角色集以逗号拼接存一行，因此多角色节点只占一行，并可按任一已登记角色被发现。首次心跳立即发出，之后按间隔执行。
   </Step>
   <Step title="心跳间隔">
     `[cluster].heartbeat_interval_secs`，默认 5s。`advertise_addr` 默认 `127.0.0.1:5082`，即对等节点用来互联的 gRPC 地址（host:port）。
@@ -212,7 +212,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     存活窗口由 `[cluster].peer_timeout_secs` 控制，默认 15s：注册表只返回 `last_heartbeat_at >= now - peer_timeout` 的节点。另有 sweeper 每 60s 删除超过 5 分钟未心跳的 `cluster_nodes` 行。
   </Step>
   <Step title="发现对等节点">
-    没有 gossip / 共识；分布式模式下各角色直接查 `cluster_nodes` 表，按**角色成员**筛选存活对等节点（节点的角色集包含所求角色即命中）。`standalone` 模式跳过整套发现，只返回自身。
+    没有 gossip / 共识；分布式模式下各角色直接查 `cluster_nodes` 表，按**角色成员**筛选存活对等节点（节点的角色集包含所求角色即命中）。`standalone` 模式跳过整套发现，只返回本地节点。
   </Step>
   <Step title="选址算法">
     Router 选 Ingester：对 `org_id|stream_name` 做一致性哈希后取模，确定性落到某个 Ingester。Router 选 Querier：朴素轮询（`now_ns % peer_count`），不是完整一致性哈希。分布式查询分片：对 `object_key` 取哈希取模散到 querier 对等节点。
@@ -258,7 +258,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 | 443 | TLS 模式下的 HTTPS（SNI） | `[http.tls].port` | 完整路由；由 `[http.tls].enabled` 运行期开启（编入所有构建，无 feature 门） |
 
 <Note>
-**`/metrics`**（GET，Prometheus 文本 0.0.4）始终装配。请在反向代理或网络边界限制访问。它会暴露固定基数的缓存、对象存储、WAL、查询、告警与自身可观测性指标。
+**`/metrics`**（GET，Prometheus 文本 0.0.4）始终装配。请在反向代理或网络边界限制访问。该端点会暴露固定基数的缓存、对象存储、WAL、查询、告警与平台可观测性指标。
 </Note>
 
 ### 健康 / 就绪探针语义
@@ -337,8 +337,8 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     # router / ingester / querier / compactor / alert-manager
     ```
     - `molesignal-router`：暴露 5080，入口。
-    - `molesignal-ingester`：挂 `obs-wal:/data/wal` 持久 WAL；其余角色无状态。
-    - 其余角色容器各自承担对应职责。
+    - `molesignal-ingester`：挂 `obs-wal:/data/wal` 持久 WAL；其他角色无状态。
+    - 剩余角色容器分别承担对应职责。
 
     <Info>另有 `deploy/docker/Dockerfile.web` 与 `nginx.conf`：Web 容器反代到 `MS_BACKEND`，对 `/api/v1/query/stream` 关闭 `proxy_buffering`、放宽 600s 读写超时以支持实时 tail；`/assets/*`（Vite hash 命名）设 1 年 immutable，`index.html` 设 `no-store`。</Info>
   </Tab>
@@ -364,7 +364,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     </Warning>
 
     <Warning>
-    `80-web.yaml` 与 `95-ingress.yaml` 都为 host `molesignal.local` 定义了 Ingress（一个指向 web 容器、一个直指 router）。它们可能是两套替代拓扑（经 web 层 vs 直连 router），同时部署会冲突，请二选一。`95-ingress.yaml` 的 router backend 引用了 port 80，而 `30-router.yaml` 的 Service 只显式定义了 5080/5082，落地前需对齐 Service 端口或 Ingress backend。
+    `80-web.yaml` 与 `95-ingress.yaml` 都为 host `molesignal.local` 定义了 Ingress（一个指向 web 容器、一个直指 router）。两个清单表示经 web 层和直连 router 两种替代拓扑，同时部署会冲突，请二选一。`95-ingress.yaml` 的 router backend 引用了 port 80，而 `30-router.yaml` 的 Service 只显式定义了 5080/5082，落地前需对齐 Service 端口或 Ingress backend。
     </Warning>
   </Tab>
 </Tabs>

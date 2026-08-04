@@ -1,0 +1,213 @@
+---
+title: "Application performance monitoring"
+sidebarTitle: "APM"
+description: "Analyze backend services, transactions, dependencies, errors, and deployments from OpenTelemetry traces."
+---
+
+MoleSignal APM turns backend OpenTelemetry trace spans into bounded RED aggregates for finding slow
+services, failing entry points, expensive dependencies, recurring backend errors, and regressions
+between deployed versions without separate metric instrumentation.
+
+<Note>
+  APM does not require another SDK or telemetry stream. Send well-instrumented traces, and
+  MoleSignal derives APM data after trace deduplication and before tail sampling. A trace that is
+  later sampled out can still contribute to APM metrics.
+</Note>
+
+## Available analysis
+
+| Page | Purpose |
+|---|---|
+| **Overview** | Review request volume, error rate, latency trends, service health, high-impact transactions, dependencies, errors, and recent versions. |
+| **Services** | Browse the service catalog and inspect RED metrics, runtime metadata, versions, and recent instances. |
+| **Transactions** | Rank HTTP, RPC, messaging, and other entry points by traffic, errors, p95 latency, or total time. |
+| **Dependencies** | Find slow or failing service, database, cache, messaging, HTTP, and RPC calls. |
+| **Errors** | Group sanitized backend exceptions and failures by stable fingerprint, then inspect impact and bounded samples. |
+| **Deployments** | Compare a baseline version with a candidate version and identify regressed transactions or errors. |
+
+## Prerequisites
+
+- OpenTelemetry traces sent to a MoleSignal [trace ingest endpoint](/en-US/ingestion);
+- `streams.query` in an organization workspace; or
+- `sys.telemetry.read` for protected `_sys` telemetry.
+
+## Instrument services for APM
+
+<Steps>
+  <Step title="Set stable service resource attributes">
+    Set `service.name` on every service. Add namespace, environment, version, and instance
+    attributes for service filtering or deployment comparison.
+
+    ```bash
+    export OTEL_SERVICE_NAME=checkout
+    export OTEL_RESOURCE_ATTRIBUTES="service.namespace=shop,deployment.environment.name=production,service.version=2.4.0,service.instance.id=checkout-01"
+    ```
+
+    The exact setup depends on the selected OpenTelemetry SDK or Collector.
+  </Step>
+  <Step title="Use the correct span kinds">
+    Create `SERVER` spans for inbound requests and `CONSUMER` spans for consumed messages. Create
+    `CLIENT` or `PRODUCER` spans for downstream calls. MoleSignal uses these span kinds to separate
+    transactions from dependencies.
+  </Step>
+  <Step title="Record status and exceptions">
+    Set OpenTelemetry span status, HTTP or RPC status attributes, and exception events. MoleSignal
+    uses the recorded status data to classify successful and failed work and build backend error groups.
+  </Step>
+  <Step title="Send traces and open APM">
+    Send OTLP traces, then open **APM → Overview**. Keep the global time range over recent traffic
+    while the projector flushes the first buckets.
+  </Step>
+</Steps>
+
+### Recommended resource attributes
+
+| Attribute | Purpose | Fallback |
+|---|---|---|
+| `service.name` | Stable service identity. Set explicitly in every service. | `unknown_service` |
+| `service.namespace` | Separates services with the same name across systems or teams. | `default` |
+| `deployment.environment.name` | Filters production, staging, and other environments. | Legacy `deployment.environment`, then `unknown` |
+| `service.version` | Enables version history and deployment comparison. | No version breakdown |
+| `service.instance.id` | Counts recently observed instances. | No instance identity |
+| `telemetry.sdk.language` | Shows runtime language in the service catalog. | `process.runtime.name` when present |
+
+Use low-cardinality values. Do not put request IDs, raw URLs, user IDs, or other unbounded values in
+service, environment, version, route, operation, or dependency attributes.
+
+## How MoleSignal derives APM data
+
+### Services and transactions
+
+`SERVER` and `CONSUMER` spans contribute service and transaction RED metrics. A parentless span
+without a kind can contribute to service totals as a compatibility fallback, but explicit span
+kinds produce more complete pages.
+
+MoleSignal builds bounded transaction names from semantic attributes:
+
+- HTTP method plus `http.route`, such as `POST /checkout`;
+- RPC service plus method;
+- messaging operation plus destination;
+- a safe, low-cardinality span name when no stronger semantic identity exists.
+
+Prefer route templates such as `/orders/{id}` over raw paths such as `/orders/83921`.
+
+### Dependencies
+
+`CLIENT` and `PRODUCER` spans contribute dependency RED metrics. MoleSignal classifies targets as a
+service, database, cache, messaging system, external HTTP endpoint, external RPC endpoint, or other
+dependency. Standard `peer.service`, `db.*`, `messaging.*`, `rpc.*`, `server.*`, and HTTP semantic
+attributes improve dependency identity.
+
+### Errors
+
+MoleSignal classifies a span as an error when an exception is present, OpenTelemetry status is
+`ERROR`, HTTP status is 500 or higher, or RPC status is non-zero. Error groups use
+a stable fingerprint based on error type, the first application stack frame, and transaction name.
+The changing error message is not part of the fingerprint.
+
+## Understand RED metrics
+
+| Metric | Meaning |
+|---|---|
+| **Requests** | Number of matching service, transaction, or dependency observations. |
+| **Error rate** | Error count divided by request count. |
+| **Latency** | Merged p50, p95, and p99 latency from fixed-boundary histograms. |
+| **Total time** | Sum of observed duration, highlighting work with the greatest aggregate impact. |
+
+Trace exemplars connect aggregate points to individual requests. An exemplar can show
+`trace_available: false` when that trace did not survive tail sampling even though the associated span still
+contributed to the aggregate.
+
+## Investigate a performance problem
+
+<Steps>
+  <Step title="Find the impact">
+    Open **Overview** and compare request volume, error rate, p95 latency, and the data-quality
+    notice for the selected time range.
+  </Step>
+  <Step title="Select a service">
+    Open **Services**, then choose the affected namespace, service, environment, and version. The
+    service workbench combines trends, transactions, dependencies, errors, and versions.
+  </Step>
+  <Step title="Narrow the cause">
+    Use **Transactions** for slow entry points, **Dependencies** for downstream time, and **Errors**
+    for recurring failures. Sort by total time when latency and traffic are both important.
+  </Step>
+  <Step title="Open evidence">
+    Follow an available trace exemplar, or pivot to filtered traces, logs, metrics, or profiles.
+    MoleSignal preserves the service filters and time range in supported pivots.
+  </Step>
+  <Step title="Check the deployment">
+    Open **Deployments**, select the service, baseline version, and candidate version, then review
+    RED deltas and regressed transactions. Treat an insufficient-data result as inconclusive.
+  </Step>
+</Steps>
+
+## Filters, resolution, and retention
+
+APM pages share the global time range and support namespace, service, environment, and version
+filters. List pages also support local search, sorting, and cursor pagination. Filters are encoded
+in the URL for sharing or revisiting the view.
+
+With default deployment settings:
+
+- an omitted API range uses the last 24 hours;
+- `auto` resolution uses minute buckets for ranges up to 24 hours and hourly buckets for longer
+  ranges;
+- minute aggregates are retained for 24 hours;
+- hourly aggregates and the maximum query range cover 30 days.
+
+Administrators can change these deployment limits. A version comparison is marked sufficient only
+after both sides reach the configured request threshold, which defaults to 1,000 requests each.
+
+## Read data-quality notices
+
+Every APM response includes data-quality metadata. The UI surfaces the same conditions.
+
+| Notice | Meaning |
+|---|---|
+| **Activation boundary** | APM projection began inside the selected range, so earlier traffic is not represented. |
+| **Partial data** | A queue, repository, flush, late-data, cardinality, or shutdown gap affected part of the range. Do not interpret missing data as zero. |
+| **Delayed data** | `last_complete_bucket_at` is behind the selected range. Recent aggregates may still be closing or rolling up. |
+| **Overflow dimensions** | A bounded identity limit was reached. Some dimensions were grouped into an overflow identity or detail was suppressed. |
+
+Reduce the time range and filters first. If partial or delayed states persist, inspect the APM
+health endpoint and platform telemetry.
+
+## Privacy and bounded data
+
+APM stores aggregates and a small amount of sanitized evidence. APM does not retain request or
+response bodies, URL query values, headers, SQL statements, or SQL parameters in APM aggregates.
+Identity values, representative messages, and stack frames are length-bounded. Sensitive-looking
+and volatile values are removed or masked before persistence.
+
+These protections do not replace good instrumentation hygiene. Avoid placing secrets or personal
+data in span names, status descriptions, exception messages, or resource attributes.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| No APM data | Confirm traces arrive in the same workspace, the time range includes recent traffic, and the active role has `streams.query`. |
+| `unknown_service` | Set a stable `service.name` resource attribute before spans are exported. |
+| Missing transactions | Add `SERVER` or `CONSUMER` span kinds and standard HTTP, RPC, or messaging attributes. |
+| Missing dependencies | Add `CLIENT` or `PRODUCER` spans around downstream calls and include target semantic attributes. |
+| Missing versions | Set `service.version` consistently on every instance in the deployment. |
+| Missing errors | Record exception events and set span, HTTP, or RPC status according to OpenTelemetry conventions. |
+| Trace link unavailable | The trace was sampled out or expired, while the pre-sampling APM aggregate remains valid. |
+| Partial or stale results | Review the data-quality notice and `GET /api/v1/apm/health`. |
+
+<CardGroup cols={2}>
+  <Card title="APM API" icon="code" href="/en-US/api/apm">
+    Query APM overview, catalogs, details, version comparisons, and health.
+  </Card>
+  <Card title="Traces" icon="route" href="/en-US/traces">
+    Inspect the individual spans and traces behind APM evidence.
+  </Card>
+  <Card title="Service map" icon="diagram-project" href="/en-US/service-map">
+    Visualize cross-service parent and child relationships.
+  </Card>
+  <Card title="Trace ingestion" icon="arrow-right-to-bracket" href="/en-US/ingestion">
+    Send OpenTelemetry traces to MoleSignal.
+  </Card>
+</CardGroup>

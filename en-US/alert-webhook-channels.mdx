@@ -1,67 +1,73 @@
 ---
-title: "Webhook alert channels"
-description: "Configure common robot webhooks such as Lark, DingTalk, and WeCom with backend-managed signing."
+title: "Webhook notification connectors"
+description: "Configure Slack, Lark, and generic webhook delivery with target overrides, signing, and encrypted credentials."
 ---
 
-MoleSignal webhook alert channels can target generic HTTP endpoints and common chat robot webhooks.
-The backend builds the provider-specific request body, resolves secret references, and applies the
-provider signing algorithm before sending the notification.
+MoleSignal currently provides three webhook connector types: Slack webhook, Lark webhook, and a
+generic JSON webhook. Create webhook connectors under **Settings → Notify management → Connectors**.
 
-## Channel model
+Read [Notification channels and delivery](/en-US/notification-channels) first for identity binding,
+policy creation, fallback routes, or delivery history.
+
+## Compare webhook types
+
+| Connector | Request format | Authentication | Target types |
+|---|---|---|---|
+| `slack_webhook` | `{ "text": "..." }` | Credential in webhook URL | `fixed_group`, `webhook` |
+| `lark_webhook` | Lark `msg_type: text` | Credential in URL, optional signature | `fixed_group`, `webhook` |
+| `webhook` | MoleSignal target and message envelope | Custom JSON headers | All target types |
+
+For `fixed_group`, the connector sends to the configured URL. For `webhook`, the target value must
+be an absolute URL and overrides the configured URL for that delivery.
+
+## Slack webhook
+
+Configure an incoming webhook URL and a timeout from 1 to 60 seconds:
 
 ```json
 {
-  "name": "ops robot",
-  "enabled": true,
-  "kind": {
-    "type": "webhook",
-    "provider": "lark",
-    "url": "https://open.larksuite.com/open-apis/bot/v2/hook/xxxxxxxx",
-    "security": {
-      "type": "lark_signature",
-      "secret_ref": "env:LARK_BOT_SECRET"
-    },
-    "headers": []
+  "webhook_url": "https://hooks.slack.com/services/T000/B000/secret",
+  "timeout_secs": 10
+}
+```
+
+MoleSignal joins the message title and Markdown body and sends:
+
+```json
+{
+  "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
+}
+```
+
+A 2xx HTTP response is successful. Any other response or timeout marks the delivery as failed.
+
+## Lark webhook
+
+Configure a Lark or Feishu custom bot URL. Add the bot signing secret only when signature
+verification is enabled:
+
+```json
+{
+  "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
+  "secret": "replace-with-signing-secret",
+  "timeout_secs": 10
+}
+```
+
+Without a signing secret, MoleSignal sends:
+
+```json
+{
+  "msg_type": "text",
+  "content": {
+    "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
   }
 }
 ```
 
-## Providers
-
-| Provider | Target | Body format | Security |
-| --- | --- | --- | --- |
-| `custom` | Any HTTP endpoint | Raw incident JSON | `none` |
-| `lark` | Lark / Feishu custom bot | `msg_type: text` | `none` or `lark_signature` |
-| `feishu` | Compatibility alias for older Feishu configs | `msg_type: text` | `none` or `feishu_signature` |
-| `wecom` | WeCom group robot | `msgtype: markdown` | `none` |
-| `dingtalk` | DingTalk custom robot | `msgtype: text` | `none` or `dingtalk_signature` |
-
-## Security types
-
-```json
-{ "type": "none" }
-{ "type": "lark_signature", "secret_ref": "env:LARK_BOT_SECRET" }
-{ "type": "feishu_signature", "secret_ref": "env:FEISHU_BOT_SECRET" }
-{ "type": "dingtalk_signature", "secret_ref": "cipher_keys:dingtalk-bot-secret" }
-```
-
-Use `secret_ref` instead of plaintext secrets. Supported secret reference prefixes:
-
-| Prefix | Resolution |
-| --- | --- |
-| `env:` | Backend environment variable |
-| `cipher_keys:` | Cluster secret repository |
-
-## Lark / Feishu signing
-
-Lark and Feishu custom bot signing uses a Unix timestamp in seconds. MoleSignal builds:
-
-```text
-timestamp + "\n" + secret
-```
-
-It then computes HMAC-SHA256 over an empty message using that string as the key, Base64-encodes the
-digest, and adds both fields to the JSON body:
+With a signing secret, MoleSignal generates a Unix timestamp in seconds, builds
+`timestamp + "\n" + secret`, uses that value as the HMAC-SHA256 key for an empty message, and
+Base64-encodes the digest. The request includes both fields:
 
 ```json
 {
@@ -69,75 +75,108 @@ digest, and adds both fields to the JSON body:
   "sign": "base64-signature",
   "msg_type": "text",
   "content": {
-    "text": "[Critical] checkout error rate high"
+    "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
   }
 }
 ```
 
-## WeCom group robots
-
-The common WeCom group robot webhook authenticates through the `key` embedded in the URL:
-
-```text
-https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx
-```
-
-MoleSignal sends a markdown payload:
-
-```json
-{
-  "msgtype": "markdown",
-  "markdown": {
-    "content": "**[Critical] checkout error rate high**\n> status: Open"
-  }
-}
-```
-
-Treat the full URL as a secret because it includes the robot credential.
-
-## DingTalk signing
-
-DingTalk custom robot signing uses a Unix timestamp in milliseconds. MoleSignal builds:
-
-```text
-timestamp + "\n" + secret
-```
-
-It computes HMAC-SHA256 using the secret as the key, Base64-encodes the digest, and appends the
-result to the webhook URL:
-
-```text
-https://oapi.dingtalk.com/robot/send?access_token=xxx&timestamp=1599360473000&sign=...
-```
-
-The request body remains a text payload:
-
-```json
-{
-  "msgtype": "text",
-  "text": {
-    "content": "[Critical] checkout error rate high"
-  }
-}
-```
-
-## Headers
-
-Headers are optional key/value rows. Header values can be plaintext or secret references:
-
-```json
-{
-  "key": "Authorization",
-  "value": {
-    "type": "secret_ref",
-    "secret_ref": "env:ALERT_WEBHOOK_TOKEN"
-  }
-}
-```
-
-Use custom headers only when the target endpoint requires them. Lark, WeCom, and DingTalk robot
-webhooks normally rely on their webhook URL and optional platform signing secret.
+MoleSignal requires both a successful HTTP status and a zero `code` or `status_code` in the Lark
+response.
 
 <Note>
-  Keep server time synchronized. Lark / Feishu and DingTalk reject stale timestamps.
+  Keep the MoleSignal server clock synchronized. Lark rejects stale signed requests.
 </Note>
+
+## Generic webhook
+
+Configure the default URL, method, headers, and timeout:
+
+```json
+{
+  "url": "https://notify.example.com/molesignal",
+  "method": "post",
+  "headers": {
+    "Authorization": "Bearer <token>",
+    "X-Environment": "production"
+  },
+  "timeout_secs": 10
+}
+```
+
+The method can be `post`, `put`, or `patch`. Header names and values must be valid HTTP headers.
+MoleSignal sends this envelope:
+
+```json
+{
+  "target": {
+    "type": "fixed_group",
+    "value": "platform-oncall",
+    "metadata": {}
+  },
+  "message": {
+    "title": "Checkout error rate is high",
+    "text": "The error rate exceeded 5%.",
+    "markdown": "**Checkout** error rate exceeded 5%.",
+    "html": null,
+    "metadata": {}
+  }
+}
+```
+
+Any 2xx response is successful. If the response includes `X-Request-ID`, MoleSignal records the
+header value as the provider message ID.
+
+## Create and test over the API
+
+Create a generic webhook connector:
+
+```bash
+curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors" \
+  -H "Authorization: Bearer $MS_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "platform webhook",
+    "connector_type": "webhook",
+    "enabled": true,
+    "config": {
+      "url": "https://notify.example.com/molesignal",
+      "method": "post",
+      "headers": {"Authorization": "Bearer <token>"},
+      "timeout_secs": 10
+    }
+  }'
+```
+
+Save the returned connector `id`, then send a test:
+
+```bash
+curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors/$CONNECTOR_ID/test" \
+  -H "Authorization: Bearer $MS_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target_type": "fixed_group",
+    "target": "platform-oncall",
+    "message": {
+      "title": "MoleSignal connector test",
+      "text": "Webhook delivery is working."
+    }
+  }'
+```
+
+Listing, reading, creating, and updating connectors returns sensitive config fields as `***`.
+During an existing connector update, send the unchanged `***` value to preserve the stored secret.
+
+## Security and limitations
+
+- MoleSignal encrypts the complete connector configuration at rest.
+- API responses mask `url`, `webhook_url`, `headers`, `secret`, tokens, and passwords.
+- Treat a webhook URL as a credential even when no additional secret is configured.
+- Prefer `https`; use `http` only on a trusted network.
+- Restrict outbound access from MoleSignal to required connector destinations.
+- A disabled connector cannot send tests or notifications.
+
+<Warning>
+  The current connector registry does not include native DingTalk or WeCom adapters. Use a generic
+  webhook only when the target accepts the MoleSignal envelope, or place a transformation relay in
+  front of the provider endpoint.
+</Warning>

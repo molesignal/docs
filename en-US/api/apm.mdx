@@ -1,0 +1,170 @@
+---
+title: "APM API"
+description: "Query application performance summaries, catalogs, details, version comparisons, and projection health."
+---
+
+The APM API exposes organization-scoped aggregates derived from trace spans. All endpoints use the
+`/api/v1/apm` prefix and require a bearer token.
+
+```http
+Authorization: Bearer <token>
+```
+
+An organization workspace requires `streams.query`. A platform caller can use
+`sys.telemetry.read` in the protected `_sys` scope.
+
+## Endpoints
+
+| Method and path | Response |
+|---|---|
+| `GET /api/v1/apm/overview` | RED summary and trend, service health, top services, transactions, dependencies, errors, and recent versions. |
+| `GET /api/v1/apm/services` | Paginated service catalog with instrumentation, versions, health, RED metrics, and trace filters. |
+| `GET /api/v1/apm/services/{service}` | Service summary, trend, transactions, dependencies, errors, and versions. |
+| `GET /api/v1/apm/transactions` | Paginated transaction RED metrics and total-time ranking. |
+| `GET /api/v1/apm/transactions/{transaction}` | Transaction trend, affected errors, versions, and trace filters. |
+| `GET /api/v1/apm/dependencies` | Paginated caller/dependency RED metrics and total-time ranking. |
+| `GET /api/v1/apm/errors` | Paginated sanitized backend error groups. |
+| `GET /api/v1/apm/errors/{fingerprint}` | Error trend, affected transactions and versions, representative stack, and bounded samples. |
+| `GET /api/v1/apm/versions/compare` | Baseline and candidate RED metrics, deltas, sufficiency status, and regressions. |
+| `GET /api/v1/apm/health` | Tenant projection status, runtime health, boundaries, and gaps. |
+
+Path parameters must be URL-encoded. Use the exact `transaction` name or error `fingerprint`
+returned by a list response.
+
+## Common query parameters
+
+| Parameter | Type | Behavior |
+|---|---|---|
+| `from` | integer | Range start in microseconds since the Unix epoch. Defaults to 24 hours before `to`. |
+| `to` | integer | Range end in microseconds since the Unix epoch. Defaults to the current time. |
+| `namespace` | string | Exact service namespace filter. |
+| `service` | string | Exact service name filter. The service-detail path overrides this value. |
+| `environment` | string | Exact deployment environment filter. |
+| `version` | string | Exact service version filter. |
+| `resolution` | enum | `auto`, `minute`, or `hour`. `auto` selects the retained resolution for the range. |
+| `sort` | string | Endpoint-specific sort field. |
+| `direction` | enum | `asc` or `desc`. Defaults to `desc`. |
+| `limit` | integer | Page size from 1 to 200. Defaults to 50. |
+| `cursor` | string | Opaque cursor from a previous list response. |
+
+Filters must be non-empty and no longer than 192 bytes. The range cannot exceed the configured
+maximum, which defaults to 30 days.
+
+### Sort fields
+
+| Endpoint | Supported `sort` values | Default |
+|---|---|---|
+| `/services` | `request_count`, `error_rate`, `p95`, `name` | `request_count` |
+| `/transactions` | `request_count`, `error_rate`, `p95`, `total_time` | `request_count` |
+| `/dependencies` | `request_count`, `error_rate`, `p95`, `total_time` | `total_time` |
+| `/errors` | `occurrence_count`, `error_rate`, `last_seen` | `occurrence_count` |
+
+`/overview` accepts the same filters and resolution but does not paginate. Detail, comparison, and
+health endpoints do not return paginated lists.
+
+## Query an overview
+
+```bash
+curl --get 'https://molesignal.example.com/api/v1/apm/overview' \
+  --header 'Authorization: Bearer <token>' \
+  --data-urlencode 'from=1785801600000000' \
+  --data-urlencode 'to=1785888000000000' \
+  --data-urlencode 'environment=production' \
+  --data-urlencode 'resolution=auto'
+```
+
+The response contains `red`, `trend`, `service_health`, `services`, `top_transactions`,
+`top_dependencies`, `top_errors`, and `recent_versions`, plus a common `meta` object.
+
+## List and paginate services
+
+```bash
+curl --get 'https://molesignal.example.com/api/v1/apm/services' \
+  --header 'Authorization: Bearer <token>' \
+  --data-urlencode 'namespace=shop' \
+  --data-urlencode 'environment=production' \
+  --data-urlencode 'sort=p95' \
+  --data-urlencode 'direction=desc' \
+  --data-urlencode 'limit=50'
+```
+
+An abbreviated paginated response uses this shape:
+
+```json
+{
+  "meta": { "resolution": "minute", "data_quality": { "partial": false } },
+  "items": [],
+  "next_cursor": null,
+  "previous_cursor": null,
+  "has_more": false,
+  "sort": "p95"
+}
+```
+
+Pass `next_cursor` or `previous_cursor` unchanged with the same endpoint, filters, range, sort, and
+direction. Cursors are signed and scoped to the original request context. Do not decode or edit a
+cursor.
+
+## Disambiguate a transaction
+
+Two transaction kinds can share a name. Pass the optional `kind` parameter to select one:
+
+```http
+GET /api/v1/apm/transactions/POST%20%2Fcheckout?kind=http&service=checkout
+```
+
+The supported kind values are `http`, `rpc`, `messaging`, `span`, and `other`.
+
+## Compare versions
+
+Supply different `baseline` and `candidate` values. Add a `service` filter to compare one service.
+
+```bash
+curl --get 'https://molesignal.example.com/api/v1/apm/versions/compare' \
+  --header 'Authorization: Bearer <token>' \
+  --data-urlencode 'service=checkout' \
+  --data-urlencode 'environment=production' \
+  --data-urlencode 'baseline=2.3.1' \
+  --data-urlencode 'candidate=2.4.0'
+```
+
+The response reports request-count, error-rate, and p95 deltas. `sufficient_data` becomes true only
+when both versions meet the configured sample threshold, which defaults to 1,000 requests per
+version.
+
+## Read response metadata
+
+Every endpoint returns a common `meta` object:
+
+```json
+{
+  "range": {
+    "from": 1785801600000000,
+    "to": 1785888000000000
+  },
+  "resolution": "minute",
+  "projection_started_at": 1785798000000000,
+  "last_complete_bucket_at": 1785887940000000,
+  "data_quality": {
+    "partial": false,
+    "gaps": [],
+    "overflow_dimensions": []
+  },
+  "activation_boundary": false
+}
+```
+
+- Treat `activation_boundary: true` as incomplete coverage before `projection_started_at`.
+- Treat `data_quality.partial: true` as incomplete data, not as a complete zero.
+- Inspect `gaps` for queue, repository, flush, late-data, cardinality, or shutdown failures.
+- Use `last_complete_bucket_at` to determine whether recent data is still being finalized.
+- Inspect `overflow_dimensions` before relying on a high-cardinality breakdown.
+
+<CardGroup cols={2}>
+  <Card title="APM guide" icon="gauge-high" href="/en-US/apm">
+    Instrument services and investigate performance in the UI.
+  </Card>
+  <Card title="Trace ingestion" icon="arrow-right-to-bracket" href="/en-US/ingestion">
+    Send OpenTelemetry traces that feed APM.
+  </Card>
+</CardGroup>

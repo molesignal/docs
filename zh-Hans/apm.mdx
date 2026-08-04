@@ -1,0 +1,201 @@
+---
+title: "应用性能监控"
+sidebarTitle: "APM"
+description: "基于 OpenTelemetry 链路分析后端服务、事务、依赖、错误与部署版本。"
+---
+
+MoleSignal APM 把后端 OpenTelemetry trace span 转换成有界 RED 聚合，无需另行维护指标埋点，
+即可发现慢服务、失败入口、高开销依赖、重复出现的后端错误，以及部署版本之间的性能回退。
+
+<Note>
+  APM 不需要另一套 SDK，也不会新增遥测数据流。发送完整埋点的 trace 后，MoleSignal 会在链路
+  去重之后、尾采样之前派生 APM 数据。因此，最终被采样丢弃的 trace 仍可计入 APM 指标。
+</Note>
+
+## 可用分析
+
+| 页面 | 主要用途 |
+|---|---|
+| **概览** | 查看请求量、错误率、时延趋势、服务健康、高影响事务、依赖、错误和最近版本。 |
+| **服务** | 浏览服务目录，检查 RED 指标、运行时元数据、版本和最近实例数。 |
+| **事务** | 按流量、错误、p95 时延或总耗时排列 HTTP、RPC、消息和其他入口。 |
+| **依赖** | 定位缓慢或失败的服务、数据库、缓存、消息、HTTP 与 RPC 调用。 |
+| **错误** | 按稳定指纹聚合脱敏后的后端异常和失败，并检查影响范围与有界样本。 |
+| **部署** | 比较基线版本和候选版本，识别发生回退的事务或错误。 |
+
+## 接入前提
+
+- 把 OpenTelemetry trace 发送到 MoleSignal 的[链路采集端点](/zh-Hans/ingestion)；
+- 在组织工作区拥有 `streams.query`；或者
+- 在受保护的 `_sys` 遥测范围拥有 `sys.telemetry.read`。
+
+## 为服务接入 APM
+
+<Steps>
+  <Step title="设置稳定的服务资源属性">
+    每个服务都要设置 `service.name`。如果需要筛选服务或比较部署，再添加命名空间、环境、
+    版本和实例属性。
+
+    ```bash
+    export OTEL_SERVICE_NAME=checkout
+    export OTEL_RESOURCE_ATTRIBUTES="service.namespace=shop,deployment.environment.name=production,service.version=2.4.0,service.instance.id=checkout-01"
+    ```
+
+    具体配置方式取决于使用的 OpenTelemetry SDK 或 Collector。
+  </Step>
+  <Step title="使用正确的 span kind">
+    为入站请求创建 `SERVER` span，为消费的消息创建 `CONSUMER` span。为下游调用创建
+    `CLIENT` 或 `PRODUCER` span。MoleSignal 通过 span kind 区分事务与依赖。
+  </Step>
+  <Step title="记录状态与异常">
+    设置 OpenTelemetry span 状态、HTTP 或 RPC 状态属性，并记录 exception event。
+    MoleSignal 用这些信息区分成功与失败，并建立后端错误组。
+  </Step>
+  <Step title="发送 trace 并打开 APM">
+    发送 OTLP trace，然后打开 **APM → 概览**。把全局时间范围保持在最近流量，等待投影器
+    刷写首批数据桶。
+  </Step>
+</Steps>
+
+### 推荐的资源属性
+
+| 属性 | 作用 | 缺失时 |
+|---|---|---|
+| `service.name` | 稳定的服务标识。每个服务都应显式设置。 | `unknown_service` |
+| `service.namespace` | 区分不同系统或团队中的同名服务。 | `default` |
+| `deployment.environment.name` | 筛选生产、预发等环境。 | 依次使用旧属性 `deployment.environment` 和 `unknown` |
+| `service.version` | 支持版本历史与部署对比。 | 不提供版本拆分 |
+| `service.instance.id` | 统计最近观察到的实例。 | 不提供实例标识 |
+| `telemetry.sdk.language` | 在服务目录中显示运行时语言。 | 存在时使用 `process.runtime.name` |
+
+请使用低基数值。不要把请求 ID、原始 URL、用户 ID 或其他无界值放进服务、环境、版本、
+路由、操作或依赖属性。
+
+## APM 数据如何派生
+
+### 服务与事务
+
+`SERVER` 和 `CONSUMER` span 会计入服务与事务 RED 指标。没有 kind 且没有父 span 的数据可作为
+服务总量的兼容回退，但显式 span kind 才能生成更完整的页面。
+
+MoleSignal 会从语义属性构造有界事务名称：
+
+- HTTP 方法与 `http.route`，例如 `POST /checkout`；
+- RPC 服务与方法；
+- 消息操作与目标端；
+- 没有更强语义标识时，使用安全、低基数的 span 名称。
+
+请使用 `/orders/{id}` 这样的路由模板，不要使用 `/orders/83921` 这样的原始路径。
+
+### 依赖
+
+`CLIENT` 和 `PRODUCER` span 会计入依赖 RED 指标。MoleSignal 会把目标分类为服务、数据库、缓存、
+消息系统、外部 HTTP、外部 RPC 或其他依赖。标准的 `peer.service`、`db.*`、`messaging.*`、
+`rpc.*`、`server.*` 和 HTTP 语义属性可以提高依赖标识质量。
+
+### 错误
+
+span 包含异常、OpenTelemetry 状态为 `ERROR`、HTTP 状态码不低于 500，或 RPC 状态非零时，
+MoleSignal 会把该 span 判定为错误。错误组的稳定指纹由错误类型、第一个应用栈帧和事务名称组成；
+经常变化的错误消息不参与指纹计算。
+
+## 理解 RED 指标
+
+| 指标 | 含义 |
+|---|---|
+| **请求数** | 匹配的服务、事务或依赖观测数量。 |
+| **错误率** | 错误数除以请求数。 |
+| **时延** | 由固定边界直方图合并得到的 p50、p95 和 p99 时延。 |
+| **总耗时** | 所有观测耗时之和，用于发现整体影响最大的工作。 |
+
+Trace exemplar 会把聚合点关联到具体请求。如果 trace 没有通过尾采样，即使对应 span 已计入聚合，
+exemplar 仍可能显示 `trace_available: false`。
+
+## 调查性能问题
+
+<Steps>
+  <Step title="确认影响">
+    打开**概览**，比较选定时间范围内的请求量、错误率、p95 时延和数据质量提示。
+  </Step>
+  <Step title="选择服务">
+    打开**服务**，选择受影响的命名空间、服务、环境和版本。服务工作台会组合趋势、事务、
+    依赖、错误与版本。
+  </Step>
+  <Step title="缩小原因范围">
+    用**事务**查找慢入口，用**依赖**检查下游耗时，用**错误**分析重复失败。当时延与流量都很
+    重要时，按总耗时排序。
+  </Step>
+  <Step title="打开证据">
+    打开可用的 trace exemplar，或跳转到已过滤的链路、日志、指标与 profile。受支持的跳转会
+    保留服务过滤条件与时间范围。
+  </Step>
+  <Step title="检查部署">
+    打开**部署**，选择服务、基线版本和候选版本，再查看 RED 差异与回退事务。数据不足表示
+    结论尚不可靠，不能直接判定没有回退。
+  </Step>
+</Steps>
+
+## 过滤、分辨率与保留
+
+APM 页面共享全局时间范围，并支持命名空间、服务、环境和版本过滤。列表页还支持本地搜索、
+排序和游标分页。过滤条件会编码进 URL，便于分享或重新打开。
+
+使用默认部署设置时：
+
+- API 未指定范围时查询最近 24 小时；
+- `auto` 对不超过 24 小时的范围使用分钟桶，对更长范围使用小时桶；
+- 分钟聚合保留 24 小时；
+- 小时聚合和最大查询范围为 30 天。
+
+管理员可以调整这些部署限制。只有对比双方都达到配置的请求量阈值时，版本对比才会标记为数据
+充足；默认阈值是每个版本 1,000 个请求。
+
+## 阅读数据质量提示
+
+每个 APM 响应都带有数据质量元数据，界面也会展示相同状态。
+
+| 提示 | 含义 |
+|---|---|
+| **激活边界** | APM 投影在所选范围内才启动，更早的流量没有被统计。 |
+| **部分数据** | 队列、存储库、刷写、迟到数据、基数或关闭过程在部分时间造成缺口。不要把缺失数据理解为零。 |
+| **数据延迟** | `last_complete_bucket_at` 落后于所选范围，最近聚合可能仍在关闭或汇总。 |
+| **维度溢出** | 达到有界标识限制，部分维度被合并到溢出标识，或细节被抑制。 |
+
+请先缩短时间范围并收窄过滤条件。如果部分或延迟状态持续存在，再检查 APM 健康端点与平台遥测。
+
+## 隐私与有界数据
+
+APM 保存聚合以及少量脱敏后的证据。APM 聚合不会保留请求体、响应体、URL 查询参数值、Header、
+SQL 语句或 SQL 参数。标识值、代表性消息和栈帧都有长度限制；疑似敏感或易变化的值会在持久化
+之前删除或掩码。
+
+这些保护不能替代良好的埋点习惯。不要把密钥或个人数据放入 span 名称、状态描述、异常消息或
+资源属性。
+
+## 故障排查
+
+| 现象 | 检查项 |
+|---|---|
+| 没有 APM 数据 | 确认 trace 已进入同一工作区，时间范围包含最近流量，并且角色拥有 `streams.query`。 |
+| 出现 `unknown_service` | 在导出 span 前设置稳定的 `service.name` 资源属性。 |
+| 缺少事务 | 添加 `SERVER` 或 `CONSUMER` span kind，以及标准 HTTP、RPC 或消息属性。 |
+| 缺少依赖 | 为下游调用添加 `CLIENT` 或 `PRODUCER` span，并携带目标端语义属性。 |
+| 缺少版本 | 在同一部署的每个实例上统一设置 `service.version`。 |
+| 缺少错误 | 按 OpenTelemetry 约定记录 exception event，并设置 span、HTTP 或 RPC 状态。 |
+| Trace 链接不可用 | Trace 已被采样丢弃或过期，但采样前生成的 APM 聚合仍然有效。 |
+| 结果不完整或陈旧 | 查看数据质量提示和 `GET /api/v1/apm/health`。 |
+
+<CardGroup cols={2}>
+  <Card title="APM API" icon="code" href="/zh-Hans/api/apm">
+    查询 APM 概览、目录、详情、版本对比与健康状态。
+  </Card>
+  <Card title="链路" icon="route" href="/zh-Hans/traces">
+    检查 APM 证据背后的具体 span 与 trace。
+  </Card>
+  <Card title="服务地图" icon="diagram-project" href="/zh-Hans/service-map">
+    可视化跨服务父子 span 关系。
+  </Card>
+  <Card title="链路采集" icon="arrow-right-to-bracket" href="/zh-Hans/ingestion">
+    把 OpenTelemetry trace 发送到 MoleSignal。
+  </Card>
+</CardGroup>

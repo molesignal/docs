@@ -1,0 +1,260 @@
+---
+title: "Notification channels and delivery"
+sidebarTitle: "Notification channels"
+description: "Configure SMTP, Slack, Lark, and webhook connectors, then route notifications through users, policies, templates, and fallbacks."
+---
+
+MoleSignal separates provider credentials from recipients and routing. Configure a connector once,
+bind identities or fallback targets, and then choose when the notification engine uses those
+routes.
+
+| Resource | Purpose |
+|---|---|
+| **Connectors** | Store organization-level provider credentials and transport settings. |
+| **Users** | Bind provider identities and order personal delivery endpoints. |
+| **Policies** | Match events, resolve recipients, select templates, and control escalation. |
+| **Templates** | Reuse text, Markdown, or HTML message bodies. |
+| **Fallback routes** | Define ordered team and organization targets after personal delivery fails. |
+| **Deliveries** | Inspect attempts, latency, errors, retries, acknowledgement, and escalation. |
+
+## Supported connectors
+
+| Connector | Configuration | Supported targets |
+|---|---|---|
+| Email SMTP (`email_smtp`) | SMTP host, port, credentials, sender, TLS mode, timeout | User or fixed email address |
+| Slack app (`slack_app`) | Bot token, Slack API base URL, timeout | Slack user ID or channel ID |
+| Slack webhook (`slack_webhook`) | Incoming webhook URL, timeout | Configured webhook or per-target webhook URL |
+| Lark app (`lark_app`) | App ID, app secret, API base URL, recipient ID type, timeout | User identity, email address, or chat ID |
+| Lark webhook (`lark_webhook`) | Custom bot webhook URL, optional signing secret, timeout | Configured webhook or per-target webhook URL |
+| Webhook (`webhook`) | Default URL, HTTP method, headers, timeout | User, address, group, or per-target webhook URL |
+
+All connector timeouts must be between 1 and 60 seconds. URLs must be absolute `http` or `https`
+URLs.
+
+## Create and test a connector
+
+Viewing connectors requires `alerts.read`. Creating, editing, testing, enabling, disabling, or
+deleting connectors requires `alerts.manage`.
+
+<Steps>
+  <Step title="Open notification management">
+    Go to **Settings → Notify management → Connectors**.
+  </Step>
+  <Step title="Choose a provider">
+    Click **New connector**, enter a unique name, and select the connector type. Connector type
+    cannot change after creation.
+  </Step>
+  <Step title="Enter provider settings">
+    Add the credentials and transport settings described below. Keep **Allow this connector to
+    deliver** enabled unless preparing the connector for later use.
+  </Step>
+  <Step title="Save the connector">
+    Click **Save connector**. MoleSignal encrypts the complete configuration at rest. API responses
+    replace sensitive values with `***`.
+  </Step>
+  <Step title="Send a test">
+    Edit the saved connector, select a compatible target type, enter a real target, and click
+    **Test connection**. The connector status changes to **Connected** or **Error** based on the
+    latest test.
+  </Step>
+</Steps>
+
+<Note>
+  Save a new connector before testing. During connector edits, leave a masked `***` value unchanged
+  to preserve the stored secret.
+</Note>
+
+## Configure each provider
+
+### Email SMTP
+
+Enter the SMTP host, port, username if required, password, and a valid **From address**. Choose one
+of these TLS modes:
+
+| TLS mode | Suitable use |
+|---|---|
+| `none` | The SMTP connection does not use TLS. Avoid this on untrusted networks. |
+| `starttls` | The server upgrades the connection with STARTTLS, commonly on port `587`. |
+| `tls` | The connection starts with TLS, commonly on port `465`. |
+
+Use `fixed_address` or `direct_user` for the test target and enter a valid mailbox such as
+`oncall@example.com`.
+
+### Slack app
+
+Create a Slack app with a bot token that can call `chat.postMessage`. Add the bot to each channel
+where notifications must be sent. Enter:
+
+- **Bot token** — the bot token, normally beginning with `xoxb-`;
+- **API base URL** — keep `https://slack.com/api` unless a compatible proxy is configured;
+- **Timeout** — a value from 1 to 60 seconds.
+
+Use a Slack member ID for `direct_user` or a channel ID for `fixed_group`. The value must not
+contain whitespace. A display name such as `#alerts` is not a channel ID.
+
+### Slack webhook
+
+Create an incoming webhook in Slack and copy the URL into **Webhook URL**. A `fixed_group` target
+uses this configured URL. A `webhook` target treats the target value as an alternate URL for that
+delivery.
+
+MoleSignal sends a JSON object with a `text` field. Any non-2xx response marks the attempt as
+failed.
+
+### Lark app
+
+Create a tenant app that can obtain a tenant access token and send messages. Enter the **App ID**
+and **App secret**. Keep the default API base URL unless another compatible Lark endpoint is used.
+
+The selected recipient ID type applies to `direct_user` targets:
+
+| Target type | Value |
+|---|---|
+| `direct_user` | `open_id`, `user_id`, `union_id`, or email, according to **Recipient ID type** |
+| `fixed_address` | Email address; MoleSignal sends with `receive_id_type=email` |
+| `fixed_group` | Lark chat ID; MoleSignal sends with `receive_id_type=chat_id` |
+
+### Lark webhook
+
+Copy the custom bot URL into **Webhook URL**. If bot signature verification is enabled, also enter
+the **Signing secret**. MoleSignal generates the timestamp and HMAC-SHA256 signature for every
+request.
+
+A `fixed_group` target uses the configured URL. A `webhook` target can override the configured URL with another
+absolute URL. See [Webhook connectors](/en-US/alert-webhook-channels) for the request and signature
+format.
+
+### Generic webhook
+
+Enter a default URL and select `POST`, `PUT`, or `PATCH`. Add request headers as a JSON object:
+
+```json
+{
+  "Authorization": "Bearer <token>",
+  "X-Environment": "production"
+}
+```
+
+MoleSignal sends this JSON body:
+
+```json
+{
+  "target": {
+    "type": "fixed_group",
+    "value": "platform-oncall",
+    "metadata": {}
+  },
+  "message": {
+    "title": "Checkout error rate is high",
+    "text": "The error rate exceeded 5%.",
+    "markdown": "**Checkout** error rate exceeded 5%.",
+    "html": null,
+    "metadata": {}
+  }
+}
+```
+
+For `direct_user`, `fixed_address`, and `fixed_group`, MoleSignal posts to the configured default
+URL and includes the target as routing data. For `webhook`, the target value replaces the default
+URL. A 2xx response is successful. If the response contains `X-Request-ID`, MoleSignal records the
+header value as the provider message ID.
+
+<Warning>
+  Webhook URLs, authorization headers, tokens, passwords, and signing secrets are credentials. Do
+  not put credential values in test targets, templates, or event attributes.
+</Warning>
+
+## Bind user notification methods
+
+Administrators can open **Settings → Notify management → Users**, select a member, and click
+**Bind notify method**. Each identity selects one connector and one external identity, such as an
+email address, Slack user ID, or Lark user ID.
+
+After binding an identity:
+
+1. send a test to confirm provider acceptance;
+2. verify the identity after the organization confirms ownership;
+3. enable the identity in the **Alert events**, **On-call events**, or **Reports** preference;
+4. order multiple identities from primary to fallback;
+5. optionally configure quiet hours and allow critical alerts to bypass the restriction.
+
+Members can manage personal identities and preferences under **Account settings → Notify**.
+Reading another member's settings requires `org.members.read`. Changing or attesting another
+member's identity requires `org.members.manage`.
+
+<Note>
+  Remove an identity from every delivery preference before deletion.
+</Note>
+
+## Create templates and policies
+
+Open **Settings → Notify management → Templates** to create a reusable text, Markdown, or HTML
+body. Select a notification category, insert supported placeholders, and use the preview attributes
+to verify the rendered message.
+
+Then open **Policies** and create the routing rule:
+
+1. select an event type and category;
+2. add JSON matchers and set the policy priority;
+3. choose a recipient resolver and resolver configuration;
+4. respect user preferences, force one connector, or send through multiple connectors;
+5. select a template and enable user, team, or organization fallbacks;
+6. optionally set an acknowledgement timeout and escalation route;
+7. inspect the live delivery preview, which resolves actual members and routes without sending.
+
+Policies currently cover alert lifecycle and on-call schedule events. The policy editor lists the
+event types and recipient resolvers supported by the running backend.
+
+## Configure fallback routes
+
+Open **Settings → Notify management → Fallback routes**. Select an organization or team scope and
+a notification category. Add one or more enabled connectors, choose `fixed_address` or
+`fixed_group`, and enter the provider target.
+
+MoleSignal tries routes in the displayed order after the enabled personal route stages fail. The
+policy decides whether to use user, team, and organization fallbacks.
+
+## Inspect and retry deliveries
+
+Open **Settings → Notify management → Deliveries**. Filter by event ID, status, or stage. Select an
+attempt to inspect the masked target, connector, latency, provider error, and complete delivery
+chain.
+
+- `alerts.read` can inspect delivery history.
+- `alerts.acknowledge` can acknowledge the source event.
+- `alerts.manage` can retry failed routes.
+
+Retries create a new attempt. Existing delivery history remains unchanged.
+
+## Connector lifecycle and status
+
+| Status | Meaning |
+|---|---|
+| **Unknown** | The connector has not completed a successful or failed test yet. |
+| **Connected** | The most recent test succeeded. |
+| **Error** | The most recent test failed; normal routing skips the connector until a later test succeeds. |
+| **Disabled** | MoleSignal does not test or deliver through the connector. |
+
+Disabling a connector does not remove references. Deletion remains blocked while a user identity,
+policy, or fallback route still references the connector. Move all references before deleting the
+connector.
+
+## Troubleshoot delivery
+
+| Symptom | Check |
+|---|---|
+| SMTP authentication or TLS failure | Verify host, port, credentials, TLS mode, sender address, DNS, and outbound network access. |
+| Slack returns an API error | Verify the bot token, `chat.postMessage` permission, target ID, and channel membership. |
+| Lark rejects the message | Verify app permissions, recipient ID type, chat membership, webhook secret, and server clock. |
+| Webhook returns an error | Verify the URL, method, header JSON, timeout, and a 2xx endpoint response. |
+| No user delivery occurs | Verify the identity and connector are enabled, the category preference contains the identity, and quiet hours do not suppress delivery. |
+| Fallback never runs | Verify the policy enables that fallback level and the category has an enabled route. |
+
+<CardGroup cols={2}>
+  <Card title="Alerting" icon="bell" href="/en-US/alerting">
+    Create rules and follow the incident lifecycle.
+  </Card>
+  <Card title="Webhook connectors" icon="webhook" href="/en-US/alert-webhook-channels">
+    Review webhook payloads, overrides, signing, and security.
+  </Card>
+</CardGroup>

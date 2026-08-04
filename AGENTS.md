@@ -1,4 +1,4 @@
-> **First-time setup**: Customize this file for your project. Prompt the user to customize this file for their project.
+> **First-time setup**: Customize this file for the project. Request project-specific customization when needed.
 > For Mintlify product knowledge (components, configuration, writing standards),
 > install the Mintlify skill: `npx skills add https://mintlify.com/docs`
 
@@ -21,7 +21,7 @@
 
 {/* Add any project-specific style rules below */}
 
-- Use active voice and second person ("you")
+- Use active voice and direct imperative sentences without first-, second-, or third-person personal pronouns
 - Keep sentences concise — one idea per sentence
 - Use sentence case for headings
 - Bold for UI elements: Click **Settings**

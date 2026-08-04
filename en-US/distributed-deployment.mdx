@@ -3,9 +3,9 @@ title: "Distributed & Role-Based Deployment"
 description: "Node-role matrix, background-worker ownership, data flow, cluster discovery, and three topologies: single-node / Docker Compose / Kubernetes."
 ---
 
-MoleSignal is a **single binary**: the same executable (the same image) serves every role, and you choose which roles a given process runs. This lets it act as a sandbox that starts with one command, and scale out horizontally into a multi-role cluster.
+MoleSignal is a **single binary**: the same executable and image serves every role. Process configuration selects the active roles. The binary supports both a one-command sandbox and horizontal scaling into a multi-role cluster.
 
-This page is aimed at operators / SREs. It systematically covers the role breakdown, which roles own which background workers, the data flow, cluster discovery, external dependencies and ports, and three deployment topologies: single-node, Docker Compose, and Kubernetes.
+This page targets operators and SREs. The guide covers role breakdown, background-worker ownership, data flow, cluster discovery, external dependencies and ports, and three deployment topologies: single-node, Docker Compose, and Kubernetes.
 
 ## Overview: design philosophy
 
@@ -14,13 +14,13 @@ This page is aimed at operators / SREs. It systematically covers the role breakd
     Every role is compiled into the same binary and packaged into the same image. Processes are distinguished purely by configuration (`[node].roles`); no separate build artifacts are required.
   </Card>
   <Card title="Roles selected by config" icon="sliders">
-    `[node].roles` determines what this process exposes and which foreground responsibilities it carries. The default is `["standalone"]`, i.e. a single process running every responsibility.
+    `[node].roles` determines process exposure and foreground responsibilities. The default is `["standalone"]`, meaning one process runs every responsibility.
   </Card>
   <Card title="State externalized where possible" icon="database">
     Metadata lands in Postgres, data lands in the object store. Aside from the Ingester's WAL/buffer, most roles are stateless and scale horizontally.
   </Card>
   <Card title="Discovery via Postgres" icon="network-wired">
-    There is no separate gossip / consensus component. Nodes write themselves into the `cluster_nodes` table via heartbeat, and other nodes discover live peers by querying that table directly.
+    There is no separate gossip or consensus component. Each node writes a heartbeat into the `cluster_nodes` table, and peer discovery queries that table directly.
   </Card>
 </CardGroup>
 
@@ -48,7 +48,7 @@ Role enum values use **snake_case** in TOML / environment variables (`standalone
 `[node].roles` is an array (`Vec<Role>`), with valid values: `standalone`, `router`, `ingester`, `querier`, `compactor`, `alert_manager`. The default is `["standalone"]`.
 
 <Note>
-**Multiple roles compose in one process.** A form like `[node].roles = ["ingester", "querier"]` starts the de-duplicated set of foreground servers each role needs (here: the gRPC server serving ingest + scan), gates the matching background loops, and registers the node under **all** its roles in `cluster_nodes` — so peers discover it under each role it carries. `standalone` is shorthand for "every role in one process".
+**Multiple roles compose in one process.** A form like `[node].roles = ["ingester", "querier"]` starts the deduplicated set of foreground servers required by each role, including the gRPC server serving ingest and scan. The configuration gates matching background loops and registers the node under **all** configured roles in `cluster_nodes`, allowing peer discovery by role. `standalone` is shorthand for "every role in one process".
 </Note>
 
 | Role | Foreground exposure | Stateful / stateless | Scaling characteristics |
@@ -61,7 +61,7 @@ Role enum values use **snake_case** in TOML / environment variables (`standalone
 | `alert_manager` | Runs the evaluation + dispatch tick loops (spawned only when the role is configured) | Stateful (evaluation state and incident state are in-process) | Single instance recommended |
 
 <Note>
-A standalone `querier` (or any role set containing `querier` / `ingester`) starts the gRPC server, which carries the Arrow Flight scan service. The coordinator discovers queriers via `list_role(querier)` and fans shards out to them over that RPC. A single-process `standalone` still works as before; distributed scan-out requires ≥2 querier peers.
+A standalone `querier` or any role set containing `querier` or `ingester` starts the gRPC server, which carries the Arrow Flight scan service. The coordinator discovers queriers via `list_role(querier)` and fans shards out over that RPC. A single-process `standalone` still works as before; distributed scan-out requires at least two querier peers.
 </Note>
 
 ### Which role carries which background worker
@@ -77,17 +77,17 @@ Role-specific loops (ingester flush, compaction + file_meta_dumper, alert evalua
 | alert dispatch (dispatcher) | `alert_manager` | `dispatch_interval_secs`, default 10s | `[alert_manager].dispatch_interval_secs` | Wired up |
 | compaction | `compactor` | `interval_secs`, default 300s (5 min) | `[compactor].interval_secs` | Wired up |
 | file_meta_dumper (cold partition flush to storage) | `compactor` (same process as compaction) | `interval_secs`, default 3600s (1h) | `[storage.file_meta_dump].interval_secs`; set `enabled=false` to disable | Wired up |
-| scheduled_reports | `alert_manager` (needs rendering dependencies, see below) | Fixed 60s tick; each report's own cron decides whether it is due | the report's `cron` (the tick interval is not configurable) | Wired up |
+| scheduled_reports | `alert_manager` (needs rendering dependencies, see below) | Fixed 60s tick; each report cron determines due state | the report `cron` (the tick interval is not configurable) | Wired up |
 | search_jobs (async search pool) | The role carrying `AppState` (typically `standalone` / a node exposing query) | Idle poll `idle_poll_secs`, default 2s; cleanup `cleanup_interval_secs`, default 3600s | `[search_jobs].workers` (default 2), etc. | Wired up |
 | ACME issuance / renewal | the TLS-terminating HTTP server (`router` / `standalone`) | Issuance `issue_poll_secs` (default 60s); renewal `renewal_retry_secs` (default 21600s / 6h) | `[http.tls].issue_poll_secs` / `renewal_retry_secs` | Wired up (active when `[http.tls].enabled = true`) |
 
 <Note>
-ACME issuance / renewal is implemented: the issue loop scans `pending` domains and the renewal loop renews `active` certs within their 30-day window, both via the single-issuance path with a per-domain cooldown. The runner is started by the TLS-terminating HTTP server when `[http.tls].enabled = true`. TLS/ACME are compiled into every build (no feature flag) and are purely runtime-gated by `[http.tls].enabled`.
+ACME issuance and renewal are implemented: the issue loop scans `pending` domains, and the renewal loop renews `active` certificates within the 30-day window. Both loops use the single-issuance path with a per-domain cooldown. The TLS-terminating HTTP server starts the runner when `[http.tls].enabled = true`. TLS and ACME are compiled into every build without a feature flag and remain runtime-gated by `[http.tls].enabled`.
 </Note>
 
 ## How to select roles
 
-Roles are configured via `[node].roles`; they can be overridden with environment variables. Environment variables share the `MS_` prefix, with **section and field separated by a `.` (dot)** (the `MS_` prefix is stripped and the remaining key is split on `.`). For example: `MS_NODE.ROLES`, `MS_STORE.META.DSN`, `MS_HTTP.PORT`.
+Configure roles through `[node].roles`; environment variables can override the setting. Environment variables share the `MS_` prefix, with **section and field separated by a `.` (dot)**. MoleSignal strips the `MS_` prefix and splits the remaining key on `.`. Examples: `MS_NODE.ROLES`, `MS_STORE.META.DSN`, `MS_HTTP.PORT`.
 
 <Tabs>
   <Tab title="TOML">
@@ -108,7 +108,7 @@ Roles are configured via `[node].roles`; they can be overridden with environment
   <Tab title="Env var override">
     ```bash
     # Variable names use the dotted form, matching the docker-compose / k8s manifests.
-    # Note: a dot is not a valid POSIX shell identifier, so you cannot `export MS_NODE.ROLES=…`;
+    # Note: a dot is not a valid POSIX shell identifier, so `export MS_NODE.ROLES=…` is invalid;
     # inject via the container / orchestrator env, or launch with an env prefix:
     env 'MS_NODE.ROLES=["ingester"]' \
         'MS_NODE.ID=ingester-a1' \
@@ -147,7 +147,7 @@ A few bootstrap / secret variables are **flat single-underscore** and live outsi
 
 ### Ingest path
 
-The entry point lands on some Ingester via the Router (rate limiting + consistent hashing); the Ingester first writes the WAL (durably persisted to disk), then writes the in-memory buffer; a background flush loop encodes the buffer into columnar files + a search index by time window or size threshold and uploads it to the object store, finally landing the FileMeta in Postgres and truncating the flushed WAL segments.
+The entry point lands on an Ingester through the Router with rate limiting and consistent hashing. The Ingester first writes the WAL durably to disk, then writes the in-memory buffer. A background flush loop encodes the buffer into columnar files and a search index by time window or size threshold, uploads each file to the object store, stores FileMeta in Postgres, and truncates flushed WAL segments.
 
 <Frame caption="Ingest path">
   <img src="/images/architecture/ingest_en_light.svg" alt="Ingest path" className="block dark:hidden" />
@@ -170,7 +170,7 @@ The query entry point is on a node that exposes HTTP. The engine is wrapped laye
 </Frame>
 
 <Note>
-Distributed query shards are fanned out to peers via a hash of `object_key`; the shard SQL only performs a scan (`SELECT * FROM <stream>`), while the full aggregation runs on the coordinator to avoid partial/final aggregation inconsistencies. The distributed path is taken only when the cluster has ≥2 querier peers; otherwise it falls back to the local engine with no network hop.
+Distributed query shards are fanned out to peers through a hash of `object_key`; shard SQL only performs a scan (`SELECT * FROM <stream>`), while full aggregation runs on the coordinator to avoid partial/final aggregation inconsistencies. The distributed path runs only when the cluster has at least two querier peers; otherwise the query falls back to the local engine with no network hop.
 </Note>
 
 ### Async search job pipeline
@@ -203,7 +203,7 @@ Target clusters are specified via `?clusters=local,sf,nyc`. After scanning local
 
 <Steps>
   <Step title="Node registration">
-    The heartbeat task periodically upserts `(node_id, roles, advertise_addr, last_heartbeat_at_micros)` into the Postgres `cluster_nodes` table (primary key `node_id`, `ON CONFLICT DO UPDATE`). The node's full role set is stored comma-joined, so a multi-role node is one row discoverable under each of its roles. The first heartbeat fires immediately, subsequent ones at the configured interval.
+    The heartbeat task periodically upserts `(node_id, roles, advertise_addr, last_heartbeat_at_micros)` into the Postgres `cluster_nodes` table (primary key `node_id`, `ON CONFLICT DO UPDATE`). The full node role set is stored comma-joined, so a multi-role node occupies one row discoverable under every configured role. The first heartbeat fires immediately, followed by heartbeats at the configured interval.
   </Step>
   <Step title="Heartbeat interval">
     `[cluster].heartbeat_interval_secs`, default 5s. `advertise_addr` defaults to `127.0.0.1:5082`, i.e. the gRPC address (host:port) peers use to interconnect.
@@ -212,13 +212,13 @@ Target clusters are specified via `?clusters=local,sf,nyc`. After scanning local
     The liveness window is controlled by `[cluster].peer_timeout_secs`, default 15s: the registry only returns nodes with `last_heartbeat_at >= now - peer_timeout`. Additionally, a sweeper deletes `cluster_nodes` rows that have not heartbeated for over 5 minutes every 60s.
   </Step>
   <Step title="Peer discovery">
-    There is no gossip / consensus; in distributed mode each role queries the `cluster_nodes` table directly and filters live peers by **role membership** (a node matches if its role set contains the requested role). `standalone` mode skips the entire discovery flow, returning only itself.
+    There is no gossip or consensus. In distributed mode, each role queries the `cluster_nodes` table directly and filters live peers by **role membership**. A node matches when the role set contains the requested role. `standalone` mode skips the entire discovery flow and returns only the local node.
   </Step>
   <Step title="Placement algorithm">
     Router selecting an Ingester: applies consistent hashing over `org_id|stream_name` then mods, landing deterministically on a particular Ingester. Router selecting a Querier: naive round-robin (`now_ns % peer_count`), not full consistent hashing. Distributed query sharding: a hash over `object_key` then mods, fanning out to querier peers.
   </Step>
   <Step title="Distributed scan RPC">
-    The coordinator encodes a scan request (org/stream/sql/file_metas/time_range) into a ticket and sends it to peers over the internal scan RPC; the peer reads columnar files, registers an in-memory table, runs the shard SQL, and returns a result stream. This trusted RPC shares port `5082` with node services and the private cluster ingest protocol. Standard external OTLP gRPC uses `4317`.
+    The coordinator encodes a scan request (org/stream/sql/file_metas/time_range) into a ticket and sends the ticket to peers over the internal scan RPC. Each peer reads columnar files, registers an in-memory table, runs the shard SQL, and returns a result stream. This trusted RPC shares port `5082` with node services and the private cluster ingest protocol. Standard external OTLP gRPC uses `4317`.
   </Step>
 </Steps>
 
@@ -258,14 +258,14 @@ Local scan-RPC calls within the cluster are unauthenticated; only federated / re
 | 443 | HTTPS in TLS mode (SNI) | `[http.tls].port` | Full routing; enabled at runtime by `[http.tls].enabled` (compiled into every build) |
 
 <Note>
-**`/metrics`** (GET, Prometheus text 0.0.4) is always mounted. Restrict it at the reverse proxy or network boundary. It exposes fixed-cardinality cache, object-store, WAL, query, alerting, and self-observability metrics.
+**`/metrics`** (GET, Prometheus text 0.0.4) is always mounted. Restrict the endpoint at the reverse proxy or network boundary. The endpoint exposes fixed-cardinality cache, object-store, WAL, query, alerting, and self-observability metrics.
 </Note>
 
 ### Health / readiness probe semantics
 
 | Probe | Path | 200 condition | 503 condition | Purpose |
 | --- | --- | --- | --- | --- |
-| Liveness | `GET /api/v1/healthz` | WAL replay complete (Ingester-relevant only; other roles bypass it) **and** the object store is not degraded | replay in progress **or** object store connection lost | Process liveness and dependency health |
+| Liveness | `GET /api/v1/healthz` | WAL replay complete (Ingester-relevant only; other roles bypass the replay check) **and** the object store is not degraded | replay in progress **or** object store connection lost | Process liveness and dependency health |
 | Readiness | `GET /api/v1/readyz` | `replay_done = true` (even if the object store is degraded) | replay still in progress | Lets K8s keep admitting read traffic while the write path is degraded |
 
 <Steps>
@@ -276,7 +276,7 @@ Local scan-RPC calls within the cluster are unauthenticated; only federated / re
     The same round-trip runs every `[store.object].health_probe_interval_secs` (default 30s); only **3 consecutive failures** set `object_store_degraded=true`, and a success resets the counter to zero.
   </Step>
   <Step title="Ingester WAL replay">
-    At startup the Ingester scans the segment files under `[wal].dir`, replays them into the in-memory buffer by `(org, stream_type, stream)`, forces a single flush once everything is loaded, then sets `replay_done=true`. `/api/v1/readyz` returns 503 until replay completes.
+    At startup the Ingester scans segment files under `[wal].dir`, replays all records into the in-memory buffer by `(org, stream_type, stream)`, forces a single flush after loading, then sets `replay_done=true`. `/api/v1/readyz` returns 503 until replay completes.
   </Step>
 </Steps>
 
@@ -284,7 +284,7 @@ Local scan-RPC calls within the cluster are unauthenticated; only federated / re
 
 - The JWT secret is auto-bootstrapped by the database on first startup; the old `jwt_secret` TOML field is deprecated (parsing is retained only for backward compatibility with old configs). To pin a fixed secret, use the environment variable `MS_AUTH_JWT_SECRET_OVERRIDE`.
 - API tokens take the form `ms_<prefix>_<secret>`, with the secret stored as an argon2id hash.
-- At startup, fields such as `store.meta.dsn`, `wal.dir`, `http.port`, `grpc.port`, `node.id` are treated as immutable; changing them at runtime triggers a warning.
+- At startup, fields such as `store.meta.dsn`, `wal.dir`, `http.port`, `grpc.port`, and `node.id` are treated as immutable; runtime changes trigger a warning.
 
 ## Deployment topologies
 
@@ -338,7 +338,7 @@ All topologies share the same image (e.g. `molesignal:dev`), distinguished by `M
     ```
     - `molesignal-router`: exposes 5080, the entry point.
     - `molesignal-ingester`: mounts `obs-wal:/data/wal` for a persistent WAL; the other roles are stateless.
-    - The remaining role containers each carry their corresponding responsibility.
+    - Each remaining role container carries the corresponding responsibility.
 
     <Info>There is also `deploy/docker/Dockerfile.web` and `nginx.conf`: the web container reverse-proxies to `MS_BACKEND`, disables `proxy_buffering` for `/api/v1/query/stream` and relaxes read/write timeouts to 600s to support live tail; `/assets/*` (Vite hash-named) is set to 1-year immutable, and `index.html` is set to `no-store`.</Info>
   </Tab>
@@ -365,7 +365,7 @@ All topologies share the same image (e.g. `molesignal:dev`), distinguished by `M
     </Warning>
 
     <Warning>
-    Both `80-web.yaml` and `95-ingress.yaml` define an Ingress for host `molesignal.local` (one pointing to the web container, one pointing directly at the router). They are likely two alternative topologies (via the web layer vs. directly connecting to the router); deploying both at once will conflict, so pick one. The router backend in `95-ingress.yaml` references port 80, while the Service in `30-router.yaml` only explicitly defines 5080/5082, so align the Service port or the Ingress backend before going live.
+    Both `80-web.yaml` and `95-ingress.yaml` define an Ingress for host `molesignal.local`: one points to the web container, and one points directly to the router. These manifests represent alternative topologies through the web layer or directly to the router. Deploying both causes a conflict, so select one. The router backend in `95-ingress.yaml` references port 80, while the Service in `30-router.yaml` explicitly defines only 5080 and 5082. Align the Service port or Ingress backend before production use.
     </Warning>
   </Tab>
 </Tabs>
@@ -396,7 +396,7 @@ Recommended metrics to monitor: for the write path, watch `wal_append_lock_wait_
     Postgres reachable, `[store.meta].backend = "postgres"` with a correct `dsn`; choose an object store backend of `s3`/`azure`/`gcs` (not `local`), with credentials injected in the precedence order "env vars > credential file > inline".
   </Step>
   <Step title="Roles and interconnect addresses">
-    Each process has an explicit `MS_NODE.ROLES`; set `MS_CLUSTER.ADVERTISE_ADDR` to a peer-reachable `host:5082` (K8s uses `$(POD_IP):5082`). A process may carry several roles at once (e.g. `["ingester","querier"]`); it will start the de-duplicated server set and register under all of them.
+    Each process has an explicit `MS_NODE.ROLES`; set `MS_CLUSTER.ADVERTISE_ADDR` to a peer-reachable `host:5082` (K8s uses `$(POD_IP):5082`). A process may carry several roles at once, such as `["ingester","querier"]`. The process starts the deduplicated server set and registers under every configured role.
   </Step>
   <Step title="Ingester persistence">
     Run the Ingester as a StatefulSet + PVC mounting the WAL directory; set `[wal].flush_strategy` / `sync_level` according to durability requirements; leave enough replay delay for the readiness probe.
@@ -411,10 +411,10 @@ Recommended metrics to monitor: for the write path, watch `wal_append_lock_wait_
     Wire `/metrics` into Prometheus; point K8s probes at `/api/v1/healthz` (liveness) and `/api/v1/readyz` (readiness). Confirm the object store startup probe passes (otherwise the process will not start).
   </Step>
   <Step title="Security and license">
-    Set `MS_AUTH_JWT_SECRET_OVERRIDE` when you need a fixed JWT secret; otherwise it is auto-bootstrapped by the DB. Inject a cipher key (do not use the dev all-zeros value in production). Federated query requires the `federated_search` license feature. TLS + automatic certificate issuance/renewal are available in every build (no feature flag) and switch on at runtime via `[http.tls].enabled`.
+    Set `MS_AUTH_JWT_SECRET_OVERRIDE` when a fixed JWT secret is required; otherwise the database bootstraps the secret automatically. Inject a cipher key and avoid the development all-zero value in production. Federated query requires the `federated_search` license feature. TLS and automatic certificate issuance or renewal are available in every build without a feature flag and activate at runtime through `[http.tls].enabled`.
   </Step>
 </Steps>
 
 <Warning>
-Before going live, be clear about the following current boundaries: the distributed-consensus WAL term source is still static (multi-node consensus is not implemented); federated query and OIDC/SAML SSO require their license features; and changing `[node].roles` requires a process restart.
+Before production use, note the current boundaries: the distributed-consensus WAL term source is still static because multi-node consensus is not implemented; federated query and OIDC/SAML SSO require the corresponding license features; and changing `[node].roles` requires a process restart.
 </Warning>

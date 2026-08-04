@@ -11,8 +11,8 @@ This repository contains the bilingual MoleSignal documentation site built with
 - `diagrams/` — editable Excalidraw architecture sources
 - `images/architecture/` — rendered light and dark architecture diagrams
 
-Keep English and Chinese navigation in parity. When you add or rename a public
-page, update both language trees and `docs.json` in the same change.
+Keep English and Chinese navigation in parity. Additions or renames of public
+pages must update both language trees and `docs.json` in the same change.
 
 ## Local development
 
@@ -55,3 +55,5 @@ API behavior must match the current MoleSignal source:
   display role.
 - Put UI labels in bold and paths, commands, fields, and permission keys in
   code formatting.
+- Avoid first-, second-, and third-person personal pronouns. Prefer direct
+  imperatives, named actors, or objective statements.

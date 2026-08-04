@@ -1,0 +1,165 @@
+---
+title: "APM API"
+description: "查询应用性能概览、目录、详情、版本对比与投影健康状态。"
+---
+
+APM API 提供从 trace span 派生的组织范围聚合。所有端点都使用 `/api/v1/apm` 前缀，并要求
+Bearer Token。
+
+```http
+Authorization: Bearer <token>
+```
+
+组织工作区需要 `streams.query`。平台调用方在受保护的 `_sys` 范围可以使用
+`sys.telemetry.read`。
+
+## 端点
+
+| 方法与路径 | 响应内容 |
+|---|---|
+| `GET /api/v1/apm/overview` | RED 汇总与趋势、服务健康、Top 服务、事务、依赖、错误和最近版本。 |
+| `GET /api/v1/apm/services` | 分页服务目录，包括埋点信息、版本、健康、RED 指标与链路过滤条件。 |
+| `GET /api/v1/apm/services/{service}` | 服务汇总、趋势、事务、依赖、错误与版本。 |
+| `GET /api/v1/apm/transactions` | 分页事务 RED 指标与总耗时排名。 |
+| `GET /api/v1/apm/transactions/{transaction}` | 事务趋势、相关错误、版本与链路过滤条件。 |
+| `GET /api/v1/apm/dependencies` | 分页调用方/依赖 RED 指标与总耗时排名。 |
+| `GET /api/v1/apm/errors` | 分页且已脱敏的后端错误组。 |
+| `GET /api/v1/apm/errors/{fingerprint}` | 错误趋势、相关事务与版本、代表性栈和有界样本。 |
+| `GET /api/v1/apm/versions/compare` | 基线和候选 RED 指标、差异、数据充足状态与回退项。 |
+| `GET /api/v1/apm/health` | 租户投影状态、运行健康、边界与缺口。 |
+
+路径参数必须经过 URL 编码。请使用列表响应返回的准确 `transaction` 名称或错误 `fingerprint`。
+
+## 通用查询参数
+
+| 参数 | 类型 | 行为 |
+|---|---|---|
+| `from` | integer | Unix 纪元以来的微秒级开始时间。默认是 `to` 之前 24 小时。 |
+| `to` | integer | Unix 纪元以来的微秒级结束时间。默认为当前时间。 |
+| `namespace` | string | 精确匹配服务命名空间。 |
+| `service` | string | 精确匹配服务名。服务详情路径中的值会覆盖该参数。 |
+| `environment` | string | 精确匹配部署环境。 |
+| `version` | string | 精确匹配服务版本。 |
+| `resolution` | enum | `auto`、`minute` 或 `hour`。`auto` 会按范围选择可用分辨率。 |
+| `sort` | string | 端点支持的排序字段。 |
+| `direction` | enum | `asc` 或 `desc`，默认为 `desc`。 |
+| `limit` | integer | 1 到 200 的每页条数，默认为 50。 |
+| `cursor` | string | 上一个列表响应返回的不透明游标。 |
+
+过滤值不能为空，且不能超过 192 字节。查询范围不能超过配置的最大值，默认是 30 天。
+
+### 排序字段
+
+| 端点 | 支持的 `sort` 值 | 默认值 |
+|---|---|---|
+| `/services` | `request_count`、`error_rate`、`p95`、`name` | `request_count` |
+| `/transactions` | `request_count`、`error_rate`、`p95`、`total_time` | `request_count` |
+| `/dependencies` | `request_count`、`error_rate`、`p95`、`total_time` | `total_time` |
+| `/errors` | `occurrence_count`、`error_rate`、`last_seen` | `occurrence_count` |
+
+`/overview` 接受相同过滤条件与分辨率，但不分页。详情、版本对比和健康端点也不返回分页列表。
+
+## 查询概览
+
+```bash
+curl --get 'https://molesignal.example.com/api/v1/apm/overview' \
+  --header 'Authorization: Bearer <token>' \
+  --data-urlencode 'from=1785801600000000' \
+  --data-urlencode 'to=1785888000000000' \
+  --data-urlencode 'environment=production' \
+  --data-urlencode 'resolution=auto'
+```
+
+响应包含 `red`、`trend`、`service_health`、`services`、`top_transactions`、
+`top_dependencies`、`top_errors` 和 `recent_versions`，以及通用 `meta` 对象。
+
+## 列出服务并分页
+
+```bash
+curl --get 'https://molesignal.example.com/api/v1/apm/services' \
+  --header 'Authorization: Bearer <token>' \
+  --data-urlencode 'namespace=shop' \
+  --data-urlencode 'environment=production' \
+  --data-urlencode 'sort=p95' \
+  --data-urlencode 'direction=desc' \
+  --data-urlencode 'limit=50'
+```
+
+分页响应的精简结构如下：
+
+```json
+{
+  "meta": { "resolution": "minute", "data_quality": { "partial": false } },
+  "items": [],
+  "next_cursor": null,
+  "previous_cursor": null,
+  "has_more": false,
+  "sort": "p95"
+}
+```
+
+请把 `next_cursor` 或 `previous_cursor` 原样传回同一个端点，并保持过滤条件、时间范围、排序字段和
+方向不变。游标带签名并绑定原始请求上下文，不要解码或修改。
+
+## 区分同名事务
+
+不同事务种类可能使用相同名称。请传入可选的 `kind` 参数指定目标：
+
+```http
+GET /api/v1/apm/transactions/POST%20%2Fcheckout?kind=http&service=checkout
+```
+
+支持的 kind 为 `http`、`rpc`、`messaging`、`span` 和 `other`。
+
+## 比较版本
+
+请提供两个不同的 `baseline` 和 `candidate`，并添加 `service` 过滤条件以比较单个服务。
+
+```bash
+curl --get 'https://molesignal.example.com/api/v1/apm/versions/compare' \
+  --header 'Authorization: Bearer <token>' \
+  --data-urlencode 'service=checkout' \
+  --data-urlencode 'environment=production' \
+  --data-urlencode 'baseline=2.3.1' \
+  --data-urlencode 'candidate=2.4.0'
+```
+
+响应会报告请求数、错误率和 p95 的差异。只有两个版本都达到配置的样本阈值时，
+`sufficient_data` 才会变为 true；默认阈值是每个版本 1,000 个请求。
+
+## 阅读响应元数据
+
+每个端点都返回通用 `meta` 对象：
+
+```json
+{
+  "range": {
+    "from": 1785801600000000,
+    "to": 1785888000000000
+  },
+  "resolution": "minute",
+  "projection_started_at": 1785798000000000,
+  "last_complete_bucket_at": 1785887940000000,
+  "data_quality": {
+    "partial": false,
+    "gaps": [],
+    "overflow_dimensions": []
+  },
+  "activation_boundary": false
+}
+```
+
+- `activation_boundary: true` 表示 `projection_started_at` 之前的数据不完整。
+- `data_quality.partial: true` 表示数据不完整，不能按完整零值解读。
+- 检查 `gaps`，确认是否发生队列、存储库、刷写、迟到数据、基数或关闭失败。
+- 使用 `last_complete_bucket_at` 判断最近数据是否仍在完成处理中。
+- 依赖高基数明细前，请检查 `overflow_dimensions`。
+
+<CardGroup cols={2}>
+  <Card title="APM 指南" icon="gauge-high" href="/zh-Hans/apm">
+    为服务接入埋点，并在界面中调查性能问题。
+  </Card>
+  <Card title="链路采集" icon="arrow-right-to-bracket" href="/zh-Hans/ingestion">
+    发送用于生成 APM 的 OpenTelemetry trace。
+  </Card>
+</CardGroup>
