@@ -1,13 +1,58 @@
 ---
-title: "RUM source maps"
-sidebarTitle: "Source maps"
-description: "Upload browser source maps and match maps to the service and release reported by the RUM SDK."
+title: "RUM source maps and symbols"
+sidebarTitle: "Source maps & symbols"
+description: "Upload browser source maps, Flutter symbols, Android mappings and native symbols, or Apple dSYM files for RUM stack restoration."
 ---
 
-Source maps let MoleSignal translate minified JavaScript stack frames into the original file,
-function, line, and column from the source tree.
+MoleSignal uses debug artifacts to restore minified JavaScript, obfuscated Dart or Android, and
+native Android or iOS stack frames. Manage every artifact type through
+`/api/v1/debug-artifacts`.
 
-## Match the SDK release
+<Warning>
+  The former `/api/v1/sourcemaps` endpoint is not exposed. Update release pipelines to use
+  `/api/v1/debug-artifacts` and send the complete build identity.
+</Warning>
+
+## Select an artifact type
+
+| Runtime | `kind` | `platform` | File |
+|---|---|---|---|
+| Browser JavaScript | `javascript_sourcemap` | `web` | External `.map` file |
+| Flutter Web | `javascript_sourcemap` | `flutter` | `main.dart.js.map` or another generated `.map` |
+| Flutter Android or iOS AOT | `flutter_symbols` | `android` or `ios` | Flutter `--split-debug-info` `.symbols` file |
+| Android R8 | `android_mapping` | `android` | Release `mapping.txt` |
+| Android NDK | `android_native_symbols` | `android` | Unstripped ELF shared object |
+| Apple native | `apple_dsym` | `ios` | DWARF binary inside the matching `.dSYM` bundle |
+
+Raw files and gzip-compressed files are accepted. The upload limit is 50 MiB. A gzip artifact can
+expand to at most 256 MiB.
+
+## Match the build identity
+
+MoleSignal selects an artifact from the RUM error build identity:
+
+| Upload field | Matching RUM value | Rule |
+|---|---|---|
+| `application_id` | `application` or `application_id` | Must match exactly |
+| `service` | SDK `service` | Must match exactly and is case-sensitive |
+| `release` | SDK `version` or event `release` | Must match exactly and is case-sensitive |
+| `kind` | Stack-frame type | Select from the supported artifact table |
+| `platform` | Event platform | Use `web`, `flutter`, `android`, or `ios` as listed above |
+| `architecture` | Event architecture | Set for mobile and native artifacts, such as `arm64` or `x86_64` |
+| `debug_id` | Event or frame Debug ID | Use the same Flutter build ID, ELF Build ID, or Mach-O UUID |
+| File name | Runtime module or bundle | Browser maps must use `<deployed bundle basename>.map` |
+
+Common ABI aliases are normalized. For example, `arm64-v8a` and `aarch64` become `arm64`, while
+`amd64` and `x64` become `x86_64`. Hex Debug IDs and UUIDs are compared without case, braces,
+hyphens, or a leading `0x`.
+
+<Warning>
+  Keep `application_id`, `service`, `release`, `architecture`, and `debug_id` in the same build
+  pipeline that produces the artifact. A stale or ambiguous identity leaves the event intact but
+  produces `missing` or `partial` symbolication.
+</Warning>
+
+### Browser example
 
 Set `service` and `version` to stable values during each build:
 
@@ -23,18 +68,17 @@ initRum({
 });
 ```
 
-Upload the map with the same values:
+Upload the map with the same identity and the exact deployed bundle name:
 
 | Upload field | SDK field | Example |
 |---|---|---|
+| Application ID | `applicationId` | `checkout-web` |
 | Service | `service` | `web-frontend` |
 | Release | `version` | `2026.08.04.1` |
 | File | generated `.map` file | `app.8f312.js.map` |
 
-<Warning>
-  A map uploaded under a different service or release cannot symbolicate the event. Keep the SDK
-  version and upload release in the same build pipeline variable.
-</Warning>
+For a deployed frame URL ending in `/assets/app.8f312.js`, upload `app.8f312.js.map`. Upload every
+lazy-loaded chunk map, not only the main bundle map.
 
 ## Upload from the UI
 
@@ -44,11 +88,11 @@ Upload the map with the same values:
     deployment when security policy requires private source code.
   </Step>
   <Step title="Open the upload page">
-    Go to **RUM → RUM settings → Source Maps**, then click **Upload Source Map**.
+    Go to **RUM → RUM settings → Source Maps & Symbols**, then click **Upload debug artifact**.
   </Step>
-  <Step title="Enter service and release">
-    Enter the exact `service` and `version` values configured in the SDK and select the generated
-    `.map` file. Each uploaded file can be at most 50 MiB.
+  <Step title="Enter the build identity">
+    Select the artifact type and platform. Enter the exact application, service, and release.
+    Add architecture and Debug ID for mobile artifacts, then select the generated file.
   </Step>
   <Step title="Verify symbolication">
     Send an error from the release, open **RUM → Errors**, and confirm the stack displays original
@@ -56,33 +100,121 @@ Upload the map with the same values:
   </Step>
 </Steps>
 
+## Prepare release artifacts
+
+<Tabs>
+  <Tab title="Web">
+    Generate external maps from the exact deployed browser bundle. Keep the `.map` files private
+    when source exposure is not allowed.
+
+    Build Flutter Web with source maps enabled:
+
+    ```bash
+    flutter build web \
+      --release \
+      --source-maps \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=javascript \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Upload `main.dart.js.map` with `kind=javascript_sourcemap`, `platform=flutter`, and
+    `architecture=javascript`.
+  </Tab>
+  <Tab title="Flutter Android">
+    Generate one Flutter symbol file for each production ABI:
+
+    ```bash
+    flutter build apk \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/android-arm64 \
+      --target-platform=android-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Upload `app.android-arm64.symbols` with `kind=flutter_symbols`, `platform=android`,
+    `architecture=arm64`, and `debug_id=${BUILD_ID}`.
+  </Tab>
+  <Tab title="Flutter iOS">
+    Generate Flutter AOT symbols from the release IPA build:
+
+    ```bash
+    flutter build ipa \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/ios-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Upload `app.ios-arm64.symbols` with `kind=flutter_symbols`, `platform=ios`,
+    `architecture=arm64`, and `debug_id=${BUILD_ID}`.
+  </Tab>
+  <Tab title="Android native">
+    Preserve `app/build/outputs/mapping/release/mapping.txt` from every R8 release. Upload it with
+    `kind=android_mapping` and `platform=android`.
+
+    Preserve an unstripped ELF `.so` for every NDK ABI. Extract its Build ID with the platform
+    toolchain, then upload it with `kind=android_native_symbols`, `platform=android`, the canonical
+    architecture, and the same Build ID sent by the crash frame.
+  </Tab>
+  <Tab title="iOS native">
+    Read the UUID from the archived dSYM and compress the DWARF binary when needed:
+
+    ```bash
+    dwarfdump --uuid Checkout.app.dSYM
+    gzip -k Checkout.app.dSYM/Contents/Resources/DWARF/Checkout
+    ```
+
+    Upload the DWARF file or `.gz` with `kind=apple_dsym`, `platform=ios`, the matching
+    architecture, and the normalized Mach-O UUID as `debug_id`.
+  </Tab>
+</Tabs>
+
 ## Upload from CI
 
-Use the authenticated debug-artifact endpoint for automatic release-pipeline uploads:
+Use a management token with `streams.configure`. Never embed this token in a browser or mobile
+application, and never use the public `msrum_` client token for artifact management.
 
 ```bash
 curl --fail-with-body \
   -H "Authorization: Bearer ${MOLESIGNAL_TOKEN}" \
-  -F "application_id=checkout-web" \
-  -F "service=web-frontend" \
+  -F "application_id=${APPLICATION_ID}" \
+  -F "service=${SERVICE}" \
   -F "release=${RELEASE_VERSION}" \
-  -F "kind=javascript_sourcemap" \
-  -F "platform=web" \
-  -F "file=@dist/assets/app.js.map" \
+  -F "kind=${ARTIFACT_KIND}" \
+  -F "platform=${PLATFORM}" \
+  -F "architecture=${ARCHITECTURE}" \
+  -F "debug_id=${DEBUG_ID}" \
+  -F "file=@${ARTIFACT_PATH}" \
   "${MOLESIGNAL_SITE}/api/v1/debug-artifacts"
 ```
 
-Use a token scoped to the target workspace. Listing map metadata requires `streams.read`; uploading
-or deleting maps requires `streams.configure`.
+Leave `architecture` or `debug_id` empty only for an intentional fallback artifact. Exact mobile
+build identity avoids ambiguous matches.
+
+List artifacts with `GET /api/v1/debug-artifacts`. Filter by `application_id`, `service`, `kind`, or
+`platform`. Delete one artifact with `DELETE /api/v1/debug-artifacts/{id}`. Listing requires
+`streams.read`; upload and deletion require `streams.configure`.
 
 ## Release checklist
 
-- Generate maps from the exact deployed artifacts.
-- Set the SDK `version` before any error can be recorded.
-- Upload every lazy-loaded chunk map, not only the main bundle map.
-- Keep service and release names case-sensitive and identical.
-- Verify one controlled error after deployment.
+- Preserve artifacts from the exact deployed binary or bundle.
+- Set an immutable SDK version before any error can be recorded.
+- Keep application, service, release, architecture, and Debug ID aligned with the build.
+- Upload every Web chunk map and every shipped mobile architecture.
+- Retain the management token only in the release pipeline.
+- Verify one controlled error after deployment and confirm restored `original_*` frame fields.
 
-<Card title="Browser RUM SDK" icon="code" href="/en-US/rum/browser-sdk">
-  Install the SDK and configure the service and release context.
-</Card>
+<CardGroup cols={2}>
+  <Card title="Browser RUM SDK" icon="code" href="/en-US/rum/browser-sdk">
+    Configure the browser application, service, and release identity.
+  </Card>
+  <Card title="Flutter App RUM SDK" icon="mobile" href="/en-US/rum/flutter-sdk">
+    Configure Flutter build identity and error collection.
+  </Card>
+</CardGroup>

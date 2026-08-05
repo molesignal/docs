@@ -1,12 +1,56 @@
 ---
-title: "RUM Source Maps"
-sidebarTitle: "Source Maps"
-description: "上传浏览器 Source Map，并与 RUM SDK 上报的服务和版本匹配。"
+title: "RUM Source Maps 与 Symbols"
+sidebarTitle: "Source Maps 与 Symbols"
+description: "为 RUM 堆栈还原上传浏览器 Source Map、Flutter Symbols、Android Mapping 与原生符号，或 Apple dSYM。"
 ---
 
-Source Map 可以让 MoleSignal 把压缩后的 JavaScript 堆栈还原为源码中的文件、函数、行和列。
+MoleSignal 使用调试产物还原压缩后的 JavaScript、混淆后的 Dart 或 Android，以及 Android、
+iOS 原生堆栈帧。所有调试产物统一通过 `/api/v1/debug-artifacts` 管理。
 
-## 匹配 SDK 版本
+<Warning>
+  旧的 `/api/v1/sourcemaps` 入口不再提供。发布流水线必须改用
+  `/api/v1/debug-artifacts`，并提交完整的构建标识。
+</Warning>
+
+## 选择产物类型
+
+| 运行时 | `kind` | `platform` | 文件 |
+|---|---|---|---|
+| Browser JavaScript | `javascript_sourcemap` | `web` | 外部 `.map` 文件 |
+| Flutter Web | `javascript_sourcemap` | `flutter` | `main.dart.js.map` 或其他生成的 `.map` |
+| Flutter Android 或 iOS AOT | `flutter_symbols` | `android` 或 `ios` | Flutter `--split-debug-info` 生成的 `.symbols` |
+| Android R8 | `android_mapping` | `android` | Release `mapping.txt` |
+| Android NDK | `android_native_symbols` | `android` | 未剥离的 ELF 动态库 |
+| Apple 原生 | `apple_dsym` | `ios` | 匹配 `.dSYM` 包内的 DWARF 二进制文件 |
+
+支持原始文件与 gzip 压缩文件。上传文件最大 50 MiB；gzip 解压后最大 256 MiB。
+
+## 匹配构建标识
+
+MoleSignal 根据 RUM Error 的构建标识选择调试产物：
+
+| 上传字段 | 对应 RUM 值 | 规则 |
+|---|---|---|
+| `application_id` | `application` 或 `application_id` | 必须完全一致 |
+| `service` | SDK `service` | 必须完全一致并区分大小写 |
+| `release` | SDK `version` 或事件 `release` | 必须完全一致并区分大小写 |
+| `kind` | 堆栈帧类型 | 从支持的产物表中选择 |
+| `platform` | 事件平台 | 按上表使用 `web`、`flutter`、`android` 或 `ios` |
+| `architecture` | 事件架构 | 移动端与原生产物应填写，例如 `arm64` 或 `x86_64` |
+| `debug_id` | 事件或帧的 Debug ID | 使用相同的 Flutter Build ID、ELF Build ID 或 Mach-O UUID |
+| 文件名 | 运行时模块或 Bundle | Browser Map 必须使用 `<已部署 Bundle 文件名>.map` |
+
+常见 ABI 别名会自动规范化。例如，`arm64-v8a` 与 `aarch64` 会转换为 `arm64`，`amd64` 与
+`x64` 会转换为 `x86_64`。十六进制 Debug ID 与 UUID 比较时会忽略大小写、花括号、连字符和
+开头的 `0x`。
+
+<Warning>
+  `application_id`、`service`、`release`、`architecture` 与 `debug_id` 必须和产物来自
+  同一条构建流水线。标识过期或存在歧义时，错误事件仍会保留，但符号化状态会是 `missing`
+  或 `partial`。
+</Warning>
+
+### Browser 示例
 
 每次构建时，为 `service` 和 `version` 设置稳定值：
 
@@ -22,17 +66,17 @@ initRum({
 });
 ```
 
-上传 Source Map 时使用相同的值：
+上传 Source Map 时使用相同标识和实际部署的 Bundle 文件名：
 
 | 上传字段 | SDK 字段 | 示例 |
 |---|---|---|
+| 应用 ID | `applicationId` | `checkout-web` |
 | 服务 | `service` | `web-frontend` |
 | 版本 | `version` | `2026.08.04.1` |
 | 文件 | 生成的 `.map` 文件 | `app.8f312.js.map` |
 
-<Warning>
-  如果 Source Map 的服务或版本不同，事件将无法完成符号化。请让 SDK 版本和上传版本使用同一个构建流水线变量。
-</Warning>
+已部署帧 URL 以 `/assets/app.8f312.js` 结尾时，需要上传 `app.8f312.js.map`。所有按需加载
+Chunk 的 Source Map 都要上传，不能只上传主 Bundle。
 
 ## 在页面中上传
 
@@ -41,43 +85,132 @@ initRum({
     在生产构建中生成外部 Source Map。如果安全策略要求源码保持私有，请不要把 Source Map 部署到公网。
   </Step>
   <Step title="打开上传页面">
-    进入 **RUM → RUM 设置 → Source Maps**，然后点击 **上传 Source Map**。
+    进入 **RUM → RUM 设置 → Source Maps 与 Symbols**，然后点击 **上传调试产物**。
   </Step>
-  <Step title="填写服务和版本">
-    输入与 SDK 配置完全一致的 `service` 和 `version`，并选择生成的 `.map` 文件。每个上传文件最大为 50 MiB。
+  <Step title="填写构建标识">
+    选择产物类型与平台，填写完全一致的应用、服务和版本。移动端产物还要填写架构与 Debug ID，
+    然后选择生成的文件。
   </Step>
   <Step title="验证符号化">
     从该版本发送一个错误，打开 **RUM → 错误**，确认堆栈已显示原始源码位置。
   </Step>
 </Steps>
 
+## 准备 Release 产物
+
+<Tabs>
+  <Tab title="Web">
+    使用实际部署的 Browser Bundle 生成外部 Source Map。源码不允许公开时，仅把 `.map` 文件
+    保存在私有发布流水线中。
+
+    构建 Flutter Web 时启用 Source Map：
+
+    ```bash
+    flutter build web \
+      --release \
+      --source-maps \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=javascript \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    上传 `main.dart.js.map` 时使用 `kind=javascript_sourcemap`、`platform=flutter` 与
+    `architecture=javascript`。
+  </Tab>
+  <Tab title="Flutter Android">
+    为每个生产 ABI 生成独立的 Flutter Symbols：
+
+    ```bash
+    flutter build apk \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/android-arm64 \
+      --target-platform=android-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    上传 `app.android-arm64.symbols` 时使用 `kind=flutter_symbols`、`platform=android`、
+    `architecture=arm64` 与 `debug_id=${BUILD_ID}`。
+  </Tab>
+  <Tab title="Flutter iOS">
+    从 Release IPA 构建生成 Flutter AOT Symbols：
+
+    ```bash
+    flutter build ipa \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/ios-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    上传 `app.ios-arm64.symbols` 时使用 `kind=flutter_symbols`、`platform=ios`、
+    `architecture=arm64` 与 `debug_id=${BUILD_ID}`。
+  </Tab>
+  <Tab title="Android 原生">
+    保留每个 R8 Release 的 `app/build/outputs/mapping/release/mapping.txt`，并使用
+    `kind=android_mapping`、`platform=android` 上传。
+
+    为每个 NDK ABI 保留未剥离的 ELF `.so`。使用平台工具链提取 Build ID，再使用
+    `kind=android_native_symbols`、`platform=android`、规范化架构，以及 Crash Frame 上报的
+    相同 Build ID 上传。
+  </Tab>
+  <Tab title="iOS 原生">
+    读取归档 dSYM 的 UUID，并按需压缩 DWARF 二进制文件：
+
+    ```bash
+    dwarfdump --uuid Checkout.app.dSYM
+    gzip -k Checkout.app.dSYM/Contents/Resources/DWARF/Checkout
+    ```
+
+    上传 DWARF 文件或 `.gz` 时使用 `kind=apple_dsym`、`platform=ios`、匹配架构，并将规范化的
+    Mach-O UUID 写入 `debug_id`。
+  </Tab>
+</Tabs>
+
 ## 从 CI 上传
 
-如果需要在发布流水线中自动上传 Source Map，请调用需要认证的调试产物接口：
+使用具有 `streams.configure` 权限的管理 Token。不得把该 Token 写入 Browser 或移动应用，
+也不得使用公开的 `msrum_` Client Token 管理调试产物。
 
 ```bash
 curl --fail-with-body \
   -H "Authorization: Bearer ${MOLESIGNAL_TOKEN}" \
-  -F "application_id=checkout-web" \
-  -F "service=web-frontend" \
+  -F "application_id=${APPLICATION_ID}" \
+  -F "service=${SERVICE}" \
   -F "release=${RELEASE_VERSION}" \
-  -F "kind=javascript_sourcemap" \
-  -F "platform=web" \
-  -F "file=@dist/assets/app.js.map" \
+  -F "kind=${ARTIFACT_KIND}" \
+  -F "platform=${PLATFORM}" \
+  -F "architecture=${ARCHITECTURE}" \
+  -F "debug_id=${DEBUG_ID}" \
+  -F "file=@${ARTIFACT_PATH}" \
   "${MOLESIGNAL_SITE}/api/v1/debug-artifacts"
 ```
 
-请使用限定到目标工作区的 Token。列出 Source Map 元数据需要 `streams.read`；上传或删除需要
-`streams.configure`。
+只有需要创建通用回退产物时，才将 `architecture` 或 `debug_id` 留空。移动端使用精确构建标识
+可以避免匹配歧义。
+
+通过 `GET /api/v1/debug-artifacts` 列出产物，可按 `application_id`、`service`、`kind` 或
+`platform` 筛选。通过 `DELETE /api/v1/debug-artifacts/{id}` 删除单个产物。列出产物需要
+`streams.read`，上传与删除需要 `streams.configure`。
 
 ## 发布检查清单
 
-- 使用实际部署的产物生成 Source Map。
-- 在任何错误可能被记录之前设置 SDK `version`。
-- 上传所有按需加载 Chunk 的 Source Map，而不只是主 Bundle。
-- 服务和版本名称区分大小写，必须完全一致。
-- 部署后发送一个受控错误完成验证。
+- 保留实际部署二进制或 Bundle 生成的产物。
+- 在任何错误可能被记录之前设置不可变的 SDK 版本。
+- 保持应用、服务、版本、架构与 Debug ID 和当前构建一致。
+- 上传全部 Web Chunk Source Map 与所有已发布移动端架构的产物。
+- 只在发布流水线中保存管理 Token。
+- 部署后发送一个受控错误，并确认堆栈帧已生成还原后的 `original_*` 字段。
 
-<Card title="Browser RUM SDK" icon="code" href="/zh-Hans/rum/browser-sdk">
-  安装 SDK，并配置服务和版本上下文。
-</Card>
+<CardGroup cols={2}>
+  <Card title="Browser RUM SDK" icon="code" href="/zh-Hans/rum/browser-sdk">
+    配置 Browser 应用、服务与版本标识。
+  </Card>
+  <Card title="Flutter App RUM SDK" icon="mobile" href="/zh-Hans/rum/flutter-sdk">
+    配置 Flutter 构建标识与错误采集。
+  </Card>
+</CardGroup>
