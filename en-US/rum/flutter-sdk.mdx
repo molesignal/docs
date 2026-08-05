@@ -1,0 +1,311 @@
+---
+title: "Flutter App RUM SDK"
+sidebarTitle: "Flutter App SDK"
+description: "Install and configure the MoleSignal Flutter App RUM SDK for views, interactions, errors, resources, performance, and session replay."
+---
+
+The MoleSignal Flutter App RUM SDK sends mobile telemetry through the same session, action, error,
+resource, and replay contract as the Browser RUM SDK. Flutter-native instrumentation preserves the
+same investigation workflow without inventing browser-only metrics.
+
+## Capability parity
+
+| Browser capability | Flutter App SDK equivalent |
+|---|---|
+| History views | `RumNavigationObserver` or `startView` |
+| Clicks and submits | Automatic taps through `RumApp`, or named `RumUserAction` widgets |
+| Rage and dead clicks | `rage_click` and visually verified `dead_click` actions |
+| Runtime and promise errors | `FlutterError`, `PlatformDispatcher.onError`, and `addError` |
+| Fetch and XHR resources | `MoleSignalHttpClient`, or `addResource` from another interceptor |
+| Long Tasks and Web Vitals | Slow Flutter frames and per-view time to first render |
+| rrweb DOM replay | Privacy-processed screenshots encoded as rrweb snapshots and mutations |
+| W3C trace correlation | Request, response, or `Server-Timing` `traceparent` |
+
+Flutter reports build, raster, vsync, first-render, and slow-frame data. Browser-only metrics such as
+LCP and CLS are not generated for Flutter applications.
+
+## Requirements
+
+- Flutter 3.35 or later;
+- Dart 3.9 or later;
+- Android 24+ or iOS 13+ when using the default persistent identity store.
+
+## Install and initialize
+
+<Warning>
+  `clientToken` ships in the application and must be treated as public. Use the application-bound
+  `msrum_` client token created by the data-source guide.
+</Warning>
+
+<Steps>
+  <Step title="Add the package">
+    ```yaml
+    dependencies:
+      molesignal_flutter: ^0.2.0
+    ```
+
+    Run `flutter pub get` after updating `pubspec.yaml`.
+  </Step>
+  <Step title="Initialize before runApp">
+    ```dart
+    import 'package:flutter/material.dart';
+    import 'package:molesignal_flutter/molesignal_flutter.dart';
+
+    Future<void> main() async {
+      WidgetsFlutterBinding.ensureInitialized();
+
+      final rum = await initRum(
+        const RumConfiguration(
+          applicationId: 'checkout-mobile',
+          clientToken: 'msrum_your_client_token',
+          site: 'https://molesignal.example.com',
+          service: 'checkout-app',
+          env: 'production',
+          version: '1.4.0+42',
+          sessionSampleRate: 100,
+          sessionReplaySampleRate: 20,
+          trackUserInteractions: true,
+        ),
+      );
+
+      runApp(
+        RumApp(
+          client: rum,
+          child: MaterialApp(
+            navigatorObservers: <NavigatorObserver>[
+              RumNavigationObserver(rum),
+            ],
+            routes: <String, WidgetBuilder>{
+              '/': (_) => const HomePage(),
+              '/checkout': (_) => const CheckoutPage(),
+            },
+          ),
+        ),
+      );
+    }
+    ```
+
+    `RumApp` installs the replay boundary, automatic tap collection, and frustration detection.
+    Replay remains disabled unless `sessionReplaySampleRate` selects the current session or recording
+    is started manually.
+  </Step>
+  <Step title="Verify the first session">
+    Open **RUM → Overview**, select a time range that includes the current time, and confirm that
+    `checkout-mobile` appears. Open **Sessions** to inspect the view and device context.
+  </Step>
+</Steps>
+
+`site` accepts the MoleSignal origin, an `/api` base URL, or an `/api/v1` base URL. The SDK
+normalizes the value and sends data to `/api/v1/rum`.
+
+## Record views and rendering performance
+
+`RumNavigationObserver` records visible named routes. Supply the observer through the router
+integration for `Router` or `go_router` applications. Call `startView` when a route has no stable
+name or when navigation is managed outside `Navigator`.
+
+```dart
+rum.startView(
+  'Order confirmation',
+  path: '/orders/complete',
+  context: const <String, Object?>{'checkout_variant': 'one-page'},
+);
+```
+
+The first rendered frame after each view produces `flutter_time_to_first_render` with build,
+raster, and vsync timing. Frames slower than `longFrameThreshold` produce slow-frame actions.
+
+## Identify users and record application activity
+
+```dart
+rum.setUser(const RumUser(
+  id: 'user-42',
+  attributes: <String, Object?>{'plan': 'enterprise'},
+));
+rum.setGlobalContextProperty('region', 'ap-southeast-1');
+
+try {
+  await submitOrder();
+} catch (error, stackTrace) {
+  rum.addError(
+    error,
+    stackTrace: stackTrace,
+    context: const <String, Object?>{'component': 'CheckoutButton'},
+  );
+}
+
+rum.addAction(
+  'Checkout submitted',
+  context: const <String, Object?>{'cart_size': 3},
+);
+```
+
+The SDK chains existing `FlutterError.onError` and `PlatformDispatcher.onError` handlers. Forward
+errors from additional isolates to the main isolate and call `addError`. Call `clearUser()` after
+sign-out when the next activity must no longer use the identified user.
+
+Automatic tap names are privacy-safe. Wrap important controls with `RumUserAction` to attach a
+stable business name without taking ownership of Flutter's gesture arena.
+
+```dart
+RumUserAction(
+  client: rum,
+  name: 'Pay now',
+  child: ElevatedButton(
+    onPressed: pay,
+    child: const Text('Pay now'),
+  ),
+)
+```
+
+Set `trackUserInteractions: true` to collect taps, then use `trackFrustrations` to control rage taps
+and visually verified dead taps. By default, frustration tracking follows `trackUserInteractions`.
+
+## Monitor HTTP resources and backend traces
+
+Wrap `package:http` with `MoleSignalHttpClient`:
+
+Declare `http: ^1.6.0` as a direct application dependency when the application does not already use
+`package:http`.
+
+```dart
+import 'package:http/http.dart' as http;
+
+final http.Client httpClient = MoleSignalHttpClient(
+  rum,
+  inner: http.Client(),
+);
+
+await httpClient.get(Uri.parse('https://api.example.com/orders'));
+```
+
+The wrapper records the sanitized URL, method, duration, status code, response size, and available
+W3C trace identifiers. Trace context is read in this order: response `traceparent`, a
+`traceparent` entry in `Server-Timing`, then request `traceparent`.
+
+Restrict trace-header reading when only selected services are trusted:
+
+```dart
+RumConfiguration(
+  // ...
+  allowedTracingUrls: <Pattern>[
+    'https://api.example.com',
+    RegExp(r'^https://edge-\w+\.example\.com/'),
+  ],
+)
+```
+
+The SDK does not globally intercept networking. Call `addResource` from a Dio or custom-client
+interceptor:
+
+```dart
+rum.addResource(RumResource(
+  method: request.method,
+  url: request.uri,
+  duration: elapsed,
+  status: response.statusCode,
+  responseSize: responseSize,
+  initiator: 'dio',
+));
+```
+
+## Enable session replay
+
+Flutter has no DOM. The first captured frame becomes rrweb `Meta` and `FullSnapshot` events. Changed
+frames become incremental image mutations, and unchanged frames are skipped. The existing MoleSignal
+replay player can therefore render browser and Flutter sessions through the same workflow.
+
+```dart
+const RumConfiguration(
+  // ...
+  sessionReplaySampleRate: 20,
+  sessionReplay: RumSessionReplayConfiguration(
+    captureInterval: Duration(seconds: 2),
+    captureOnAction: true,
+    pixelRatio: 0.75,
+    maximumImageDimension: 1200,
+  ),
+)
+
+rum.startSessionReplayRecording();
+rum.stopSessionReplayRecording();
+```
+
+`sessionReplaySampleRate` applies within sessions included by `sessionSampleRate`; multiply both rates
+to calculate effective replay coverage. Manual recording also applies only to an included session.
+Replay uses a separate queue, a 10-second default flush interval, per-session sequence numbers,
+approximately 1 MiB target segments, and an 8 MiB request ceiling.
+
+## Protect replay content
+
+The default `RumPrivacyLevel.mask` covers `Text`, `RichText`, and editable regions before PNG
+encoding. Input fields stay masked in `allow` mode. The SDK also removes URL queries and fragments,
+recursively redacts common sensitive context keys, and withholds raw error stacks by default. Wrap
+sensitive images, maps, custom-painted content, platform views, or complete components in an
+explicit privacy boundary:
+
+```dart
+RumReplayBlock(
+  child: AccountBalanceCard(),
+)
+```
+
+`RumReplayMask` and `RumReplayBlock` both replace the captured region with an opaque block. Raw,
+unmasked pixels never enter the event queue.
+
+<Warning>
+  Text drawn by `CustomPainter` cannot be detected from the widget type. Wrap the custom-painted
+  region explicitly. Platform-view capture depends on platform composition; verify sensitive
+  platform views on real Android and iOS devices.
+</Warning>
+
+## Main configuration
+
+| Option | Default | Purpose |
+|---|---|---|
+| `applicationId`, `clientToken`, `site` | Required | Application identity, authentication, and ingestion endpoint |
+| `service` | `applicationId` | Service stored on actions and errors |
+| `env`, `version`, `user`, `globalContext` | Unset | Deployment, release, identity, and custom dimensions |
+| `sessionSampleRate` | `100` | Session sampling percentage |
+| `sessionReplaySampleRate` | `0` | Replay percentage within sampled sessions |
+| `sessionReplay` | Privacy-safe defaults | Capture interval, resolution, action capture, and mask color |
+| `trackUserInteractions` | `false` | Automatic taps through `RumApp` |
+| `trackFrustrations` | Interaction setting | Rage- and dead-tap detection |
+| `trackResources` | `true` | HTTP resource collection |
+| `trackLongTasks` | `true` | Flutter frames over the configured threshold |
+| `trackViewPerformance` | `true` | Per-view time to first render |
+| `longFrameThreshold` | `100 ms` | Slow-frame threshold |
+| `trackFlutterErrors`, `trackPlatformErrors` | `true` | Framework and root-isolate errors |
+| `trackAppLifecycle` | `true` | Foreground/background actions and background flush |
+| `trackAnonymousUser` | `true` | Persistent anonymous identity |
+| `trackUrlQueryString` | `false` | Preserve URL query strings when enabled |
+| `defaultPrivacyLevel` | `mask` | Replay text, interaction labels, and raw-stack policy |
+| `flushInterval`, `batchSize` | `5 s`, `50` | Standard event transport |
+| `replayFlushInterval`, `replayBatchSize` | `10 s`, `100` | Replay event transport |
+| `beforeSend` | Unset | Modify or drop any event kind, including replay |
+
+`RumSessionReplayConfiguration` defaults to a 5-second capture interval, capture after actions,
+`0.5` output pixels per logical pixel, a 900-pixel maximum image edge, and mask color `#6B7280`.
+
+`excludedUrls`, `allowedTracingUrls`, `maxQueueSize`, session timeouts, diagnostics, custom
+transport, and persistence are also configurable. `trackLongFrames` remains a compatibility alias
+for `trackLongTasks`.
+
+## Flush and stop
+
+Call `flush()` before a controlled transition that must wait for queued events. Call `stop()` during
+final teardown to remove instrumentation and flush both event queues.
+
+```dart
+await rum.flush();
+await rum.stop();
+```
+
+<CardGroup cols={2}>
+  <Card title="Browser RUM SDK" icon="code" href="/en-US/rum/browser-sdk">
+    Compare the Browser SDK setup and browser-specific instrumentation.
+  </Card>
+  <Card title="RUM overview" icon="chart-line" href="/en-US/rum">
+    Review the shared RUM data model and investigation workflow.
+  </Card>
+</CardGroup>

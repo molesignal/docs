@@ -1,0 +1,302 @@
+---
+title: "Flutter App RUM SDK"
+sidebarTitle: "Flutter App SDK"
+description: "安装和配置 MoleSignal Flutter App RUM SDK，采集页面、交互、错误、网络资源、性能与会话回放。"
+---
+
+MoleSignal Flutter App RUM SDK 与 Browser RUM SDK 使用同一套会话、Action、错误、资源和回放
+写入契约。Flutter 原生监测让移动端沿用相同的排障流程，同时避免伪造浏览器专属指标。
+
+## 能力对齐
+
+| Browser SDK 能力 | Flutter App SDK 对应能力 |
+|---|---|
+| History 页面 View | `RumNavigationObserver` 或 `startView` |
+| Click 与 Submit | `RumApp` 自动 Tap，或使用 `RumUserAction` 显式命名 |
+| Rage Click 与 Dead Click | `rage_click` 与结合画面变化判断的 `dead_click` Action |
+| Runtime 与 Promise Error | `FlutterError`、`PlatformDispatcher.onError` 与 `addError` |
+| Fetch 与 XHR Resource | `MoleSignalHttpClient`，或从其他网络拦截器调用 `addResource` |
+| Long Task 与 Web Vitals | Flutter 慢帧与每个 View 的首次渲染耗时 |
+| rrweb DOM Replay | 经过隐私处理的屏幕截图，编码为 rrweb Snapshot 与 Mutation |
+| W3C Trace 关联 | 请求、响应或 `Server-Timing` 中的 `traceparent` |
+
+Flutter 上报 build、raster、vsync、首次渲染与慢帧数据。LCP、CLS 等浏览器专属指标不会在
+Flutter 应用中生成。
+
+## 环境要求
+
+- Flutter 3.35 或更高版本；
+- Dart 3.9 或更高版本；
+- 使用默认持久化身份存储时，需要 Android 24+ 或 iOS 13+。
+
+## 安装与初始化
+
+<Warning>
+  `clientToken` 会随 App 下发，必须视为公开凭证。请使用数据源接入向导生成的应用绑定
+  `msrum_` Client Token。
+</Warning>
+
+<Steps>
+  <Step title="添加依赖">
+    ```yaml
+    dependencies:
+      molesignal_flutter: ^0.2.0
+    ```
+
+    更新 `pubspec.yaml` 后运行 `flutter pub get`。
+  </Step>
+  <Step title="在 runApp 前初始化">
+    ```dart
+    import 'package:flutter/material.dart';
+    import 'package:molesignal_flutter/molesignal_flutter.dart';
+
+    Future<void> main() async {
+      WidgetsFlutterBinding.ensureInitialized();
+
+      final rum = await initRum(
+        const RumConfiguration(
+          applicationId: 'checkout-mobile',
+          clientToken: 'msrum_your_client_token',
+          site: 'https://molesignal.example.com',
+          service: 'checkout-app',
+          env: 'production',
+          version: '1.4.0+42',
+          sessionSampleRate: 100,
+          sessionReplaySampleRate: 20,
+          trackUserInteractions: true,
+        ),
+      );
+
+      runApp(
+        RumApp(
+          client: rum,
+          child: MaterialApp(
+            navigatorObservers: <NavigatorObserver>[
+              RumNavigationObserver(rum),
+            ],
+            routes: <String, WidgetBuilder>{
+              '/': (_) => const HomePage(),
+              '/checkout': (_) => const CheckoutPage(),
+            },
+          ),
+        ),
+      );
+    }
+    ```
+
+    `RumApp` 提供回放边界、自动 Tap 采集与交互挫败检测。只有当前会话命中回放采样，
+    或手动开始录制时，SDK 才会采集屏幕回放。
+  </Step>
+  <Step title="验证第一个会话">
+    打开 **RUM → 概览**，选择包含当前时间的时间范围，确认 `checkout-mobile` 已出现。
+    再打开 **会话**，检查页面 Action 与设备上下文。
+  </Step>
+</Steps>
+
+`site` 可以是 MoleSignal Origin、`/api` 基础地址或 `/api/v1` 基础地址。SDK 会自动规范化地址，
+并将数据发送到 `/api/v1/rum`。
+
+## 采集页面与渲染性能
+
+`RumNavigationObserver` 会记录当前可见的具名路由。使用 `Router` 或 `go_router` 时，将观察器
+传给对应路由集成。路由没有稳定名称，或应用不通过 `Navigator` 管理页面时，调用 `startView`：
+
+```dart
+rum.startView(
+  'Order confirmation',
+  path: '/orders/complete',
+  context: const <String, Object?>{'checkout_variant': 'one-page'},
+);
+```
+
+每个 View 的首个渲染帧会生成 `flutter_time_to_first_render`，并携带 build、raster 与 vsync
+耗时。超过 `longFrameThreshold` 的帧会生成慢帧 Action。
+
+## 识别用户并记录应用活动
+
+```dart
+rum.setUser(const RumUser(
+  id: 'user-42',
+  attributes: <String, Object?>{'plan': 'enterprise'},
+));
+rum.setGlobalContextProperty('region', 'cn-east-1');
+
+try {
+  await submitOrder();
+} catch (error, stackTrace) {
+  rum.addError(
+    error,
+    stackTrace: stackTrace,
+    context: const <String, Object?>{'component': 'CheckoutButton'},
+  );
+}
+
+rum.addAction(
+  'Checkout submitted',
+  context: const <String, Object?>{'cart_size': 3},
+);
+```
+
+SDK 会链式调用已有的 `FlutterError.onError` 与 `PlatformDispatcher.onError` 处理器。
+额外 isolate 中的错误需要转发到主 isolate，再调用 `addError`。退出登录后可以调用
+`clearUser()`，避免后续活动继续关联已登录用户。
+
+自动 Tap 使用隐私安全的名称。用 `RumUserAction` 包裹关键控件，可以添加稳定的业务名称，
+同时不会抢占 Flutter Gesture Arena：
+
+```dart
+RumUserAction(
+  client: rum,
+  name: 'Pay now',
+  child: ElevatedButton(
+    onPressed: pay,
+    child: const Text('Pay now'),
+  ),
+)
+```
+
+设置 `trackUserInteractions: true` 采集 Tap，再通过 `trackFrustrations` 控制 Rage Tap 与经过
+画面变化验证的 Dead Tap。默认情况下，挫败检测跟随 `trackUserInteractions`。
+
+## 监控 HTTP 资源并关联后端链路
+
+使用 `MoleSignalHttpClient` 包装 `package:http`：
+
+如果应用尚未使用 `package:http`，请在应用中直接声明 `http: ^1.6.0` 依赖。
+
+```dart
+import 'package:http/http.dart' as http;
+
+final http.Client httpClient = MoleSignalHttpClient(
+  rum,
+  inner: http.Client(),
+);
+
+await httpClient.get(Uri.parse('https://api.example.com/orders'));
+```
+
+该包装器会采集脱敏 URL、Method、耗时、状态码、响应大小与可用的 W3C Trace 标识。
+Trace Context 的读取顺序为：响应 `traceparent`、`Server-Timing` 中的 `traceparent`，
+最后是请求 `traceparent`。
+
+只信任指定服务时，限制读取 Trace Header 的 URL：
+
+```dart
+RumConfiguration(
+  // ...
+  allowedTracingUrls: <Pattern>[
+    'https://api.example.com',
+    RegExp(r'^https://edge-\w+\.example\.com/'),
+  ],
+)
+```
+
+SDK 不会全局拦截网络。使用 Dio 或自定义客户端时，从 Interceptor 调用 `addResource`：
+
+```dart
+rum.addResource(RumResource(
+  method: request.method,
+  url: request.uri,
+  duration: elapsed,
+  status: response.statusCode,
+  responseSize: responseSize,
+  initiator: 'dio',
+));
+```
+
+## 启用会话回放
+
+Flutter 没有 DOM。首次采集的画面会转换为 rrweb `Meta` 与 `FullSnapshot` 事件；后续变化的
+画面会转换为增量图片 Mutation，未变化画面不会重复上传。因此现有 MoleSignal 回放播放器可以
+沿用同一流程呈现浏览器与 Flutter 会话。
+
+```dart
+const RumConfiguration(
+  // ...
+  sessionReplaySampleRate: 20,
+  sessionReplay: RumSessionReplayConfiguration(
+    captureInterval: Duration(seconds: 2),
+    captureOnAction: true,
+    pixelRatio: 0.75,
+    maximumImageDimension: 1200,
+  ),
+)
+
+rum.startSessionReplayRecording();
+rum.stopSessionReplayRecording();
+```
+
+`sessionReplaySampleRate` 只作用于已经被 `sessionSampleRate` 选中的会话，两者相乘得到实际回放
+覆盖率。手动录制同样只作用于已选中的会话。回放使用独立队列，默认每 10 秒刷新，每个会话使用
+独立递增序号，目标分段约为 1 MiB，单次请求上限为 8 MiB。
+
+## 保护回放内容
+
+默认的 `RumPrivacyLevel.mask` 会在 PNG 编码前遮住 `Text`、`RichText` 与可编辑区域。
+Input 在 `allow` 模式下也始终保持遮罩。SDK 还会默认移除 URL Query 与 Fragment、递归脱敏
+常见敏感上下文字段，并且不上传 Raw Error Stack。敏感图片、地图、自绘内容、Platform View
+或完整组件需要放入显式隐私边界：
+
+```dart
+RumReplayBlock(
+  child: AccountBalanceCard(),
+)
+```
+
+`RumReplayMask` 与 `RumReplayBlock` 都会在采集画面中将对应区域替换为不透明色块。
+未遮罩的原始像素不会进入事件队列。
+
+<Warning>
+  SDK 无法从 Widget 类型识别 `CustomPainter` 绘制的文字，必须显式包裹自绘区域。
+  Platform View 的采集结果取决于平台合成方式，请在 Android 与 iOS 真机上验证敏感内容。
+</Warning>
+
+## 主要配置
+
+| 选项 | 默认值 | 用途 |
+|---|---|---|
+| `applicationId`, `clientToken`, `site` | 必填 | 应用标识、鉴权与写入地址 |
+| `service` | `applicationId` | Action 与 Error 的服务名 |
+| `env`, `version`, `user`, `globalContext` | 未设置 | 部署、发布、身份与自定义维度 |
+| `sessionSampleRate` | `100` | 会话采样百分比 |
+| `sessionReplaySampleRate` | `0` | 已采样会话中的回放百分比 |
+| `sessionReplay` | 隐私安全默认值 | 采集周期、分辨率、Action 后采集与遮罩颜色 |
+| `trackUserInteractions` | `false` | 通过 `RumApp` 自动采集 Tap |
+| `trackFrustrations` | 跟随交互配置 | Rage Tap 与 Dead Tap 检测 |
+| `trackResources` | `true` | HTTP Resource 采集 |
+| `trackLongTasks` | `true` | 超过阈值的 Flutter 慢帧 |
+| `trackViewPerformance` | `true` | 每个 View 的首次渲染耗时 |
+| `longFrameThreshold` | `100 ms` | 慢帧阈值 |
+| `trackFlutterErrors`, `trackPlatformErrors` | `true` | Framework 与 root-isolate 错误 |
+| `trackAppLifecycle` | `true` | 前后台 Action 与进入后台时刷新 |
+| `trackAnonymousUser` | `true` | 持久化匿名 ID |
+| `trackUrlQueryString` | `false` | 启用后保留 URL Query |
+| `defaultPrivacyLevel` | `mask` | 回放文字、交互标签与 Raw Stack 策略 |
+| `flushInterval`, `batchSize` | `5 s`, `50` | 普通事件上传策略 |
+| `replayFlushInterval`, `replayBatchSize` | `10 s`, `100` | 回放事件上传策略 |
+| `beforeSend` | 未设置 | 修改或丢弃任意事件，包括 Replay |
+
+`RumSessionReplayConfiguration` 的默认值为每 5 秒采集、Action 后采集、每个逻辑像素输出 `0.5`
+个像素、图片最长边 900 像素，并使用 `#6B7280` 作为遮罩颜色。
+
+还可配置 `excludedUrls`、`allowedTracingUrls`、`maxQueueSize`、会话超时、诊断回调、
+自定义 Transport 与持久化。`trackLongFrames` 是 `trackLongTasks` 的兼容别名。
+
+## 刷新与停止
+
+受控跳转前需要等待队列上报时，调用 `flush()`。应用最终清理时调用 `stop()`，移除监测并刷新
+普通事件与回放队列。
+
+```dart
+await rum.flush();
+await rum.stop();
+```
+
+<CardGroup cols={2}>
+  <Card title="Browser RUM SDK" icon="code" href="/zh-Hans/rum/browser-sdk">
+    对比 Browser SDK 接入方式与浏览器专属监测能力。
+  </Card>
+  <Card title="RUM 概览" icon="chart-line" href="/zh-Hans/rum">
+    查看 Web 与 App 共用的数据模型和排障流程。
+  </Card>
+</CardGroup>
