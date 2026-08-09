@@ -17,7 +17,7 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
     `[node].roles` 决定本进程对外暴露什么、承载哪些前台职责。默认 `["standalone"]`，即单进程跑全部职责。
   </Card>
   <Card title="状态尽量外置" icon="database">
-    元数据落 Postgres，数据落对象存储。除 Ingester 的 WAL/缓冲外，大多数角色是无状态的，可水平扩。
+    元数据落 Postgres，数据落对象存储。除 Intake 的 WAL/缓冲外，大多数角色是无状态的，可水平扩。
   </Card>
   <Card title="发现走 Postgres" icon="network-wired">
     没有独立的 gossip 或共识组件。每个节点通过心跳写入 `cluster_nodes` 表，其他节点直接查表发现存活对等节点。
@@ -33,9 +33,9 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
     - 依赖仍然是外置的 Postgres + 对象存储（或本地文件系统后端）。
   </Tab>
   <Tab title="分角色集群">
-    - 写入与查询负载需要独立扩缩；或需要把有状态的 Ingester 与无状态角色分开调度。
-    - 用 Router 做入口与限流，把写入按一致性哈希散到多个 Ingester，把查询分发到多个 Querier。
-    - 适合 Kubernetes：无状态角色用 Deployment，Ingester 用 StatefulSet + PVC。
+    - 写入与查询负载需要独立扩缩；或需要把有状态的 Intake 与无状态角色分开调度。
+    - 用 Router 做入口与限流，把写入按一致性哈希散到多个 Intake，把查询分发到多个 Querier。
+    - 适合 Kubernetes：无状态角色用 Deployment，Intake 用 StatefulSet + PVC。
   </Tab>
 </Tabs>
 
@@ -45,28 +45,28 @@ MoleSignal 是一个**单一二进制（single binary）**：同一份可执行�
 
 ## 节点角色总表
 
-`[node].roles` 是一个数组（`Vec<Role>`），合法取值：`standalone`、`router`、`ingester`、`querier`、`compactor`、`alert_manager`。默认 `["standalone"]`。
+`[node].roles` 是一个数组（`Vec<Role>`），合法取值：`standalone`、`router`、`intake`、`querier`、`compactor`、`alert_manager`。默认 `["standalone"]`。
 
 <Note>
-**多角色可在一个进程内组合。** 形如 `[node].roles = ["ingester", "querier"]` 会启动各角色所需的去重后前台 server（此例为同时承载 ingest + 扫描的 gRPC server），按角色 gate 对应后台循环，并把节点的**全部**角色登记进 `cluster_nodes`。对等节点可以按任一已登记角色完成发现。`standalone` 是“全部角色合一进程”的简写。
+**多角色可在一个进程内组合。** 形如 `[node].roles = ["intake", "querier"]` 会启动各角色所需的去重后前台 server（此例为同时承载 intake + 扫描的 gRPC server），按角色 gate 对应后台循环，并把节点的**全部**角色登记进 `cluster_nodes`。对等节点可以按任一已登记角色完成发现。`standalone` 是“全部角色合一进程”的简写。
 </Note>
 
 | 角色 | 前台暴露 | 有/无状态 | 扩缩特性 |
 | --- | --- | --- | --- |
-| `standalone` | HTTP + gRPC，并在进程内运行全部内部职责 | 含状态（内含 Ingester） | 评估用单实例；不适合作为横向扩展单元 |
+| `standalone` | HTTP + gRPC，并在进程内运行全部内部职责 | 含状态（内含 Intake） | 评估用单实例；不适合作为横向扩展单元 |
 | `router` | HTTP 反向代理 + 限流；**不直接暴露业务 HTTP listener 之外的内部服务** | 无状态（限流器为进程内、临时） | 可水平扩，前置一个 L4/L7 LB 即可 |
-| `ingester` | 承载 WAL 重放 + 缓冲 + 周期 flush（flush 循环在配置了该角色时于启动期 spawn） | **有状态**（WAL、内存缓冲、file_meta 缓存） | 一致性哈希分片；扩缩需考虑 WAL 持久卷与再平衡 |
+| `intake` | 承载 WAL 重放 + 缓冲 + 周期 flush（flush 循环在配置了该角色时于启动期 spawn） | **有状态**（WAL、内存缓冲、file_meta 缓存） | 一致性哈希分片；扩缩需考虑 WAL 持久卷与再平衡 |
 | `querier` | gRPC 上的分布式扫描端（Arrow Flight `do_get`）：读列式文件、跑 shard SQL、流式返回结果批 | 无状态 | 可水平扩 |
 | `compactor` | 运行压实 + retention tick 循环（仅当配置了该角色才 spawn） | 无状态（逐 tick 处理） | **建议单实例**（见高可用一节） |
 | `alert_manager` | 运行评估 + 派发 tick 循环（仅当配置了该角色才 spawn） | 有状态（评估状态、事件状态在进程内） | 建议单实例 |
 
 <Note>
-独立 `querier`（或任何含 `querier` / `ingester` 的角色集）会启动承载 Arrow Flight 扫描服务的 gRPC server。协调端经 `list_role(querier)` 发现各 querier 并向对等节点散播分片。单进程 `standalone` 仍如常工作；分布式散播需 ≥2 个 querier 对等节点。
+独立 `querier`（或任何含 `querier` / `intake` 的角色集）会启动承载 Arrow Flight 扫描服务的 gRPC server。协调端经 `list_role(querier)` 发现各 querier 并向对等节点散播分片。单进程 `standalone` 仍如常工作；分布式散播需 ≥2 个 querier 对等节点。
 </Note>
 
 ### 后台 worker 由哪个角色承载
 
-角色相关的循环（ingester flush、compaction + file_meta_dumper、告警评估/派发）**只有在配置归属角色时才 spawn**（`standalone` 视为全部角色）。少数常驻 worker（心跳、sweeper、对象存储探针、MMDB 刷新、search_jobs、scheduled_reports）在每个节点都运行。下表给出归属角色与周期。
+角色相关的循环（intake flush、compaction + file_meta_dumper、告警评估/派发）**只有在配置归属角色时才 spawn**（`standalone` 视为全部角色）。少数常驻 worker（心跳、sweeper、对象存储探针、MMDB 刷新、search_jobs、scheduled_reports）在每个节点都运行。下表给出归属角色与周期。
 
 | 后台 worker | 建议承载角色 | 周期 | 配置键 | 现状 |
 | --- | --- | --- | --- | --- |
@@ -94,9 +94,9 @@ ACME 签发 / 续期已实现：签发循环扫 `pending` 域名、续期循环�
     ```toml
     [node]
     # 节点唯一标识，留空则由进程生成
-    id = "ingester-a1"
+    id = "intake-a1"
     # 角色数组；多角色可在一个进程内组合
-    roles = ["ingester"]
+    roles = ["intake"]
 
     [cluster]
     # 对等节点用于互联的 gRPC 地址（host:port）
@@ -110,8 +110,8 @@ ACME 签发 / 续期已实现：签发循环扫 `pending` 域名、续期循环�
     # 变量名用点分，与 docker-compose / k8s 清单一致。
     # 注意：点号不是合法的 POSIX shell 标识符，不能 `export MS_NODE.ROLES=…`；
     # 需经容器 / 编排的 env 注入，或用 env 前缀启动：
-    env 'MS_NODE.ROLES=["ingester"]' \
-        'MS_NODE.ID=ingester-a1' \
+    env 'MS_NODE.ROLES=["intake"]' \
+        'MS_NODE.ID=intake-a1' \
         'MS_CLUSTER.ADVERTISE_ADDR=10.0.1.21:5082' \
         'MS_HTTP.PORT=5080' \
         'MS_GRPC.PORT=5082' \
@@ -125,7 +125,7 @@ ACME 签发 / 续期已实现：签发循环扫 `pending` 域名、续期循环�
     MS_NODE.ROLES='["router"]'
 
     # 写入节点（需持久卷挂 WAL）
-    MS_NODE.ROLES='["ingester"]'
+    MS_NODE.ROLES='["intake"]'
 
     # 查询节点
     MS_NODE.ROLES='["querier"]'
@@ -140,21 +140,21 @@ ACME 签发 / 续期已实现：签发循环扫 `pending` 域名、续期循环�
 </Tabs>
 
 <Info>
-少数 bootstrap / 密钥类变量是**扁平单下划线**且不进 `Settings`，直接从环境读取：`MS_CIPHER_KEY`、`MS_AUTH_JWT_SECRET_OVERRIDE`、`MS_LICENSE_FILE`、`MS_SELF_TELEMETRY_CLUSTER_TOKEN`，以及仅开发回退使用的 `MS_INTELLIGENCE_<PROVIDER>_*`。剩余结构化字段一律走 `MS_<SECTION>.<FIELD>` 点分形式，例如 `MS_NODE.ROLES`、`MS_STORE.META.DSN` 与 `MS_CLUSTER.ADVERTISE_ADDR`。
+少数 bootstrap / 密钥类变量是**扁平单下划线**且不进 `Settings`，直接从环境读取：`MS_CIPHER_KEY`、`MS_AUTH_JWT_SECRET_OVERRIDE`、`MS_LICENSE_FILE`、`MS_SELF_TELEMETRY_CLUSTER_TOKEN`，以及仅开发回退使用的 `MS_AGENT_<PROVIDER>_*`。剩余结构化字段一律走 `MS_<SECTION>.<FIELD>` 点分形式，例如 `MS_NODE.ROLES`、`MS_STORE.META.DSN` 与 `MS_CLUSTER.ADVERTISE_ADDR`。
 </Info>
 
 ## 数据流
 
 ### 写入路径
 
-入口经 Router（限流 + 一致性哈希）落到某个 Ingester；Ingester 先写 WAL（落盘持久），再写内存缓冲；后台 flush 循环按时间窗或大小阈值把缓冲编码成列式文件 + 检索索引上传对象存储，最后把 FileMeta 落 Postgres，并截断已 flush 的 WAL 段。
+入口经 Router（限流 + 一致性哈希）落到某个 Intake；Intake 先写 WAL（落盘持久），再写内存缓冲；后台 flush 循环按时间窗或大小阈值把缓冲编码成列式文件 + 检索索引上传对象存储，最后把 FileMeta 落 Postgres，并截断已 flush 的 WAL 段。
 
 <Frame caption="写入路径">
-  <img src="/images/architecture/ingest_zh-Hans_light.svg" alt="写入路径" className="block dark:hidden" />
-  <img src="/images/architecture/ingest_zh-Hans_dark.svg" alt="写入路径" className="hidden dark:block" />
+  <img src="/images/architecture/intake_zh-Hans_light.svg" alt="写入路径" className="block dark:hidden" />
+  <img src="/images/architecture/intake_zh-Hans_dark.svg" alt="写入路径" className="hidden dark:block" />
 </Frame>
 
-关键配置：`[wal].dir`、`[wal].segment_size_mb`、`[wal].flush_strategy`（`batch`/`none`/`every_write`）、`[wal].sync_level`（`data`/`all`）；`[ingester].buffer_max_mb`（默认 256）、`flush_interval_secs`（默认 30）、`flush_parallelism`（默认 4）；`[router.rate_limit].ingest_qps`（默认每 org 1000，0=不限）。
+关键配置：`[wal].dir`、`[wal].segment_size_mb`、`[wal].flush_strategy`（`batch`/`none`/`every_write`）、`[wal].sync_level`（`data`/`all`）；`[intake].buffer_max_mb`（默认 256）、`flush_interval_secs`（默认 30）、`flush_parallelism`（默认 4）；`[router.rate_limit].intake_qps`（默认每 org 1000，0=不限）。
 
 <Note>
 Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retry-After`。`org_id` 来自请求头 `X-Org-Id`，缺省为 `default`。
@@ -215,7 +215,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     没有 gossip / 共识；分布式模式下各角色直接查 `cluster_nodes` 表，按**角色成员**筛选存活对等节点（节点的角色集包含所求角色即命中）。`standalone` 模式跳过整套发现，只返回本地节点。
   </Step>
   <Step title="选址算法">
-    Router 选 Ingester：对 `org_id|stream_name` 做一致性哈希后取模，确定性落到某个 Ingester。Router 选 Querier：朴素轮询（`now_ns % peer_count`），不是完整一致性哈希。分布式查询分片：对 `object_key` 取哈希取模散到 querier 对等节点。
+    Router 选 Intake：对 `org_id|stream_name` 做一致性哈希后取模，确定性落到某个 Intake。Router 选 Querier：朴素轮询（`now_ns % peer_count`），不是完整一致性哈希。分布式查询分片：对 `object_key` 取哈希取模散到 querier 对等节点。
   </Step>
   <Step title="分布式扫描 RPC">
     协调端把扫描请求（含 org/stream/sql/file_metas/time_range）编码成 ticket，经内部扫描 RPC 发到对等节点；对等节点读列式文件、注册内存表、跑分片 SQL、回传结果流。该 RPC 与 gRPC 节点服务、数据接入服务共用同一端口（默认 5082）。
@@ -251,7 +251,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 | --- | --- | --- | --- |
 | 5080 | HTTP | `[http].bind`（默认 `0.0.0.0`）、`[http].port` | `/api/v1/*`、`/metrics`、`/api/v1/healthz`、`/api/v1/readyz`、`/.well-known/acme-challenge/` 等 |
 | 5082 | 内部 gRPC | `[grpc].bind`、`[grpc].port`、`max_message_size_mb`（默认 32MB） | 可信节点、扫描与私有集群采集协议 |
-| 4317 | OTLP gRPC | `[otlp_grpc]` | 对外标准日志、指标、链路与性能剖析 Receiver；Standalone 与 Ingester 默认启用 |
+| 4317 | OTLP gRPC | `[otlp_grpc]` | 对外标准日志、指标、链路与性能剖析 Receiver；Standalone 与 Intake 默认启用 |
 | 5083 | Flight SQL | `[flight_sql]` | 对外需 Bearer 身份验证的 SQL Listener；Standalone 与 Querier 默认关闭 |
 | 5084 | pprof HTTP | `[profiling]` | 节点诊断；默认关闭且只绑定回环 |
 | 80 | TLS 模式下的明文 HTTP | `[http.tls].plain_port` | 健康检查 + ACME HTTP-01 挑战 + 301 跳转 HTTPS |
@@ -265,7 +265,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
 
 | 探针 | 路径 | 200 条件 | 503 条件 | 用途 |
 | --- | --- | --- | --- | --- |
-| Liveness | `GET /api/v1/healthz` | WAL 重放完成（仅 Ingester 相关；其他角色绕过）**且**对象存储未降级 | 重放进行中 **或** 对象存储连接丢失 | 进程存活与依赖健康 |
+| Liveness | `GET /api/v1/healthz` | WAL 重放完成（仅 Intake 相关；其他角色绕过）**且**对象存储未降级 | 重放进行中 **或** 对象存储连接丢失 | 进程存活与依赖健康 |
 | Readiness | `GET /api/v1/readyz` | `replay_done = true`（即使对象存储已降级） | 重放仍在进行中 | 允许 K8s 在写路径降级时仍放读流量进来 |
 
 <Steps>
@@ -275,8 +275,8 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
   <Step title="后台周期探针">
     每 `[store.object].health_probe_interval_secs`（默认 30s）做一次同样的往返；**连续 3 次失败**才置 `object_store_degraded=true`，成功则计数归零。
   </Step>
-  <Step title="Ingester WAL 重放">
-    Ingester 启动时扫描 `[wal].dir` 下的段文件，按 `(org, stream_type, stream)` 重放进内存缓冲，全部载入后强制 flush 一次，再置 `replay_done=true`。重放未完成前 `/api/v1/readyz` 返回 503。
+  <Step title="Intake WAL 重放">
+    Intake 启动时扫描 `[wal].dir` 下的段文件，按 `(org, stream_type, stream)` 重放进内存缓冲，全部载入后强制 flush 一次，再置 `replay_done=true`。重放未完成前 `/api/v1/readyz` 返回 503。
   </Step>
 </Steps>
 
@@ -334,10 +334,10 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     **multirole profile（先移除旧 Connector 服务）：**
     ```bash
     docker compose -f deploy/docker/docker-compose.yaml --profile multirole up
-    # router / ingester / querier / compactor / alert-manager
+    # router / intake / querier / compactor / alert-manager
     ```
     - `molesignal-router`：暴露 5080，入口。
-    - `molesignal-ingester`：挂 `obs-wal:/data/wal` 持久 WAL；其他角色无状态。
+    - `molesignal-intake`：挂 `obs-wal:/data/wal` 持久 WAL；其他角色无状态。
     - 剩余角色容器分别承担对应职责。
 
     <Info>另有 `deploy/docker/Dockerfile.web` 与 `nginx.conf`：Web 容器反代到 `MS_BACKEND`，对 `/api/v1/query/stream` 关闭 `proxy_buffering`、放宽 600s 读写超时以支持实时 tail；`/assets/*`（Vite hash 命名）设 1 年 immutable，`index.html` 设 `no-store`。</Info>
@@ -351,7 +351,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     | 清单 | kind | 副本 | 角色 | 卷 / Service |
     | --- | --- | --- | --- | --- |
     | `30-router.yaml` | Deployment | 2 | `router` | 无状态；5080/http + 5082/grpc；ClusterIP；`readinessProbe GET /api/v1/healthz` |
-    | `40-ingester.yaml` | **StatefulSet** | 2 | `ingester` | `volumeClaimTemplate` data 20Gi RWO/副本 挂 `/data`（WAL）；headless Service（`clusterIP: None`）；就绪探针 10s 初始延迟（留重放窗口） |
+    | `40-intake.yaml` | **StatefulSet** | 2 | `intake` | `volumeClaimTemplate` data 20Gi RWO/副本 挂 `/data`（WAL）；headless Service（`clusterIP: None`）；就绪探针 10s 初始延迟（留重放窗口） |
     | `50-querier.yaml` | Deployment | 2 | `querier` | 无状态；5080 + 5082（扫描 RPC）；ClusterIP；就绪探针 5s |
     | `60-compactor.yaml` | Deployment | **1** | `compactor` | 无状态；单实例避免合并冲突（未来计划 lease 表加锁）；ClusterIP |
     | `70-alert-manager.yaml` | Deployment | 1 | `alert_manager` | 承载告警评估 + 定时报表（PNG/PDF 需 chromium，带注解 `molesignal.io/scheduled-reports-renderer: requires-chromium`）；ClusterIP |
@@ -378,7 +378,7 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
   <Card title="Querier — 可水平扩" icon="magnifying-glass">
     无状态。querier 进程经 gRPC 提供扫描 RPC；≥2 个 querier 对等节点才触发分布式扫描，否则协调端回退到进程内引擎、无网络跳。瓶颈在列式文件读取 + 查询引擎内存。
   </Card>
-  <Card title="Ingester — 有状态" icon="database">
+  <Card title="Intake — 有状态" icon="database">
     用 StatefulSet + 每副本 PVC 持久 WAL。Router 按 `org|stream` 一致性哈希落点，扩缩会改变取模结果导致再平衡；缩容前应确保 WAL 已 flush。就绪探针留足重放窗口（清单设 10s 初始延迟）。
   </Card>
   <Card title="Compactor / AlertManager — 单实例" icon="gauge">
@@ -395,16 +395,16 @@ Router 限流粒度为 `(org_id, route_class)`，超限返回 `429` 并带 `Retr
     Postgres 可达、`[store.meta].backend = "postgres"` 且 `dsn` 正确；对象存储后端选 `s3`/`azure`/`gcs`（非 `local`），凭据按"环境变量 > 凭据文件 > 内联"优先级注入。
   </Step>
   <Step title="角色与互联地址">
-    每个进程 `MS_NODE.ROLES` 明确；`MS_CLUSTER.ADVERTISE_ADDR` 设为对等节点可达的 `host:5082`（K8s 用 `$(POD_IP):5082`）。一个进程可同时承担多个角色（如 `["ingester","querier"]`），会起去重后的 server 集并以全部角色登记。
+    每个进程 `MS_NODE.ROLES` 明确；`MS_CLUSTER.ADVERTISE_ADDR` 设为对等节点可达的 `host:5082`（K8s 用 `$(POD_IP):5082`）。一个进程可同时承担多个角色（如 `["intake","querier"]`），会起去重后的 server 集并以全部角色登记。
   </Step>
-  <Step title="Ingester 持久化">
-    Ingester 用 StatefulSet + PVC 挂 WAL 目录；`[wal].flush_strategy` / `sync_level` 按持久性要求设置；就绪探针留足重放延迟。
+  <Step title="Intake 持久化">
+    Intake 用 StatefulSet + PVC 挂 WAL 目录；`[wal].flush_strategy` / `sync_level` 按持久性要求设置；就绪探针留足重放延迟。
   </Step>
   <Step title="单实例角色">
     Compactor、AlertManager 各保持 1 副本。确认 `[compactor].interval_secs`、`retention_days`、`[storage.file_meta_dump].enabled` 符合预期。
   </Step>
   <Step title="入口与限流">
-    Router 前置 LB；按 org 设 `[router.rate_limit].ingest_qps` / `query_qps`；注意多副本下限流为近似值。Ingress 对 `/api/v1/query/stream` 关闭缓冲。
+    Router 前置 LB；按 org 设 `[router.rate_limit].intake_qps` / `query_qps`；注意多副本下限流为近似值。Ingress 对 `/api/v1/query/stream` 关闭缓冲。
   </Step>
   <Step title="可观测与探针">
     `/metrics` 接入 Prometheus；K8s 探针指向 `/api/v1/healthz`（liveness）与 `/api/v1/readyz`（readiness）。确认对象存储启动探测能通过（否则进程不启动）。

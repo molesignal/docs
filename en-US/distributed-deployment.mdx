@@ -17,7 +17,7 @@ This page targets operators and SREs. The guide covers role breakdown, backgroun
     `[node].roles` determines process exposure and foreground responsibilities. The default is `["standalone"]`, meaning one process runs every responsibility.
   </Card>
   <Card title="State externalized where possible" icon="database">
-    Metadata lands in Postgres, data lands in the object store. Aside from the Ingester's WAL/buffer, most roles are stateless and scale horizontally.
+    Metadata lands in Postgres, data lands in the object store. Aside from the Intake's WAL/buffer, most roles are stateless and scale horizontally.
   </Card>
   <Card title="Discovery via Postgres" icon="network-wired">
     There is no separate gossip or consensus component. Each node writes a heartbeat into the `cluster_nodes` table, and peer discovery queries that table directly.
@@ -29,13 +29,13 @@ This page targets operators and SREs. The guide covers role breakdown, backgroun
 <Tabs>
   <Tab title="Single-node standalone">
     - Evaluation, development, PoC, low-traffic production.
-    - One process exposes HTTP + gRPC and runs every internal responsibility in-process (ingest, query, compaction, alert evaluation, etc.).
+    - One process exposes HTTP + gRPC and runs every internal responsibility in-process (intake, query, compaction, alert evaluation, etc.).
     - Dependencies are still externalized: Postgres + object store (or a local filesystem backend).
   </Tab>
   <Tab title="Role-split cluster">
-    - Ingest and query loads need to scale independently; or the stateful Ingester needs to be scheduled separately from the stateless roles.
-    - Use the Router as the entry point and rate limiter, fanning ingest across multiple Ingesters via consistent hashing and distributing queries across multiple Queriers.
-    - A good fit for Kubernetes: stateless roles as Deployments, the Ingester as a StatefulSet + PVC.
+    - Intake and query loads need to scale independently; or the stateful Intake needs to be scheduled separately from the stateless roles.
+    - Use the Router as the entry point and rate limiter, fanning intake across multiple Intake nodes via consistent hashing and distributing queries across multiple Queriers.
+    - A good fit for Kubernetes: stateless roles as Deployments, the Intake as a StatefulSet + PVC.
   </Tab>
 </Tabs>
 
@@ -45,28 +45,28 @@ Role enum values use **snake_case** in TOML / environment variables (`standalone
 
 ## Node role reference
 
-`[node].roles` is an array (`Vec<Role>`), with valid values: `standalone`, `router`, `ingester`, `querier`, `compactor`, `alert_manager`. The default is `["standalone"]`.
+`[node].roles` is an array (`Vec<Role>`), with valid values: `standalone`, `router`, `intake`, `querier`, `compactor`, `alert_manager`. The default is `["standalone"]`.
 
 <Note>
-**Multiple roles compose in one process.** A form like `[node].roles = ["ingester", "querier"]` starts the deduplicated set of foreground servers required by each role, including the gRPC server serving ingest and scan. The configuration gates matching background loops and registers the node under **all** configured roles in `cluster_nodes`, allowing peer discovery by role. `standalone` is shorthand for "every role in one process".
+**Multiple roles compose in one process.** A form like `[node].roles = ["intake", "querier"]` starts the deduplicated set of foreground servers required by each role, including the gRPC server serving intake and scan. The configuration gates matching background loops and registers the node under **all** configured roles in `cluster_nodes`, allowing peer discovery by role. `standalone` is shorthand for "every role in one process".
 </Note>
 
 | Role | Foreground exposure | Stateful / stateless | Scaling characteristics |
 | --- | --- | --- | --- |
-| `standalone` | HTTP + gRPC, running every internal responsibility in-process | Stateful (embeds an Ingester) | Single instance for evaluation; not suitable as a horizontal scaling unit |
+| `standalone` | HTTP + gRPC, running every internal responsibility in-process | Stateful (embeds an Intake) | Single instance for evaluation; not suitable as a horizontal scaling unit |
 | `router` | HTTP reverse proxy + rate limiting; **does not directly expose internal services beyond the business HTTP listener** | Stateless (the rate limiter is in-process and ephemeral) | Scales horizontally; just put an L4/L7 LB in front |
-| `ingester` | Carries WAL replay + buffering + periodic flush (the flush loop is spawned at startup when the role is configured) | **Stateful** (WAL, in-memory buffer, file_meta cache) | Sharded via consistent hashing; scaling must account for the WAL persistent volume and rebalancing |
+| `intake` | Carries WAL replay + buffering + periodic flush (the flush loop is spawned at startup when the role is configured) | **Stateful** (WAL, in-memory buffer, file_meta cache) | Sharded via consistent hashing; scaling must account for the WAL persistent volume and rebalancing |
 | `querier` | gRPC distributed-scan endpoint (Arrow Flight `do_get`): reads columnar files, runs the shard SQL, streams result batches | Stateless | Scales horizontally |
 | `compactor` | Runs the compaction + retention tick loop (spawned only when the role is configured) | Stateless (processes tick by tick) | **Single instance recommended** (see the high-availability section) |
 | `alert_manager` | Runs the evaluation + dispatch tick loops (spawned only when the role is configured) | Stateful (evaluation state and incident state are in-process) | Single instance recommended |
 
 <Note>
-A standalone `querier` or any role set containing `querier` or `ingester` starts the gRPC server, which carries the Arrow Flight scan service. The coordinator discovers queriers via `list_role(querier)` and fans shards out over that RPC. A single-process `standalone` still works as before; distributed scan-out requires at least two querier peers.
+A standalone `querier` or any role set containing `querier` or `intake` starts the gRPC server, which carries the Arrow Flight scan service. The coordinator discovers queriers via `list_role(querier)` and fans shards out over that RPC. A single-process `standalone` still works as before; distributed scan-out requires at least two querier peers.
 </Note>
 
 ### Which role carries which background worker
 
-Role-specific loops (ingester flush, compaction + file_meta_dumper, alert evaluation/dispatch) are **spawned only when the owning role is configured** (`standalone` counts as all roles). A handful of always-on workers (heartbeat, sweeper, object-store probe, MMDB refresh, search-jobs, scheduled-reports) run on every node. The table below gives the owning role and interval.
+Role-specific loops (intake flush, compaction + file_meta_dumper, alert evaluation/dispatch) are **spawned only when the owning role is configured** (`standalone` counts as all roles). A handful of always-on workers (heartbeat, sweeper, object-store probe, MMDB refresh, search-jobs, scheduled-reports) run on every node. The table below gives the owning role and interval.
 
 | Background worker | Recommended carrying role | Interval | Config key | Status |
 | --- | --- | --- | --- | --- |
@@ -94,9 +94,9 @@ Configure roles through `[node].roles`; environment variables can override the s
     ```toml
     [node]
     # Unique node identifier; leave empty to have the process generate one
-    id = "ingester-a1"
+    id = "intake-a1"
     # Role array; multiple roles compose in one process
-    roles = ["ingester"]
+    roles = ["intake"]
 
     [cluster]
     # gRPC address (host:port) peers use to interconnect
@@ -110,8 +110,8 @@ Configure roles through `[node].roles`; environment variables can override the s
     # Variable names use the dotted form, matching the docker-compose / k8s manifests.
     # Note: a dot is not a valid POSIX shell identifier, so `export MS_NODE.ROLES=…` is invalid;
     # inject via the container / orchestrator env, or launch with an env prefix:
-    env 'MS_NODE.ROLES=["ingester"]' \
-        'MS_NODE.ID=ingester-a1' \
+    env 'MS_NODE.ROLES=["intake"]' \
+        'MS_NODE.ID=intake-a1' \
         'MS_CLUSTER.ADVERTISE_ADDR=10.0.1.21:5082' \
         'MS_HTTP.PORT=5080' \
         'MS_GRPC.PORT=5082' \
@@ -124,8 +124,8 @@ Configure roles through `[node].roles`; environment variables can override the s
     # Entry router
     MS_NODE.ROLES='["router"]'
 
-    # Ingest node (needs a persistent volume for the WAL)
-    MS_NODE.ROLES='["ingester"]'
+    # Intake node (needs a persistent volume for the WAL)
+    MS_NODE.ROLES='["intake"]'
 
     # Query node
     MS_NODE.ROLES='["querier"]'
@@ -140,21 +140,21 @@ Configure roles through `[node].roles`; environment variables can override the s
 </Tabs>
 
 <Info>
-A few bootstrap / secret variables are **flat single-underscore** and live outside `Settings`, read directly from the environment: `MS_CIPHER_KEY`, `MS_AUTH_JWT_SECRET_OVERRIDE`, `MS_LICENSE_FILE`, `MS_SELF_TELEMETRY_CLUSTER_TOKEN`, and the development-only `MS_INTELLIGENCE_<PROVIDER>_*` fallback. All other structured fields use the `MS_<SECTION>.<FIELD>` dotted form (for example `MS_NODE.ROLES`, `MS_STORE.META.DSN`, and `MS_CLUSTER.ADVERTISE_ADDR`).
+A few bootstrap / secret variables are **flat single-underscore** and live outside `Settings`, read directly from the environment: `MS_CIPHER_KEY`, `MS_AUTH_JWT_SECRET_OVERRIDE`, `MS_LICENSE_FILE`, `MS_SELF_TELEMETRY_CLUSTER_TOKEN`, and the development-only `MS_AGENT_<PROVIDER>_*` fallback. All other structured fields use the `MS_<SECTION>.<FIELD>` dotted form (for example `MS_NODE.ROLES`, `MS_STORE.META.DSN`, and `MS_CLUSTER.ADVERTISE_ADDR`).
 </Info>
 
 ## Data flow
 
-### Ingest path
+### Intake path
 
-The entry point lands on an Ingester through the Router with rate limiting and consistent hashing. The Ingester first writes the WAL durably to disk, then writes the in-memory buffer. A background flush loop encodes the buffer into columnar files and a search index by time window or size threshold, uploads each file to the object store, stores FileMeta in Postgres, and truncates flushed WAL segments.
+The entry point lands on an Intake through the Router with rate limiting and consistent hashing. The Intake first writes the WAL durably to disk, then writes the in-memory buffer. A background flush loop encodes the buffer into columnar files and a search index by time window or size threshold, uploads each file to the object store, stores FileMeta in Postgres, and truncates flushed WAL segments.
 
-<Frame caption="Ingest path">
-  <img src="/images/architecture/ingest_en_light.svg" alt="Ingest path" className="block dark:hidden" />
-  <img src="/images/architecture/ingest_en_dark.svg" alt="Ingest path" className="hidden dark:block" />
+<Frame caption="Intake path">
+  <img src="/images/architecture/intake_en_light.svg" alt="Intake path" className="block dark:hidden" />
+  <img src="/images/architecture/intake_en_dark.svg" alt="Intake path" className="hidden dark:block" />
 </Frame>
 
-Key config: `[wal].dir`, `[wal].segment_size_mb`, `[wal].flush_strategy` (`batch`/`none`/`every_write`), `[wal].sync_level` (`data`/`all`); `[ingester].buffer_max_mb` (default 256), `flush_interval_secs` (default 30), `flush_parallelism` (default 4); `[router.rate_limit].ingest_qps` (default 1000 per org, 0 = unlimited).
+Key config: `[wal].dir`, `[wal].segment_size_mb`, `[wal].flush_strategy` (`batch`/`none`/`every_write`), `[wal].sync_level` (`data`/`all`); `[intake].buffer_max_mb` (default 256), `flush_interval_secs` (default 30), `flush_parallelism` (default 4); `[router.rate_limit].intake_qps` (default 1000 per org, 0 = unlimited).
 
 <Note>
 The Router rate limits at `(org_id, route_class)` granularity, returning `429` with a `Retry-After` header when exceeded. `org_id` comes from the `X-Org-Id` request header and defaults to `default`.
@@ -215,10 +215,10 @@ Target clusters are specified via `?clusters=local,sf,nyc`. After scanning local
     There is no gossip or consensus. In distributed mode, each role queries the `cluster_nodes` table directly and filters live peers by **role membership**. A node matches when the role set contains the requested role. `standalone` mode skips the entire discovery flow and returns only the local node.
   </Step>
   <Step title="Placement algorithm">
-    Router selecting an Ingester: applies consistent hashing over `org_id|stream_name` then mods, landing deterministically on a particular Ingester. Router selecting a Querier: naive round-robin (`now_ns % peer_count`), not full consistent hashing. Distributed query sharding: a hash over `object_key` then mods, fanning out to querier peers.
+    Router selecting an Intake: applies consistent hashing over `org_id|stream_name` then mods, landing deterministically on a particular Intake. Router selecting a Querier: naive round-robin (`now_ns % peer_count`), not full consistent hashing. Distributed query sharding: a hash over `object_key` then mods, fanning out to querier peers.
   </Step>
   <Step title="Distributed scan RPC">
-    The coordinator encodes a scan request (org/stream/sql/file_metas/time_range) into a ticket and sends the ticket to peers over the internal scan RPC. Each peer reads columnar files, registers an in-memory table, runs the shard SQL, and returns a result stream. This trusted RPC shares port `5082` with node services and the private cluster ingest protocol. Standard external OTLP gRPC uses `4317`.
+    The coordinator encodes a scan request (org/stream/sql/file_metas/time_range) into a ticket and sends the ticket to peers over the internal scan RPC. Each peer reads columnar files, registers an in-memory table, runs the shard SQL, and returns a result stream. This trusted RPC shares port `5082` with node services and the private cluster intake protocol. Standard external OTLP gRPC uses `4317`.
   </Step>
 </Steps>
 
@@ -250,8 +250,8 @@ Local scan-RPC calls within the cluster are unauthenticated; only federated / re
 | Port | Protocol / service | Config key | Notes |
 | --- | --- | --- | --- |
 | 5080 | HTTP | `[http].bind` (default `0.0.0.0`), `[http].port` | `/api/v1/*`, `/metrics`, `/api/v1/healthz`, `/api/v1/readyz`, `/.well-known/acme-challenge/`, etc. |
-| 5082 | Internal gRPC | `[grpc].bind`, `[grpc].port`, `max_message_size_mb` (default 32MB) | Trusted node, scan, and private cluster ingest protocols |
-| 4317 | OTLP gRPC | `[otlp_grpc]` | External standard logs, metrics, traces, and profiles receiver; enabled by default on Standalone and Ingester |
+| 5082 | Internal gRPC | `[grpc].bind`, `[grpc].port`, `max_message_size_mb` (default 32MB) | Trusted node, scan, and private cluster intake protocols |
+| 4317 | OTLP gRPC | `[otlp_grpc]` | External standard logs, metrics, traces, and profiles receiver; enabled by default on Standalone and Intake |
 | 5083 | Flight SQL | `[flight_sql]` | External bearer-authenticated SQL listener; disabled by default on Standalone and Querier |
 | 5084 | pprof HTTP | `[profiling]` | Node diagnostics; disabled and loopback-only by default |
 | 80 | Plaintext HTTP in TLS mode | `[http.tls].plain_port` | Health checks + ACME HTTP-01 challenge + 301 redirect to HTTPS |
@@ -265,7 +265,7 @@ Local scan-RPC calls within the cluster are unauthenticated; only federated / re
 
 | Probe | Path | 200 condition | 503 condition | Purpose |
 | --- | --- | --- | --- | --- |
-| Liveness | `GET /api/v1/healthz` | WAL replay complete (Ingester-relevant only; other roles bypass the replay check) **and** the object store is not degraded | replay in progress **or** object store connection lost | Process liveness and dependency health |
+| Liveness | `GET /api/v1/healthz` | WAL replay complete (Intake-relevant only; other roles bypass the replay check) **and** the object store is not degraded | replay in progress **or** object store connection lost | Process liveness and dependency health |
 | Readiness | `GET /api/v1/readyz` | `replay_done = true` (even if the object store is degraded) | replay still in progress | Lets K8s keep admitting read traffic while the write path is degraded |
 
 <Steps>
@@ -275,8 +275,8 @@ Local scan-RPC calls within the cluster are unauthenticated; only federated / re
   <Step title="Background periodic probe">
     The same round-trip runs every `[store.object].health_probe_interval_secs` (default 30s); only **3 consecutive failures** set `object_store_degraded=true`, and a success resets the counter to zero.
   </Step>
-  <Step title="Ingester WAL replay">
-    At startup the Ingester scans segment files under `[wal].dir`, replays all records into the in-memory buffer by `(org, stream_type, stream)`, forces a single flush after loading, then sets `replay_done=true`. `/api/v1/readyz` returns 503 until replay completes.
+  <Step title="Intake WAL replay">
+    At startup the Intake scans segment files under `[wal].dir`, replays all records into the in-memory buffer by `(org, stream_type, stream)`, forces a single flush after loading, then sets `replay_done=true`. `/api/v1/readyz` returns 503 until replay completes.
   </Step>
 </Steps>
 
@@ -334,10 +334,10 @@ All topologies share the same image (e.g. `molesignal:dev`), distinguished by `M
     **multirole profile (after removing the legacy connector service):**
     ```bash
     docker compose -f deploy/docker/docker-compose.yaml --profile multirole up
-    # router / ingester / querier / compactor / alert-manager
+    # router / intake / querier / compactor / alert-manager
     ```
     - `molesignal-router`: exposes 5080, the entry point.
-    - `molesignal-ingester`: mounts `obs-wal:/data/wal` for a persistent WAL; the other roles are stateless.
+    - `molesignal-intake`: mounts `obs-wal:/data/wal` for a persistent WAL; the other roles are stateless.
     - Each remaining role container carries the corresponding responsibility.
 
     <Info>There is also `deploy/docker/Dockerfile.web` and `nginx.conf`: the web container reverse-proxies to `MS_BACKEND`, disables `proxy_buffering` for `/api/v1/query/stream` and relaxes read/write timeouts to 600s to support live tail; `/assets/*` (Vite hash-named) is set to 1-year immutable, and `index.html` is set to `no-store`.</Info>
@@ -351,7 +351,7 @@ All topologies share the same image (e.g. `molesignal:dev`), distinguished by `M
     | Manifest | kind | Replicas | Role | Volumes / Service |
     | --- | --- | --- | --- | --- |
     | `30-router.yaml` | Deployment | 2 | `router` | Stateless; 5080/http + 5082/grpc; ClusterIP; `readinessProbe GET /api/v1/healthz` |
-    | `40-ingester.yaml` | **StatefulSet** | 2 | `ingester` | `volumeClaimTemplate` data 20Gi RWO/replica mounted at `/data` (WAL); headless Service (`clusterIP: None`); readiness probe with 10s initial delay (leaving a replay window) |
+    | `40-intake.yaml` | **StatefulSet** | 2 | `intake` | `volumeClaimTemplate` data 20Gi RWO/replica mounted at `/data` (WAL); headless Service (`clusterIP: None`); readiness probe with 10s initial delay (leaving a replay window) |
     | `50-querier.yaml` | Deployment | 2 | `querier` | Stateless; 5080 + 5082 (scan RPC); ClusterIP; readiness probe 5s |
     | `60-compactor.yaml` | Deployment | **1** | `compactor` | Stateless; single instance to avoid merge conflicts (a lease-table lock is planned for the future); ClusterIP |
     | `70-alert-manager.yaml` | Deployment | 1 | `alert_manager` | Carries alert evaluation + scheduled reports (PNG/PDF needs chromium, annotated `molesignal.io/scheduled-reports-renderer: requires-chromium`); ClusterIP |
@@ -379,7 +379,7 @@ All topologies share the same image (e.g. `molesignal:dev`), distinguished by `M
   <Card title="Querier — scales horizontally" icon="magnifying-glass">
     Stateless. A querier process serves the scan RPC over gRPC; distributed scans only trigger with ≥2 querier peers, otherwise the coordinator falls back to the in-process engine with no network hop. The bottleneck is columnar-file reads + query-engine memory.
   </Card>
-  <Card title="Ingester — stateful" icon="database">
+  <Card title="Intake — stateful" icon="database">
     Use a StatefulSet + a per-replica PVC for a persistent WAL. The Router places via consistent hashing over `org|stream`; scaling changes the mod result and causes rebalancing, so ensure the WAL is flushed before scaling down. Leave enough of a replay window for the readiness probe (the manifest sets a 10s initial delay).
   </Card>
   <Card title="Compactor / AlertManager — single instance" icon="gauge">
@@ -396,16 +396,16 @@ Recommended metrics to monitor: for the write path, watch `wal_append_lock_wait_
     Postgres reachable, `[store.meta].backend = "postgres"` with a correct `dsn`; choose an object store backend of `s3`/`azure`/`gcs` (not `local`), with credentials injected in the precedence order "env vars > credential file > inline".
   </Step>
   <Step title="Roles and interconnect addresses">
-    Each process has an explicit `MS_NODE.ROLES`; set `MS_CLUSTER.ADVERTISE_ADDR` to a peer-reachable `host:5082` (K8s uses `$(POD_IP):5082`). A process may carry several roles at once, such as `["ingester","querier"]`. The process starts the deduplicated server set and registers under every configured role.
+    Each process has an explicit `MS_NODE.ROLES`; set `MS_CLUSTER.ADVERTISE_ADDR` to a peer-reachable `host:5082` (K8s uses `$(POD_IP):5082`). A process may carry several roles at once, such as `["intake","querier"]`. The process starts the deduplicated server set and registers under every configured role.
   </Step>
-  <Step title="Ingester persistence">
-    Run the Ingester as a StatefulSet + PVC mounting the WAL directory; set `[wal].flush_strategy` / `sync_level` according to durability requirements; leave enough replay delay for the readiness probe.
+  <Step title="Intake persistence">
+    Run the Intake as a StatefulSet + PVC mounting the WAL directory; set `[wal].flush_strategy` / `sync_level` according to durability requirements; leave enough replay delay for the readiness probe.
   </Step>
   <Step title="Single-instance roles">
     Keep Compactor and AlertManager at 1 replica each. Confirm `[compactor].interval_secs`, `retention_days`, and `[storage.file_meta_dump].enabled` match expectations.
   </Step>
   <Step title="Entry point and rate limiting">
-    Put an LB in front of the Router; set `[router.rate_limit].ingest_qps` / `query_qps` per org; note that rate limiting is approximate under multiple replicas. Disable buffering for `/api/v1/query/stream` on the Ingress.
+    Put an LB in front of the Router; set `[router.rate_limit].intake_qps` / `query_qps` per org; note that rate limiting is approximate under multiple replicas. Disable buffering for `/api/v1/query/stream` on the Ingress.
   </Step>
   <Step title="Observability and probes">
     Wire `/metrics` into Prometheus; point K8s probes at `/api/v1/healthz` (liveness) and `/api/v1/readyz` (readiness). Confirm the object store startup probe passes (otherwise the process will not start).

@@ -44,23 +44,23 @@ const M2E = 'https://esm.sh/@excalidraw/mermaid-to-excalidraw@1.1.0';
 
 // --- Diagram sources: one mermaid flowchart per (key, language) -------------
 const DIAGRAMS = {
-  ingest: {
-    title: { en: 'Ingest path', 'zh-Hans': '写入路径' },
+  intake: {
+    title: { en: 'Intake path', 'zh-Hans': '写入路径' },
     mermaid: {
       en: `flowchart TD
   client["Client<br/>:5080 / :5082"]
   router["Router<br/>stateless · rate limit"]
-  ingester["Ingester<br/>stateful"]
+  intake["Intake<br/>stateful"]
   wal[("WAL on disk")]
   buf["in-memory buffer<br/>by seq"]
   flush["background flush loop"]
   store[("object store<br/>local / s3 / azure / gcs")]
   meta[("Postgres: FileMeta<br/>time_range · rows · min/max")]
   client -->|"HTTP / gRPC"| router
-  router -->|"consistent hashing"| ingester
+  router -->|"consistent hashing"| intake
   router -. "429 + Retry-After" .-> client
-  ingester -->|"1 · write WAL (fsync)"| wal
-  ingester -->|"2 · buffer"| buf
+  intake -->|"1 · write WAL (fsync)"| wal
+  intake -->|"2 · buffer"| buf
   buf -->|"flush_interval / threshold"| flush
   flush -->|"snapshot: columnar + sidecar"| store
   flush --> meta
@@ -68,17 +68,17 @@ const DIAGRAMS = {
       'zh-Hans': `flowchart TD
   client["客户端<br/>:5080 / :5082"]
   router["Router<br/>无状态 · 限流"]
-  ingester["Ingester<br/>有状态"]
+  intake["Intake<br/>有状态"]
   wal[("WAL 落盘")]
   buf["内存缓冲<br/>按 seq"]
   flush["后台 flush 循环"]
   store[("对象存储<br/>local / s3 / azure / gcs")]
   meta[("Postgres：FileMeta<br/>time_range · rows · min/max")]
   client -->|"HTTP / gRPC"| router
-  router -->|"一致性哈希"| ingester
+  router -->|"一致性哈希"| intake
   router -. "429 + Retry-After" .-> client
-  ingester -->|"1 · 写 WAL (fsync)"| wal
-  ingester -->|"2 · 缓冲"| buf
+  intake -->|"1 · 写 WAL (fsync)"| wal
+  intake -->|"2 · 缓冲"| buf
   buf -->|"flush_interval / 阈值"| flush
   flush -->|"snapshot：列式 + 侧车"| store
   flush --> meta
@@ -237,7 +237,7 @@ const DIAGRAMS = {
   read["read window<br/>SELECT * over range"]
   steps["VRL transform chain<br/>function_steps · in order"]
   ext[("extend tables<br/>join lookups")]
-  target[("target stream<br/>standard ingest")]
+  target[("target stream<br/>standard intake")]
   egress["connectors<br/>S3 / Kafka egress"]
   trigger --> read
   src --> read
@@ -251,7 +251,7 @@ const DIAGRAMS = {
   read["读窗口<br/>SELECT * over range"]
   steps["VRL 转换链<br/>function_steps · 按序"]
   ext[("扩展表<br/>join 查找")]
-  target[("目标数据流<br/>标准 ingest")]
+  target[("目标数据流<br/>标准 intake")]
   egress["connector<br/>S3 / Kafka egress"]
   trigger --> read
   src --> read

@@ -48,7 +48,7 @@ API behavior must match the current MoleSignal source:
 
 - Use **workspace** for an organization in end-user UI instructions. Use
   **organization** for API and IAM boundary names.
-- Use **Mole Intelligence** for the product area and **Mole Agent** for the
+- Use **Mole Agent** consistently for the product area and embedded
   assistant.
 - Use **OpenSource Edition** and **Enterprise Edition** in user-facing copy.
 - Name exact permissions, such as `streams.query`, instead of assuming a
