@@ -1,0 +1,122 @@
+---
+title: "拨测"
+description: "创建 HTTP、浏览器、网络与心跳检查，从内置或私有地点执行，并发布已验证的修订。"
+---
+
+拨测从外部主动验证服务，在客户反馈之前发现故障。打开**拨测**，创建检查、发布调度、查看执行证据并管理私有 Probe 地点。
+
+## 可以监控什么
+
+| 检查类型 | 适用场景 |
+|---|---|
+| **HTTP / API** | 验证 URL、方法、Header、Body、响应状态、内容与耗时。 |
+| **浏览器** | 运行浏览器旅程，并验证页面或步骤结果。 |
+| **TCP** | 确认主机与端口可以建立连接。 |
+| **DNS** | 解析记录并验证返回结果。 |
+| **ICMP / Ping** | 测量基础连通性与延迟。 |
+| **TLS** | 验证 TLS 握手、证书身份与到期时间。 |
+| **gRPC** | 调用 gRPC Endpoint 并验证响应。 |
+| **Heartbeat** | 要求外部任务或服务在截止时间前主动上报。 |
+
+## 创建并发布检查
+
+<Steps>
+  <Step title="创建草稿">
+    打开**拨测 → 检查**，选择**创建检查**并确定类型。配置目标、超时、断言、调度与一个或多个地点。新检查首先保存为草稿。
+  </Step>
+  <Step title="测试修订">
+    选择**测试修订**。MoleSignal 会执行草稿，但不会激活调度。检查最终目标、尝试次数、分段耗时、断言证据与错误。
+  </Step>
+  <Step title="发布修订">
+    测试成功后，**发布修订**才会启用。发布会激活该修订，并计算第一次计划运行时间。
+  </Step>
+  <Step title="运营 Monitor">
+    使用**立即运行**发起一次人工执行。编辑已发布的检查会生成新草稿，旧版本会继续调度，直到替代版本测试并发布。暂停、恢复或归档不会删除已有结果。
+  </Step>
+</Steps>
+
+<Note>
+草稿门禁避免未经验证的目标或断言直接替换正在工作的生产调度。
+</Note>
+
+## 调度与重试
+
+使用固定间隔或带明确时区的 Cron 表达式。多数主动检查支持 10 秒到一天的间隔，浏览器检查从 60 秒起。超时范围为 100 毫秒到 5 分钟，并且必须短于调度间隔。一次运行最多可重试两次，之后记录最终结果。
+
+Heartbeat 不发起出站请求，而是等待任务在截止时间前上报。由拥有该任务的工作负载发送心跳，再通过结果历史区分迟到与真正失败。
+
+## 断言与健康状态
+
+断言可以检查响应状态、Body、Header、DNS 答案、证书属性或浏览器步骤等协议字段。**警告**断言失败会得到降级结果；**严重**断言失败会得到失败结果。
+
+Monitor 健康状态根据连续成功与失败次数及所选地点计算。配置失败阈值、恢复阈值与地点策略，避免状态抖动，也避免单个网络异常被误判为全局故障。
+
+## 地点与 Probe Agent
+
+MoleSignal 支持两种地点：
+
+| 地点 | 行为 |
+|---|---|
+| **内置本地地点** | Standalone 会自动启动进程内 Probe runner，适合本地评估或从 MoleSignal 所在网络发起检查。 |
+| **Agent Pool** | 一个或多个外部 <code>probe-agent</code> 从私有网络、区域或边缘地点执行检查。 |
+
+在**拨测 → 地点**中创建 Agent Pool 地点并生成一次性注册 Token，然后注册 Agent：
+
+```bash
+probe-agent register \
+  --endpoint https://molesignal.example.com:5084 \
+  --token ONE_TIME_TOKEN \
+  --ca-certificate-base64 BASE64_CA
+```
+
+再启动控制流：
+
+```bash
+probe-agent run
+```
+
+注册过程使用服务端 TLS。Agent 将私有身份保存在 <code>--state-dir</code> 下，并通过 5085 端口的 mTLS 控制流接收任务。默认目录为 <code>/var/lib/molesignal-probe</code>。
+
+在 <code>conf/config.toml</code> 中配置服务端 Endpoint：
+
+Probe 控制面会在 **Standalone** 与 **Alert Manager** 节点自动启动，不提供单独的启用开关。
+
+```toml
+[probe]
+bind = "0.0.0.0"
+register_port = 5084
+control_port = 5085
+register_endpoint = "https://molesignal.example.com:5084"
+control_endpoint = "https://molesignal.example.com:5085"
+server_names = ["molesignal.example.com"]
+```
+
+<Warning>
+每个网络请求都会先经过出站策略。除非所选地点策略明确允许，否则 Loopback、Link-local 与私网地址都会被拒绝。该限制用于防止 MoleSignal 主机和私有网络遭受服务端请求伪造。
+</Warning>
+
+## 变量、密钥与证据
+
+使用变量复用非敏感值，使用加密密钥保存凭据。密钥是只写字段，API 不会返回明文。结果详情会记录有界的请求/响应证据、耗时、尝试元数据、地点与生效修订，但不会暴露已保存的密钥。
+
+## 发布故障到状态页
+
+状态页自动化规则可以选择**拨测 Monitor**作为来源。选择 Monitor，匹配状态转换与严重度，映射受影响组件，再选择人工批准或自动发布。参见[状态页](/zh-Hans/status-pages#发布自动化)。
+
+## 权限
+
+| 权限 | 能力 |
+|---|---|
+| <code>synthetics.read</code> | 读取检查、修订、调度、运行、结果、地点与 Agent 状态。 |
+| <code>synthetics.manage</code> | 创建、测试、发布、暂停、恢复、执行和归档检查。 |
+| <code>synthetics.locations.manage</code> | 管理地点、Agent Pool、注册 Token 与出站策略。 |
+| <code>synthetics.secrets.manage</code> | 创建、轮换和删除拨测加密密钥。 |
+
+<CardGroup cols={2}>
+  <Card title="状态页" icon="signal" href="/zh-Hans/status-pages">
+    将 Monitor 状态转换为经过审核或自动发布的客户沟通。
+  </Card>
+  <Card title="告警" icon="bell" href="/zh-Hans/alerting">
+    在发布客户更新前，先把运维事件路由给响应人员。
+  </Card>
+</CardGroup>
