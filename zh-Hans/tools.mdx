@@ -1,0 +1,185 @@
+---
+title: "Tool Catalog 与执行模型"
+sidebarTitle: "Tools"
+description: "了解 MoleSignal 的共享 Tool Catalog、渐进发现、租户隔离、风险策略、审批流程与产品领域覆盖。"
+---
+
+MoleSignal 将 AI 可操作的产品能力建模为协议无关的 **Tool Catalog**。Mole Agent 与
+Inbound MCP 共用 `ToolSpec` 契约和同一套服务端 Runtime，不在不同 Adapter 中重复实现业务逻辑。
+
+当前 Catalog 包含 **190 个注册 Tool**。每个 Tool 都声明稳定名称、Canonical description、输入与输出 Schema、所需 IAM 权限、风险等级、访问模式、Annotations 与允许暴露的 Surface。
+
+<CardGroup cols={2}>
+  <Card title="产品级操作" icon="wrench">
+    Tool 表达查询日志、测试告警或更新一个 Dashboard Panel 等有界产品操作，而不是任意 HTTP
+    请求。
+  </Card>
+  <Card title="租户安全上下文" icon="shield">
+    认证 Adapter 注入调用者与组织身份。`user_id` 和 `org_id` 不能选择执行租户。
+  </Card>
+  <Card title="渐进上下文" icon="magnifying-glass">
+    常用 Tool 固定可见，其他 Tool 仅在需要时搜索，控制模型上下文与 Token 消耗。
+  </Card>
+  <Card title="统一执行路径" icon="arrows-rotate">
+    权限、许可证、策略、超时、输出限制、幂等、审批、验证与审计都会在执行时再次强制检查。
+  </Card>
+</CardGroup>
+## Tool 颗粒度
+
+良好的 MoleSignal Tool 只表达一个明确的运维意图，并返回一个有界结果。
+
+- 一个 Tool 只执行一次原子读取、预检或变更。
+- list、get、create、update、delete、test、trigger、cancel 与 retry 分别建模。
+- 暴露产品概念，不暴露原始 Route 或任意请求构造器。
+- 返回适合模型处理与审计记录的结构化、有界结果。
+- 凭证明文、二进制传输、原始 Intake、Shell 执行与浏览器控制不进入 Catalog。
+
+这种颗粒度让 IAM 与 Tool Policy 可以控制具体操作，而不是为整组 HTTP Resource 提供宽泛权限。
+
+## Surface
+
+每个 Runtime Surface 都有显式的 Tool exposure。
+
+| Surface | 发现与执行方式 |
+|---|---|
+| Mole Agent | 常用 Tool，加上用于延迟发现内置 Tool 与已授权 Outbound MCP Tool 的 `tool_search → tools_call`。 |
+| Inbound MCP | 常用只读与审批控制 Tool，加上 `tool_search → call_read_tool` 或 `call_managed_tool`。 |
+| Automation | 默认不暴露内置 Tool；每个 Tool 必须显式加入 Automation Surface。 |
+
+服务端在生成 Tool 列表和执行前都会检查 Surface exposure。绕过 `tools/list` 不能绕过该边界。
+
+## Inbound MCP 渐进发现
+
+Inbound MCP 保持 `tools/list` 精简。授权后的响应可以包含：
+
+- 7 个固定只读 Tool：`query_logs`、`query_metrics`、`list_streams`、
+  `get_stream_schema`、`list_traces`、`get_trace` 与 `get_incident`；
+- 审批控制：`list_agent_approvals`、`get_agent_approval` 与
+  `execute_agent_approval`；
+- 执行控制：`list_agent_executions` 与 `get_agent_execution`；
+- `tool_search`、`call_read_tool` 与 `call_managed_tool`。
+
+IAM 与 Tool Policy 可以从列表中移除任意产品 Tool。
+
+### 搜索已授权 Catalog
+
+使用产品关键词或 Domain 调用 `tool_search`：
+
+```json
+{
+  "query": "status page incident",
+  "limit": 10,
+  "include_schema": true
+}
+```
+
+结果只包含同时满足 Inbound MCP exposure、workspace Tool Policy 启用状态与凭证 IAM
+授权的 Tool。请求 Schema 时，每个匹配项还会返回 Schema 与实际执行元数据。
+
+### 执行读取或预检
+
+将搜索到的名称与参数交给 `call_read_tool`：
+
+```json
+{
+  "name": "list_status_page_incidents",
+  "arguments": {
+    "status_page_id": "status-page-id",
+    "lifecycle": "active"
+  }
+}
+```
+
+当 MCP 客户端声明 Tasks extension 时，可以将 `as_task` 设为 `true`，把读取转为持久任务，再使用 MCP Task 方法轮询、更新或取消。
+
+### 执行受控变更
+
+调用 `call_managed_tool` 时传入唯一幂等 Key：
+
+```json
+{
+  "name": "update_annotation",
+  "arguments": {
+    "annotation_id": "annotation-id",
+    "text": "Deployment rollback started"
+  },
+  "idempotency_key": "8d7788d2-9b4e-44bd-bf35-61a5690f0064"
+}
+```
+
+MoleSignal 会在创建审批或执行变更前，为当前认证 Principal 预占该 Key。重复相同请求会返回已保存结果或进行中状态；使用相同 Key 传入不同参数会被拒绝。
+
+## 风险与执行策略
+
+Tool 风险等级提供安全默认值，workspace Tool Policy 可以配置更严格的执行模式。
+
+| 风险 | 默认模式 | 含义 |
+|---|---|---|
+| L0 | 自动执行 | 有界只读操作。 |
+| L1 | 用户确认 | 低风险变更需要 MCP Host 确认，除非策略选择自动执行。 |
+| L2 | 单人审批 | 需要一名 MoleSignal 审批人。 |
+| L3 | 双人审批 | 需要两名 MoleSignal 审批人。 |
+| L4 | 禁用 | 高风险或破坏性远程操作默认不可用。 |
+
+自动执行的受控变更仍会创建可审计的 Approval Record。确认模式可以使用 MCP 多轮输入；单人和双人审批模式会等待 MoleSignal 内的审核。达到所需审核数后，原请求方可以使用另一个
+`idempotency_key` 调用 `execute_agent_approval` 完成操作。
+
+执行前，Runtime 会重新验证：
+
+1. 认证 Principal 与组织状态；
+2. 所需 IAM 权限与 Permission Mode；
+3. 许可证与功能可用性；
+4. Surface exposure 与当前 Tool Policy；
+5. 输入 Schema、目标资源状态与风险；
+6. 超时、响应大小限制与幂等；
+7. 操作后验证与审计记录。
+
+## Catalog 覆盖范围
+
+Catalog 覆盖适合 AI 调查与管理的安全产品操作。
+
+| Domain | 代表能力 |
+|---|---|
+| Logs、Metrics 与 Streams | 查询遥测数据、检查 Schema 与设置、搜索相邻事件、探索指标 Label 或 Series。 |
+| Traces、APM、RUM 与 Profiles | 检查 Trace、服务拓扑、Session、Error、Dependency、Flame Graph 与跨信号关联。 |
+| Alerts 与 Incidents | 读取事件与值班状态；创建、更新、删除、测试或触发告警规则；确认或解决事件。 |
+| Dashboards、Reports 与 Annotations | 管理 Dashboard、Folder、Panel、Annotation、Report Template、Schedule 与 Delivery。 |
+| Search Jobs 与 Saved Views | 提交、检查、取消、重试或删除持久搜索，并管理 Saved View。 |
+| Pipelines、Functions、Enrichment 与 Connectors | 检查定时运行、管理 Function、测试转换，并读取 Enrichment 或 Connector 元数据。 |
+| Synthetics 与 Status Pages | 检查 Monitor 与结果、运行或暂停 Monitor，并管理 Status Page 生命周期与自动化。 |
+| Notifications | 检查 Connector、Policy、Template 与 Delivery，并重试或确认投递。 |
+| IAM 与管理 | 读取用户、团队、角色、Capability、审计事件、Service Account 与 API Token 元数据；管理非 Secret 凭证状态。 |
+| Mole Agent 控制 | 检查 Investigation、Approval、Execution 与 Automation，并在授权后执行已批准操作。 |
+
+使用 `get_platform_capabilities` 获取当前 Surface 过滤后的 Capability 摘要。使用
+`tool_search` 获取当前已授权名称与 Schema，不要依赖静态列表。
+
+## 身份与 Secret 边界
+
+- 认证凭证提供调用者 `user_id` 与 `org_id`。
+- `get_user_profile` 与 `get_user_preferences` 的可选 `target_user_id` 只用于选择资源。读取其他成员需要 `org.members.read`，并验证目标属于当前组织。
+- 读取和列表 Tool 只返回凭证元数据。
+- `create_api_token` 与 `create_service_account` 不在 Inbound MCP 上暴露，因为两者都会产生一次性明文；请在 Web UI 中创建。
+- 已有 Service Account 与 API Token 仍可通过已授权的非 Secret Tool 列出、更新、启用、禁用、撤销或删除。
+
+Catalog 明确排除登录、注册、密码重置、公开免登录 Route、原始 OTLP 或 Prometheus
+Intake、外部 Webhook、二进制上传下载、节点 Drain、Runtime Profiling、任意 HTTP、Shell
+与浏览器执行。
+
+## MCP Resources、Prompts 与 Tasks
+
+Inbound MCP 还会暴露经过 IAM 过滤的平台 Capability、Tool Catalog、Approval、Execution、
+Search Job 与 Stream Schema Resource。内置、组织级与当前用户的 Mole Agent Prompt 可以通过
+`prompts/list` 和 `prompts/get` 获取。
+
+长时间读取可以作为 MCP Task 执行。协商的 MCP 协议版本支持时，还可以使用进度通知、Resource
+订阅与 Catalog 变更通知。
+
+<CardGroup cols={2}>
+  <Card title="接入 MCP 客户端" icon="plug" href="/zh-Hans/inbound-mcp">
+    启用端点，并通过 OAuth 2.1 或 API Token 建立连接。
+  </Card>
+  <Card title="Mole Agent" icon="robot" href="/zh-Hans/agent">
+    从内置运维智能体使用同一套受控 Catalog。
+  </Card>
+</CardGroup>

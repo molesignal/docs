@@ -1,0 +1,173 @@
+---
+title: "接入 MCP 客户端"
+sidebarTitle: "Inbound MCP"
+description: "通过 OAuth 2.1、API Token、IAM、Tool Policy 与审批控制，将 Codex 等 Streamable HTTP MCP 客户端接入 MoleSignal。"
+---
+
+**Inbound MCP** 允许 Codex、ChatGPT 与其他 Streamable HTTP MCP 客户端发现并操作 MoleSignal，底层使用与 Mole Agent 相同的受控 Tool Runtime。
+
+端点格式如下：
+
+```text
+https://molesignal.example.com/api/v1/mcp
+```
+
+服务使用 Streamable HTTP，支持 `2026-07-28`、`2025-11-25`、`2025-06-18`
+与 `2025-03-26` MCP 协议版本，不暴露旧版 HTTP+SSE 或 stdio Transport。
+
+<Warning>
+  Inbound MCP 需要 `agent` 许可证功能。具备 `agent.manage` 权限的管理员可以在
+  **Mole Agent → 设置 → Inbound MCP** 中调整服务设置。
+</Warning>
+
+<CardGroup cols={2}>
+  <Card title="凭证绑定身份" icon="key">
+    Bearer 凭证决定用户、Service Account 与组织。Tool 参数不能选择调用者身份。
+  </Card>
+  <Card title="分层授权" icon="shield">
+    实际可用 Catalog 是 Inbound MCP surface、当前 IAM 权限与 workspace Tool Policy
+    的交集。
+  </Card>
+  <Card title="受控变更" icon="check">
+    写操作的幂等、确认、审批、执行与审计全部保留在 MoleSignal 服务端。
+  </Card>
+  <Card title="渐进发现" icon="magnifying-glass">
+    初始 Tool 列表保持精简；需要其他能力时，再搜索当前身份有权使用的完整 Catalog。
+  </Card>
+</CardGroup>
+
+## 接入前准备
+
+1. 非回环地址部署时，将 `http.external_url` 配置为 MoleSignal 对外访问 Origin。参见
+   [配置](/zh-Hans/configuration)。
+2. 打开 **Mole Agent → 设置 → Inbound MCP**，确认服务已启用。
+3. 复制页面展示的完整端点，包括协议与 Host。
+4. 选择 OAuth 2.1、个人 API Token 或 Service Account API Token。
+
+符合许可证条件的 workspace 默认启用 Inbound MCP。运行限制与 Origin 白名单的变更在下一次 MCP HTTP 请求开始时生效；执行中的请求继续使用已有设置快照。
+
+## 选择 Agent 客户端
+
+交互式人工会话优先使用 OAuth。根据客户端进入对应示例，复制准确的配置格式与认证命令。
+
+<CardGroup cols={2}>
+  <Card title="Codex" icon="terminal" href="/zh-Hans/inbound-mcp/codex">
+    使用 `codex mcp` 注册 Streamable HTTP 端点并完成 OAuth。
+  </Card>
+  <Card title="Claude Code" icon="sparkles" href="/zh-Hans/inbound-mcp/claude-code">
+    按 local、project 或 user scope 添加远程 HTTP Server。
+  </Card>
+  <Card title="Cursor" icon="arrow-pointer" href="/zh-Hans/inbound-mcp/cursor">
+    配置 `.cursor/mcp.json`，然后在 **Tools & MCP** 中连接。
+  </Card>
+  <Card title="VS Code" icon="code" href="/zh-Hans/inbound-mcp/vscode">
+    为 Copilot Agent Mode 配置 `mcp.json` 并确认 Server Trust。
+  </Card>
+  <Card title="Gemini CLI" icon="gem" href="/zh-Hans/inbound-mcp/gemini-cli">
+    添加远程 HTTP Server，再使用 `/mcp auth` 完成认证。
+  </Card>
+</CardGroup>
+
+<Note>
+  所有地址统一使用一个规范 Host。`localhost` 与 `127.0.0.1` 属于不同的浏览器 Cookie
+  Origin；混用会触发再次登录或 OAuth resource 不匹配。
+</Note>
+
+## 使用 API Token 接入
+
+API Token 适合非交互客户端与自动化。
+
+<Tabs>
+  <Tab title="个人 API Token">
+    在 **Workspace → API tokens** 中创建 Token。Token 使用当前用户 Principal 与分配给该
+    用户的角色。通过客户端的 Secret 或环境变量机制发送
+    `Authorization: Bearer <token>`。
+  </Tab>
+  <Tab title="Service Account API Token">
+    在 **Workspace → 服务账号** 中创建 Service Account。创建时会自动生成一个绑定的 API
+    Token，并且只展示一次原文。
+
+    Service Account 是非交互身份，不能登录 Web UI，也不能批准 OAuth 授权。
+    通过客户端的 Secret 或环境变量机制发送 `Authorization: Bearer <token>`。
+  </Tab>
+</Tabs>
+
+不要把 API Token 提交到项目级 MCP 配置文件。Codex 与 Claude Code 示例包含适合非交互场景的环境变量配置。
+
+Inbound MCP 只接受个人、Service Account 与 OAuth Access Token。Intake 与 RUM 凭证不能访问此端点。MCP Resource、Tool、执行历史与审计记录永远不会返回凭证原文。
+
+## OAuth 发现与有效期
+
+MoleSignal 在以下地址发布 OAuth 元数据：
+
+```text
+https://molesignal.example.com/.well-known/oauth-protected-resource/api/v1/mcp
+https://molesignal.example.com/.well-known/oauth-authorization-server
+```
+
+授权服务器支持带 PKCE `S256` 的 Authorization Code、RFC 8707 resource 绑定、动态客户端注册、Refresh Token 轮换与 Token family 撤销。Access Token 有效期为一小时。Refresh Token 需要
+`offline_access` scope 与 `refresh_token` grant，有效期为 30 天，并在每次使用后轮换。
+
+可以在 **Mole Agent → 设置 → Inbound MCP** 中查看和撤销活动 OAuth 连接。
+
+## 理解租户边界
+
+不要在端点、自定义 Header 或 Tool 参数中发送 `user_id` 或 `org_id`。MoleSignal 从认证凭证派生这两个身份，在每次请求中重新加载当前 IAM 快照，并将 MCP Session 绑定到初始化该 Session 的凭证。
+
+实际可用 Tool 集合为：
+
+```text
+Inbound MCP surface ∩ 凭证 IAM 权限 ∩ workspace Tool Policy
+```
+
+Agent Profile 不限制 Inbound MCP。为 Mole Agent 配置的 Outbound MCP Server 及其远程 Tool 不会通过此端点代理。
+
+## 从 Tool 适配器开始
+
+`tools/list` 只公布一组精简且已授权的能力：7 个常用只读 Tool、审批与执行控制 Tool，以及 3 个渐进发现适配器。
+
+| 适配器 | 用途 |
+|---|---|
+| `tool_search` | 搜索当前身份有权使用的完整 Inbound MCP Catalog。 |
+| `call_read_tool` | 执行搜索到的只读或预检 Tool。 |
+| `call_managed_tool` | 使用必填的 `idempotency_key` 执行搜索到的受控变更。 |
+
+典型提示词：
+
+- “搜索 MoleSignal 中的近期事件工具，总结影响最大的未解决事件。”
+- “查找状态页工具并列出活动事件，不要执行任何变更。”
+- “先测试这条告警规则；只有在完成所需确认或审批后才更新。”
+
+参见 [Tool Catalog 与执行模型](/zh-Hans/tools)，了解发现 Schema、风险等级、审批行为与支持的产品领域。
+
+## 运行限制
+
+| 限制 | 默认值 | 可配置范围 |
+|---|---:|---:|
+| 请求体 | 1 MiB | 1 KiB–8 MiB |
+| 响应体 | 1 MiB | 1 KiB–8 MiB |
+| 单凭证并发 HTTP 调用 | 8 | 1–128 |
+| 单凭证每分钟 HTTP 调用 | 60 | 1–10,000 |
+| 只读 Tool 超时 | 30 秒 | 100 ms–300 秒 |
+
+在 **Mole Agent → 设置 → Inbound MCP** 中编辑这些值。组织 Tool Policy 可以为单个 Tool
+设置更严格的超时或响应大小限制。
+
+## 浏览器 Origin 与 Host 检查
+
+非浏览器 MCP 客户端可以不发送 `Origin` Header。浏览器请求必须同源，或精确匹配 Inbound
+MCP 设置中的 HTTP/HTTPS Origin。
+
+非回环地址部署时，请求 `Host` 必须匹配 `http.external_url`。该检查用于阻止针对本地 MCP
+Server 的 DNS rebinding 攻击。
+
+## 排查连接问题
+
+| 现象 | 检查项 |
+|---|---|
+| `401 missing Authorization Bearer token` | 运行 `codex mcp login molesignal`，或配置受支持的 API Token 环境变量。 |
+| 授权页要求再次登录 | Web UI、`http.external_url` 与 MCP 端点统一使用相同协议与 Host，避免混用 `localhost` 和 `127.0.0.1`。 |
+| `duplicate field resource` | 移除手动配置的 `--oauth-resource`，然后重新注册端点。 |
+| OAuth 回调显示连接被拒绝 | 在浏览器跳回临时回环回调前保持 MCP 客户端运行；监听已停止时重新运行 `codex mcp login`。 |
+| MCP 端点返回 `403` | 检查 Agent 许可证、服务启用状态、浏览器 Origin、凭证状态、IAM 权限与 Tool Policy。 |
+| 找不到某个 Tool | 先使用 `tool_search` 搜索；无结果时检查 surface exposure、IAM 与 Tool Policy。 |

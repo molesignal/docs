@@ -1,0 +1,207 @@
+---
+title: "Tool catalog and execution"
+sidebarTitle: "Tools"
+description: "Understand MoleSignal's shared tool catalog, progressive discovery, tenant isolation, risk policy, approvals, and product-domain coverage."
+---
+
+MoleSignal models AI-operable product capabilities as a protocol-neutral **Tool Catalog**. Mole
+Agent and Inbound MCP use the same `ToolSpec` contracts and the same server-side runtime instead
+of duplicating business logic in each adapter.
+
+The current catalog contains **190 registered tools**. Each tool defines a stable name, canonical
+description, input and output schemas, required IAM permissions, risk level, access mode,
+annotations, and allowed surfaces.
+
+<CardGroup cols={2}>
+  <Card title="Product-level operations" icon="wrench">
+    Tools represent bounded product actions such as querying logs, testing an alert, or updating
+    one dashboard panel—not arbitrary HTTP requests.
+  </Card>
+  <Card title="Tenant-safe context" icon="shield">
+    The authenticated adapter injects the caller identity and organization. `user_id` and
+    `org_id` never select the execution tenant.
+  </Card>
+  <Card title="Progressive context" icon="magnifying-glass">
+    Common tools stay visible. Deferred tools are searched only when needed, keeping model
+    context and token usage bounded.
+  </Card>
+  <Card title="One execution path" icon="arrows-rotate">
+    Permission, license, policy, timeout, output bounds, idempotency, approval, verification, and
+    audit are enforced again at execution time.
+  </Card>
+</CardGroup>
+## Tool granularity
+
+A good MoleSignal tool has one clear operational intent and one bounded result.
+
+- Use one tool for one atomic read, preflight, or mutation.
+- Keep list, get, create, update, delete, test, trigger, cancel, and retry operations separate.
+- Expose product concepts instead of raw routes or arbitrary request builders.
+- Return structured, bounded output suitable for a model and an audit record.
+- Keep credential plaintext, binary transfer, raw intake, shell execution, and browser control
+  outside the catalog.
+
+This granularity lets IAM and Tool Policy control the exact operation rather than granting broad
+access to an entire HTTP resource family.
+
+## Surfaces
+
+Tool exposure is explicit for each runtime surface.
+
+| Surface | Discovery and execution |
+|---|---|
+| Mole Agent | Common tools plus `tool_search → tools_call` for deferred built-in and authorized outbound MCP tools. |
+| Inbound MCP | Common reads and approval controls plus `tool_search → call_read_tool` or `call_managed_tool`. |
+| Automation | No built-in tool by default; each tool must explicitly opt in to the automation surface. |
+
+The server checks surface exposure both while building a tool list and immediately before
+execution. Bypassing `tools/list` does not bypass the surface boundary.
+
+## Inbound MCP discovery
+
+Inbound MCP keeps `tools/list` small. The authorized response can include:
+
+- seven pinned read tools: `query_logs`, `query_metrics`, `list_streams`,
+  `get_stream_schema`, `list_traces`, `get_trace`, and `get_incident`;
+- approval controls: `list_agent_approvals`, `get_agent_approval`, and
+  `execute_agent_approval`;
+- execution controls: `list_agent_executions` and `get_agent_execution`;
+- `tool_search`, `call_read_tool`, and `call_managed_tool`.
+
+IAM and Tool Policy can remove any product tool from this list.
+
+### Search the authorized catalog
+
+Call `tool_search` with a product phrase or domain:
+
+```json
+{
+  "query": "status page incident",
+  "limit": 10,
+  "include_schema": true
+}
+```
+
+The result includes only tools that are available on Inbound MCP, enabled by workspace Tool
+Policy, and authorized for the credential. Each match includes the schema and effective execution
+metadata when requested.
+
+### Run a read or preflight
+
+Pass the discovered name and arguments to `call_read_tool`:
+
+```json
+{
+  "name": "list_status_page_incidents",
+  "arguments": {
+    "status_page_id": "status-page-id",
+    "lifecycle": "active"
+  }
+}
+```
+
+Set `as_task` to `true` for a durable read task when the MCP client advertises the Tasks
+extension. Poll, update, or cancel the returned task with the MCP task methods.
+
+### Run a managed change
+
+Pass a unique idempotency key to `call_managed_tool`:
+
+```json
+{
+  "name": "update_annotation",
+  "arguments": {
+    "annotation_id": "annotation-id",
+    "text": "Deployment rollback started"
+  },
+  "idempotency_key": "8d7788d2-9b4e-44bd-bf35-61a5690f0064"
+}
+```
+
+MoleSignal reserves the key for the authenticated principal before creating an approval or
+executing the change. Repeating the same request returns the persisted result or in-progress
+state. Reusing the key with different arguments is rejected.
+
+## Risk and execution policy
+
+The tool risk level supplies a safe default. Workspace Tool Policy can apply a stricter execution
+mode.
+
+| Risk | Default mode | Meaning |
+|---|---|---|
+| L0 | Automatic | Bounded read-only operations. |
+| L1 | Confirmation | Low-risk changes require MCP-host confirmation unless policy selects automatic execution. |
+| L2 | Single approval | One MoleSignal approval is required. |
+| L3 | Dual approval | Two MoleSignal approvals are required. |
+| L4 | Disabled | High-risk or destructive remote operations remain unavailable by default. |
+
+Automatic managed changes still create an auditable approval record. Confirmation mode can use
+the MCP multi-round input flow. Single- and dual-approval modes wait for reviews in MoleSignal.
+After the required reviews, the original requester can call `execute_agent_approval` with another
+`idempotency_key` to finish the operation.
+
+Before execution, the runtime revalidates:
+
+1. authenticated principal and organization state;
+2. required IAM permissions and permission mode;
+3. license and feature availability;
+4. surface exposure and current Tool Policy;
+5. input schema, target resource state, and risk;
+6. timeout, response-size limit, and idempotency;
+7. post-operation verification and audit recording.
+
+## Catalog coverage
+
+The catalog covers the product operations that are safe and useful for AI-driven investigation
+and administration.
+
+| Domain | Representative capabilities |
+|---|---|
+| Logs, metrics, and streams | Query telemetry, inspect schemas and settings, search surrounding events, and explore metric labels or series. |
+| Traces, APM, RUM, and profiles | Inspect traces, service topology, sessions, errors, dependencies, flame graphs, and cross-signal correlations. |
+| Alerts and incidents | Read incidents and on-call state; create, update, delete, test, or trigger alert rules; acknowledge or resolve incidents. |
+| Dashboards, reports, and annotations | Manage dashboards, folders, panels, annotations, report templates, schedules, and deliveries. |
+| Search jobs and saved views | Submit, inspect, cancel, retry, or delete durable searches and manage saved views. |
+| Pipelines, functions, enrichment, and connectors | Inspect scheduled runs, manage functions, test transformations, and read enrichment or connector metadata. |
+| Synthetics and status pages | Inspect monitors and results, run or pause monitors, manage status-page lifecycle and automation. |
+| Notifications | Inspect connectors, policies, templates, and deliveries; retry or acknowledge a delivery. |
+| IAM and administration | Read users, teams, roles, capabilities, audit events, Service Accounts, and API Token metadata; manage non-secret credential state. |
+| Mole Agent control | Inspect investigations, approvals, executions, and automations, then execute an approved operation when authorized. |
+
+Call `get_platform_capabilities` for a surface-filtered capability summary. Call `tool_search` for
+the current authorized names and schemas instead of relying on a static list.
+
+## Identity and secret boundaries
+
+- The authenticated credential supplies the caller `user_id` and `org_id`.
+- `get_user_profile` and `get_user_preferences` accept an optional `target_user_id` only to
+  select a resource. Reading another member requires `org.members.read` and an organization
+  membership check.
+- Read and list tools return credential metadata only.
+- `create_api_token` and `create_service_account` are not available on Inbound MCP because both
+  produce one-time plaintext. Create these credentials in the Web UI.
+- Existing Service Accounts and API tokens can still be listed, updated, enabled, disabled,
+  revoked, or deleted through authorized non-secret tools.
+
+The catalog intentionally excludes login, registration, password reset, public unauthenticated
+routes, raw OTLP or Prometheus intake, external webhooks, binary upload and download, node drain,
+runtime profiling, arbitrary HTTP, shell, and browser execution.
+
+## MCP resources, prompts, and tasks
+
+Inbound MCP also exposes IAM-filtered resources for platform capabilities, the tool catalog,
+approvals, executions, search jobs, and stream schemas. Built-in, organization, and current-user
+Mole Agent prompts are available through `prompts/list` and `prompts/get`.
+
+Long read operations can run as MCP tasks. Progress notifications, resource subscriptions, and
+catalog-change notifications are available when supported by the negotiated MCP protocol
+version.
+
+<CardGroup cols={2}>
+  <Card title="Connect an MCP client" icon="plug" href="/en-US/inbound-mcp">
+    Enable the endpoint and connect with OAuth 2.1 or an API token.
+  </Card>
+  <Card title="Mole Agent" icon="robot" href="/en-US/agent">
+    Use the same governed catalog from the embedded operations agent.
+  </Card>
+</CardGroup>
