@@ -198,7 +198,7 @@ const DIAGRAMS = {
   degraded["degraded_clusters<br/>graceful degradation"]
   sql["execute full user SQL"]
   resp["return federation<br/>scanned · degraded · reason"]
-  post -->|"license: federated_search<br/>else 403"| local
+  post --> local
   local -->|"fan-out"| r1
   local --> r2
   r1 --> merge
@@ -216,7 +216,7 @@ const DIAGRAMS = {
   degraded["degraded_clusters<br/>优雅降级"]
   sql["执行完整用户 SQL"]
   resp["返回 federation<br/>scanned · degraded · reason"]
-  post -->|"license：federated_search<br/>否则 403"| local
+  post --> local
   local -->|"fan-out"| r1
   local --> r2
   r1 --> merge

@@ -50,7 +50,7 @@ API behavior must match the current MoleSignal source:
   **organization** for API and IAM boundary names.
 - Use **Mole Agent** consistently for the product area and embedded
   assistant.
-- Use **OpenSource Edition** and **Enterprise Edition** in user-facing copy.
+- Keep future offering content in the **Enterprise & Cloud** tab until details are ready.
 - Name exact permissions, such as `streams.query`, instead of assuming a
   display role.
 - Put UI labels in bold and paths, commands, fields, and permission keys in
