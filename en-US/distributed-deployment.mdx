@@ -17,7 +17,7 @@ The `router` role is the entry point of a role-split cluster. It serves the comp
 | `intake` | WAL replay, in-memory buffering, periodic flush to Parquet, real-time alert rules, the internal gRPC intake endpoint, and the OTLP gRPC receiver | Stateful: the WAL of the most recent flush window | Sharded by consistent hashing. Plan the WAL volume and the rebalancing before scaling. |
 | `querier` | Query execution for SQL and PromQL requests that other nodes send, the Arrow Flight scan endpoint for federated queries, and asynchronous search jobs | Stateless | Scales horizontally. |
 | `compactor` | File compaction, retention, and storage maintenance: index rebuild, delayed object deletion, and catalog reconciliation | Stateless between runs | Scales horizontally. Several nodes divide the work by stream and by organization. See [Work division between compactor nodes](#work-division-between-compactor-nodes). |
-| `alert` | Rule evaluation, escalation dispatch, scheduled reports, connector runners, pipeline runners, and the Probe Agent gRPC endpoints | Stateless between runs: evaluation state and incidents live in the metadata database | Run a single instance. Several instances would evaluate every rule and run every scheduled job more than once. |
+| `alert` | Rule evaluation, escalation dispatch, scheduled reports, connector runners, pipeline runners, background jobs that run on one node, and the Probe Agent gRPC endpoints | Stateless between runs: evaluation state and incidents live in the metadata database | Scales horizontally. Several nodes divide the work by rule, report, pipeline, and connector, and one primary node runs the jobs that must run once. See [Work division between alert nodes](#work-division-between-alert-nodes). |
 
 A process can carry several roles, for example `["intake", "querier"]`.
 
@@ -163,6 +163,29 @@ Every compactor node applies `[compactor].max_concurrent_groups` on its own, so 
 
 On `/metrics`, the gauges `work_ownership_members`, `work_ownership_active`, and `work_ownership_owned_units` report the number of members a node sees, whether the node currently takes work, and how many streams or organizations it owned in its latest round. The `work` label of `work_ownership_owned_units` names the job: `compaction` and `partition_manifest` count streams, and `index_rebuild` and `storage_reconciler` count organizations. When the membership is stable, the values of all compactor nodes add up to the number of streams or organizations.
 
+### Work division between alert nodes
+
+Several nodes can run the `alert` role at the same time. The nodes divide the work by item, and one node, the primary, runs the jobs that must run once. A `standalone` node counts as one of the alert nodes.
+
+| Work | Divided by | Runs on |
+|---|---|---|
+| Rule evaluation | Rule | The owner of the rule |
+| Escalation of open incidents | Rule of the incident | The owner of the rule, which is also the node that evaluates it |
+| Scheduled reports | Report | The owner of the report |
+| Scheduled pipelines | Pipeline | The owner of the pipeline |
+| Pull connectors | Connector | The owner of the connector |
+| Notification delivery, on-call events, and status page notifications | Not divided | Every alert node. A node claims an event or a delivery in the database before it sends it, and event ids are stable, so repeating the work has no effect. |
+| Cross-cluster event push and gossip, service graph recompute, APM rollup, status page maintenance, synthetic monitoring automation, slow query analysis, and incident root cause analysis | Not divided | The primary node only |
+
+The owner of an item comes from rendezvous hashing over the ids of the live alert nodes, in the same way as for compactor nodes. The primary is the owner of one fixed key. Membership changes follow the compactor rules above: the remaining nodes take over the items of a node that fails or shuts down with the same timings, and a new node takes work after it has been in the membership for `[cluster].peer_timeout_secs`. When the primary fails or shuts down, another node becomes the primary, and its jobs resume at their next round. A node that joins can take over the primary role, and the jobs pause until that node has finished its warm-up.
+
+- **Rules.** A node evaluates the rules it owns in each round (`[alert].eval_interval_secs`). During a membership change, two nodes can briefly own the same rule. A node skips a rule that was evaluated less than half of `[alert].eval_interval_secs` ago, so a period counts once and the `for_periods` debounce is not used up early.
+- **Reports, pipelines, and connectors.** A node claims an item with a lease before it runs the item, and releases the lease when the run ends. A node that crashes during a run keeps the lease for up to 10 minutes, then another node runs the item again. A run that takes longer than 10 minutes can be repeated by another node. A connector resumes from its stored cursor, so no data is lost, but the events of an interrupted window can be written twice.
+
+Keep the clocks of the nodes synchronized, because the nodes compare the timestamps that they write. Set a unique `[node].id` on every node.
+
+On `/metrics`, the `work` label of `work_ownership_owned_units` reports `rule_evaluation` and `escalation_dispatch` as the number of rules and incidents the node owned in its latest round, and `primary` as `1` on the primary node and `0` on the others. The `primary` value updates every `[cluster].heartbeat_interval_secs`. `work_overlap_skipped_total` counts the items that a node skipped because another node had already run them in the same period. The counter stays flat while the membership is stable.
+
 ## Rate limiting
 
 The `router` role limits requests per organization and route class with `[router.rate_limit]`. The intake class covers `/api/v1/intake/*` and the query class covers `/api/v1/query` and the paths below it. The limit counts requests of the authenticated organization and answers `429` with a `Retry-After` header when it is exceeded. Each router replica counts on its own, so the effective limit scales with the number of replicas. A `standalone` node does not apply this limit.
@@ -173,7 +196,7 @@ The `router` role limits requests per organization and route class with `[router
 - **Querier.** Add replicas. Each query runs on one querier, so more queriers raise the number of queries that run at the same time.
 - **Intake.** Run each node with its own persistent WAL volume (a StatefulSet in Kubernetes). Consistent hashing moves organizations when the number of nodes changes, so make sure the WAL has been flushed before scaling down, and leave time for WAL replay before routing traffic to a restarted node.
 - **Compactor.** Add replicas. The nodes divide the work by stream and by organization, the remaining nodes take over when one fails, and rolling updates are safe. See [Work division between compactor nodes](#work-division-between-compactor-nodes).
-- **Alert.** Run exactly one instance, and replace it by stopping the old instance before starting the new one (`strategy: Recreate` in Kubernetes). Reliability comes from fast restarts. Evaluation state and incidents live in the metadata database, so a restarted instance resumes from there.
+- **Alert.** Add replicas. The nodes divide the work by rule, report, pipeline, and connector, one primary node runs the jobs that must run once, the remaining nodes take over when a node fails, and rolling updates are safe. See [Work division between alert nodes](#work-division-between-alert-nodes).
 - **Multi-node consensus.** WAL replication between intake nodes is not implemented. Losing an intake node's volume loses the records that were not yet flushed. Changing `[node].roles` requires a restart.
 
 See [Deploy MoleSignal](/en-US/deployment) for installation and ports, and [Production checklist](/en-US/production-checklist) before going live.
