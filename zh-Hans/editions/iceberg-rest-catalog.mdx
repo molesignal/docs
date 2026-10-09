@@ -1,0 +1,127 @@
+---
+title: "Iceberg REST Catalog"
+sidebarTitle: "Iceberg REST Catalog"
+description: "通过受管的 Apache Iceberg REST Catalog，用 Spark、Trino、Flink、DuckDB 查询 MoleSignal 遥测数据。"
+tag: "enterprise cloud"
+"en_link": "/en-US/editions/iceberg-rest-catalog"
+---
+
+<Warning>
+  规划中，面向企业版与 MoleSignal Cloud。该能力处于设计阶段，尚未包含在任何发行版中，开源版不提供。本页的名称、范围与行为在发布前可能调整。
+</Warning>
+
+Iceberg REST Catalog 把组织的遥测数据发布为 [Apache Iceberg](https://iceberg.apache.org) 表。运行在组织自选基础设施上的查询引擎连接 Catalog 后，把数据流当作表发现，并直接从对象存储读取 Parquet 文件。MoleSignal 负责表、元数据、权限、租户边界与数据位置；引擎、查询与算力由组织自行选择和运行。
+
+## 职责划分
+
+MoleSignal 负责：
+
+- **表。** 每个开放的数据流呈现为只读 Iceberg 表，schema 与数据流一致。
+- **元数据。** 快照、数据文件与统计信息始终与合并和保留策略保持一致。
+- **权限。** Catalog 决定哪个主体可以列出、读取哪些表。
+- **租户隔离。** 组织只能看到自己的表和文件。
+- **数据位置。** MoleSignal 决定文件存放位置，并为其签发短期有效的只读凭据。
+
+组织自行负责：
+
+- **引擎。** Apache Spark、Trino、Apache Flink、DuckDB，或任何支持 Iceberg REST Catalog 规范的客户端。
+- **工作负载。** 查询、ETL 流水线、机器学习任务与 BI 看板。
+- **算力与成本。** 集群、调度与结果存储。
+
+## 连接流程
+
+<Steps>
+  <Step title="身份验证">
+    引擎向 Catalog 端点出示 API Token 或服务账号凭据。
+  </Step>
+  <Step title="发现表">
+    Catalog 列出该主体可读的数据流，并按数据流类型分组。
+  </Step>
+  <Step title="加载表">
+    Catalog 返回同一个一致快照的 schema、分区与数据文件，并附带该表存储位置的短期只读凭据。
+  </Step>
+  <Step title="读取文件">
+    引擎直接从对象存储读取 Parquet 文件。文件内容不经过 MoleSignal。
+  </Step>
+</Steps>
+
+## 选择访问方式
+
+| | Iceberg REST Catalog | [Arrow Flight SQL](/zh-Hans/query/database-clients) |
+|---|---|---|
+| 查询运行位置 | 组织自己的引擎 | MoleSignal |
+| 典型用途 | 面向时间范围的批量分析、ETL、机器学习与 BI | 数据库客户端的交互式 SQL |
+| 字段遮掩 | 不生效，见[数据保护边界](#数据保护边界) | 生效 |
+| 版本 | 企业版与 Cloud（规划中） | 所有版本 |
+
+受治理的交互式查询使用 Flight SQL 或查询 API。需要在引擎侧用自有算力扫描大时间范围时，使用 Catalog。
+
+## 开放的内容
+
+- **一个数据流对应一张表。** 命名空间与数据流类型一致：`logs`、`metrics`、`traces`、`profiles`。
+- **列与数据流 schema 一致。** `_timestamp` 在最前，微秒精度，UTC。JSON 字段为字符串。加密字段保持密文。
+- **文件按事件时间分区。** 时间范围过滤可以裁剪文件。
+- **不开放。** 存放在内存中的 Extend 表，以及 MoleSignal 为内部功能维护的派生读模型。
+
+## 访问控制
+
+- **身份验证。** API Token（`ms_<prefix>_<secret>`）与服务账号，与 HTTP API、Flight SQL 使用相同的凭据。
+- **授权。** 由独立的 Catalog 权限控制，权限名在发布时确定。读取一张表需要该权限和 `streams.query`。
+- **租户隔离。** 每个组织拥有独立的 Catalog 范围。存储凭据只覆盖所请求表的文件，短期过期，不允许写入或删除。
+- **审计。** 凭据签发和开放范围变更都会记录为审计事件。
+
+## 数据保护边界
+
+<Warning>
+  直接读取 Parquet 文件的引擎看到的是存储的原始值。字段遮掩规则只作用于 MoleSignal 查询和 Flight SQL 结果，不作用于引擎直接读取的文件。加密字段在文件中保持加密，引擎拿到的是密文。
+</Warning>
+
+因此，Catalog 访问等同于对所开放数据流的原始数据访问：
+
+- 只向有权读取未遮掩数据的主体授予 Catalog 权限。
+- 管理员决定 Catalog 开放哪些数据流。命中生效中的字段遮掩规则的数据流，需要管理员明确允许后才会开放。
+- Metrics 数据流不参与字段遮掩，按常规开放设置处理。
+
+## 数据新鲜度与一致性
+
+- 快照只列出已提交的文件。仍在接入缓冲区中的记录，在下一次刷写后可见。
+- 合并和保留的结果体现在下一个快照中。被合并替换的文件会在对象存储中保留一段宽限期，已经按旧快照规划的任务得以完成。运行时间超过宽限期的任务需要重新规划。
+
+## 支持的引擎
+
+Catalog 遵循开放的 Iceberg REST Catalog 规范。验证目标如下：
+
+| 引擎 | 状态 |
+|---|---|
+| Apache Spark | 规划中 |
+| Trino | 规划中 |
+| Apache Flink | 规划中 |
+| DuckDB | 规划中 |
+| PyIceberg 及其他 REST Catalog 客户端 | 预期可用，未验证 |
+
+已验证的版本和连接配置在发布时公布。
+
+## 首个版本的限制
+
+- **只读。** Catalog 拒绝写入、建表和 schema 变更。schema 和保留策略在数据流上修改。
+- **仅当前快照。** 不提供时间旅行、分支和标签。
+- **没有视图，也没有多表事务。**
+- **不托管组织自有的表。** 引擎可以同时挂载多个 Catalog，因此结果可以与组织自行运维的 Catalog 中的表关联，也可以写入其中。
+- **仅限能签发范围受限访问的对象存储。** `local` 对象存储后端无法向外部引擎提供文件。
+
+## 可用性
+
+| 版本 | 可用性 |
+|---|---|
+| 开源版 | 不包含。外部 SQL 访问请使用 [Arrow Flight SQL](/zh-Hans/query/database-clients)。 |
+| 企业版 | 规划中。需要引擎可以访问到的对象存储，以及包含该能力的 License。 |
+| MoleSignal Cloud | 规划中。各区域在其组织数据旁提供 Catalog。 |
+
+<CardGroup cols={2}>
+  <Card title="用数据库客户端连接" icon="database" href="/zh-Hans/query/database-clients">
+    现在即可通过 Arrow Flight SQL 查询 MoleSignal。
+  </Card>
+  <Card title="安全与多租户" icon="shield" href="/zh-Hans/security">
+    租户隔离、字段遮掩与字段加密。
+  </Card>
+</CardGroup>

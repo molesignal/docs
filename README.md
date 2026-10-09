@@ -49,7 +49,10 @@ API behavior must match the current MoleSignal source:
   **organization** for API and IAM boundary names.
 - Use **Mole Agent** consistently for the product area and embedded
   assistant.
-- Keep future offering content in the **Enterprise & Cloud** tab until details are ready.
+- Document each Enterprise or Cloud capability as one page under **Capabilities** in the
+  **Enterprise & Cloud** tab. Set the frontmatter `tag` to `"enterprise cloud"`, `"enterprise"`,
+  or `"cloud"` so that the sidebar shows a topic chip for each edition that offers the
+  capability.
 - Name exact permissions, such as `streams.query`, instead of assuming a
   display role.
 - Put UI labels in bold and paths, commands, fields, and permission keys in

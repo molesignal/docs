@@ -64,7 +64,7 @@ Describe access with exact permission keys such as `streams.query`.
 
 - Document the open source edition: Apache License 2.0, PostgreSQL as the only metadata database, the embedded JavaScript and VRL runtimes, RustFS as the sandbox object store, and the standalone deployment as the supported topology.
 - Describe the role-split deployment with the router as the entry point of the full API, and state its limits next to it.
-- The **Enterprise & Cloud** tab holds placeholders until the content is ready.
+- The **Enterprise & Cloud** tab lists one page per capability under **Capabilities**. Show which editions offer a capability with topic tags in the sidebar, like GitHub repository topics. Set `tag: "enterprise cloud"` in the frontmatter when both editions offer the capability, and `tag: "enterprise"` or `tag: "cloud"` when only one does. Keep the order `enterprise cloud` and the same value in both languages. `style.css` draws each word as a separate chip. Mark a capability that has not shipped with a `<Warning>` that states its planned status.
 - Do not document internal source layout, internal module names, or development-only switches.
 
 ## Validation
