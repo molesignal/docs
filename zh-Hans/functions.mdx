@@ -1,28 +1,50 @@
 ---
 title: "函数"
-description: "创建可复用转换，用样例事件进行测试，并在数据管道中使用。"
+description: "创建可复用的 VRL 与 JavaScript 转换，用样例事件进行测试，并在流水线中使用。"
 ---
 
-函数用于封装可复用的事件转换。打开**函数**可以独立于数据管道创建、测试和维护转换逻辑。
+函数用于封装可复用的事件转换。打开 **函数** 可以独立于流水线创建、测试和维护转换逻辑。
 
 ## 语言
 
 | 语言 | 可用条件 | 适用场景 |
 |---|---|---|
-| VRL | 始终可用 | 解析、标准化、过滤、脱敏与数据扩展。 |
-| JavaScript | 构建时启用 `js-runtime` | 更适合使用 JavaScript 表达的处理逻辑。 |
-| LLM | 通过 API 配置；需要 `llm_eval_enabled` 与模型供应商 | 用模型输出完成低吞吐分类或数据扩展。 |
+| VRL | 内置 | 解析、标准化、过滤、脱敏与数据扩展。 |
+| JavaScript | 内置 | 更适合使用 JavaScript 表达的处理逻辑。 |
+| LLM | 通过 API 配置；需要 `llm_eval_enabled` 与模型服务商 | 用模型输出完成低吞吐分类或数据扩展。 |
+
+VRL 与 JavaScript 都运行在 MoleSignal 二进制内部，不需要配置项，也不需要额外安装。
 
 保存函数时，MoleSignal 会验证并编译源代码。无效代码不会成为当前生效版本。
 
-当前函数工作台提供 VRL 与 JavaScript。LLM 函数属于高级 API 工作流：函数源码是系统指令，事件是模型
-输入，`params_schema.output_field` 决定输出字段（默认 `_llm_eval`）。
+函数工作台提供 VRL 与 JavaScript。LLM 函数属于高级 API 工作流：函数源码是系统指令，事件是模型输入，`params_schema.output_field` 决定输出字段（默认 `_llm_eval`）。每个命中的事件都会触发一次模型调用，因此配置项 `[functions].llm_eval_enabled` 默认保持为 `false`，参见[配置](/zh-Hans/configuration#功能与集成)。
+
+## 内置预设
+
+每个组织都能看到以下只读的 VRL 函数：
+
+| 函数 | 作用 |
+|---|---|
+| `add-intake-time` | 添加接入时间戳，用于诊断端到端延迟。 |
+| `normalize-logs` | 解析 JSON 格式的 message，添加环境与集群字段，并把 `level` 规范为小写。 |
+| `parse-key-value` | 把 logfmt 或 `key=value` 形式的 message 解析为字段，并合并回事件。 |
+| `redact-email` | 把 `message` 中的邮箱地址替换为占位符。 |
+| `route-by-service` | 规范服务名，并派生出按服务划分的目标数据流（`logs_<service>`）作为路由提示。 |
 
 ## 保存前测试
 
-函数工作台包含源码编辑器和 JSON 样例运行器。当前 `POST /api/v1/functions/run` 执行路径只运行 VRL
-样例。JavaScript 在 runtime 编入后会进行保存时语法校验，但该端点暂不支持运行未保存的 JavaScript
-样例。LLM 函数只作为流水线步骤执行。
+函数工作台包含源码编辑器和 JSON 样例运行器。运行器调用 `POST /api/v1/functions/run`，传入语言、源码和样例事件，并返回转换后的事件：
+
+```bash
+curl -X POST http://localhost:5080/api/v1/functions/run \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{"language":"vrl","source":".service = downcase!(string!(.service))","input":{"service":"Checkout"}}'
+```
+
+```json
+{ "output": { "service": "checkout" } }
+```
 
 VRL 示例：
 
@@ -34,21 +56,46 @@ if exists(.customer_id) {
 }
 ```
 
+## JavaScript 函数
+
+源码对每个事件运行一次。全局对象 `molesignal` 提供事件和辅助方法：
+
+| 成员 | 用途 |
+|---|---|
+| `molesignal.fields` | 以对象形式表示的事件。可以读取、修改，也可以赋值为新的对象。 |
+| `molesignal.set(name, value)` | 设置字段。 |
+| `molesignal.del(name)` | 删除字段。 |
+| `molesignal.now()` | 当前时间，自 Unix 纪元起的微秒数。 |
+| `molesignal.parse_json(text)` 与 `molesignal.encode_json(value)` | 在 JSON 文本与值之间转换。 |
+| `molesignal.sha256(text)` | 文本 UTF-8 字节的 SHA-256 摘要，64 个小写十六进制字符。 |
+
+```js
+molesignal.set("severity", String(molesignal.fields.level || "info").toUpperCase());
+molesignal.set("seen_at", molesignal.now());
+molesignal.del("level");
+```
+
+JavaScript 函数运行在隔离的引擎中，有以下限制：
+
+- 运行时间超过 50 毫秒会停止，并报 `js timeout 50ms`。
+- 单个函数的堆内存上限为 32 MiB。
+- 不提供网络访问、定时器和 `TextEncoder`。
+
 ## 使用函数
 
-在数据管道中将函数添加为转换节点。数据管道保存有序步骤，并依次将事件传给每个函数。
+在流水线中将函数添加为转换节点。流水线保存有序步骤，并依次将事件传给每个函数。
 
-删除或修改函数可能影响所有引用该函数的数据管道。进行不兼容变更前，请先检查使用情况。
+删除或修改函数可能影响所有引用该函数的流水线。进行不兼容变更前，请先检查使用情况。
 
 ## 权限
 
 - `functions.read` 用于列出和打开函数。
 - `functions.create` 和 `functions.edit` 用于管理函数定义。
-- `functions.run` 用于执行 VRL 样例运行器。
+- `functions.run` 用于执行样例运行器。
 - `functions.delete` 用于删除函数定义。
 
 <CardGroup cols={2}>
-  <Card title="数据管道" icon="diagram-project" href="/zh-Hans/pipelines">
+  <Card title="流水线" icon="diagram-project" href="/zh-Hans/pipelines">
     构建数据源 → 转换 → 目标端工作流。
   </Card>
   <Card title="扩展表" icon="table" href="/zh-Hans/extend-tables">

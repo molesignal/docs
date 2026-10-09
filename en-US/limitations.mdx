@@ -1,0 +1,49 @@
+---
+title: "Known limitations"
+description: "Behavior of the current release that differs from what a deployment might expect, with workarounds."
+---
+
+MoleSignal is pre-1.0. This page lists limits that affect planning and operation.
+
+## Deployment
+
+- **No WAL replication.** Intake nodes do not replicate the write-ahead log. Losing an intake volume loses the records that were not flushed to object storage yet.
+- **Single instance role.** Run one `alert` node. Reliability comes from fast restarts.
+- **PostgreSQL only.** PostgreSQL is the only metadata database.
+- **Restart to apply configuration.** A running process does not apply changes to the configuration file. See [Configuration](/en-US/configuration).
+- **Forward-only migrations.** A database that a newer build migrated cannot be opened by an older build, and builds before 1.0 can change the baseline schema. See [Upgrade](/en-US/upgrade).
+
+## Intake
+
+- **Request size.** A request body larger than 2 MiB is rejected with `413`.
+- **OTLP over HTTP compression.** Compressed request bodies are rejected with `400`. Disable compression in the sender.
+- **Histogram buckets.** OTLP histograms store `count`, `sum`, `min`, and `max`. Bucket boundaries, bucket counts, and summary quantiles are not stored.
+- **Duplicate spans.** A span that is sent again with the same `trace_id` and `span_id` is dropped.
+- **Loki push.** The endpoint decodes the JSON request shape only. Senders that use snappy-compressed protobuf, such as Promtail and Grafana Alloy, cannot push to it.
+- **Prometheus remote_write.** Native histograms and metric metadata are skipped.
+- **OTLP gRPC without TLS.** The receiver does not terminate TLS. Put a TLS-terminating proxy in front of it for traffic that leaves a trusted network.
+- **Rate limiting.** Only the `router` role limits requests. The limit counts the requests of the authenticated organization, and every router replica counts separately.
+- **Reserved stream name.** `_molesignal` is reserved for the service's own telemetry and rejects public intake.
+
+## Query
+
+- **Long ranges run asynchronously.** A query whose estimated size reaches `[querier].auto_async_threshold_rows` returns `202` with a job to follow. With the defaults, that is a range of about 13.9 hours. Send `Prefer: respond-sync` to run it in the request. See [Query](/en-US/query#time-ranges-and-asynchronous-jobs).
+- **PromQL over the query endpoint.** `POST /api/v1/query` evaluates PromQL as an instant query at `time_range.end`.
+- **PromQL subset.** The engine implements a subset of PromQL. See [PromQL support matrix](/en-US/query/promql-subset).
+- **Rows per query.** A query that would read more than `[querier].max_scan_rows` rows (100 million by default) is rejected with `400`. Narrow the time range or add filters. PromQL applies the limit to each selector.
+- **Freshness in a role-split cluster.** A query reads the files that the catalog lists, so a record that an intake node still buffers becomes visible after the next flush, within `[intake].flush_interval_secs`. A `standalone` node also reads its own buffer.
+
+## Alerting
+
+- **Real-time rules count per intake node.** A `real_time` rule counts the records that one intake node receives, and the counts live in memory. In a role-split cluster every intake node counts on its own, and a restart starts the count at zero. The statement is limited to `SELECT count(*) FROM <stream> [WHERE <condition>]`. See [Real-time rules](/en-US/alerting#real-time-rules).
+
+## Security and identity
+
+- **Internal gRPC is unauthenticated.** Port `5082` carries node-to-node traffic without authentication. Keep it on a private network.
+- **No multi-factor authentication.** The web UI has no multi-factor authentication or passkeys. Use SSO with an identity provider that enforces it.
+- **Password reset needs email.** Resetting a password sends a link by email, so `[notify.smtp]` and `[http].external_url` must be configured.
+- **Sessions.** The account settings page manages only the session of the current browser.
+
+## Reports
+
+- **PDF and PNG rendering** needs headless Chrome. The release container image includes Chromium. A binary installation needs a Chrome installation, and `[scheduled_reports.renderer].base_url` must reach the web UI.

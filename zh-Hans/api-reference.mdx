@@ -1,9 +1,9 @@
 ---
 title: "API 入门"
-description: "基础 URL、身份验证、权限、请求约定、流式响应与错误处理。"
+description: "基础 URL、身份验证、权限、请求约定、分页、流式响应与错误处理。"
 ---
 
-MoleSignal 提供带版本的 HTTP API。产品端点通常使用 `/api/v1`；探针、Prometheus 指标、公开共享链接和部分兼容协议也会使用顶层路径。
+MoleSignal 提供带版本的 HTTP API。产品端点使用 `/api/v1`。健康探针、Prometheus 指标、公开共享链接和少数兼容协议也会使用其他路径。
 
 ## 基础 URL
 
@@ -13,90 +13,131 @@ MoleSignal 提供带版本的 HTTP API。产品端点通常使用 `/api/v1`；�
 http://localhost:5080/api/v1
 ```
 
-生产环境请将主机替换为部署配置的外部可访问 URL。
+生产环境请把主机替换为部署的对外地址，也就是 `[http].external_url` 的值。
 
-## Bearer 身份验证
+## 身份验证
 
-受保护端点接受登录 JWT 或 API Token：
+受保护的端点在 `Authorization` 请求头中接受 Bearer Token：
 
 ```http
 Authorization: Bearer <token>
 ```
 
-API Token 格式为 `ms_<prefix>_<secret>`。身份验证会生成包含主体、当前组织或平台范围，以及实际生效权限的 IAM 上下文。
+| Token | 获取方式 | 有效期 |
+|---|---|---|
+| 登录 Token（JWT） | 用邮箱和密码调用 `POST /api/v1/auth/signin`，参见[登录](/zh-Hans/api/auth/login)。 | 默认 24 小时。 |
+| API Token | **身份与访问 → API tokens**，或[签发 API Token](/zh-Hans/api/auth/issue-token)。格式形如 `ms_<prefix>_<secret>`。 | 直到被撤销，或到所选的过期时间。 |
+| 默认接入 Token | `GET /api/v1/auth/tokens/default`，仅限 `streams.write`。 | 不会过期。 |
+| RUM Client Token | `GET /api/v1/auth/tokens/rum?application_id=<id>`，仅限 `rum.write`。 | 不会过期。 |
+
+脚本和采集器请使用 API Token。登录 Token 会过期，并让使用它的发送端中断。接入 Token 的细节参见[数据源](/zh-Hans/intake#接入-token)。
+
+身份验证会生成包含主体、当前组织或平台范围，以及实际生效权限的 IAM 上下文。请求所属的组织始终来自这个上下文，请求体无法选择其他组织。
 
 ## 公开与自验证路由
 
-无法使用普通组织 Bearer Token 的路由会验证路由专用的窄范围凭据或策略。目前包括：
+少数路由无法使用组织的 Bearer Token，它们会改为验证范围更窄的凭据或策略：
 
 - 登录、注册策略与密码重置；
-- 健康状态与 Prometheus 指标；
-- 公开资源共享交换与共享会话请求；
+- `GET /api/v1/healthz` 与顶层的 `/metrics`；
+- 公开资源共享的交换与共享会话请求；
 - 签名文件下载与公开头像；
-- Stripe 与推送型 Connector Webhook。
+- 推送型连接器端点，它们验证推送 Token。
 
-不要把公开路由理解为无限制访问。对应 Handler 会验证注册策略、共享 Token、下载 Token、签名或 Connector 凭据。
+公开路由并非不受限制。对应的处理逻辑会检查注册策略、共享 Token、下载 Token、签名或连接器凭据。
 
 ## 授权
 
-受保护端点可以同时要求：
+一个端点可能要求以下一个或多个条件：
 
-- `streams.query` 等组织权限；
-- `sys.telemetry.read` 等平台权限；
-- 所有权、资源关系或跨组织授权；
-- 活动组织或有效计费状态。
+- 组织权限，例如 `streams.query`；
+- 平台权限，例如 `sys.telemetry.read`；
+- 对资源的所有权、与资源的关系，或跨组织授权。
 
-使用 `GET /api/v1/iam/capabilities` 检查当前主体的实际生效快照。不要根据角色名称或隐藏导航项推断访问权。
+`GET /api/v1/iam/capabilities` 返回当前主体实际生效的权限。不要根据角色名称或可见的菜单项推断访问能力。
 
 ## 请求
 
-- 大多数请求体使用 JSON 与 `Content-Type: application/json`。
-- 兼容采集端点使用各自原生负载，包括 Protobuf、NDJSON 或压缩请求体。
-- 以 `_micros` 结尾的字段使用 Unix 微秒时间。
-- 原生遥测记录使用 `_timestamp`；转换 SDK 时间时请遵循具体端点结构。
-- 将路径 ID 或数据流名称插入 URL 时必须进行 URL 编码。
-- 组织范围来自已通过身份验证的 IAM 上下文，而不是模型或浏览器提供的组织 ID。
+- 大多数请求体是 JSON，使用 `Content-Type: application/json`。
+- 兼容类接入端点使用各自协议的载荷，例如 Protobuf、NDJSON 或 gzip 压缩的请求体。
+- 超过 2 MiB 的接入请求体会被拒绝并返回 `413`。
+- 以 `_micros` 结尾的字段保存以微秒表示的 Unix 时间。原生遥测记录使用 `_timestamp`，同样以微秒计。
+- 路径中的 id 和数据流名称需要做 URL 编码。
 
-## 查询与长时间响应
+## 响应与错误
 
-查询家族支持普通 JSON、NDJSON 流式响应、运行中查询控制与异步搜索任务。流式调用方应处理网络分段交付与客户端取消。
+成功的响应是 JSON，除非端点以流或文件的形式返回。错误响应包含状态码，以及带有机器可读的 `error` 码和 `message` 的 JSON 响应体：
 
-大型 Agent 证据、生成报告、性能剖析文件与导出内容可以保存为文件，并通过限定范围 Token 下载，而不是嵌入 JSON。
+```json
+{
+  "error": "unauthorized",
+  "message": "unauthorized: missing Authorization Bearer token"
+}
+```
 
-## 错误
+`validation_failed` 错误还会附带 `issues` 数组，每个无效字段一项。
 
-API 错误使用 HTTP 状态码与 JSON 错误消息。常见状态包括：
+| 状态码 | `error` | 含义 |
+|---|---|---|
+| `400` | `invalid_argument`、`validation_failed` | 请求或其中某个参数无效。 |
+| `401` | `unauthorized` | Token 缺失、格式错误、无效或已过期。 |
+| `403` | `forbidden` | 缺少权限、关系或范围。 |
+| `404` | `not_found` | 资源不存在，或在授权范围内不可见。 |
+| `409` | `conflict` | 状态或唯一性冲突。 |
+| `413` | `payload_too_large` | 请求体超出限制。 |
+| `429` | `resource_exhausted` | 触发了速率限制，如果有 `Retry-After` 响应头，请遵循它。 |
+| `499` | `cancelled` | 请求已被取消。 |
+| `503` | `unavailable` | 依赖不可用。 |
+| `500` | `internal` | 内部故障。响应体中的 message 为 `internal error`，详细信息只保留在服务端日志中。 |
 
-| 状态 | 含义 |
+请求体无法解析时，请求在到达端点之前就会失败，此时的响应是纯文本而不是 JSON：
+
+| 状态码 | 含义 |
 |---|---|
-| `400` | 请求无效或参数不受支持。 |
-| `401` | 凭据缺失、无效、过期或未通过路由专用验证。 |
-| `402` | 组织服务因计费或试用策略暂停。 |
-| `403` | 缺少权限、资源关系或作用域。 |
-| `404` | 资源不存在，或在已授权范围中不可见。 |
-| `409` | 状态或唯一性冲突。 |
-| `413` | 负载或存储超过限制。 |
-| `429` | 超过限流。 |
-| `500` | 内部失败；使用请求 ID 与 Trace ID 进行关联。 |
+| `400` | 请求体不是有效的 JSON。 |
+| `415` | 请求缺少 `Content-Type: application/json`。 |
+| `422` | 字段缺失或类型错误，文本中会指出字段名。 |
 
-响应可以包含 `X-Request-Id` 与 `X-Trace-Id`。报告服务端失败时请附上这些值。
+每个响应都带有 `X-Request-Id` 与 `X-Trace-Id` 响应头。报告服务端故障时请同时提供这两个值。
+
+## 分页
+
+可能返回大量行的端点接受 `limit` 与 `cursor`，这类响应包含 `items` 与 `next_cursor`。把 `next_cursor` 作为 `cursor` 传回即可读取下一页，为空时停止。其他列表端点会返回完整列表，具体见各端点页面。
+
+## 查询与长耗时任务
+
+查询族接口返回普通 JSON、以流的形式返回 NDJSON，并把耗时较长的查询作为异步搜索任务运行。规模过大的查询会返回 `202`，并带有 `job_id` 与 `monitor` 路径。流式调用方需要处理部分数据到达的情况，并在不再需要结果时取消请求，参见[查询](/zh-Hans/query)。
+
+生成的报告、Profile 数据块和导出文件等大体积产物，通过限定范围的下载 Token 以文件形式交付，而不是放在 JSON 响应体中。
 
 ## 浏览 API
 
-<CardGroup cols={2}>
-  <Card title="当前 API 目录" icon="list" href="/zh-Hans/api/catalog">
-    将路由家族映射到产品能力与授权。
+<CardGroup cols={3}>
+  <Card title="API 目录" icon="list" href="/zh-Hans/api/catalog">
+    路由族、用途以及保护它们的权限。
   </Card>
-  <Card title="身份验证示例" icon="key" href="/zh-Hans/api/auth/login">
+  <Card title="身份验证" icon="key" href="/zh-Hans/api/auth/login">
     登录并管理 API Token。
   </Card>
-  <Card title="采集示例" icon="inbox" href="/zh-Hans/api/intake/native-json">
-    发送原生 JSON 与协议兼容遥测。
+  <Card title="数据接入" icon="inbox" href="/zh-Hans/api/intake/native-json">
+    发送原生 JSON 与兼容协议的遥测数据。
   </Card>
-  <Card title="查询示例" icon="magnifying-glass" href="/zh-Hans/api/query/execute">
-    运行 SQL、兼容 PromQL、流式与保存查询。
+  <Card title="查询" icon="magnifying-glass" href="/zh-Hans/api/query/execute">
+    运行 SQL、兼容 PromQL、流式与已保存的查询。
   </Card>
-  <Card title="告警示例" icon="bell" href="/zh-Hans/api/alerting/list-rules">
+  <Card title="APM" icon="gauge-high" href="/zh-Hans/api/apm">
+    读取服务、事务、依赖与错误指标。
+  </Card>
+  <Card title="数据流" icon="database" href="/zh-Hans/api/streams/list">
+    创建、查看并配置数据流。
+  </Card>
+  <Card title="告警" icon="bell" href="/zh-Hans/api/alerting/list-rules">
     管理规则、事件、渠道与升级。
+  </Card>
+  <Card title="关联与 Web" icon="diagram-project" href="/zh-Hans/api/web/correlation">
+    搜索、拓扑、链路与跨信号跳转。
+  </Card>
+  <Card title="平台与管理" icon="shield-halved" href="/zh-Hans/api/admin/audit">
+    审计日志、加密密钥与健康检查。
   </Card>
 </CardGroup>

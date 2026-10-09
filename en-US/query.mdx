@@ -4,111 +4,252 @@ sidebarTitle: "Overview"
 description: "Run SQL, PromQL-compatible metric queries, streaming searches, and asynchronous jobs over organization streams."
 ---
 
-MoleSignal exposes a single query endpoint backed by **DataFusion**. The endpoint supports full SQL
-— including joins, CTEs, and window functions — or a **PromQL subset** for metrics, all against the
-same store.
+MoleSignal exposes a single query endpoint backed by **DataFusion**. The endpoint supports full SQL, including joins, CTEs, and window functions, and a **PromQL subset** for metrics, all against the same store.
 
 ## The query endpoint
 
 ```http
 POST /api/v1/query
-Authorization: Bearer <jwt>
+Authorization: Bearer <token>
 Content-Type: application/json
 ```
+
+The endpoint requires the `streams.query` permission.
 
 ### Request body
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `org_id` | string | ✅ | Retained in the body for compatibility; the authenticated organization is authoritative. |
-| `language` | string | ✅ | `sql` or `promql`. |
-| `statement` | string | ✅ | The query text. |
-| `time_range` | object | ✅ | `{ "start": <microseconds>, "end": <microseconds> }` — microseconds since epoch. |
-| `stream` | object | — | `{ "name": "app", "stream_type": "logs" }`; queryable signal types are `logs`, `metrics`, `traces`, and `profiles`. |
-| `limit` | integer | — | Row cap. |
+| `org_id` | string | Yes | Must be present, and the value is ignored. The authenticated organization applies. |
+| `language` | string | Yes | `sql` or `promql`. |
+| `statement` | string | Yes | The query text. |
+| `time_range` | object | Yes | `{ "start": <microseconds>, "end": <microseconds> }`, in microseconds since the Unix epoch. |
+| `stream` | object | For SQL | `{ "name": "app", "stream_type": "logs" }`. Names the primary table of the statement. Both fields are required. |
+| `limit` | integer | No | Row cap. |
+
+The query string parameter `clusters` selects remote clusters for a [federated search](#federated-search).
 
 ### Response
 
-The response carries `columns`, array-shaped `rows`, `scanned_rows`, and `took_ms`. Federated
-responses may also carry federation metadata.
+The response carries `columns`, array-shaped `rows`, `scanned_rows`, and `took_ms`:
+
+```json
+{
+  "columns": ["level", "n"],
+  "rows": [["error", 2], ["info", 2]],
+  "scanned_rows": 4,
+  "took_ms": 155
+}
+```
+
+Each cell follows the type of its column:
+
+| Column type | JSON value |
+|---|---|
+| Missing value | `null`. |
+| Integer, floating point | Number. `NaN` and infinity return `null`. |
+| Decimal | Number for a precision up to 15 digits, otherwise a string that keeps every digit. |
+| Text | String. |
+| Binary | Lowercase hexadecimal string. |
+| Timestamp | Integer microseconds since the Unix epoch, for every time unit and time zone. |
+| Date, time | String such as `2022-01-08` or `01:01:01.500`. |
+| List, struct, map | Array, object, object. |
+| Other types | String. |
+
+Federated responses can also carry federation metadata.
 
 <Note>
-  Send `Accept: application/x-ndjson` to stream objects row-by-row, followed by a `__meta__`
-  record. Streaming bypasses the result cache.
+  Send `Accept: application/x-ndjson` to stream one JSON object per row, followed by a final
+  `{"__meta__": {...}}` record with `scanned_rows` and `took_ms`. Streaming bypasses the result cache.
 </Note>
+
+## Time ranges and asynchronous jobs
+
+Use a bounded `time_range` for interactive queries. MoleSignal estimates the size of a query as the length of the range in seconds multiplied by `[querier].estimate_throughput_per_sec`. When the estimate reaches `[querier].auto_async_threshold_rows`, the query runs as a durable search job. With the defaults, that is a range of 50,000 seconds, or about 13.9 hours.
+
+An asynchronous query answers `202` with the job to follow:
+
+```json
+{
+  "job_id": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+Control the mode with the `Prefer` request header:
+
+| Header | Effect |
+|---|---|
+| `Prefer: respond-async` | Always creates a search job. |
+| `Prefer: respond-sync` | Runs the query in the request, even for a long range. |
+
+Follow a job with these endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/query/jobs` | Submit a job directly. |
+| `GET /api/v1/query/jobs` | List jobs. Accepts `limit`. |
+| `GET /api/v1/query/jobs/{id}` | State, timestamps, `result_rows`, `error`, and `expires_at_micros`. |
+| `GET /api/v1/query/jobs/{id}/results` | Rows as objects, with `page`, `page_size` (default 1000), and `has_more`. |
+| `POST /api/v1/query/jobs/{id}/cancel` | Cancel a running job. |
+| `POST /api/v1/query/jobs/{id}/retry` | Run a failed job again. |
+| `DELETE /api/v1/query/jobs/{id}` | Remove a job. |
+
+A job keeps its result for seven days. Jobs report the states `pending`, `running`, `done`, `failed`, and `cancelled`.
 
 ## SQL
 
+A SQL statement names a stream in `FROM`, and the `stream` field of the request names the same primary stream:
+
 ```bash
+NOW=$(date +%s)000000
 curl -X POST http://localhost:5080/api/v1/query \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
   -d "{\"org_id\":\"$MS_ORG\",\"language\":\"sql\",
-       \"statement\":\"SELECT level, count(*) FROM app WHERE _timestamp > 0 GROUP BY level\",
-       \"time_range\":{\"start\":0,\"end\":2000000000000000},
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"time_range\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
        \"stream\":{\"name\":\"app\",\"stream_type\":\"logs\"}}"
 ```
 
-Because logs, metrics, and traces live in the same store, one query can **join across signals** —
-for example, join error logs to matching spans on `trace_id`:
+### Join across signals
+
+Logs, metrics, and traces live in the same store, so one query can join them. Name the primary stream in `stream`, and reference the other streams by name. For example, join error logs to the matching spans on `trace_id`:
 
 ```sql
-SELECT l.msg, t.duration_ms
+SELECT l.msg, t.name, t.duration_ns
 FROM app AS l
-JOIN spans AS t ON l.trace_id = t.trace_id
+JOIN traces AS t ON l.trace_id = t.trace_id
 WHERE l.level = 'error'
 ```
 
+### Text search
+
+| Function | Behavior |
+|---|---|
+| `MATCH(field, 'text')` | Case-insensitive substring match on any field. `%`, `_`, and `*` are literal characters. |
+| `MATCH_TEXT(field, 'query')` | Full-text search on a field with `index_type` set to `full_text`. A field without that index fails with `MATCH_TEXT: field ... has no full-text index configured`. |
+
+`MATCH_TEXT` understands several words as an AND of tokens, `"a b"` as a phrase, `error*` and `*error` as wildcards, `a OR b`, and `-a` to exclude a term. Add the index when creating a stream or editing its schema. See [Streams](/en-US/streams#schema-and-fields).
+
+```sql
+SELECT * FROM app WHERE MATCH(msg, 'timeout');
+SELECT * FROM app WHERE MATCH_TEXT(msg, 'panic "disk full" -debug');
+```
+
+### Timestamps in SQL
+
+`_timestamp` is a `Timestamp(µs, "UTC")` column. An integer literal that is compared with `_timestamp` counts microseconds since the Unix epoch, so these two filters select the same rows:
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= 1790000000000000
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= to_timestamp_micros(1790000000000000)
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+Only a literal is read as microseconds. To compare `_timestamp` with an expression or another column, convert the value with `to_timestamp_micros(...)`. Read the microseconds of a row with `CAST(_timestamp AS BIGINT)`.
+
+### Encrypted fields
+
+`decrypt(field)` restores the plaintext of a field that was marked encrypted. See [Streams](/en-US/streams#encrypted-fields).
+
 ## PromQL
 
-Set `language: "promql"` to run PromQL over metric streams. Both instant and range queries are
-supported (range steps through `[start, end]` and returns a matrix). Coverage is broad — the rate
-family and all `*_over_time`, the standard aggregations (incl. `topk` / `limitk`),
-`histogram_quantile`, `label_replace` / `label_join`, math & trig, the `and` / `or` / `unless` set
-operators with `on` / `ignoring` + `group_left` / `group_right` matching, selector `@` / `offset`,
-and subqueries.
+Set `language` to `promql` to run PromQL over metric streams. A metric selector names a metrics stream, the `value` column holds the sample, and the other columns are labels. Through this endpoint, MoleSignal evaluates the expression as an instant query at `time_range.end` and returns one row per series, with `value` first and then the labels:
 
 ```json
 {
   "org_id": "<org>",
   "language": "promql",
-  "statement": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))",
-  "time_range": { "start": 0, "end": 2000000000000000 }
+  "statement": "sum by (service) (http_requests_total)",
+  "time_range": { "start": 1790000000000000, "end": 1790003600000000 }
 }
 ```
 
+Coverage is broad. It includes the rate family and all `*_over_time` functions, the standard aggregations including `topk` and `limitk`, `histogram_quantile`, `label_replace` and `label_join`, math and trigonometry, the `and`, `or`, and `unless` set operators with `on`, `ignoring`, `group_left`, and `group_right` matching, the selector modifiers `@` and `offset`, and subqueries.
+
 <Card title="PromQL support matrix" icon="table-list" href="/en-US/query/promql-subset">
-  The full list of supported functions, operators, and modifiers — plus the known gaps
-  (native-histogram functions, the binary `default` fill-in).
+  The full list of supported functions, operators, and modifiers, plus the known gaps
+  (native-histogram functions and the binary `default` fill-in).
 </Card>
 
 ## Search around an event
 
-To pull the N events immediately before and after a given one (log context view), use
-`POST /api/v1/query/search_around` with `event_timestamp_us`, `stream`, `stream_type`, and optional
-`before` / `after` counts (default 50 each).
+`POST /api/v1/query/search_around` returns the events immediately before and after a given one, so an investigation can read the context of a log line. See [Search around an event](/en-US/api/query/search-around).
 
-## Async, inspection, and cancellation
+## Inspection and control
 
-- Add `Prefer: respond-async` to `POST /api/v1/query`, or submit directly to
-  `POST /api/v1/query/jobs`, for a durable search job.
-- `GET /api/v1/query/jobs/{id}` reports state; `/results` returns completed output.
-- `POST /api/v1/query/inspect` plans without executing and returns query metadata and the available
-  logical plan.
+- `POST /api/v1/query/inspect` plans a query without executing it and returns query metadata and the logical plan.
 - `POST /api/v1/query/recommendations` analyzes a query profile without executing the query.
-- `GET /api/v1/query/running` and `POST /api/v1/query/{id}/cancel` let organization administrators
-  inspect and cancel active work.
+- `GET /api/v1/query/running` and `POST /api/v1/query/{id}/cancel` let organization administrators inspect and cancel active work.
+- `GET /api/v1/query/sql/capabilities` and `GET /api/v1/query/promql/capabilities` list the supported functions for editors.
 
-Standard queries require `streams.query`. Active-query administration requires
-`org.settings.read` or `org.settings.manage`.
+Standard queries require `streams.query`. Active-query administration requires `org.settings.read` or `org.settings.manage`.
 
 ## Federated search
 
-Add `?clusters=local,cluster-name` to the query endpoint for federated search. Unreachable remotes are represented as degraded
-clusters in federation metadata instead of silently becoming local data.
+Add `?clusters=local,cluster-name` to the query endpoint for a federated search. An unreachable remote cluster appears as degraded in the federation metadata and never silently becomes local data. See [Role-based deployment](/en-US/distributed-deployment#federated-query).
+
+## Stored fields
+
+The fields of a stream depend on what senders provide. These are the fields that OTLP intake produces. Resource and record attributes become top-level fields with their original keys, such as `service.name`, and keep their numeric types.
+
+### OTLP log fields
+
+| Field | Content |
+|---|---|
+| `_timestamp` | Event time in microseconds, from `timeUnixNano`. |
+| `body` | The log body. |
+| `severity_text`, `severity_number` | The OTLP severity. |
+| `trace_id`, `span_id` | The correlation identifiers, as lowercase hex. |
+| `scope_name`, `scope_version` | The instrumentation scope. |
+| Resource and record attributes | One top-level field per attribute. |
+
+### Trace span fields
+
+| Field | Content |
+|---|---|
+| `_timestamp` | Span start in microseconds. |
+| `trace_id`, `span_id`, `parent_span_id` | The identifiers of the span and its parent. |
+| `name`, `kind` | The span name and kind. |
+| `start_time_unix_nano`, `end_time_unix_nano`, `duration_ns` | Timing in nanoseconds. |
+| `status_code`, `status_message` | `OK`, `ERROR`, or `UNSET`, with the message. |
+| `attributes`, `resource`, `scope`, `events`, `links` | The full OTLP structures as JSON text. |
+| Attribute keys such as `http.method` and `service.name` | Flattened copies of the attributes. |
+| `sampling_reason` and bookkeeping fields | How the tail sampler kept the trace, plus `partial`, `late`, `duplicate`, and `conflict` flags. |
+
+A span is identified by its `trace_id` and `span_id`. A span that is sent again is dropped as a duplicate.
+
+### OTLP metric fields
+
+MoleSignal flattens every OTLP data point into one metric event. Resource, scope, and data-point attributes stay queryable fields. The reserved fields below take precedence over attributes of the same name.
+
+| Field | Meaning |
+|---|---|
+| `metric_name` | The OTLP metric name. |
+| `metric_kind` | `gauge`, `counter`, `up_down_counter`, `histogram`, `exponential_histogram`, or `summary`. |
+| `metric_description`, `metric_unit` | Present when non-empty. |
+| `metric_temporality` | `delta`, `cumulative`, `unspecified`, or `unknown:<value>`. Absent for gauges. |
+| `metric_monotonic` | Whether a sum is monotonic. A monotonic sum is stored as `counter`. |
+| `metric_start_time_unix_nano` | Start of the aggregation interval, when non-zero. |
+| `value` | The scalar of a gauge or sum point. |
+| `count`, `sum`, `min`, `max` | Histogram points store these four values. Exponential histograms store `count` and `sum`, and summaries store `count` and `sum`. |
+
+Histogram bucket boundaries and counts, and summary quantiles, are not stored.
+
+Delta points are stored as received. The PromQL rate family reads the stored temporality: `increase` sums delta values in the window, `rate` divides that sum by the range, and `irate` divides the latest delta value by its interval. For cumulative monotonic sums, counter resets are handled. If an exporter changes temporality inside one window, only the latest run with the same semantics is evaluated.
+
+OTLP over HTTP accepts protobuf (`http/protobuf`) and JSON for metrics, logs, and traces. The JSON encoding writes 64-bit integers as strings, such as `"asInt": "340"` and `"count": "4"`. MoleSignal reads the strings and the plain numbers alike.
 
 ## Caching
 
-Queries flow through a 3-level cache — `file_meta`, `parquet_meta`, and `query_result` — plus a
-parquet disk cache enabled by default (`./data/cache/parquet`, 10 GB LRU). Caching is transparent
-to the response contract; use server metrics to measure cache behavior.
+Queries use in-process caches for open index handles, results of closed time windows, search term counts, and index footers. For remote object storage, an on-disk cache keeps byte ranges of objects under `./data/cache/objects`, 10 GiB by default. Caching is transparent to the response contract. Use `/metrics` to measure cache behavior, and see [Configuration](/en-US/configuration#caches) to size the caches.

@@ -46,7 +46,7 @@ Authorization: Bearer <token>
 | `limit` | integer | 1 到 200 的每页条数，默认为 50。 |
 | `cursor` | string | 上一个列表响应返回的不透明游标。 |
 
-过滤值不能为空，且不能超过 192 字节。查询范围不能超过配置的最大值，默认是 30 天。
+过滤值不能为空，且不能超过 192 字节。查询范围不能超过配置的最大值，默认是 30 天（`[apm].max_query_range_days`）。
 
 ### 排序字段
 
@@ -61,14 +61,17 @@ Authorization: Bearer <token>
 
 ## 查询概览
 
-```bash
-curl --get 'https://molesignal.example.com/api/v1/apm/overview' \
-  --header 'Authorization: Bearer <token>' \
-  --data-urlencode 'from=1785801600000000' \
-  --data-urlencode 'to=1785888000000000' \
+<RequestExample>
+```bash cURL
+NOW=$(date +%s)000000
+curl --get 'http://localhost:5080/api/v1/apm/overview' \
+  --header "Authorization: Bearer $MS_JWT" \
+  --data-urlencode "from=$((NOW-86400000000))" \
+  --data-urlencode "to=$NOW" \
   --data-urlencode 'environment=production' \
   --data-urlencode 'resolution=auto'
 ```
+</RequestExample>
 
 响应包含 `red`、`trend`、`service_health`、`services`、`top_transactions`、
 `top_dependencies`、`top_errors` 和 `recent_versions`，以及通用 `meta` 对象。
@@ -76,8 +79,8 @@ curl --get 'https://molesignal.example.com/api/v1/apm/overview' \
 ## 列出服务并分页
 
 ```bash
-curl --get 'https://molesignal.example.com/api/v1/apm/services' \
-  --header 'Authorization: Bearer <token>' \
+curl --get 'http://localhost:5080/api/v1/apm/services' \
+  --header "Authorization: Bearer $MS_JWT" \
   --data-urlencode 'namespace=shop' \
   --data-urlencode 'environment=production' \
   --data-urlencode 'sort=p95' \
@@ -85,21 +88,82 @@ curl --get 'https://molesignal.example.com/api/v1/apm/services' \
   --data-urlencode 'limit=50'
 ```
 
-分页响应的精简结构如下：
+分页响应的结构如下，`items` 中每个服务对应一个条目：
 
-```json
+<ResponseExample>
+```json 200
 {
   "meta": { "resolution": "minute", "data_quality": { "partial": false } },
-  "items": [],
+  "items": [
+    {
+      "service": { "namespace": "shop", "name": "payments", "environment": "production" },
+      "first_seen_at": 1790000000000000,
+      "last_seen_at": 1790003600000000,
+      "instrumentation": {
+        "runtime_language": null,
+        "telemetry_sdk_name": null,
+        "telemetry_sdk_version": null,
+        "recent_instance_count": 0
+      },
+      "versions": [],
+      "red": {
+        "request_count": 2,
+        "error_count": 2,
+        "error_rate": 1.0,
+        "duration_sum_micros": 230000,
+        "duration_average_micros": 115000,
+        "p50_micros": 128000,
+        "p95_micros": 256000,
+        "p99_micros": 256000,
+        "latency_partial": false,
+        "exemplars": [
+          {
+            "trace_id": "0af7651916cd43dd8448eb211c80319c",
+            "span_id": "53995c3f42cd8ad8",
+            "event_time": 1790000000000000,
+            "duration_micros": 140000,
+            "trace_available": true
+          }
+        ]
+      },
+      "health": "critical",
+      "traces": {
+        "namespace": "shop",
+        "service": "payments",
+        "environment": "production",
+        "version": null,
+        "transaction": null,
+        "dependency": null,
+        "error_fingerprint": null,
+        "from": 1789996400000000,
+        "to": 1790003600000000
+      }
+    }
+  ],
   "next_cursor": null,
   "previous_cursor": null,
   "has_more": false,
   "sort": "p95"
 }
 ```
+</ResponseExample>
 
 请把 `next_cursor` 或 `previous_cursor` 原样传回同一个端点，并保持过滤条件、时间范围、排序字段和
 方向不变。游标带签名并绑定原始请求上下文，不要解码或修改。
+
+条目中的 `traces` 对象重述了该条目的服务、版本、事务、依赖和错误过滤条件以及时间范围，客户端可据此打开对应的链路。
+
+## 读取 RED 指标
+
+每个汇总都带有 `red` 对象，包含范围内的请求、错误和耗时数据。
+
+| 字段 | 说明 |
+|---|---|
+| `request_count`、`error_count`、`error_rate` | 请求数、失败请求数，以及两者的比值（0 到 1）。 |
+| `duration_sum_micros`、`duration_average_micros` | 总耗时与平均耗时，单位为微秒。没有请求时平均值为 `null`。 |
+| `p50_micros`、`p95_micros`、`p99_micros` | 延迟百分位，单位为微秒，由直方图桶估算得到。它们报告的是桶边界，不是精确的耗时。没有请求时为 `null`。 |
+| `latency_partial` | 部分时间桶使用了另一种延迟桶定义（`[apm.histogram].schema_version`）时为 `true`。百分位会排除这些时间桶，而计数、总和与平均值仍然包含它们。 |
+| `exemplars` | 范围内最多 8 个示例 Span，耗时最长的在前。链路没有通过[尾部采样](/zh-Hans/configuration#链路捕获与尾部采样)保留下来或已过期时，`trace_available` 为 `false`，聚合结果仍然有效。 |
 
 ## 区分同名事务
 
@@ -109,23 +173,75 @@ curl --get 'https://molesignal.example.com/api/v1/apm/services' \
 GET /api/v1/apm/transactions/POST%20%2Fcheckout?kind=http&service=checkout
 ```
 
-支持的 kind 为 `http`、`rpc`、`messaging`、`span` 和 `other`。
+支持的 kind 为 `http`、`rpc`、`messaging`、`span` 和 `other`。名称被多个服务或种类共用时，返回 `400`，消息为 `APM transaction identity is ambiguous; provide service, namespace, environment, and kind`。
 
 ## 比较版本
 
 请提供两个不同的 `baseline` 和 `candidate`，并添加 `service` 过滤条件以比较单个服务。
 
 ```bash
-curl --get 'https://molesignal.example.com/api/v1/apm/versions/compare' \
-  --header 'Authorization: Bearer <token>' \
+curl --get 'http://localhost:5080/api/v1/apm/versions/compare' \
+  --header "Authorization: Bearer $MS_JWT" \
   --data-urlencode 'service=checkout' \
   --data-urlencode 'environment=production' \
   --data-urlencode 'baseline=2.3.1' \
   --data-urlencode 'candidate=2.4.0'
 ```
 
-响应会报告请求数、错误率和 p95 的差异。只有两个版本都达到配置的样本阈值时，
-`sufficient_data` 才会变为 true；默认阈值是每个版本 1,000 个请求。
+响应包含 `baseline` 与 `candidate` 两侧（各有 `version`、`sample_count` 和 `red`），以及 `delta`、`status`、`regressed_transactions` 和 `regressed_errors`。每个回退列表最多 20 项。
+
+| 字段 | 说明 |
+|---|---|
+| `sufficient_data` | 只有两个版本都达到配置的样本阈值时才为 `true`，默认阈值是每个版本 1,000 个请求（`[apm.version_comparison].min_requests_per_version`）。 |
+| `status` | `insufficient_data`、`regressed`、`improved` 或 `neutral`。错误率或 p95 升高为 `regressed`，降低为 `improved`。 |
+| `delta` | `request_count_absolute` 与 `request_count_relative`、`error_rate_absolute` 与 `error_rate_relative`、`p95_absolute_micros` 与 `p95_relative`。基线为零或缺失时，相对值为 `null`。 |
+
+缺少 `candidate` 或 `baseline`，或者两个版本相同，都会返回 `400`。
+
+## 检查投影健康状态
+
+`GET /api/v1/apm/health` 报告投影是否在运行，以及是否健康。
+
+<ResponseExample>
+```json 200
+{
+  "meta": { "resolution": "minute", "data_quality": { "partial": false } },
+  "enabled": true,
+  "degraded": false,
+  "runtime": {
+    "enabled": true,
+    "candidate_owner": true,
+    "projector": {
+      "accepting": true,
+      "queue_depth": 0,
+      "queue_capacity": 65536,
+      "accepted_facts": 26838,
+      "duplicate_skips": 0,
+      "late_facts": 0,
+      "queue_drops": 0,
+      "cardinality_rejections": 0,
+      "flush_successes": 130,
+      "flush_failures": 0,
+      "pending_snapshots": 5,
+      "last_success_at": 1790000000000000,
+      "latest_event_at": 1790000000000000,
+      "degraded": false,
+      "last_error": null
+    },
+    "rollup": {
+      "running": true,
+      "runs": 11,
+      "failures": 0,
+      "last_success_at": 1790000000000000,
+      "degraded": false,
+      "last_error": null
+    }
+  }
+}
+```
+</ResponseExample>
+
+投影器或汇总任务报告问题时，`degraded` 为 `true`，`last_error` 说明原因。`queue_drops`、`flush_failures` 或 `cardinality_rejections` 持续增长，可以解释数据中的缺口。
 
 ## 阅读响应元数据
 
@@ -154,6 +270,14 @@ curl --get 'https://molesignal.example.com/api/v1/apm/versions/compare' \
 - 检查 `gaps`，确认是否发生队列、存储库、刷写、迟到数据、基数或关闭失败。
 - 使用 `last_complete_bucket_at` 判断最近数据是否仍在完成处理中。
 - 依赖高基数明细前，请检查 `overflow_dimensions`。
+
+## 错误
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 参数无效：不支持的 `sort`（`unsupported APM sort field`）、超出 1 到 200 的 `limit`、为空或过长的过滤值（`invalid APM service filter`）、超过最大值的时间范围（`APM query range exceeds configured maximum`）、结束早于开始（`APM range end precedes start`），或未知的 `direction`、`resolution`。 |
+| `403` | Token 缺少 `streams.query`。 |
+| `404` | 范围内不存在该错误指纹、事务或服务。 |
 
 <CardGroup cols={2}>
   <Card title="APM 指南" icon="gauge-high" href="/zh-Hans/apm">

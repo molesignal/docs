@@ -1,0 +1,209 @@
+---
+title: "集成指南"
+description: "从 OpenTelemetry Collector、OpenTelemetry SDK、Vector、Fluent Bit 与 Prometheus 发送遥测数据。"
+---
+
+本指南覆盖最常见的发送端。**数据源** 页面会生成同样的配置，端点与 Token 已替换为真实值，并覆盖更多平台，参见[数据源](/zh-Hans/intake)。
+
+把 `molesignal.example.com` 替换为部署的实际地址，把 `MS_TOKEN` 替换为[接入 Token](/zh-Hans/intake#接入-token)。Docker Compose 沙箱使用 `http://localhost:5080`。
+
+## OpenTelemetry Collector
+
+Collector 的 `otlphttp` 导出端把 `endpoint` 当作基础 URL，并自动追加 `/v1/logs`、`/v1/metrics` 与 `/v1/traces`。把 `endpoint` 设为 `/api` 路径，请求就会到达 `/api/v1/logs`、`/api/v1/metrics` 与 `/api/v1/traces`。
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+processors:
+  batch:
+    send_batch_size: 500
+    send_batch_max_size: 500
+
+exporters:
+  otlphttp/molesignal:
+    endpoint: https://molesignal.example.com/api
+    compression: none
+    headers:
+      authorization: "Bearer ${env:MS_TOKEN}"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+```
+
+<Warning>
+  保持 `compression: none`。`otlphttp` 导出端默认使用 gzip 压缩，而 OTLP over HTTP 会以 `400` 拒绝压缩的请求体。超过 2 MiB 的请求体会以 `413` 拒绝，因此要根据记录大小把 `send_batch_max_size` 设得足够小。导出端日志出现 `413` 时请调小它。
+</Warning>
+
+通过 gRPC 发送时使用 `otlp` 导出端。`4317` 端口提供明文 gRPC，除非有代理终止 TLS，否则需要设置 `tls.insecure: true`：
+
+```yaml
+exporters:
+  otlp/molesignal:
+    endpoint: molesignal.example.com:4317
+    tls:
+      insecure: true
+    headers:
+      authorization: "Bearer ${env:MS_TOKEN}"
+```
+
+在 `headers` 中添加 `stream-name: <stream>` 可写入 `default` 之外的数据流。该请求头对使用这个导出端的所有信号生效，信号需要写入不同数据流时，请为每个数据流定义一个导出端。
+
+## OpenTelemetry SDK
+
+所有 OpenTelemetry SDK 都读取标准环境变量。把 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向 `/api` 路径，并通过 HTTP 发送 OTLP：
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://molesignal.example.com/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer ${MS_TOKEN}"
+export OTEL_SERVICE_NAME=checkout
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment=production
+```
+
+SDK 导出端默认不压缩。请不要设置 `OTEL_EXPORTER_OTLP_COMPRESSION`，或将其设为 `none`。
+
+<Tabs>
+  <Tab title="Python">
+    ```bash
+    pip install opentelemetry-distro opentelemetry-exporter-otlp
+    opentelemetry-bootstrap -a install
+
+    opentelemetry-instrument python app.py
+    ```
+  </Tab>
+  <Tab title="Node.js">
+    ```bash
+    npm i @opentelemetry/api @opentelemetry/auto-instrumentations-node
+
+    NODE_OPTIONS="--require @opentelemetry/auto-instrumentations-node/register" node server.js
+    ```
+  </Tab>
+  <Tab title="Java">
+    ```bash
+    java -javaagent:opentelemetry-javaagent.jar \
+      -Dotel.service.name=checkout \
+      -Dotel.exporter.otlp.protocol=http/protobuf \
+      -Dotel.exporter.otlp.endpoint=https://molesignal.example.com/api \
+      -Dotel.exporter.otlp.headers="authorization=Bearer ${MS_TOKEN}" \
+      -jar app.jar
+    ```
+  </Tab>
+  <Tab title="Go">
+    Go 的链路导出端需要完整的信号 URL：
+
+    ```go
+    exp, _ := otlptracehttp.New(ctx,
+      otlptracehttp.WithEndpointURL("https://molesignal.example.com/api/v1/traces"),
+      otlptracehttp.WithHeaders(map[string]string{"authorization": "Bearer " + token}),
+    )
+    tp := trace.NewTracerProvider(trace.WithBatcher(exp))
+    otel.SetTracerProvider(tp)
+    ```
+  </Tab>
+</Tabs>
+
+## Vector
+
+用 `http` sink 把日志发送到原生 HTTP JSON 接入端点。没有 `_timestamp` 字段的事件使用服务端接收它的时间。
+
+```yaml
+sources:
+  host_journald:
+    type: journald
+    current_boot_only: true
+
+sinks:
+  molesignal_logs:
+    type: http
+    inputs: [host_journald]
+    uri: https://molesignal.example.com/api/v1/intake/logs/default
+    encoding: { codec: json }
+    auth: { strategy: bearer, token: "${MS_TOKEN}" }
+```
+
+## Fluent Bit
+
+使用 JSON 格式的 `http` 输出：
+
+```ini
+[INPUT]
+    Name        tail
+    Path        /var/log/nginx/access.log
+    Parser      nginx
+    Tag         nginx.access
+
+[OUTPUT]
+    Name        http
+    Match       nginx.*
+    Host        molesignal.example.com
+    Port        443
+    URI         /api/v1/intake/logs/default
+    Format      json
+    Header      Authorization Bearer ${MS_TOKEN}
+    tls         On
+```
+
+Docker Compose 沙箱把 `Port` 设为 `5080`，`tls` 设为 `Off`。
+
+### Kubernetes
+
+把 Fluent Bit 作为 DaemonSet 运行，采集 `/var/log/containers`。打开 **数据源 → Kubernetes** 可获得端点与 Token 已替换好的完整清单。Fluent Bit 配置中的输出部分与上面的 `http` 输出相同，匹配规则为 `Match kube.*`。
+
+## Prometheus
+
+把 MoleSignal 添加为 remote write 目标。评估期间可以让 Prometheus 继续在本地抓取并存储：
+
+```yaml
+remote_write:
+  - url: https://molesignal.example.com/api/v1/prometheus/api/v1/write
+    authorization:
+      credentials: "${MS_TOKEN}"
+```
+
+每条时间序列写入以其 `__name__` 命名的指标数据流。用 PromQL 查询这些数据，支持的函数参见 [PromQL 支持矩阵](/zh-Hans/query/promql-subset)。
+
+## 脚本与自定义发送端
+
+用 `curl` 或任意 HTTP 客户端发送 JSON 记录数组：
+
+```bash
+curl -X POST https://molesignal.example.com/api/v1/intake/logs/app \
+  -H "authorization: Bearer ${MS_TOKEN}" \
+  -H 'content-type: application/json' \
+  -d '[{"level":"info","service":"billing","msg":"invoice created"}]'
+```
+
+按批发送记录以保持在 2 MiB 请求上限之内；事件的原始时间很重要时，用微秒发送 `_timestamp`。
+
+## 验证数据
+
+1. 打开 **首页**，在 **重点数据流** 中确认该数据流为 **正常**。
+2. 打开 **数据流**，确认数据流名称、类型与最后接收时间。
+3. 打开 **日志**、**指标** 或 **链路**，选择该数据流。
+
+没有数据到达时，检查发送端日志：`401`（Token 缺失或已过期）、`403`（Token 没有 `streams.write`）、`400`（OTLP 请求体被压缩）和 `413`（请求体超过 2 MiB）。参见[故障排查](/zh-Hans/troubleshooting)。
+
+## 从其他方案迁移
+
+| 来源 | 可以沿用的部分 |
+|---|---|
+| Prometheus | 保留 Prometheus 并添加 `remote_write` 目标。PromQL 只覆盖该语言的一个子集，迁移告警规则前请先查看[支持矩阵](/zh-Hans/query/promql-subset)。 |
+| Grafana | 在 **仪表盘** 中导入仪表盘 JSON。不支持的可视化会回退为时间序列面板，参见[仪表盘](/zh-Hans/dashboards)。 |
+| Loki | 把 Vector 或 Fluent Bit 指向原生 HTTP JSON 接入端点。Promtail 与 Grafana Alloy 无法向 Loki 端点发送数据。 |
+| Elasticsearch | 使用 `_bulk` 协议的发送端可以改指向 `/api/v1/_bulk`。查询使用 SQL，而不是 Elasticsearch 查询 DSL。 |

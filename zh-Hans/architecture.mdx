@@ -1,90 +1,104 @@
 ---
 title: "架构"
-description: "了解 MoleSignal 单一 Rust Crate、适配器、数据平面、存储、Worker 与 Web 应用之间的关系。"
+description: "MoleSignal 二进制、PostgreSQL、对象存储、角色与后台 Worker 如何协同工作。"
 ---
 
-MoleSignal 以一个支持角色组合的 Rust 服务和一个 React Web 应用交付。Rust 代码保持单一 Crate，同时执行清晰的模块边界。
+MoleSignal 是一个内嵌网页应用的 Rust 二进制文件。`[node].roles` 配置决定进程承担哪些职责。两个外部服务保存全部持久状态：PostgreSQL 与对象存储。
 
-## 分层
+## 组件
 
-| 层 | 职责 |
+| 组件 | 职责 |
 |---|---|
-| `domain` | 实体、策略、值对象与 Repository/Service 端口。 |
-| `app` | 依赖领域端口的用例与编排。 |
-| `infra` | PostgreSQL、对象存储、查询、运行时、通知与外部适配器。 |
-| `api` | HTTP/gRPC 协议、身份验证、授权与 DTO 转换。 |
-| `bootstrap` | 角色启动与依赖装配。 |
-| `shared` | ID、时间、健康与链路等稳定横切契约。 |
-| `web` | 感知访问能力的产品路由、查询工作区、管理与可视化。 |
+| HTTP API 与网页界面 | `5080` 端口。提供产品 API、内嵌的网页应用、`/metrics` 与健康检查端点。 |
+| 接入（Intake） | 通过 HTTP 与 OTLP gRPC（`4317`）接收遥测数据，完成校验，应用脱敏与流水线，并写入 WAL 和内存缓冲。 |
+| 预写日志（WAL） | 尚未刷写记录的本地持久化日志，启动时重放。 |
+| 对象存储 | Parquet 数据文件、检索索引侧车、已封存的分区清单、Profile 数据块、导出文件与较大的 Agent 证据。 |
+| PostgreSQL | 元数据：身份、组织、数据流与 schema、文件目录、产品资源与任务状态。 |
+| 查询引擎 | 基于 Arrow 的 Apache DataFusion。执行 SQL 与兼容 PromQL 的查询，用目录元数据与检索索引裁剪文件，并合并本地与联邦扫描。 |
+| 搜索任务 | 持久化的异步查询，任何节点都可以从 PostgreSQL 领取。 |
+| Compactor | 合并文件、执行保留策略，并维护目录、索引与对象垃圾回收。 |
+| Alert | 评估规则、驱动升级、渲染定时报告并运行连接器。 |
+| 拨测执行器 | 执行拨测。`standalone` 节点运行内置执行器，外部 Probe Agent 通过 `5084` 与 `5085` 端口连接。 |
+| Mole Agent | 通过共享的工具目录调查问题，使用已登录用户的权限。 |
 
-基础设施通过领域和应用契约向内依赖。领域代码不依赖 Axum、SQLx、对象存储客户端或 Web DTO。
-
-## 装配
-
-`src/bootstrap/bootstrap.rs` 是 `build_state` 总编排入口。内聚的 builder 直接放在
-`src/bootstrap/` 下，包括 `core`、`storage`、`query`、`iam`、`alerting`、
-`agent`、`tracing` 与 `platform`；角色生命周期和 Worker 启动分别归入专属的
-`roles/` 与 `workers/` 模块。
-
-顶层 `AppState` 暴露核心应用服务，以及 alerting、IAM、telemetry、storage、cluster、
-platform 和 Agent 等功能状态分组。Handler 因此按功能访问依赖，不再把每个基础设施
-Repository 平铺成一个全局容器。
+不涉及 Kafka、Redis 或共识服务。缓存保存在进程内存和本地磁盘中。
 
 ## 运行角色
 
-`[node].roles` 设置会在进程中组合一个或多个角色：
+`[node].roles` 配置把一个或多个角色组合进进程：
 
 | 角色 | 主要职责 |
 |---|---|
-| `standalone` | 为紧凑部署提供全部 API 与 Worker。 |
-| `router` | 入口路由、限流与集群感知转发。 |
-| `intake` | 采集验证、数据管道、脱敏、WAL、缓冲与 Parquet 刷写。 |
-| `querier` | DataFusion、PromQL、搜索任务与分布式查询。 |
-| `compactor` | 文件压缩、数据保留与冷元数据维护。 |
-| `alert_manager` | 规则评估、值班计划、升级与通知投递。 |
+| `standalone` | 在一个进程内运行全部 API、网页界面与全部 Worker。 |
+| `router` | 完整的 HTTP API 与网页界面、速率限制，以及把写入转发给 intake 节点、把查询转发给 querier 节点。 |
+| `intake` | 校验、流水线、脱敏、WAL、缓冲以及刷写为 Parquet。 |
+| `querier` | 执行其它节点转来的查询，以及异步搜索任务。 |
+| `compactor` | 文件合并、保留策略与存储维护。 |
+| `alert` | 规则评估、排班、升级、投递派发与连接器。 |
 
-所有角色使用同一个二进制与配置模型。修改角色后需要重启。
+所有角色使用同一个二进制和同一套配置模型，更换角色需要重启，参见[分角色部署](/zh-Hans/distributed-deployment)。
 
 ## 数据路径
 
 ```text
 发送端
-  -> 协议接收器
-  -> 身份验证 + IAM + 配额
-  -> 数据结构 / 脱敏 / 数据管道
+  -> 协议接收端
+  -> 身份验证 + IAM
+  -> schema / 脱敏 / 流水线
   -> WAL + Arrow 缓冲
-  -> Parquet + Tantivy 元数据
-  -> 对象存储
+  -> Parquet + 检索索引
+  -> 对象存储 + PostgreSQL 中的目录行
 
 查询
-  -> 规划器 + 组织重写
-  -> 元数据与索引裁剪
+  -> 规划器 + 组织改写
+  -> 目录与索引裁剪
   -> DataFusion / PromQL
-  -> 本地或基于 Flight 的分布式执行
+  -> 本地或联邦扫描
   -> 行 / NDJSON / 异步搜索任务
 ```
 
-PostgreSQL 保存元数据与产品资源。对象存储保存 Parquet、性能剖析文件、导出文件与大型 Agent 证据。本地磁盘用于 WAL 与可选缓存。
+刷写时先上传文件，再把它们登记到目录，随后截断已刷写的 WAL 分段。查询会读取目录，找出与其时间范围和数据流重叠的文件，因此只有这些文件会从对象存储中读取。
 
-## 控制平面与 Worker 平面
+## 数据存放位置
 
-后台 Worker 负责压缩、告警评估、数据管道运行、搜索任务、报告、服务图聚合、试用、ACME 与遥测维护。任务所有权由所选角色决定，避免所有重复进程执行同一工作。
+| 位置 | 内容 |
+|---|---|
+| PostgreSQL | 元数据与文件目录。 |
+| 对象存储 | `artifacts/v1/...` 数据与索引文件、`manifests/v1/...` 已封存的分区清单，以及 Profile 与会话回放等其他数据块。对象按组织、信号类型、数据集与时间分区归类。 |
+| intake 节点的本地磁盘 | WAL，以及可选的 `./data/cache` 下的缓存。 |
+
+数据流与组织是逻辑概念：数据流在对象存储中对应一个数据集，在 PostgreSQL 中对应一行元数据；组织对应一个对象前缀，以及由查询规划器强制执行的范围。
+
+## 后台 Worker
+
+| Worker | 运行位置 | 默认间隔 |
+|---|---|---|
+| 心跳与过期节点清理 | 每个节点 | 5 秒、60 秒 |
+| 对象存储健康探测 | 每个节点 | 30 秒 |
+| 接入刷写 | `intake` | 30 秒或达到缓冲阈值 |
+| 合并与保留 | `compactor` | 300 秒 |
+| 目录封存、索引构建、垃圾回收与对账 | `compactor` | 30 到 300 秒 |
+| 告警评估与升级派发 | `alert` | 30 秒、10 秒 |
+| 定时报告 | `alert` | 每 60 秒检查一次到期的报告 |
+| 搜索任务 | 提供 API 的节点 | 按需领取 |
+| ACME 签发与续期 | 终止 TLS 的节点 | 60 秒、6 小时 |
+| 自遥测采集 | 每个节点 | 指标 15 秒 |
+
+任务归属由所选角色决定，因此重复的进程不会都执行同一项任务。多个 `compactor` 节点按数据流与组织分工，参见[分角色部署](/zh-Hans/distributed-deployment#compactor-节点之间的分工)。所有间隔参见[配置](/zh-Hans/configuration)。
 
 ## 授权
 
-身份验证生成 IAM 上下文。授权读取数据库中的权限、角色、资源关系与显式跨组织授权。资源 Handler 在变更前先加载目标、验证组织所有权，并授权所请求操作。
+身份验证会生成 IAM 上下文。授权读取数据库中的权限、角色、资源关系与显式的跨组织授权。资源处理逻辑在变更之前会加载目标资源、校验组织归属并授权请求的操作，参见[安全与多租户](/zh-Hans/security)。
 
-## Web 架构
+## 网页应用
 
-React Router 定义所有产品路由。产品信息架构元数据与访问能力快照共同控制导航发现。路由即使被隐藏，后端权限检查仍然有效。
-
-查询页面共享时间上下文和信号关联契约。设置与 IAM 分别使用组织范围和系统范围。
+网页应用内置在二进制中，与 API 共用 HTTP 端口。能力快照决定显示哪些菜单项，被隐藏的菜单项仍然受后端权限检查保护。
 
 <CardGroup cols={2}>
   <Card title="核心概念" icon="diagram-project" href="/zh-Hans/concepts">
     了解信号、数据流、组织与存储。
   </Card>
-  <Card title="分布式部署" icon="server" href="/zh-Hans/distributed-deployment">
-    使用 Docker Compose 或 Kubernetes 部署不同角色。
+  <Card title="分角色部署" icon="server" href="/zh-Hans/distributed-deployment">
+    在独立进程中运行各个角色。
   </Card>
 </CardGroup>

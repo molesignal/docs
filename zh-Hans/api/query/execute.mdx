@@ -1,36 +1,44 @@
 ---
 title: "执行查询"
-description: "对组织作用域内的遥测数据流运行 SQL 或 PromQL。"
+description: "对组织的数据流运行 SQL 或 PromQL。"
 ---
 
 ```http
 POST /api/v1/query
 ```
 
+运行查询并返回行；规模较大的查询则启动异步搜索任务。该调用需要 `streams.query`，系统遥测则需要 `sys.telemetry.read`。
+
 **请求体**
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `org_id` | string | ✅ | 为请求兼容保留；实际以认证上下文中的组织为准。 |
-| `language` | string | ✅ | `sql` 或 `promql`。 |
-| `statement` | string | ✅ | 查询文本。 |
-| `time_range` | object | ✅ | `{ "start": <微秒>, "end": <微秒> }`。 |
-| `stream` | object | — | `{ "name", "stream_type" }`；类型可为 `logs`、`metrics`、`traces`、`profiles` 或 `extend`。 |
-| `limit` | integer | — | 行数上限。 |
+| `org_id` | string | 是 | 必须存在，但值会被忽略，生效的是已认证的组织。 |
+| `language` | string | 是 | `sql` 或 `promql`。 |
+| `statement` | string | 是 | 查询语句。 |
+| `time_range` | object | 是 | `{ "start": <微秒>, "end": <微秒> }`。 |
+| `stream` | object | SQL 必填 | `{ "name": "app", "stream_type": "logs" }` 指明主表，两个字段都必填，类型为 `logs`、`metrics`、`traces`、`profiles` 或 `extend`。 |
+| `limit` | integer | 否 | 行数上限。 |
 
-执行需要 `streams.query`；系统遥测查询也可使用 `sys.telemetry.read`。发送
-`Accept: application/x-ndjson` 会逐行返回对象，最后附一个 `__meta__` 记录。发送
-`Prefer: respond-async` 会收到 `202` 搜索任务。添加
-`?clusters=local,remote-name` 发起联邦查询。
+**请求头与查询字符串**
+
+| 名称 | 效果 |
+|---|---|
+| `Prefer: respond-async` | 总是创建搜索任务并返回 `202`。 |
+| `Prefer: respond-sync` | 在请求内运行，即使时间范围很长。 |
+| `Accept: application/x-ndjson` | 逐行流式返回 JSON 对象，最后附带一条 `{"__meta__": ...}` 记录。 |
+| `?clusters=local,remote` | 在联邦搜索中包含远程集群。 |
 
 <RequestExample>
 ```bash cURL
+NOW=$(date +%s)000000
+
 curl -X POST http://localhost:5080/api/v1/query \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
   -d "{\"org_id\":\"$MS_ORG\",\"language\":\"sql\",
-       \"statement\":\"SELECT level, count(*) FROM app GROUP BY level\",
-       \"time_range\":{\"start\":0,\"end\":2000000000000000},
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"time_range\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
        \"stream\":{\"name\":\"app\",\"stream_type\":\"logs\"}}"
 ```
 </RequestExample>
@@ -38,10 +46,31 @@ curl -X POST http://localhost:5080/api/v1/query \
 <ResponseExample>
 ```json 200
 {
-  "columns": ["level", "count"],
-  "rows": [["error", 12]],
+  "columns": ["level", "n"],
+  "rows": [["error", 12], ["info", 40]],
   "scanned_rows": 10432,
   "took_ms": 18
 }
 ```
 </ResponseExample>
+
+估算规模达到 `[querier].auto_async_threshold_rows` 的查询会返回 `202`：
+
+```json
+{
+  "job_id": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+阈值与任务端点参见[查询](/zh-Hans/query#时间范围与异步任务)。
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 语句无法规划，SQL 缺少 `stream` 提示（`query.stream hint is required`），或查询读取的行数超过 `[querier].max_scan_rows` 的限制。 |
+| `503` | 在分角色集群中，没有存活的 `querier` 节点（`no querier node is available`）。 |
+| `403` | 组织中不存在该数据流（`stream not found: <name>`），或 Token 缺少 `streams.query`。 |
+| `422` | 请求体字段缺失或类型错误，例如 `org_id` 或 `stream_type`，响应为纯文本。 |

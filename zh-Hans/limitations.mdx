@@ -1,0 +1,49 @@
+---
+title: "已知限制"
+description: "当前版本中与部署预期可能不同的行为，以及对应的解决办法。"
+---
+
+MoleSignal 目前处于 1.0 之前的阶段。本页列出会影响规划和运维的限制。
+
+## 部署
+
+- **WAL 不做复制。** intake 节点之间不复制预写日志。丢失 intake 的卷，会丢失尚未刷写到对象存储的记录。
+- **单实例角色。** `alert` 只运行一个实例，可靠性依靠快速重启。
+- **仅支持 PostgreSQL。** PostgreSQL 是唯一受支持的元数据库。
+- **配置需要重启才生效。** 运行中的进程不会应用配置文件的变化，参见[配置](/zh-Hans/configuration)。
+- **迁移只能向前。** 被较新构建迁移过的数据库，无法被较旧的构建打开，而且 1.0 之前的构建可能修改基线 schema，参见[升级](/zh-Hans/upgrade)。
+
+## 接入
+
+- **请求大小。** 超过 2 MiB 的请求体会被拒绝并返回 `413`。
+- **OTLP over HTTP 压缩。** 压缩的请求体会被拒绝并返回 `400`，请在发送端关闭压缩。
+- **直方图分桶。** OTLP 直方图只保存 `count`、`sum`、`min` 与 `max`，分桶边界、分桶计数与 summary 分位数不会被保存。
+- **重复的 Span。** 以相同的 `trace_id` 与 `span_id` 重复发送的 Span 会被丢弃。
+- **Loki push。** 该端点只解码 JSON 请求格式。使用 snappy 压缩 protobuf 的发送端（例如 Promtail 与 Grafana Alloy）无法向它推送。
+- **Prometheus remote_write。** 原生直方图与指标元数据会被跳过。
+- **OTLP gRPC 不含 TLS。** 接收端不终止 TLS，流量离开可信网络时，请在前面放置终止 TLS 的代理。
+- **速率限制。** 只有 `router` 角色限制请求。限流按已认证组织的请求计数，并且每个 router 副本各自计数。
+- **保留数据流名称。** `_molesignal` 保留给服务自身的遥测，拒绝公开接入。
+
+## 查询
+
+- **长时间范围异步运行。** 估算规模达到 `[querier].auto_async_threshold_rows` 的查询会返回 `202` 和一个待跟踪的任务，在默认配置下对应约 13.9 小时的时间范围。发送 `Prefer: respond-sync` 可以在请求内运行，参见[查询](/zh-Hans/query#时间范围与异步任务)。
+- **查询端点上的 PromQL。** `POST /api/v1/query` 把 PromQL 作为 instant 查询，在 `time_range.end` 处求值。
+- **PromQL 子集。** 引擎实现了 PromQL 的一个子集，参见[PromQL 支持矩阵](/zh-Hans/query/promql-subset)。
+- **单次查询的行数。** 读取行数超过 `[querier].max_scan_rows`（默认 1 亿）的查询会被拒绝并返回 `400`，请缩小时间范围或增加过滤条件。PromQL 对每个选择器应用该限制。
+- **分角色集群中的新鲜度。** 查询读取目录列出的文件，因此 intake 节点仍缓冲着的记录要等下一次刷写之后才可见，时间在 `[intake].flush_interval_secs` 之内。`standalone` 节点还会读取自己的缓冲。
+
+## 告警
+
+- **实时规则按 intake 节点计数。** `real_time` 规则统计单个 intake 节点收到的记录，计数保存在内存中。在分角色集群中，每个 intake 节点各自计数，重启后从零开始。语句限定为 `SELECT count(*) FROM <stream> [WHERE <condition>]`。参见[实时规则](/zh-Hans/alerting#实时规则)。
+
+## 安全与身份
+
+- **内部 gRPC 不带认证。** `5082` 端口承载不带认证的节点间流量，请把它放在私有网络内。
+- **没有多因素认证。** 网页界面没有多因素认证和 Passkey。请使用能强制多因素认证的身份提供方，通过 SSO 登录。
+- **密码重置依赖邮件。** 重置密码会通过邮件发送链接，因此必须配置 `[notify.smtp]` 与 `[http].external_url`。
+- **会话。** 账号设置页面只能管理当前浏览器的会话。
+
+## 报告
+
+- **PDF 与 PNG 渲染** 需要无头 Chrome。发布的容器镜像已包含 Chromium。二进制安装需要在节点上安装 Chrome，并确保 `[scheduled_reports.renderer].base_url` 能访问网页界面。

@@ -1,79 +1,180 @@
 ---
 title: "查询"
 sidebarTitle: "概览"
-description: "在组织数据流上运行 SQL、兼容 PromQL 的指标查询、流式搜索与异步任务。"
+description: "对组织的数据流运行 SQL、兼容 PromQL 的指标查询、流式搜索与异步任务。"
 ---
 
-MoleSignal 暴露单一查询端点，底层是 **DataFusion**。可运行完整 SQL —— 包括 join、CTE、窗口
-函数 —— 或面向指标的 **PromQL 子集**，都针对同一存储。
+MoleSignal 提供一个由 **DataFusion** 驱动的查询端点。该端点支持完整的 SQL（包括 JOIN、CTE 与窗口函数），也支持用于指标的 **PromQL 子集**，两者查询的是同一份存储。
 
 ## 查询端点
 
 ```http
 POST /api/v1/query
-Authorization: Bearer <jwt>
+Authorization: Bearer <token>
 Content-Type: application/json
 ```
+
+该端点需要 `streams.query` 权限。
 
 ### 请求体
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `org_id` | string | ✅ | 为请求兼容保留；实际以认证上下文中的组织为准。 |
-| `language` | string | ✅ | `sql` 或 `promql`。 |
-| `statement` | string | ✅ | 查询文本。 |
-| `time_range` | object | ✅ | `{ "start": <微秒>, "end": <微秒> }` —— Unix 纪元起微秒。 |
-| `stream` | object | — | `{ "name": "app", "stream_type": "logs" }`；可查询信号类型为 `logs`、`metrics`、`traces` 和 `profiles`。 |
-| `limit` | integer | — | 行数上限。 |
+| `org_id` | string | 是 | 必须存在，但值会被忽略，生效的是已认证的组织。 |
+| `language` | string | 是 | `sql` 或 `promql`。 |
+| `statement` | string | 是 | 查询语句。 |
+| `time_range` | object | 是 | `{ "start": <微秒>, "end": <微秒> }`，自 Unix 纪元起的微秒数。 |
+| `stream` | object | SQL 必填 | `{ "name": "app", "stream_type": "logs" }`，指明语句的主表，两个字段都必填。 |
+| `limit` | integer | 否 | 行数上限。 |
+
+查询字符串参数 `clusters` 用于为[联邦搜索](#联邦搜索)选择远程集群。
 
 ### 响应
 
-响应包含 `columns`、数组形态的 `rows`、`scanned_rows` 与 `took_ms`。联邦查询响应还可能包含
-federation 元数据。
+响应包含 `columns`、数组形式的 `rows`、`scanned_rows` 与 `took_ms`：
+
+```json
+{
+  "columns": ["level", "n"],
+  "rows": [["error", 2], ["info", 2]],
+  "scanned_rows": 4,
+  "took_ms": 155
+}
+```
+
+每个单元格按所在列的类型取值：
+
+| 列类型 | JSON 值 |
+|---|---|
+| 缺失的值 | `null`。 |
+| 整数、浮点数 | 数字。`NaN` 与无穷大返回 `null`。 |
+| 定点数 | 精度不超过 15 位时为数字，否则为保留全部位数的字符串。 |
+| 文本 | 字符串。 |
+| 二进制 | 小写十六进制字符串。 |
+| 时间戳 | 整数，自 Unix 纪元起的微秒数，不论时间单位与时区。 |
+| 日期、时间 | 字符串，如 `2022-01-08`、`01:01:01.500`。 |
+| 列表、结构体、映射 | 数组、对象、对象。 |
+| 其它类型 | 字符串。 |
+
+联邦查询的响应还可能带有联邦元数据。
 
 <Note>
-  发送 `Accept: application/x-ndjson` 可逐行返回对象，并在最后附上 `__meta__` 记录。流式会绕过
-  结果缓存。
+  发送 `Accept: application/x-ndjson` 可以逐行流式返回 JSON 对象，最后附带一条包含 `scanned_rows` 与 `took_ms` 的 `{"__meta__": {...}}` 记录。流式查询会绕过结果缓存。
 </Note>
+
+## 时间范围与异步任务
+
+交互式查询请使用有界的 `time_range`。MoleSignal 把查询规模估算为“时间范围的秒数 × `[querier].estimate_throughput_per_sec`”。当估算值达到 `[querier].auto_async_threshold_rows` 时，查询会作为持久化的搜索任务运行。在默认配置下，对应 50,000 秒，约 13.9 小时的时间范围。
+
+异步查询返回 `202`，并给出需要跟踪的任务：
+
+```json
+{
+  "job_id": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+用 `Prefer` 请求头控制运行方式：
+
+| 请求头 | 效果 |
+|---|---|
+| `Prefer: respond-async` | 总是创建搜索任务。 |
+| `Prefer: respond-sync` | 在请求内同步运行查询，即使时间范围很长。 |
+
+用以下端点跟踪任务：
+
+| 端点 | 用途 |
+|---|---|
+| `POST /api/v1/query/jobs` | 直接提交任务。 |
+| `GET /api/v1/query/jobs` | 列出任务，支持 `limit`。 |
+| `GET /api/v1/query/jobs/{id}` | 状态、时间戳、`result_rows`、`error` 与 `expires_at_micros`。 |
+| `GET /api/v1/query/jobs/{id}/results` | 以对象形式返回行，带有 `page`、`page_size`（默认 1000）与 `has_more`。 |
+| `POST /api/v1/query/jobs/{id}/cancel` | 取消运行中的任务。 |
+| `POST /api/v1/query/jobs/{id}/retry` | 重新运行失败的任务。 |
+| `DELETE /api/v1/query/jobs/{id}` | 删除任务。 |
+
+任务的结果保留七天。任务的状态有 `pending`、`running`、`done`、`failed` 与 `cancelled`。
 
 ## SQL
 
+SQL 语句在 `FROM` 中写出数据流名称，请求中的 `stream` 字段指明同一个主数据流：
+
 ```bash
+NOW=$(date +%s)000000
 curl -X POST http://localhost:5080/api/v1/query \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
   -d "{\"org_id\":\"$MS_ORG\",\"language\":\"sql\",
-       \"statement\":\"SELECT level, count(*) FROM app WHERE _timestamp > 0 GROUP BY level\",
-       \"time_range\":{\"start\":0,\"end\":2000000000000000},
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"time_range\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
        \"stream\":{\"name\":\"app\",\"stream_type\":\"logs\"}}"
 ```
 
-由于日志、指标、追踪同处一个存储，可在一条查询里**跨信号 join** —— 例如按 `trace_id` 把错误
-日志和对应 span 关联起来：
+### 跨信号 JOIN
+
+日志、指标与链路存放在同一份存储中，因此一条查询就可以把它们关联起来。在 `stream` 中指明主数据流，其他数据流直接按名称引用。例如，用 `trace_id` 把错误日志关联到对应的 Span：
 
 ```sql
-SELECT l.msg, t.duration_ms
+SELECT l.msg, t.name, t.duration_ns
 FROM app AS l
-JOIN spans AS t ON l.trace_id = t.trace_id
+JOIN traces AS t ON l.trace_id = t.trace_id
 WHERE l.level = 'error'
 ```
 
+### 文本搜索
+
+| 函数 | 行为 |
+|---|---|
+| `MATCH(field, 'text')` | 对任意字段做不区分大小写的子串匹配。`%`、`_` 与 `*` 都按字面字符处理。 |
+| `MATCH_TEXT(field, 'query')` | 对 `index_type` 为 `full_text` 的字段做全文搜索。没有该索引的字段会失败，并报 `MATCH_TEXT: field ... has no full-text index configured`。 |
+
+`MATCH_TEXT` 把多个词理解为 token 级 AND，`"a b"` 表示短语，`error*` 与 `*error` 是通配符，另有 `a OR b`，以及用 `-a` 排除某个词。创建数据流或编辑 schema 时添加该索引，参见[数据流](/zh-Hans/streams#schema-与字段)。
+
+```sql
+SELECT * FROM app WHERE MATCH(msg, 'timeout');
+SELECT * FROM app WHERE MATCH_TEXT(msg, 'panic "disk full" -debug');
+```
+
+### SQL 中的时间戳
+
+`_timestamp` 是 `Timestamp(µs, "UTC")` 类型的列。与 `_timestamp` 比较的整数字面量按自 Unix 纪元起的微秒数处理，因此下面两个过滤条件选出的行相同：
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= 1790000000000000
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= to_timestamp_micros(1790000000000000)
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+只有字面量会被当作微秒。要把 `_timestamp` 与表达式或其它列比较，请先用 `to_timestamp_micros(...)` 转换。用 `CAST(_timestamp AS BIGINT)` 可以读出一行的微秒数。
+
+### 加密字段
+
+`decrypt(field)` 会还原被标记为加密的字段的明文，参见[数据流](/zh-Hans/streams#加密字段)。
+
 ## PromQL
 
-设 `language: "promql"` 即可对指标流运行 PromQL。instant 与 range 查询均支持（range 按
-`[start, end]` 步进、输出 matrix）。覆盖面很广——rate 家族与全部 `*_over_time`、标准聚合
-（含 `topk` / `limitk`）、`histogram_quantile`、`label_replace` / `label_join`、数学与三角、
-集合运算 `and` / `or` / `unless` 配 `on` / `ignoring` + `group_left` / `group_right` 向量匹配、
-选择器 `@` / `offset`，以及子查询。
+把 `language` 设为 `promql`，即可对指标数据流运行 PromQL。指标选择器对应一个指标数据流，`value` 列保存样本，其余列是标签。通过该端点时，MoleSignal 把表达式作为 instant 查询，在 `time_range.end` 处求值，每个时间序列返回一行，先是 `value`，再是各个标签：
 
 ```json
 {
   "org_id": "<org>",
   "language": "promql",
-  "statement": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))",
-  "time_range": { "start": 0, "end": 2000000000000000 }
+  "statement": "sum by (service) (http_requests_total)",
+  "time_range": { "start": 1790000000000000, "end": 1790003600000000 }
 }
 ```
+
+覆盖面很广，包括 rate 家族与全部 `*_over_time` 函数、含 `topk` 与 `limitk` 的标准聚合、`histogram_quantile`、`label_replace` 与 `label_join`、数学与三角函数、配合 `on`、`ignoring`、`group_left`、`group_right` 向量匹配的 `and`、`or`、`unless` 集合运算、选择器修饰符 `@` 与 `offset`，以及子查询。
 
 <Card title="PromQL 支持矩阵" icon="table-list" href="/zh-Hans/query/promql-subset">
   支持的函数、运算符、修饰符完整清单，以及已知差异（native-histogram 函数、二元 `default`）。
@@ -81,27 +182,72 @@ WHERE l.level = 'error'
 
 ## 事件上下文（search around）
 
-要拉取某条事件前后各 N 条（日志上下文视图），用 `POST /api/v1/query/search_around`，传
-`event_timestamp_us`、`stream`、`stream_type`，以及可选的 `before` / `after`（各默认 50）。
+`POST /api/v1/query/search_around` 返回某条事件前后紧邻的事件，方便调查时查看一行日志的上下文，参见[事件上下文](/zh-Hans/api/query/search-around)。
 
-## 异步、检查与取消
+## 检查与控制
 
-- 给 `POST /api/v1/query` 加 `Prefer: respond-async`，或直接提交到
-  `POST /api/v1/query/jobs`，可创建持久化搜索任务。
-- `GET /api/v1/query/jobs/{id}` 返回状态，`/results` 返回完成后的结果。
-- `POST /api/v1/query/inspect` 只做规划不执行，返回查询元数据与当前可用的逻辑计划。
+- `POST /api/v1/query/inspect` 只做规划不执行，返回查询元数据与逻辑计划。
 - `POST /api/v1/query/recommendations` 不执行查询，只分析查询画像。
 - `GET /api/v1/query/running` 与 `POST /api/v1/query/{id}/cancel` 供组织管理员查看和取消活动查询。
+- `GET /api/v1/query/sql/capabilities` 与 `GET /api/v1/query/promql/capabilities` 列出供编辑器使用的受支持函数。
 
-普通查询需要 `streams.query`；活动查询管理分别需要 `org.settings.read` 或
-`org.settings.manage`。
+普通查询需要 `streams.query`；活动查询管理需要 `org.settings.read` 或 `org.settings.manage`。
 
 ## 联邦搜索
 
-给查询端点添加 `?clusters=local,cluster-name` 可发起联邦查询。无法访问的远端会在 federation 元数据中标为 degraded，不会被静默当成本地
-数据。
+给查询端点添加 `?clusters=local,cluster-name` 即可发起联邦搜索。无法访问的远程集群会在联邦元数据中显示为降级，不会被悄悄当成本地数据，参见[分角色部署](/zh-Hans/distributed-deployment#联邦查询)。
+
+## 存储字段
+
+数据流的字段取决于发送端提供的内容。以下是 OTLP 接入产生的字段。资源与记录的属性会成为保留原始键名的顶层字段（例如 `service.name`），并保留各自的数值类型。
+
+### OTLP 日志字段
+
+| 字段 | 内容 |
+|---|---|
+| `_timestamp` | 事件时间，微秒，来自 `timeUnixNano`。 |
+| `body` | 日志正文。 |
+| `severity_text`、`severity_number` | OTLP 的严重级别。 |
+| `trace_id`、`span_id` | 关联标识符，小写十六进制。 |
+| `scope_name`、`scope_version` | 埋点范围（instrumentation scope）。 |
+| 资源与记录属性 | 每个属性对应一个顶层字段。 |
+
+### 链路 Span 字段
+
+| 字段 | 内容 |
+|---|---|
+| `_timestamp` | Span 开始时间，微秒。 |
+| `trace_id`、`span_id`、`parent_span_id` | Span 及其父 Span 的标识符。 |
+| `name`、`kind` | Span 名称与类型。 |
+| `start_time_unix_nano`、`end_time_unix_nano`、`duration_ns` | 以纳秒表示的时间信息。 |
+| `status_code`、`status_message` | `OK`、`ERROR` 或 `UNSET`，以及对应的消息。 |
+| `attributes`、`resource`、`scope`、`events`、`links` | 完整的 OTLP 结构，以 JSON 文本保存。 |
+| `http.method`、`service.name` 等属性键 | 属性的展开副本。 |
+| `sampling_reason` 与记录性字段 | 尾部采样器保留该链路的原因，以及 `partial`、`late`、`duplicate`、`conflict` 标志。 |
+
+Span 由 `trace_id` 与 `span_id` 标识，重复发送的 Span 会被当作重复数据丢弃。
+
+### OTLP 指标字段
+
+MoleSignal 把每个 OTLP 数据点展平为一个指标事件。资源、scope 与数据点的属性仍是可查询的字段。下表中的保留字段优先于同名属性。
+
+| 字段 | 含义 |
+|---|---|
+| `metric_name` | OTLP 指标名称。 |
+| `metric_kind` | `gauge`、`counter`、`up_down_counter`、`histogram`、`exponential_histogram` 或 `summary`。 |
+| `metric_description`、`metric_unit` | 非空时才存在。 |
+| `metric_temporality` | `delta`、`cumulative`、`unspecified` 或 `unknown:<value>`，gauge 没有该字段。 |
+| `metric_monotonic` | Sum 是否单调。单调的 Sum 存为 `counter`。 |
+| `metric_start_time_unix_nano` | 聚合区间的开始时间，非零时才存在。 |
+| `value` | gauge 或 Sum 数据点的标量值。 |
+| `count`、`sum`、`min`、`max` | histogram 数据点保存这四个值。指数直方图保存 `count` 与 `sum`，summary 保存 `count` 与 `sum`。 |
+
+直方图的分桶边界与计数，以及 summary 的分位数，都不会被保存。
+
+Delta 数据点按接收时的样子保存。PromQL 的 rate 家族按存储的 temporality 计算：`increase` 累加窗口内的 delta 值，`rate` 再除以 range，`irate` 用最后一个 delta 值除以它的区间。对于 cumulative 单调 Sum，会处理 counter 重置。如果导出端在同一个窗口内改变了 temporality，只计算最新一段语义连续的样本。
+
+通过 HTTP 发送 OTLP 时，指标、日志与链路都支持 protobuf（`http/protobuf`）和 JSON。JSON 编码把 64 位整数写成字符串，例如 `"asInt": "340"` 与 `"count": "4"`。MoleSignal 对字符串和普通数字一视同仁。
 
 ## 缓存
 
-查询经过三级缓存 —— `file_meta`、`parquet_meta`、`query_result` —— 外加默认启用的 parquet 磁盘缓存
-（`./data/cache/parquet`，10 GB LRU）。缓存对响应契约透明，请通过服务器指标观察缓存行为。
+查询使用进程内缓存，覆盖已打开的索引句柄、已关闭时间窗的结果、检索词项计数与索引 footer。对于远程对象存储，磁盘缓存会把对象的字节范围保存在 `./data/cache/objects` 下，默认 10 GiB。缓存对响应契约透明，请通过 `/metrics` 观察缓存行为，容量设置参见[配置](/zh-Hans/configuration#缓存)。

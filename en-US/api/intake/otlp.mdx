@@ -1,29 +1,70 @@
 ---
 title: "OpenTelemetry (OTLP)"
-description: "Intake via the OTLP HTTP or gRPC exporter."
+description: "Send logs, metrics, and traces with an OTLP HTTP or gRPC exporter."
 ---
 
-Point any OpenTelemetry SDK or Collector at MoleSignal.
+Point an OpenTelemetry SDK or Collector at MoleSignal. Both transports require a bearer credential with the permission `streams.write`.
 
 | Transport | Endpoint |
 |---|---|
-| OTLP HTTP | `POST /api/v1/logs`, `/api/v1/metrics`, `/api/v1/traces` |
-| OTLP gRPC | `:4317` |
+| OTLP over HTTP | `POST /api/v1/logs`, `POST /api/v1/metrics`, `POST /api/v1/traces` |
+| OTLP over gRPC | `:4317` |
+
+Port `5082` is the trusted internal cluster port and is not an OTLP receiver.
+
+## OTLP over HTTP
+
+Set the exporter endpoint to the `/api` base path. Exporters append `/v1/logs`, `/v1/metrics`, and `/v1/traces` themselves.
+
+| Header | Notes |
+|---|---|
+| `Authorization` | `Bearer <token>`. |
+| `Content-Type` | `application/x-protobuf` or `application/json`. The JSON encoding writes 64-bit integers as strings, and MoleSignal reads strings and numbers alike. |
+| `stream-name` | Optional. The target stream. The default is `default`. |
+
+The body must not be compressed: a compressed body answers `400`. Disable compression in the exporter. The body limit is 2 MiB. A successful request answers `200` with `{"partialSuccess":null}`.
 
 <RequestExample>
-```yaml OTel Collector
+```yaml OpenTelemetry Collector
 exporters:
-  otlphttp:
-    endpoint: http://localhost:5080/api/v1
+  otlphttp/molesignal:
+    endpoint: http://localhost:5080/api
+    compression: none
     headers:
-      authorization: "Bearer ${MS_JWT}"
-  otlp:
-    endpoint: localhost:4317
-    headers:
-      authorization: "Bearer ${MS_JWT}"
+      authorization: "Bearer ${env:MS_TOKEN}"
+```
+
+```bash SDK environment variables
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer ${MS_TOKEN}"
 ```
 </RequestExample>
 
-Port `5082` is reserved for trusted internal cluster gRPC and is not an OTLP receiver. Both
-transports require a bearer credential with `streams.write`. Set the optional `stream-name` header
-to override the default stream.
+## OTLP over gRPC
+
+The receiver on `:4317` serves the logs, metrics, traces, and profiles services without TLS. Send `authorization: Bearer <token>` and the optional `stream-name` as gRPC metadata. Terminate TLS in front of the port for traffic that leaves a trusted network.
+
+```yaml
+exporters:
+  otlp/molesignal:
+    endpoint: localhost:4317
+    tls:
+      insecure: true
+    headers:
+      authorization: "Bearer ${env:MS_TOKEN}"
+```
+
+## Stored fields
+
+Resource and record attributes become top-level fields with their original keys. See [Stored fields](/en-US/query#stored-fields) for the columns of logs, spans, and metrics.
+
+## Errors
+
+| Status | Cause |
+|---|---|
+| `400` | A compressed body, or a body that is not valid OTLP. |
+| `401` | Missing or invalid token. |
+| `403` | The token lacks `streams.write`. |
+| `404` | The exporter endpoint omits `/api`, so the request reaches `/v1/logs`. |
+| `413` | The body exceeds 2 MiB. |

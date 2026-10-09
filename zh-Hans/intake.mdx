@@ -1,125 +1,188 @@
 ---
-title: "数据接入"
+title: "数据源"
 sidebarTitle: "数据源"
-description: "面向 OpenTelemetry、Prometheus、日志、云发送端与应用事件的原生及协议兼容采集。"
+description: "通过数据源页面、接入 Token，以及原生、OpenTelemetry、Prometheus、Loki 与 Elasticsearch 协议接入遥测数据。"
 ---
 
-MoleSignal 支持原生及协议兼容采集，因此许多现有 Agent 与 SDK 只需少量配置即可发送数据。除推送型
-[connector](/zh-Hans/connectors)（用 connector token）外，每个接入端点都需 `Authorization: Bearer <jwt>`
-认证（或使用 API token，见 [安全](/zh-Hans/security)）。
+所有信号都通过 intake API 进入 MoleSignal。网页界面中的 **数据源** 页面会为每个数据源生成端点、Token 和配置片段，同样的协议也可以手工配置。
 
-## 支持的协议
+## 数据源页面
 
-| 协议 | 端点 | 兼容发送端 |
-|---|---|---|
-| OTLP gRPC | `:4317` | OpenTelemetry SDK / Collector |
-| OTLP HTTP | `POST /api/v1/logs`、`/metrics`、`/traces` | OTel HTTP exporter |
-| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus / VictoriaMetrics |
-| Elasticsearch `_bulk` | `POST /api/v1/_bulk` | Filebeat、Vector ES sink、Logstash |
-| Loki JSON push | `POST /api/v1/loki/api/v1/push` | 能发送 Loki JSON 请求结构的客户端 |
-| Kinesis Firehose | `POST /api/v1/_kinesis_firehose` | AWS Firehose |
-| Cloudflare Logpush | `POST /api/v1/_cloudflare` | Cloudflare Logpush |
-| Heroku log drain | `POST /api/v1/_heroku` | Heroku |
-| 原生 HTTP JSON | `POST /api/v1/intake/{type}/{stream}` | curl / 应用 SDK |
+打开 **数据源**（页面标题为 **数据源接入中心**）接入数据源：
 
-<Note>
-  Kinesis Firehose、Cloudflare Logpush、Heroku log drain 按源单独配置——见
-  [Connector](/zh-Hans/connectors) 指南。
-</Note>
+1. 在目录中搜索，或按分类筛选：**推荐**、**基础设施**、**云服务**、**数据库**、**消息队列**、**应用与语言**、**安全** 与 **自定义**。信号标签（**日志**、**指标**、**链路**、**Profiles**）可以进一步缩小范围。
+2. 选择一个数据源，例如 Kubernetes、Linux 主机、AWS、OpenTelemetry SDK 或 Web RUM。
+3. 按四个步骤完成接入：
+   - **准备接入信息** 显示要使用的端点和 Token。
+   - **部署采集器** 显示命令和配置，其中的端点与 Token 已替换为真实值。
+   - **验证数据接收** 显示数据是否已经到达。**验证接入** 检查一次，状态也会每 30 秒自动刷新。
+   - **完成接入** 结束向导。
+
+设置了 `http.external_url` 时，端点取自该配置；否则取自浏览器当前地址。位于反向代理之后时，请设置 `http.external_url`，让生成的片段指向对外地址。参见[配置](/zh-Hans/configuration)。
+
+## 接入 Token
+
+发送端使用 Bearer Token 认证：`Authorization: Bearer <token>`。
+
+| Token | 权限 | 创建方式 | 用途 |
+|---|---|---|---|
+| 默认接入 Token（`ms_…`） | 仅 `streams.write` | 数据源页面，或 `GET /api/v1/auth/tokens/default` | 发送日志、指标与链路的采集器、Agent 与 SDK 导出端。不会过期。 |
+| RUM Client Token（`msrum_…`） | 仅 `rum.write`，绑定一个应用 | Web RUM 与移动端 RUM 数据源的数据源页面，或 `GET /api/v1/auth/tokens/rum?application_id=<id>` | 浏览器与移动端代码。终端用户可以看到该 Token。 |
+| 个人或服务账号 Token（`ms_…`） | 所选角色的权限 | **身份与访问 → API tokens** | 自动化、脚本与 MCP 客户端。 |
+| 登录 Token（JWT） | 登录用户的权限 | `POST /api/v1/auth/signin` | 交互式使用。默认 24 小时后过期（`[auth].token_ttl_secs`）。 |
+
+持续运行的发送端使用默认接入 Token 或服务账号 Token。登录 Token 到期后即失效，所有使用它的发送端都会随之中断。在 **身份与访问 → API tokens** 中撤销 Token 可立即使其失效。
+
+在数据源页面输入应用 id 后会创建 RUM Client Token。应用 id 由 1 到 128 个字符组成，可使用 `A-Z`、`a-z`、`0-9`、`.`、`_`、`:` 与 `-`。SDK 中的 `applicationId` 使用同一个 id，参见[浏览器 RUM SDK](/zh-Hans/rum/browser-sdk)。
+
+## 端点与协议
+
+| 协议 | 端点 | 兼容的发送端 | 目标数据流 |
+|---|---|---|---|
+| 原生 HTTP JSON | `POST /api/v1/intake/{logs,metrics,traces}/{stream}` | `curl`、应用代码、Vector `http` sink、Fluent Bit `http` 输出 | 路径中的 `{stream}` |
+| OTLP over HTTP | `POST /api/v1/logs`、`/api/v1/metrics`、`/api/v1/traces` | OpenTelemetry SDK 与 Collector | `stream-name` 请求头，缺省为 `default` |
+| OTLP over gRPC | `:4317` | OpenTelemetry SDK 与 Collector | `stream-name` 元数据，缺省为 `default` |
+| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus、VictoriaMetrics 及任何 remote_write v1 发送端 | 每个指标名一个指标数据流 |
+| Elasticsearch `_bulk` | `POST /api/v1/_bulk` | Filebeat、Logstash、Vector `elasticsearch` sink | 每个 action 的 `_index`，否则 `stream-name` 请求头，否则 `default` |
+| Loki push（JSON） | `POST /api/v1/loki/api/v1/push` | 能发送 Loki JSON 格式的发送端 | `stream-name` 请求头，缺省为 `default` |
+| Kinesis Firehose、Cloudflare Logpush、Heroku | `/api/v1/_kinesis_firehose`、`/api/v1/_cloudflare`、`/api/v1/_heroku` | AWS、Cloudflare、Heroku | 在连接器上配置，参见[连接器](/zh-Hans/connectors) |
+
+除推送型连接器外，所有端点都需要具备 `streams.write` 权限的 Bearer Token。组织由 Token 决定，不会出现在 URL 中。
+
+### 影响发送端的限制
+
+- **请求大小。** 超过 2 MiB 的请求体会被拒绝并返回 `413`。请让每批数据小于该大小。
+- **压缩。** OTLP over HTTP 不接受压缩的请求体，会返回 `400`。请在发送端关闭压缩；OpenTelemetry Collector 的 `otlphttp` 导出端默认使用 gzip 压缩，需要设置 `compression: none`。Elasticsearch `_bulk`、Loki push 与推送型连接器接受 `Content-Encoding: gzip`。
+- **Loki 编码。** 只解析 JSON 请求格式。Promtail 与 Grafana Alloy 默认发送 snappy 压缩的 protobuf，无法向该端点发送数据。
+- **速率限制。** `router` 角色按组织限制请求，超限时返回 `429` 并附带 `Retry-After` 响应头。`standalone` 节点不应用这个限制。参见[分角色部署](/zh-Hans/distributed-deployment#速率限制)。
+- **保留数据流。** 数据流名称 `_molesignal` 保留给服务自身的遥测，拒绝公开接入。
+
+## 数据流与 Schema
+
+数据流在首次写入时创建，schema 会随新字段出现而演进。数据流由名称和信号类型共同标识，因此 `default` 可以同时存在于日志、指标和链路类型下。参见[数据流](/zh-Hans/streams)。
+
+每个事件都有一个自 Unix 纪元起的微秒时间戳。原生 JSON 与 Elasticsearch `_bulk` 读取 `_timestamp` 字段。没有 `_timestamp` 的事件使用服务端接收它的时间。
 
 ## 原生 HTTP JSON
 
-最简单的方式。把一个记录数组 POST 到 `intake/{logs,metrics,traces}/{stream}`。时间戳为 Unix 纪元起
-的微秒数，放在 `_timestamp` 字段。
+向 `/api/v1/intake/{logs,metrics,traces}/{stream}` 发送记录数组：
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/intake/logs/app \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
-  -d '[{"_timestamp":1700000000000000,"level":"error","msg":"db pool exhausted","trace_id":"abc123"}]'
+  -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
 ```
 
-流在首次写入时创建，schema 随新字段出现自动演进。
+响应会给出已接收与已拒绝的记录数，并为每条被拒绝的记录给出下标与原因：
+
+```json
+{"accepted":1,"rejected":0,"errors":[]}
+```
 
 ## OpenTelemetry
 
+把 OpenTelemetry SDK 或 Collector 指向 `/api` 基础路径。导出端会自动追加 `/v1/logs`、`/v1/metrics` 与 `/v1/traces`，对应 `/api/v1/logs`、`/api/v1/metrics` 与 `/api/v1/traces`。
+
 <Tabs>
-  <Tab title="OTLP HTTP">
-    把 OTel HTTP exporter 指向 MoleSignal：
+  <Tab title="OTLP over HTTP">
+    SDK 环境变量：
+
+    ```bash
+    export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+    export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer ${MS_TOKEN}"
+    ```
+
+    OpenTelemetry Collector：
 
     ```yaml
     exporters:
-      otlphttp:
-        endpoint: http://localhost:5080/api/v1
+      otlphttp/molesignal:
+        endpoint: http://localhost:5080/api
+        compression: none
         headers:
-          authorization: "Bearer ${MS_JWT}"
+          authorization: "Bearer ${env:MS_TOKEN}"
     ```
 
-    日志、指标、追踪分别 POST 到 `/api/v1/logs`、`/api/v1/metrics`、`/api/v1/traces`。
+    请发送 protobuf（`application/x-protobuf`），这是各 SDK 与 Collector 的默认编码。日志、指标与链路也接受 JSON（`application/json`）。添加 `stream-name` 请求头可选择 `default` 之外的数据流，该请求头对通过这个导出端发送的所有信号生效。
   </Tab>
-  <Tab title="OTLP gRPC">
-    对外标准 OTLP gRPC Receiver 默认监听 `4317` 端口：
+  <Tab title="OTLP over gRPC">
+    OTLP gRPC 接收端监听 `4317` 端口，提供日志、指标、链路与 Profiles 四个服务。它不终止 TLS，流量离开可信网络时，需要在前面终止 TLS。
+
+    ```bash
+    export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+    export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer ${MS_TOKEN}"
+    ```
+
+    OpenTelemetry Collector：
 
     ```yaml
     exporters:
-      otlp:
+      otlp/molesignal:
         endpoint: localhost:4317
+        tls:
+          insecure: true
         headers:
-          authorization: "Bearer ${MS_JWT}"
+          authorization: "Bearer ${env:MS_TOKEN}"
     ```
 
-    `5082` 端口保留给可信内部集群 gRPC，不应作为公开 OTLP 端点。
+    端口前面有终止 TLS 的代理时，去掉 `insecure: true`。`5082` 是集群内部 gRPC 端口，不是 OTLP 接收端。
   </Tab>
 </Tabs>
 
+OTLP 指标按数据点逐条存储，存储字段参见[指标存储约定](/zh-Hans/query#otlp-指标字段)。
+
 ## Prometheus remote_write
 
-在 `prometheus.yml` 中把 MoleSignal 加为远程写入目标：
+在 `prometheus.yml` 中把 MoleSignal 添加为 remote write 目标：
 
 ```yaml
 remote_write:
   - url: http://localhost:5080/api/v1/prometheus/api/v1/write
     authorization:
-      credentials: "${MS_JWT}"
+      credentials: "${MS_TOKEN}"
 ```
 
-## Loki 与 Elasticsearch
+每条时间序列写入以其 `__name__` 命名的指标数据流，其余标签成为字段。原生直方图与指标元数据会被跳过，exemplar 与样本一起保存。
 
-<CodeGroup>
-```text Loki push
-POST /api/v1/loki/api/v1/push
-# 只接受 JSON 请求结构，不解析 snappy-protobuf。
+## Elasticsearch bulk
+
+支持 Elasticsearch bulk 协议的发送端无需依赖 Loki 或 OTLP 即可使用：
+
+```bash
+curl -X POST http://localhost:5080/api/v1/_bulk \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/x-ndjson' \
+  --data-binary $'{"index":{"_index":"app"}}\n{"level":"info","msg":"hello"}\n'
 ```
 
-```text Elasticsearch _bulk
-POST /api/v1/_bulk
-# 适配 Filebeat、Logstash 与 Vector ES sink。
+每个 action 的 `_index` 决定目标数据流。没有 `_index` 时使用 `stream-name` 请求头，再缺省为 `default`。
+
+## Loki push
+
+该端点接受 Loki 的 JSON 请求格式：
+
+```json
+{"streams":[{"stream":{"service":"checkout","level":"error"},"values":[["1700000000000000000","payment failed"]]}]}
 ```
-</CodeGroup>
 
-Loki 端点接受 `{"streams":[{"stream":{...},"values":[["<unix_nano>","<line>"]]}]}`。
-通过 `stream-name` 选择 MoleSignal 日志流。请把发送端配置为 JSON，而不是 Loki 默认的
-snappy-protobuf 编码。
+标签成为字段，日志行写入 `message` 字段，纳秒时间戳会转换为微秒。响应为 `204`。用 `stream-name` 请求头选择目标数据流。
 
-## 管道函数（Pipeline functions）
+## 相关页面
 
-可在接入热路径上用**管道函数**转换事件。管道函数是挂在管道步骤上的可复用变换。运行时支持：
-
-- **VRL** —— 始终可用。按 `(function_id, updated_at)` 编译，使用 `vrl::compiler` 标准库
-  （`del`、`parse_json`、`to_int`、`match`、`encrypt`/`decrypt` 等）。
-- **JavaScript** —— 可选，基于 `deno_core`（V8）。只有二进制使用 `--features js-runtime`
-  构建时可用，没有运行时 TOML 开关。
-- **LLM 评估** —— 适合低吞吐流水线；需设置 `[functions].llm_eval_enabled = true`，且组织内有已
-  启用的模型供应商。每条事件都会触发一次模型请求。
-
-<Warning>
-  JS isolate 刻意做得极简：没有 `fetch`、`setTimeout`、`import`、`npm`。每个事件有 50 ms 墙钟预算与
-  32 MiB 堆。任何超出单次同步执行的逻辑在设计上都不支持。
-</Warning>
-
-```js
-// 把 `severity` 字段小写化，写入新的 `level` 字段。
-molesignal.set("level", molesignal.fields.severity.toLowerCase());
-// 删除一个敏感字段。
-molesignal.del("pw");
-```
+<CardGroup cols={2}>
+  <Card title="集成指南" icon="plug" href="/zh-Hans/integrations">
+    OpenTelemetry Collector、Vector、Fluent Bit、Filebeat、Prometheus 与 Kubernetes 的完整配置。
+  </Card>
+  <Card title="流水线" icon="code-branch" href="/zh-Hans/pipelines">
+    在事件到达时或按定时计划，对事件做路由、标准化、脱敏与扩展。
+  </Card>
+  <Card title="连接器" icon="inbox" href="/zh-Hans/connectors">
+    接收 Kinesis Firehose、Cloudflare Logpush 与 Heroku 日志投递。
+  </Card>
+  <Card title="身份与访问" icon="key" href="/zh-Hans/identity">
+    创建服务账号并管理 API Token。
+  </Card>
+</CardGroup>

@@ -1,0 +1,87 @@
+---
+title: "备份与恢复"
+description: "需要备份哪些内容、如何保持 PostgreSQL 与对象存储一致，以及如何恢复 MoleSignal 部署。"
+---
+
+MoleSignal 的状态保存在 PostgreSQL、对象存储、intake 的 WAL 卷以及配置与密钥中。请逐一备份，并在依赖备份之前演练一次恢复。
+
+## 需要备份的内容
+
+| 状态 | 内容 | 备份 |
+|---|---|---|
+| PostgreSQL | 用户、组织、Token、数据流、仪表盘、告警规则，以及把数据流映射到对象的文件目录 | 必须 |
+| 对象存储 | Parquet 数据文件、检索索引与 Profile 数据块 | 必须 |
+| `MS_CIPHER_KEY` | PostgreSQL 中密文的根密钥 | 必须，与数据库备份分开保存。 |
+| 配置 | `config.toml`、环境变量，以及使用时的 `MS_AUTH_JWT_SECRET_OVERRIDE` | 必须 |
+| WAL 卷（`[wal].dir`） | 尚未刷写到对象存储的记录 | 可选，只包含尚未刷写的记录。 |
+| ACME 目录（`[http.tls].key_storage_dir`） | ACME 账号密钥与域名密钥 | 可选，证书可以重新签发。 |
+| 缓存目录（`[cache.object].root`） | 远程对象字节范围的本地副本 | 不需要备份。 |
+
+## 保持数据库与对象一致
+
+PostgreSQL 中的文件目录引用 bucket 中的对象。刷写时先上传对象，再把它登记到目录。合并与保留策略先移除目录中的引用，垃圾回收器在 `[storage.gc].grace_period_secs`（默认 3600 秒）之后才删除对象。
+
+按以下顺序备份才能保持一致：
+
+1. 先做 PostgreSQL 备份。
+2. 紧接着复制 bucket，并在宽限时间内完成。
+
+在宽限时间内完成的复制，包含数据库备份引用的全部对象。复制耗时更长时，请在备份前调大 `grace_period_secs`，或启用 bucket 版本控制，并把对象恢复到数据库备份的时间点。
+
+## 备份 PostgreSQL
+
+使用 PostgreSQL 服务自带的备份功能，例如带时间点恢复的定时快照。自建数据库在小规模部署中可以使用逻辑转储：
+
+```bash
+pg_dump --format=custom --file=molesignal.dump "postgres://molesignal@db.internal:5432/molesignal"
+```
+
+## 备份对象存储
+
+使用云厂商的 bucket 复制或版本控制。定时复制到第二个 bucket 同样可行：
+
+```bash
+aws s3 sync s3://molesignal s3://molesignal-backup
+```
+
+RustFS 等兼容 S3 的服务需要加上 `--endpoint-url`。备份所用的凭据不应具备删除备份 bucket 内容的权限。
+
+## 恢复
+
+<Steps>
+  <Step title="停止所有节点">
+    停止全部 MoleSignal 进程，确保替换数据期间没有写入。
+  </Step>
+  <Step title="恢复 PostgreSQL">
+    把备份恢复到一个空数据库：
+
+    ```bash
+    pg_restore --no-owner --dbname "postgres://molesignal@db.internal:5432/molesignal" molesignal.dump
+    ```
+  </Step>
+  <Step title="恢复对象">
+    把备份复制到节点使用的 bucket。把 bucket 恢复到数据库备份的时间点或之后的状态。
+
+    对账器会把恢复后的目录没有引用的对象排入孤儿队列，垃圾回收器会在 `[storage.reconciler].orphan_grace_secs`（默认 24 小时）之后删除它们。较新的对象如果可能还有用，请先复制到别处。
+  </Step>
+  <Step title="恢复密钥与配置">
+    提供配置，以及被备份的部署所使用的同一个 `MS_CIPHER_KEY`。使用不同密钥的节点无法解密已保存的密文，启动时会失败，并报类似 `open Probe CA key` 的错误。
+  </Step>
+  <Step title="有条件时恢复 WAL 卷">
+    把 WAL 卷挂载到 `[wal].dir`，intake 会在启动时重放。没有这块卷时，故障发生时尚未刷写的记录将丢失。
+  </Step>
+  <Step title="启动并验证">
+    启动节点，等待 `GET /api/v1/healthz` 返回 `200`。登录后打开一个数据流，对恢复的时间范围执行查询。
+
+    检查 `/metrics` 中 `reason="missing"` 的 `storage_reconciler_issues_total`。出现这样的条目，说明目录引用了 bucket 中不存在的对象。
+  </Step>
+</Steps>
+
+## 故障场景
+
+| 丢失的内容 | 影响 | 恢复方式 |
+|---|---|---|
+| intake 节点的 WAL 卷 | 尚未刷写的记录丢失。 | 用空卷启动节点。 |
+| PostgreSQL | 全部元数据丢失，对象无法访问。 | 恢复最新备份。备份之后写入的数据无法恢复，因为它们的对象在目录中没有条目。 |
+| bucket | 对丢失时间范围的查询失败。 | 恢复 bucket。目录中没有对象的条目会在 `/metrics` 中显示为 `missing`。 |
+| `MS_CIPHER_KEY` | 已保存的密文无法解密，节点无法启动。 | 从密钥管理系统恢复密钥。没有它，加密的列无法找回。 |

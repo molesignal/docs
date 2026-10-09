@@ -1,313 +1,572 @@
 ---
 title: "配置"
-description: "配置当前单 Crate 服务、端口、存储、Worker、安全、遥测与可选运行时。"
+description: "MoleSignal 如何加载配置、有哪些环境变量，以及每个配置项及其默认值的参考。"
 ---
 
-使用一个 TOML 文件启动 MoleSignal：
+MoleSignal 读取一个 TOML 文件和 `MS_` 环境变量。请以每个发布版附带的示例文件 `conf/config.toml` 为起点。示例文件列出了全部配置项，本页对每一项都有说明。
 
 ```bash
 molesignal --config /etc/molesignal/config.toml
 ```
 
-配置按以下顺序应用，后面的来源覆盖前面的来源：
+## 配置如何加载
 
-1. Rust 内置默认值；
-2. `--config` 指定的文件；
+配置项按以下顺序生效，后面的来源覆盖前面的。
+
+1. 内置默认值。
+2. 通过 `--config` 传入的 TOML 文件。
 3. `MS_` 环境变量。
 
-结构化环境变量在分区之间使用点号：
+修改配置后需要重启进程。运行中的进程只会在日志中记录文件的变化，不会应用它们。
 
-```bash
-env 'MS_HTTP.PORT=5081' \
-    'MS_STORE.META.DSN=postgres://user:pass@db:5432/molesignal' \
-    molesignal --config /etc/molesignal/config.toml
-```
+<Note>
+  大多数配置段会忽略它没有定义的键，所以拼写错误既不生效也没有警告。`[meta_database]`、`[object_store]`（包括 `[object_store.retry]`）、`[telemetry]`（包括 `[telemetry.trace]` 与 `[telemetry.self_collect]`）、`[apm]`、`[probe]`、`[otlp_grpc]`、`[notify]` 与 `[scheduled_reports.renderer]` 则相反：出现未知键时，进程会在启动时退出。
+</Note>
 
-配置结构定义在 `src/config/`。仓库维护的生产向示例是 `conf/config.toml`；升级时请检查该文件，因为未填写的新设置会使用代码默认值。
+参考表中的 **默认值** 列取自示例文件 `conf/config.toml`。缺少某个键时使用的内置值与之不同的，会在说明中注明。
 
-## 仅 Secret 的值
+## 环境变量
 
-以下值应尽量保留在 TOML 外：
+每个配置项都有对应的环境变量：先写 `MS_` 前缀，再把配置路径的每一层转为大写，并用单个下划线连接。
 
-| 环境变量 | 用途 |
+| 配置项 | 环境变量 |
 |---|---|
-| `MS_AUTH_JWT_SECRET_OVERRIDE` | 部署策略要求时固定引导 JWT 签名材料。 |
-| `MS_CIPHER_KEY` | 组织加密密钥存储的根材料。 |
-| `MS_SELF_TELEMETRY_CLUSTER_TOKEN` | 验证拆分角色之间的自身遥测转发。 |
-| `MS_AGENT_OPENAI_*` | 开发环境回退 OpenAI Key 与基础 URL。 |
-| `MS_AGENT_ANTHROPIC_*` | 开发环境回退 Anthropic Key 与基础 URL。 |
-| `MS_AGENT_COMPATIBLE_*` | 开发环境回退 OpenAI 兼容 Key 与基础 URL。 |
+| `[http].port` | `MS_HTTP_PORT` |
+| `[meta_database].dsn` | `MS_META_DATABASE_DSN` |
+| `[cluster].advertise_addr` | `MS_CLUSTER_ADVERTISE_ADDR` |
+| `[node].roles` | `MS_NODE_ROLES` |
 
-生产环境通常应在 **Mole Agent → Agent 设置**中创建模型供应商。供应商 Key 会加密、只写保存，并优先于环境变量回退从 PostgreSQL 解析。
+列表使用 TOML 语法，例如 `MS_NODE_ROLES='["intake","querier"]'`。包含点号或双下划线的名称不会被识别。
 
-## 节点角色
+以下变量独立于配置项读取：
 
-```toml
-[node]
-roles = ["standalone"]
-id = ""
-drain_timeout_secs = 30
-```
+| 变量 | 用途 |
+|---|---|
+| `MS_CIPHER_KEY` | MoleSignal 加密保存在 PostgreSQL 中的密文所用的根密钥。取 32 个随机字节并以 base64 编码。缺少它时，进程回退到全零的开发密钥并记录警告。更换密钥前必须执行 `rewrap-kek`，参见[生产检查清单](/zh-Hans/production-checklist)。 |
+| `MS_AUTH_JWT_SECRET_OVERRIDE` | 固定 JWT 签名密钥，取代首次启动时在 PostgreSQL 中生成的密钥。 |
+| `MS_SELF_TELEMETRY_CLUSTER_TOKEN` | 为分角色节点之间转发的链路候选与自遥测做认证的共享密钥。启用[链路捕获](#链路捕获与尾部采样)（默认启用）或 `[telemetry.self_collect]` 时，每个分角色节点都要设置相同的值，没有 `intake` 角色的节点缺少它会拒绝启动。 |
+| `MS_AGENT_OPENAI_API_KEY`、`MS_AGENT_ANTHROPIC_API_KEY`、`MS_AGENT_COMPATIBLE_API_KEY` | Mole Agent 模型服务商的开发用回退 API Key，各自有对应的 `_BASE_URL` 变量。生产环境请在产品中配置服务商。 |
+| `RELEASE_CHANNEL` | 标记部署成熟度：`alpha`、`beta`、`rc` 或 `stable`。 |
+| `RUST_LOG` | 设置后覆盖 `[telemetry].log_level`。 |
+| `AZURE_STORAGE_ACCOUNT`、`AZURE_STORAGE_ACCESS_KEY` | `azure` 对象存储后端的 Azure Blob 凭据。 |
+| `GOOGLE_APPLICATION_CREDENTIALS` | `gcs` 对象存储后端使用的服务账号 JSON 文件路径。 |
 
-角色可选 `standalone`、`router`、`intake`、`querier`、`compactor` 与 `alert_manager`。`standalone` 会组合完整服务。`id` 为空时在启动时生成。关闭进程会等待最多 `drain_timeout_secs`，让待处理采集数据刷写完成。
+## 最小生产配置
 
-## 网络监听器
-
-| 默认端口 | 分区 | 暴露范围 |
-|---|---|---|
-| `5080` | `[http]` | 产品 HTTP API、UI 代理目标、健康与指标。 |
-| `5082` | `[grpc]` | 可信内部节点、扫描与私有采集协议。 |
-| `5083` | `[flight_sql]` | 对外需身份验证的 Arrow Flight SQL；默认关闭。 |
-| `4317` | `[otlp_grpc]` | 对外标准 OTLP gRPC；默认开启。 |
-| `5084` | `[profiling]` | 节点本地 pprof 诊断；默认关闭且只绑定回环。 |
-### HTTP 与 TLS
+生产节点至少需要以下配置，文件的其余部分可以保持默认值。
 
 ```toml
 [http]
-bind = "0.0.0.0"
-port = 5080
-gzip = true
-external_url = ""
+external_url = "https://molesignal.example.com"
 
-[http.tls]
-enabled = false
-plain_port = 80
-port = 443
-acme_directory = "production"
-account_email = ""
-key_storage_dir = "/var/lib/molesignal/acme"
-issue_poll_secs = 60
-renewal_retry_secs = 21600
-```
+[meta_database]
+dsn = "postgres://molesignal:<password>@db.internal:5432/molesignal"
 
-如果反向代理改变了主机或协议，请将 `external_url` 设置为公开 Origin。启用 TLS 后会启动 ACME HTTP-01 Listener 与 rustls SNI 端点。
-
-### 内部 gRPC、Flight SQL 与 OTLP
-
-```toml
-[grpc]
-bind = "0.0.0.0"
-port = 5082
-max_message_size_mb = 32
-
-[flight_sql]
-enabled = false
-bind = "0.0.0.0"
-port = 5083
-default_lookback_hours = 24
-max_message_size_mb = 32
-
-[otlp_grpc]
-enabled = true
-bind = "0.0.0.0"
-port = 4317
-max_message_size_mb = 32
-```
-
-不要把 `5082` 暴露到不可信网络。对外 OTLP 与 Flight SQL 要求 Bearer 身份验证；公开暴露前请终止 TLS。
-
-## 元数据与对象存储
-
-内置开发默认值使用 SQLite 与本地文件系统。仓库示例使用 PostgreSQL 保存元数据。
-
-```toml
-[store.meta]
-backend = "postgres"
-dsn = "postgres://molesignal:molesignal@db:5432/molesignal"
-max_connections = 16
-
-[store.object]
+[object_store]
 backend = "s3"
-root = ""
 bucket = "molesignal"
-region = "ap-southeast-1"
-endpoint = ""
-credentials_file = "/etc/molesignal/object-store.toml"
-multipart_threshold_mb = 32
-multipart_part_size_mb = 8
-range_threshold_mb = 16
-range_chunk_mb = 8
-max_concurrency = 8
-op_timeout_secs = 30
-health_probe_interval_secs = 30
+region = "us-east-1"
+endpoint = ""          # AWS S3 留空，兼容 S3 的服务填写服务地址
+access_key = ""        # 建议改用 MS_OBJECT_STORE_ACCESS_KEY
+secret_key = ""        # 建议改用 MS_OBJECT_STORE_SECRET_KEY
 
-[store.object.retry]
-max_attempts = 4
-base_backoff_ms = 100
-max_backoff_ms = 5000
-jitter_ratio = 0.2
-```
-
-对象存储后端包括 `local`、`s3`、`azure` 与 `gcs`。凭据优先级是环境变量、凭据文件、TOML 内联。多节点部署请使用共享对象存储与 PostgreSQL。
-
-## 采集、WAL、查询与保留
-
-```toml
 [wal]
-dir = "./data/wal"
-segment_size_mb = 256
-flush_strategy = "batch"
-sync_level = "data"
-batch_max_pending = 64
-batch_max_delay_ms = 50
+dir = "/var/lib/molesignal/wal"
 
-[intake]
-buffer_max_mb = 256
-flush_interval_secs = 30
-flush_parallelism = 4
-
-[querier]
-concurrency = 0
-max_scan_rows = 100000000
-auto_async_threshold_rows = 50000000
-estimate_throughput_per_sec = 1000
-
-[compactor]
-interval_secs = 300
-target_mb = 512
-max_concurrent_groups = 4
-retention_days = 30
-downsample_after_days = 0
-downsample_interval_secs = 3600
+[auth]
+root_email = "admin@example.com"
+root_password = "<初始密码>"
 ```
 
-`concurrency = 0` 使用可用 CPU。查询估算超过 `auto_async_threshold_rows` 时会转为异步搜索任务；将阈值设为 `0` 可关闭自动转换。数据流保留策略会覆盖 Compactor 默认值。
+同时在环境中设置 `MS_CIPHER_KEY`。上线前的完整步骤参见[生产检查清单](/zh-Hans/production-checklist)。
 
-## 集群与限流
+## 节点
 
-```toml
-[cluster]
-advertise_addr = "127.0.0.1:5082"
-heartbeat_interval_secs = 5
-peer_timeout_secs = 15
+`[node]` 选择进程运行的角色，参见[分角色部署](/zh-Hans/distributed-deployment)。
 
-[router.rate_limit]
-intake_qps = 1000
-query_qps = 100
-burst_multiplier = 2
-```
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `roles` | `["standalone"]` | 要运行的角色：`standalone`、`router`、`intake`、`querier`、`compactor`、`alert`。`standalone` 在一个进程内运行全部角色。 |
+| `id` | 空 | 节点 id，最长 64 个字符。留空时使用操作系统的主机名。同一台主机运行多个进程时，必须为每个进程设置不同的 id。 |
+| `drain_timeout_secs` | `30` | 收到 `SIGTERM` 或 `SIGINT` 后，等待 intake 待处理数据刷写完成的时间。超时后进程退出。 |
 
-将 `advertise_addr` 设为所有对等节点都能访问的地址。速率设为 `0` 会关闭对应限制。远程集群定义与组织映射保存在数据库中，不属于该配置块。
+## 监听端口
+
+### HTTP
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `bind` | `0.0.0.0` | 监听地址。 |
+| `port` | `5080` | `[http.tls]` 未启用时的 HTTP 端口。 |
+| `gzip` | `true` | 压缩 HTTP 响应。反向代理已经压缩时设为 `false`。 |
+| `external_url` | 空 | 对外访问的源地址，例如 `https://molesignal.example.com`。留空时网页界面使用浏览器当前的源地址。生成的接入片段使用该值，状态页自定义域名也把它作为 CNAME 目标。修改后需要重启。 |
+
+### HTTP TLS 与 ACME
+
+`[http.tls]` 启动 TLS 监听器，并通过 Let's Encrypt 等 ACME 服务自动签发证书。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 总开关。为 `false` 时，其余键全部被忽略。 |
+| `plain_port` | `80` | 用于 ACME HTTP-01 验证和跳转到 HTTPS 的明文 HTTP 端口。 |
+| `port` | `443` | HTTPS 端口。 |
+| `acme_directory` | `production` | `production`、`staging`（Let's Encrypt 测试环境）或自定义目录 URL。 |
+| `account_email` | 空 | ACME 账号邮箱。Let's Encrypt 要求提供。 |
+| `key_storage_dir` | `/var/lib/molesignal/acme` | 保存 ACME 账号密钥和各域名密钥的目录。 |
+| `issue_poll_secs` | `60` | 扫描等待签发证书的域名的间隔。 |
+| `renewal_retry_secs` | `21600` | 续期重试与到期扫描的间隔。 |
+
+### 内部 gRPC
+
+`[grpc]` 承载节点之间的流量，请把该端口放在可信网络内。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `bind` | `0.0.0.0` | 监听地址。 |
+| `port` | `5082` | 端口。对端通过 `[cluster].advertise_addr` 使用它。 |
+| `max_message_size_mb` | `32` | gRPC 单条消息的最大大小，单位 MiB。 |
+
+### OTLP gRPC
+
+`[otlp_grpc]` 配置 OTLP gRPC 接收端。接收端没有启用开关，在每个运行 `intake` 角色的节点（包括 `standalone`）上监听。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `bind` | `0.0.0.0` | 监听地址。 |
+| `port` | `4317` | 端口。 |
+| `max_message_size_mb` | `32` | gRPC 单条消息的最大大小，单位 MiB。 |
+
+### Arrow Flight SQL
+
+`[flight_sql]` 为 DBeaver、JDBC、ADBC 等 SQL 客户端提供服务。每次调用都需要 API Token，参见[用数据库客户端连接](/zh-Hans/query/database-clients)。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 启动监听器。 |
+| `bind` | `0.0.0.0` | 监听地址。 |
+| `port` | `5083` | 端口。 |
+| `default_lookback_hours` | `24` | SQL 没有时间过滤条件时默认回看的小时数。 |
+| `max_message_size_mb` | `32` | 单条消息的最大大小，单位 MiB。 |
+
+### Probe Agent
+
+`[probe]` 配置 Probe Agent 的注册与控制端点，这些端点在 `standalone` 与 `alert` 节点上启动。注册使用服务端认证的 TLS，控制流使用短期有效的双向 TLS 身份。参见[拨测](/zh-Hans/synthetics)。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `bind` | `0.0.0.0` | 监听地址。 |
+| `register_port` | `5084` | 注册端口，必须与 `control_port` 不同。 |
+| `control_port` | `5085` | 控制流端口。 |
+| `register_endpoint` | `https://localhost:5084` | Agent 注册时使用的对外 `https://` 地址，一次性注册命令会打印它。位于代理或负载均衡器之后时需要设置。 |
+| `control_endpoint` | `https://localhost:5085` | 控制流的对外 `https://` 地址。 |
+| `server_names` | `["localhost", "127.0.0.1"]` | 服务端证书中包含的 DNS 名称与 IP 地址，应包含端点的对外主机名。 |
+| `certificate_days` | `30` | 签发证书的有效期，范围 1 到 365。 |
+| `max_message_size_mb` | `32` | 单条消息的最大大小，单位 MiB。 |
+
+### pprof
+
+`[profiling]` 启动用于诊断的节点本地 pprof 监听器。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 启动监听器。 |
+| `bind` | `127.0.0.1` | 监听地址。除非 `allow_remote` 为 `true`，否则必须是回环地址。 |
+| `port` | `5084` | 端口。同一台主机上 Probe Agent 注册端口使用相同值时，需要修改其中一个。 |
+| `allow_remote` | `false` | 允许非回环的 `bind`。对外暴露可能泄露运行时信息。 |
+
+## 存储
+
+### 元数据库
+
+`[meta_database]` 配置保存元数据、身份、文件目录与产品资源的 PostgreSQL 数据库。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `dsn` | `postgres://molesignal:molesignal@localhost:5432/molesignal` | PostgreSQL 连接串。请替换示例中的凭据。 |
+| `min_connections` | `2` | 启动时建立的连接数，不超过 `max_connections`。 |
+| `max_connections` | `16` | 连接池上限。 |
+
+MoleSignal 启动时会把内嵌的 schema 迁移应用到该数据库，参见[升级](/zh-Hans/upgrade)。
+
+### 对象存储
+
+`[object_store]` 配置存放 Parquet 文件、检索索引与 Profile 数据块的存储。后端有 `local`、`s3`、`azure`、`gcs`。AWS S3 以及 RustFS、Cloudflare R2、阿里云 OSS 等兼容 S3 的服务使用 `s3`。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `backend` | `local` | `local`、`s3`、`azure` 或 `gcs`。 |
+| `root` | `./data/objects` | `local` 后端的目录，其他后端忽略。 |
+| `bucket` | 空 | `s3` 与 `gcs` 的 bucket 名称，`azure` 的容器名称。这些后端必填。 |
+| `region` | 空 | S3 region。兼容 S3 的服务按其要求填写。 |
+| `endpoint` | 空 | S3 端点 URL。AWS S3 留空。RustFS 等服务使用 `http://host:9000` 形式的地址。 |
+| `path_style` | `false` | `false` 使用虚拟主机寻址，AWS S3 与华为云 OBS 需要。`true` 使用路径寻址，RustFS 与大多数自建服务需要。 |
+| `access_key` | 空 | S3 的 access key，或 Azure 的存储访问密钥。 |
+| `secret_key` | 空 | S3 的 secret key。 |
+| `credentials_file` | 空 | 凭据文件的路径，文件包含 `access_key=<值>` 与 `secret_key=<值>` 两行。优先级见下文。 |
+| `multipart_threshold_mb` | `32` | 大小达到该值（MiB）的对象分片上传。manifest 对象与带版本条件的写入始终用单个请求上传。最小值为 1。 |
+| `multipart_part_size_mb` | `8` | 分片上传中单个分片的大小（MiB），取值 5 到 1024。很大的对象使用更大的分片，使一次上传不超过 10000 个分片。 |
+| `range_threshold_mb` | `16` | 字节范围读取的大小达到该值（MiB）时，拆成并行执行的块请求。最小值为 1。 |
+| `range_chunk_mb` | `8` | 单个块请求的大小（MiB），取值 1 到 1024。 |
+| `max_concurrency` | `8` | 每个进程允许同时进行的对象存储操作数。 |
+| `op_timeout_secs` | `30` | 等待并发许可以及单次后端操作的超时时间。 |
+| `health_probe_interval_secs` | `30` | 后台写入、读取、删除探测的间隔，最小为 5。 |
+
+S3 与 Azure 客户端从下列来源中第一个同时提供 access key 与 secret key 的来源读取凭据：
+
+1. 变量 `MS_OBJECT_STORE_ACCESS_KEY` 与 `MS_OBJECT_STORE_SECRET_KEY`。
+2. `credentials_file` 指向的文件。
+3. 配置键 `access_key` 与 `secret_key`。
+
+启动日志会把胜出的来源报告为 `object_store_credentials_source`：`env`、`file`、`inline` 或 `none`。secret 建议用环境变量或凭据文件提供，不要写进 `config.toml`。
+
+分片上传的每个分片与分段读取的每个块，都是占用一个并发槽位的对象存储操作：各自独立重试，并计入 `object_store_*` 指标。一次传输最多占用一半的并发槽位，因此大对象不会饿死其他操作。
+
+云后端的暂态错误会按指数退避重试：
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `[object_store.retry].max_attempts` | `4` | 单次操作的总尝试次数。 |
+| `[object_store.retry].base_backoff_ms` | `100` | 首次等待时间。 |
+| `[object_store.retry].max_backoff_ms` | `5000` | 等待时间上限。 |
+| `[object_store.retry].jitter_ratio` | `0.2` | 施加在每次等待上的随机抖动比例，范围 0 到 1。 |
+
+### 预写日志
+
+`[wal]` 配置运行 `intake` 角色的节点的预写日志。请把目录放在持久化的本地卷上，参见[备份与恢复](/zh-Hans/backup-restore)。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `dir` | `./data/wal` | WAL 目录。 |
+| `segment_size_mb` | `256` | 分段大小，单位 MB。写满后切换到新分段。 |
+| `flush_strategy` | `batch` | 何时执行 `fsync`。`none` 从不同步，只依赖页缓存。`every_write` 每条记录都同步，持久性最强、延迟最高。`batch` 在积累 `batch_max_pending` 条记录或经过 `batch_max_delay_ms` 后同步。 |
+| `sync_level` | `data` | 每次同步的深度。`none` 跳过同步。`data` 同步文件数据。`all` 同时同步元数据与父目录。 |
+| `batch_max_pending` | `64` | `batch` 模式下触发同步的记录数。 |
+| `batch_max_delay_ms` | `50` | `batch` 模式下两次同步之间的最长间隔。 |
+| `encrypt` | `false` | 写入磁盘前，用根密钥（`MS_CIPHER_KEY`）加密每条记录的内容。示例文件中没有该键。 |
+| `max_replay_mb` | `512` | 启动重放的内存上限。超出后重放会先刷写一次。 |
+
+### 接入缓冲
+
+`[intake]` 控制 intake 节点的内存缓冲。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `buffer_max_mb` | `256` | 单个数据流原始缓冲的硬上限，自适应阈值不会超过它。 |
+| `max_buffer_memory_mb` | `1024` | 进程内活跃缓冲与已分离缓冲占用的内存总上限。 |
+| `flush_interval_secs` | `30` | 两次刷写之间的最长间隔。 |
+| `flush_parallelism` | `4` | 并发刷写数。 |
+
+`[intake.rotation]` 自适应地调整 Parquet 文件大小：
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `adaptive_enabled` | `true` | 根据已完成文件的编码后与原始大小之比，调整每个数据流下一次的原始阈值。 |
+| `target_file_size_mb` | `128` | 编码后 Parquet 文件的目标大小。 |
+| `min_buffer_mb` | `16` | 自适应阈值的下限。 |
+| `ewma_alpha` | `0.2` | 该比率的平滑系数，大于 0 且不超过 1。 |
+
+`[intake.prometheus]` 限制 Prometheus `remote_write` 的输入：
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `max_labels_per_series` | `64` | 每个 series 的标签数，不含 `__name__`。 |
+| `max_label_name_bytes` | `128` | 标签名的最大 UTF-8 字节数。 |
+| `max_label_value_bytes` | `2048` | 标签值的最大 UTF-8 字节数。 |
+| `max_samples_per_batch` | `16384` | 一个内部批次承载的 sample 数。 |
+
+`[intake.prometheus.cardinality]` 在一致性哈希路由到的 intake 节点上做 series 准入：
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 应用这些限制。 |
+| `max_active_series_per_process` | `1000000` | 每个进程的活跃 series 数，不得小于组织级上限。 |
+| `max_active_series_per_org` | `200000` | 每个组织的活跃 series 数，不得小于指标级上限。 |
+| `max_active_series_per_metric` | `100000` | 一个组织内单个指标的活跃 series 数。 |
+| `max_new_series_per_minute` | `20000` | 进程每分钟接纳的新 series 数。 |
+| `idle_ttl_secs` | `900` | 空闲超过该时长的 series 会释放其占用的容量。 |
+
+### 合并与保留
+
+`[compactor]` 负责合并文件并执行保留策略，在 `standalone` 与 `compactor` 节点上运行。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `interval_secs` | `300` | 两轮合并之间的间隔。 |
+| `target_mb` | `512` | 合并后 Parquet 的目标大小，单位 MiB。 |
+| `max_concurrent_groups` | `4` | 每个节点在一轮内同时处理的数据流数。 |
+| `retention_days` | `30` | 未单独设置保留期的数据流使用的保留天数。数据流自己的保留期优先。 |
+| `downsample_after_days` | `0` | 把早于该天数的指标降采样为时间桶。`0` 表示关闭。 |
+| `downsample_interval_secs` | `3600` | 降采样时间桶的宽度。 |
+
+### 目录维护
+
+`[storage.*]` 各配置段控制文件目录与对象存储的后台维护。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `[storage.catalog].seal_after_hours` | `168` | 分区结束超过该小时数后写入不可变的清单。`0` 表示不封存。 |
+| `[storage.catalog].manifest_cache_bytes` | `268435456` | 清单缓存的内存大小。 |
+| `[storage.catalog].interval_secs` | `300` | 封存任务的间隔。 |
+| `[storage.catalog].batch_size` | `64` | 每轮处理的分区数。 |
+| `[storage.index].enabled` | `true` | 构建并重建检索索引。 |
+| `[storage.index].interval_secs` | `30` | 任务间隔。 |
+| `[storage.index].batch_size` | `64` | 每轮处理的文件数。 |
+| `[storage.index].max_concurrency` | `2` | 并发构建索引的数量。 |
+| `[storage.index].retry_after_secs` | `300` | 构建失败后重试前的等待时间。 |
+| `[storage.gc].enabled` | `true` | 删除目录不再引用的对象。 |
+| `[storage.gc].interval_secs` | `30` | 任务间隔。 |
+| `[storage.gc].grace_period_secs` | `3600` | 每个对象都先在删除队列中等待该时长。最终删除前会再次检查目录引用与校验和。 |
+| `[storage.gc].lease_secs` | `900` | 已领取的删除批次的租约时长。 |
+| `[storage.gc].batch_size` | `128` | 每轮处理的对象数。 |
+| `[storage.gc].max_concurrency` | `4` | 并发删除数。 |
+| `[storage.reconciler].enabled` | `true` | 对比目录与对象存储。 |
+| `[storage.reconciler].interval_secs` | `300` | 任务间隔。 |
+| `[storage.reconciler].batch_size` | `256` | 每轮处理的对象数。 |
+| `[storage.reconciler].orphan_grace_secs` | `86400` | 未被引用的对象存在超过该时长后才算孤儿对象。 |
+| `[storage.reconciler].verify_checksums` | `true` | 对账时校验对象的校验和。 |
+
+## 查询
+
+### 限制与异步任务
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `[querier].concurrency` | `0` | 查询引擎的并行度。`0` 表示使用 CPU 数。 |
+| `[querier].max_scan_rows` | `100000000` | 单个查询最多可读取的行数：查询需要读取的文件所含行数，加上内存缓冲中的行数。更大的查询在读取数据之前就会被拒绝并返回 `400`。PromQL 对每个选择器应用该限制。`0` 表示不限制。 |
+| `[querier].auto_async_threshold_rows` | `50000000` | 估算行数超过该值的查询会转为异步搜索任务。`0` 表示关闭自动转换。 |
+| `[querier].estimate_throughput_per_sec` | `1000` | 规模估算使用的保守每秒行数。 |
+| `[search].max_result_rows` | `0` | 对没有 `LIMIT` 且不是聚合的查询注入的行数上限。`0` 表示不限制。示例文件中没有该键。 |
+| `[search_jobs].workers` | `2` | 单个节点同时运行的搜索任务数。 |
+| `[search_jobs].idle_poll_secs` | `2` | 兜底轮询的初始间隔，空闲时会退避。 |
+| `[search_jobs].cleanup_interval_secs` | `3600` | 清理过期任务的间隔。 |
+
+### 准入控制
+
+`[search.admission]` 按工作组限制并发查询数。所有值默认为 `0` 或空，表示不限制。示例文件中没有该配置段。
+
+| 键 | 说明 |
+|---|---|
+| `default_max_concurrent` | 未在 `groups` 中配置的工作组的节点并发上限。 |
+| `groups` | 工作组名称到节点并发上限的映射表。 |
+| `role_map` | 角色（`owner`、`admin`、`editor`、`viewer`）到工作组的映射表。未映射的角色使用 `default`。 |
+| `cluster_default_max_concurrent` | 未在 `cluster_groups` 中配置的工作组的集群级软上限。 |
+| `cluster_groups` | 工作组名称到集群级软上限的映射表。 |
+| `cluster_sync_interval_secs` | 发布节点负载的间隔。`0` 表示使用 5。 |
+| `cluster_stale_secs` | 超过该时长没有更新的节点会退出集群视图。`0` 表示使用 30。 |
+
+### 缓存
+
+每一层都是带存活时间的 LRU 缓存，容量为 `0` 即关闭该层。命中率通过 `/metrics` 的 `cache_<layer>_hit_ratio` 暴露。
+
+| 配置段 | 默认容量 | 默认存活时间 | 缓存内容 |
+|---|---|---|---|
+| `[cache.index_handle]` | `10000` | `600` 秒 | 已打开的检索索引句柄。 |
+| `[cache.query_result]` | `1000` | `60` 秒 | 对已关闭时间窗的 SQL 查询结果。 |
+| `[cache.tantivy_result]` | `1000000` | `600` 秒 | 用于裁剪文件的词项计数。 |
+| `[cache.tantivy_footer]` | `100000` | `3600` 秒 | 索引 footer，省去范围读取。 |
+
+每个配置段都接受 `capacity` 与 `ttl_secs`。
+
+`[cache.object]` 把远程对象的字节范围缓存在本地磁盘。`local` 对象后端会绕过它。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 启用缓存。`max_bytes` 为 `0` 时同样关闭。 |
+| `root` | `./data/cache/objects` | 缓存目录。 |
+| `max_bytes` | `10737418240` | 缓存大小上限，10 GiB。 |
+| `block_size_bytes` | `4194304` | 块大小，范围 1 MiB 到 16 MiB。 |
+| `min_free_bytes` | `1073741824` | 需要保留的磁盘剩余空间，1 GiB。 |
+| `max_concurrent_fetches` | `16` | 并发获取块的数量，必须大于 0。 |
+| `max_concurrent_fetches_per_object` | `4` | 单个对象的并发获取数量，必须大于 0。 |
+
+### 范围查询增量缓存
+
+`[search.stream_agg_cache]` 缓存 `rate(metric[5m])` 这类范围 PromQL 查询中已封存的时间窗，仪表盘刷新时只需重新计算最新的窗口。默认关闭。
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `capacity` | `0` | 缓存的查询指纹数量。`0` 表示关闭缓存。 |
+| `ttl_secs` | `300` | 条目存活时间，用来兜底超出 `safe_lookback_secs` 的迟到数据。 |
+| `safe_lookback_secs` | `300` | 只缓存右端早于当前时间减去该值的窗口。 |
+| `max_series_per_query` | `10000` | 每个指纹缓存的 series 数。`0` 表示不限制。 |
+
+## 集群与速率限制
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `[cluster].advertise_addr` | `127.0.0.1:5082` | 对端用来连接内部 gRPC 端口的地址，写入 `cluster_nodes` 表。请设置为所有对端都能访问的地址。 |
+| `[cluster].heartbeat_interval_secs` | `5` | 心跳间隔。 |
+| `[cluster].peer_timeout_secs` | `15` | 对端超过该时长没有心跳即视为离线。新加入的 compactor 节点也要等待该时长后才开始承担工作。 |
+| `[router.rate_limit].intake_qps` | `1000` | `router` 角色上每个组织每秒的接入请求数。`0` 表示不限制。 |
+| `[router.rate_limit].query_qps` | `100` | `router` 角色上每个组织每秒的查询请求数。`0` 表示不限制。 |
+| `[router.rate_limit].burst_multiplier` | `2` | 令牌桶容量相对速率的倍数。 |
+
+速率限制只作用于 `router` 角色，每个 router 副本各自计数，参见[分角色部署](/zh-Hans/distributed-deployment#速率限制)。
 
 ## 告警与邮件
 
-```toml
-[alert_manager]
-eval_interval_secs = 30
-dispatch_interval_secs = 10
-eval_timeout_secs = 10
-default_ack_timeout_secs = 300
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `[alert].eval_interval_secs` | `30` | 规则评估间隔。 |
+| `[alert].dispatch_interval_secs` | `10` | 升级派发器的间隔。 |
+| `[alert].eval_timeout_secs` | `10` | 单条规则评估的超时时间。超时会计入 `alert_rule_eval_timeout_total`，不会阻塞下一轮。 |
+| `[alert].default_ack_timeout_secs` | `300` | 省略 `ack_timeout_secs` 的升级步骤所取的值。该值随步骤一起保存，之后修改它不会改变已保存的步骤。 |
 
-[notify.smtp]
-host = ""
-port = 587
-username = ""
-password = ""
-from = "molesignal@example.com"
-tls = "starttls"
-timeout_secs = 10
-```
+`[notify.smtp]` 配置平台邮件，例如注册审批。邮件类型的通知渠道使用各自保存在加密连接器中的凭据。`host` 为空时 SMTP 保持关闭。
 
-`host` 非空时启用 SMTP。Slack、Webhook 渠道、通知模板、值班计划与升级策略是组织资源，通过 UI 或 API 管理。
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `host` | 空 | SMTP 服务器。非空即启用 SMTP。 |
+| `port` | `587` | 端口。内置值 `0` 会回退为 `587`。 |
+| `username` | 空 | 登录用户名。留空表示不认证。 |
+| `password` | 空 | 登录密码，仅在设置了 `username` 时使用。 |
+| `from` | `molesignal@example.com` | 发件人地址。启用 SMTP 时必填，内置值为空。 |
+| `tls` | `starttls` | `none`、`starttls` 或 `tls`。 |
+| `timeout_secs` | `10` | 连接与发送的超时时间。内置值 `0` 按 1 秒处理。 |
 
-## 身份验证
+## 认证
 
-```toml
-[auth]
-token_ttl_secs = 86400
-issuer = "molesignal"
-root_email = ""
-root_password = ""
-```
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `token_ttl_secs` | `86400` | 登录 Token（JWT）与 API Token 的默认有效期，24 小时。 |
+| `root_email` | `admin@example.com` | root 账号的邮箱。内置值为空。 |
+| `root_password` | `admin` | root 账号的密码。内置值为空。请替换示例值。 |
 
-JWT 签名密钥持久化在 PostgreSQL。旧 `[auth].jwt_secret` 设置会被忽略，应当删除。
+数据库中没有任何用户且两个值都已设置时，MoleSignal 会在首次启动时创建 root 账号。之后再修改 `root_password` 不会改变已有账号的密码，请在网页界面中修改。每次启动时，邮箱为 `root_email` 的账号会成为平台管理员，因此 `root_email` 必须属于一个已存在的用户。
 
-## 自身可观测性与性能剖析
+JWT 签名密钥在首次启动时生成并保存在 PostgreSQL 中。旧版本的 `[auth].jwt_secret` 会被忽略。用 `MS_AUTH_JWT_SECRET_OVERRIDE` 固定密钥，用 `POST /api/v1/auth/jwt/rotate` 轮换密钥。
 
-进程日志使用 `[telemetry]`。尾采样、受保护的 `_sys` 采集、外部链路导出和 pprof Listener 使用以下嵌套分区：
+## 自身可观测性
 
-```toml
-[telemetry]
-log_level = "info"
-log_format = "text"
-log_output = "console"
+进程日志与自采集遥测使用 `[telemetry]`，参见[自身可观测性](/zh-Hans/self-observability)。
 
-[telemetry.self_collect]
-enabled = false
-retention_days = 7
-metrics_retention_days = 7
-traces_retention_days = 7
-profiles_retention_days = 7
-metrics_enabled = true
-metrics_interval_secs = 15
-queue_capacity = 8192
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `[telemetry].log_level` | `info,tantivy=warn` | `EnvFilter` 语法的日志过滤规则。内置值为 `info`。设置 `RUST_LOG` 时以它为准。 |
+| `[telemetry].log_format` | `text` | `text` 或 `json`。 |
+| `[telemetry].log_output` | `console` | `console` 或 `file`。 |
+| `[telemetry].log_directory` | `logs` | `log_output` 为 `file` 时的日志文件目录。 |
+| `[telemetry].log_rotation` | `daily` | `minutely`、`hourly`、`daily` 或 `never`。 |
+| `[telemetry].log_max_files` | `7` | 保留的轮转文件数。 |
 
-[telemetry.trace]
-enabled = true
-force_disabled = false
-filter = "info"
-deployment_environment = "production"
-normal_sample_ratio = 0.10
-development_sample_ratio = 1.0
-decision_window_secs = 30
+最后三个键在示例文件中被注释掉，表中给出的是 `log_output` 为 `file` 时的取值。
 
-[telemetry.trace.external]
-endpoint = ""
-protocol = "grpc"
-timeout_ms = 5000
-queue_capacity = 8192
-batch_size = 256
-gzip = false
-allow_self_export = false
+### 自采集遥测
 
-[profiling]
-enabled = false
-bind = "127.0.0.1"
-port = 5084
-allow_remote = false
-```
+`[telemetry.self_collect]` 把进程自身的指标、链路与 Profile 写入保留的 `_molesignal` 数据流。
 
-完整尾采样上限、慢操作阈值、各信号保留、导出器 TLS 与 Profile 计划见 `conf/config.toml`。修改前请阅读[自身可观测性](/zh-Hans/self-observability)。
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 总开关。内置值为 `false`。链路还要求 `[telemetry.trace].enabled` 有效。 |
+| `retention_days` | `7` | 通用保留天数，范围 1 到 3650。 |
+| `metrics_retention_days` | `7` | 指标的保留天数，范围 1 到 3650。 |
+| `traces_retention_days` | `7` | 链路的保留天数，范围 1 到 3650。 |
+| `profiles_retention_days` | `7` | Profile 的保留天数，范围 1 到 3650。 |
+| `metrics_enabled` | `true` | 采集进程指标。 |
+| `metrics_interval_secs` | `15` | 指标采集间隔。 |
+| `queue_capacity` | `8192` | 每类信号的有界内存队列容量。 |
+| `batch_max_events` | `256` | 单批最多事件数。 |
+| `batch_max_delay_ms` | `1000` | 等待凑满一批的最长时间。 |
+| `flush_timeout_secs` | `5` | 退出时冲刷队列的时间。 |
+| `profiles_enabled` | `false` | 采集进程 Profile。 |
+| `profile_kinds` | `["cpu"]` | `cpu`、`heap`，或两者都选。 |
+| `profile_interval_secs` | `600` | Profile 采集间隔。 |
+| `profile_duration_secs` | `10` | 单次 CPU Profile 的采集时长，范围 1 到 120。 |
 
-## 搜索任务、缓存与冷元数据
+### 链路捕获与尾部采样
 
-以下分区用于调整查询准入与运行存储：
+`[telemetry.trace]` 控制服务记录的自身 Span，以及决定保留哪些链路的尾部采样器。
 
-- `[search.admission]` 按工作组设置节点与集群并发。
-- `[search] max_result_rows` 限制无界且非聚合的结果。
-- `[search.stream_agg_cache]` 缓存已关闭的 PromQL 窗口；`capacity = 0` 表示关闭。
-- `[search_jobs]` 控制 Worker 数量、空闲轮询与清理。
-- `[cache.*]` 设置 FileMeta、Parquet 元数据、查询结果、Tantivy、Footer 与冷 Dump 缓存。
-- `[cache.disk_cache] max_size_gb = 0` 关闭本地 Parquet 缓存。
-- `[storage.file_meta_dump]` 将旧 FileMeta 分区迁移到对象存储。
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 捕获与尾部采样的默认开关。`force_disabled` 为 `false` 时，运行时策略仍可调整。 |
+| `force_disabled` | `false` | 部署级的最高优先级开关，`/api/v1/system/telemetry` 的运行时策略无法覆盖它。 |
+| `filter` | `info` | 仅作用于 Span 捕获与导出的 `EnvFilter`，与 `RUST_LOG` 和 `log_level` 相互独立。 |
+| `deployment_environment` | `production` | 环境标识。`development`、`dev`、`test` 使用 `development_sample_ratio`，其余使用 `normal_sample_ratio`。 |
+| `normal_sample_ratio` | `0.10` | 非开发环境下正常链路的基础采样比例，范围 0.0 到 1.0。 |
+| `development_sample_ratio` | `1.0` | 开发环境下的基础采样比例，范围 0.0 到 1.0。 |
+| `decision_window_secs` | `30` | 采样器聚合一条链路后作出决定的窗口，范围 5 到 120。 |
+| `root_grace_millis` | `1000` | Root Span 结束后继续等待迟到子 Span 的时间。 |
+| `decision_cache_secs` | `300` | 采样决定的缓存时间，不得小于 `decision_window_secs`。 |
+| `tail_max_traces` | `10000` | 采样器允许同时保留的未决链路数。 |
+| `tail_memory_bytes` | `268435456` | 未决链路的内存上限。 |
+| `max_spans_per_trace` | `1000` | 每条链路最多保留的 Span 数。 |
+| `max_attributes_per_span` | `128` | 每个 Span 最多保留的属性数。 |
+| `max_events_per_span` | `128` | 每个 Span 最多保留的事件数。 |
+| `max_links_per_span` | `128` | 每个 Span 最多保留的链接数。 |
+| `max_string_bytes` | `4096` | 单个属性、事件或链接字符串的最大 UTF-8 字节数。 |
+| `shutdown_timeout_secs` | `10` | 退出时停止采集流水线的等待时间。 |
 
-完整缓存 Key 与默认值请以仓库配置示例为准。
+`[telemetry.trace.slow_thresholds]` 以毫秒为单位判定慢 Span：`http_ms = 1000`、`query_ms = 5000`、`batch_intake_ms = 2000`、`database_ms = 200`、`object_store_ms = 500`、`external_ms = 1000`、`background_ms = 30000`。
 
-## 函数、报告与 Agent
+`[telemetry.trace.external]` 把链路导出到外部 OTLP 接收端。`endpoint` 为空时保持关闭。
 
-```toml
-[functions]
-llm_eval_enabled = false
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `endpoint` | 空 | OTLP 接收端地址。 |
+| `protocol` | `grpc` | `grpc` 或 `http/protobuf`，不会根据 URL 推断。 |
+| `timeout_ms` | `5000` | 连接与导出的超时时间。 |
+| `queue_capacity` | `8192` | 导出队列容量。 |
+| `batch_size` | `256` | 每批的链路数。 |
+| `gzip` | `false` | 压缩载荷。 |
+| `allow_self_export` | `false` | 允许导出到当前 MoleSignal 集群。默认禁止，以防形成回路。 |
+| `headers` | 无 | OTLP 请求头。敏感值用 `env:NAME` 或 `secret:NAME` 引用，不要直接写入。 |
+| `custom_ca_file` | 无 | HTTPS 服务端证书使用的 CA 文件。 |
+| `client_certificate_file` | 无 | mTLS 客户端证书，必须与 `client_key_file` 同时设置。 |
+| `client_key_file` | 无 | mTLS 客户端私钥，必须与 `client_certificate_file` 同时设置。 |
 
-[scheduled_reports.renderer]
-enabled = false
-base_url = "http://127.0.0.1:5173"
-concurrent_renders = 2
-render_timeout_secs = 30
-viewport_width = 1280
-viewport_height = 800
+### APM
 
-[agent]
-enabled = false
-default_provider = "openai"
-```
+`[apm]` 控制应用性能监控的聚合投影，在持有链路候选的节点或运行告警汇总的节点上启动。参见[应用性能监控](/zh-Hans/apm)。
 
-VRL 始终可用。JavaScript 需要带 `js-runtime` 构建，并且没有独立运行配置开关。`llm_eval_enabled` 允许数据管道按事件调用模型，可能增加采集延迟与成本。
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `queue_capacity` | `65536` | 输入队列容量，范围 1024 到 1048576。 |
+| `flush_interval_ms` | `5000` | 聚合数据的刷新间隔，范围 100 到 60000。 |
+| `flush_max_snapshots` | `10000` | 单次刷新最多写出的快照数，范围 1 到 100000。 |
+| `shutdown_drain_secs` | `10` | 退出时排空队列的时间，范围 1 到 300。 |
+| `late_grace_secs` | `300` | 仍接受迟到链路数据的时间，必须大于 0 且短于热数据保留时间。 |
+| `hot_retention_hours` | `24` | 高分辨率数据的保留时间，范围 1 到 168。 |
+| `rollup_retention_days` | `30` | 汇总数据的保留天数，范围 1 到 3650。 |
+| `max_query_range_days` | `30` | 单次 APM 查询的最大时间范围，不得超过 `rollup_retention_days`。 |
+| `max_exemplars_per_bucket` | `3` | 每个聚合桶保留的 exemplar 数，范围 1 到 16。 |
+| `max_error_samples_per_group` | `8` | 每个错误分组保留的样本数，范围 1 到 64。 |
+| `[apm.histogram].schema_version` | `1` | 延迟分桶定义的版本号。修改 `boundaries_ms` 时同步递增。 |
+| `[apm.histogram].boundaries_ms` | `[1, 2, 4, …, 60000]` | 延迟分桶的有限上界，单位毫秒，需严格递增，数量为 2 到 64 个。系统自动追加 `+Inf`。 |
+| `[apm.version_comparison].min_requests_per_version` | `1000` | 一个版本进入版本对比所需的最少请求数。 |
 
-PDF 与 PNG 报告需要启用渲染器，并配置可访问的 Web `base_url`。
+`[apm.cardinality]` 限制每小时记录的不同取值数量，每项范围 1 到 100000：`services_per_org_hour = 200`、`transactions_per_service_hour = 32`、`dependencies_per_service_hour = 16`、`error_groups_per_service_hour = 16`、`versions_per_service_hour = 16`、`instances_per_service_hour = 256`。
 
-`[agent].enabled` 是本地开发解锁。模型供应商、提示词、工具、MCP 服务器与审批策略保存在 PostgreSQL 中，并在产品内管理。
+## 功能与集成
 
-## 数据库管理的设置
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `[functions].llm_eval_enabled` | `false` | 允许 `llm` 流水线步骤。每个命中的事件都会触发一次模型调用，成本与延迟随接入量增长，只在低吞吐的数据流上使用。 |
+| `[mmdb].license_key` | 空 | 用于运行期刷新的 MaxMind GeoLite2 license key。为空时继续使用随包内置的数据库。 |
+| `[mmdb].db_path` | `/usr/share/molesignal/mmdb/GeoLite2-City.mmdb` | GeoIP 数据库。指向可写路径才能启用刷新。 |
+| `[mmdb].refresh_interval_secs` | `604800` | 刷新间隔，7 天。 |
 
-不要重新添加已经移除的 SSO 或产品策略 TOML 分区。OIDC/SAML 供应商、注册与共享策略、远程集群、域名、加密密钥、模型定价、Agent 设置、通知渠道，以及多数组织配置都保存在 PostgreSQL 中，并通过 UI 或 API 修改。
+发布版二进制内置 JavaScript 函数运行时与 VRL，两者都不需要配置项。参见[函数](/zh-Hans/functions)。
+
+PDF 或 PNG 形式的定时报告使用无头 Chrome 渲染页面：
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `[scheduled_reports.renderer].base_url` | `http://127.0.0.1:5173` | 无头 Chrome 加载报告页面的源地址，必须是绝对的 `http` 或 `https` URL。默认值指向网页界面的开发服务器，请设置为节点能访问到的网页界面地址。 |
+| `[scheduled_reports.renderer].concurrent_renders` | `2` | 并发渲染数。`0` 按 1 处理，大于 4 时收敛为 4。 |
+| `[scheduled_reports.renderer].render_timeout_secs` | `30` | 单次渲染的超时时间。`0` 按 30 处理，大于 60 时收敛为 60。 |
+| `[scheduled_reports.renderer].viewport_width` | `1280` | 视口宽度，单位像素。 |
+| `[scheduled_reports.renderer].viewport_height` | `800` | 视口高度，单位像素。 |
+
+Chrome 不可用时，PDF 与 PNG 导出会返回错误，不会生成占位文件。
+
+## 保存在数据库中的设置
+
+以下设置保存在 PostgreSQL 中，由网页界面或 API 修改，没有对应的 TOML 键：
+
+- SSO 服务商（OIDC、SAML 与 LDAP）。
+- 联邦查询使用的远程集群。
+- 状态页的域名与证书。
+- 通知渠道、排班与升级策略。
+- Mole Agent 的模型服务商、提示词、工具与审批策略。
+- 组织的加密密钥、字段脱敏规则与共享策略。

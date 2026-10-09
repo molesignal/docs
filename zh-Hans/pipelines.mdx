@@ -1,60 +1,66 @@
 ---
-title: "调度流水线"
+title: "流水线"
 sidebarTitle: "流水线"
-description: "按调度读取源数据流，用 VRL 转换链处理，再写入目标数据流或外部 connector。"
+description: "在事件到达时转换并路由事件，或按定时计划处理已经存储的数据。"
 ---
 
-**调度流水线**按时间窗读取源数据流，依次应用一组 VRL 转换，并把结果写入目标数据流（标准
-intake）——还可把同一批事件扇出到外部 **connector**（S3、Kafka）。流水线按简化间隔计划运行，也可对
-历史窗口按需做一次**回填（backfill）**。
+**流水线** 用一组有序的步骤转换事件，并把结果写入目标数据流。步骤可以是 [VRL](/zh-Hans/functions) 转换，也可以是内置的路由步骤。流水线有两种运行模式：
 
-<Note>
-  调度流水线在数据落库**之后**作为周期任务处理。若想在 intake 热路径上即时转换事件，请改为在 intake
-  步骤挂一个[函数](/zh-Hans/functions)。
-</Note>
+| | 实时 | 定时 |
+|---|---|---|
+| 运行时机 | 接入期间，在事件被存储之前。 | 按间隔运行，处理已经存储数据中的一个时间窗口。 |
+| 信号 | 日志。 | 日志、指标与链路。 |
+| 来源与目标 | 一个来源数据流和一个数据流目标。 | 一个来源数据流、一个目标数据流，以及可选的连接器。 |
+| 典型用途 | 在日志到达时做标准化、脱敏并路由到不同数据流。 | 对已存储的数据做扩展、聚合或复制，并回填历史数据。 |
+| 回填与运行历史 | 不支持。 | 支持。 |
 
-<Frame caption="调度流水线">
-  <img src="/images/architecture/pipeline_zh-Hans_light.svg" alt="调度流水线" className="block dark:hidden" />
-  <img src="/images/architecture/pipeline_zh-Hans_dark.svg" alt="调度流水线" className="hidden dark:block" />
+<Frame caption="定时流水线">
+  <img src="/images/architecture/pipeline_zh-Hans_light.svg" alt="定时流水线" className="block dark:hidden" />
+  <img src="/images/architecture/pipeline_zh-Hans_dark.svg" alt="定时流水线" className="hidden dark:block" />
 </Frame>
 
 ## 在图形编排器里搭建
 
-打开 **流水线 → 新建**，在画布上排布 **来源 → 转换 → 目标**。节点可拖动，可在端点之间连线，编排器会随
-时校验图（缺来源/目标、转换缺名称或脚本、流名重复、来源与目标同名等）。第一个来源和第一个数据流目标会
-保存为流水线的 `source_stream` 与 `target_stream`。
+打开 **流水线 → 新建**，在画布上排布 **来源 → 转换 → 目标**。节点可拖动，可在端点之间连线，编排器会随时校验图：缺少来源或目标、转换缺少名称或脚本、数据流名称重复，以及来源同时又是目标。第一个来源和第一个数据流目标会保存为流水线的 `source_stream` 与 `target_stream`。
 
 | 节点 | 含义 |
 |---|---|
-| **来源** | 每次运行读取的数据流。 |
-| **转换** | 一个 VRL 步骤。多个步骤自上而下按序执行。 |
-| **目标** | 目标数据流（标准 intake）或外部 connector。 |
+| **来源** | 流水线读取的数据流。 |
+| **转换** | 一个步骤。多个步骤自上而下按序执行。 |
+| **目标** | 通过标准接入写入的目标数据流，或外部连接器。 |
 
-## 转换
+## 步骤
 
-每个转换是一段 [VRL](/zh-Hans/functions) 脚本。转换检视面板的「复用」下拉里，可选用
-**内置预设**或任意已保存的[函数](/zh-Hans/functions)——选中即把脚本灌入该步骤，之后
-可内联编辑。
+### VRL 转换
+
+每个转换是一段 [VRL](/zh-Hans/functions) 脚本。转换检视面板的“复用”下拉里，可选用 **内置预设** 或任意已保存的[函数](/zh-Hans/functions)。选中后会填入脚本，之后仍可编辑。
 
 内置预设随每个实例提供，且只读：
 
 | 预设 | 作用 |
 |---|---|
-| `normalize-logs` | 解析 JSON `message`，补充环境/集群字段，统一 `level` 小写。 |
-| `route-by-service` | 归一化 `service` 并派生每服务目标流名（`logs_<service>`）。 |
-| `parse-key-value` | 把 `logfmt` / `key=value` 形式的 message 解析为字段后合并回事件。 |
+| `normalize-logs` | 解析 JSON 格式的 `message`，添加环境与集群字段，并把 `level` 转为小写。 |
+| `route-by-service` | 规范 `service`，并派生出按服务划分的数据流名称（`logs_<service>`）作为路由提示。 |
+| `parse-key-value` | 解析 `logfmt` 或 `key=value` 形式的 message，并把字段合并回事件。 |
 | `redact-email` | 把 `message` 中的邮箱地址替换为占位符。 |
-| `add-intake-time` | 附加摄取时间戳，便于排查端到端延迟。 |
+| `add-intake-time` | 添加接入时间戳，便于排查端到端延迟。 |
 
 <Tip>
-  预设与已保存函数共用一个目录，二者都出现在**函数**页。内置预设带标识且只读；使用**复制脚本**可
-  创建新的自定义函数。
+  预设与已保存的函数共用 **函数** 页面中的同一个目录。预设只读，可用 **复制脚本** 创建自定义函数。
 </Tip>
+
+### 路由
+
+内置的路由步骤决定每个事件写入哪个目标数据流，两种模式都支持。路由有两种形式：
+
+- **固定数据流**；
+- **按字段动态分流**：写入由事件中某个字段指定的数据流。可以设置 **流名前缀**，字段缺失、不是字符串或不是有效流名的事件写入 **兜底数据流**。
+
+路由读取该步骤运行时事件中的字段，之后的步骤不会改变已经作出的决定。存在多个路由步骤时，以最后一个结果为准。数据流名称由 1 到 255 个字符组成，可使用 ASCII 字母、数字、`_`、`-` 与 `.`。`.`、`..` 以及受保护的 `_molesignal` 这样的名称会被拒绝。不存在的数据流会在首次写入时创建。
 
 ### 扩展表
 
-**扩展表**是一张 key → 记录的查找表，可在转换里 join。打开**扩展表**，新建表并添加行（一个 key 加若干
-命名字段），再在 VRL 里查找：
+**扩展表** 是转换可以使用的“键 → 记录”查找表。打开 **扩展表**，创建一张表，添加行（一个键加若干命名字段），然后在 VRL 中做查找：
 
 ```ruby
 # 用所属团队丰富每条事件
@@ -63,47 +69,87 @@ intake）——还可把同一批事件扇出到外部 **connector**（S3、Kafk
 
 查找在内存中完成，不会给运行增加查询开销。
 
-## 目标与 connector egress
+## 实时流水线
 
-目标可以是**目标数据流**（默认——事件经标准 intake 写入并可被查询），也可以是外部 **connector**：
+实时流水线在接入期间、事件被存储之前处理每条日志事件。可以在图形编排器中把 **执行模式** 设为 **实时** 来创建，也可以通过 API：
 
-| Connector | 投递负载 |
+```bash
+curl -X POST http://localhost:5080/api/v1/scheduled_pipelines \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "route-app-logs",
+    "source_stream": "default",
+    "target_stream": "default",
+    "cron": "",
+    "lookback_secs": 300,
+    "enabled": true,
+    "function_steps": {
+      "mode": "realtime",
+      "signal_type": "logs",
+      "sources": ["default"],
+      "sinks": ["default"],
+      "retain_source": false,
+      "steps": [
+        { "transform_name": "lowercase-level", "kind": "vrl",
+          "script": ".level = downcase!(string!(.level))" },
+        { "transform_name": "route-by-app", "kind": "builtin", "operation": "route",
+          "routing": { "kind": "field", "field": "appname", "prefix": "app_", "fallback": "default" } }
+      ]
+    }
+  }'
+```
+
+`appname` 为 `checkout` 的事件会进入数据流 `app_checkout`，没有 `appname` 的事件进入兜底数据流 `default`。
+
+规划时需要了解的行为：
+
+- 每个事件按顺序经过各个步骤。某个步骤失败，或结果不是对象，会拒绝该事件。接入响应会列出它，例如 `{"index":1,"reason":"realtime transform `needs-level` failed"}`，同一批中的其他事件仍会被接收。
+- **同时保留到源数据流** 会把原始事件与转换后的副本一起保留在来源数据流中，默认关闭。来源与目标是同一个数据流时，只写入转换后的事件。
+- 每个来源数据流只能启用一条实时流水线，再创建第二条会返回 `409`。实时流水线只支持日志。
+- 配置变更对之后的批次生效，已经开始处理的批次继续使用它读取到的配置。
+- 流水线的输出不会再触发另一条流水线。
+- 向多个目标数据流的写入不是原子的。整批重试可能让已经成功的数据流出现重复事件，因此该流水线不承诺恰好一次投递。
+- 实时流水线不产生运行记录，也不能回填。列表中的 **等待接收** 状态表示配置已启用，并不表示数据已经到达。
+
+## 定时流水线
+
+定时流水线按时间窗口读取来源数据流，应用转换链，并把输出写入目标数据流。它还可以把同一批事件扇出到连接器。
+
+### 目标与连接器出口
+
+目标可以是 **目标数据流**（默认，经标准接入写入并可被查询），也可以是外部 **连接器**：
+
+| 连接器 | 投递负载 |
 |---|---|
 | **S3** | 批量 JSON Lines `PUT` 到 `s3://<bucket>/<prefix><id>.jsonl`。 |
-| **Kafka** | 每条事件产生一条 JSON 记录到配置的 topic。 |
+| **Kafka** | 每条事件向配置的 topic 产生一条 JSON 记录。 |
 
-在**流水线 → Connectors**添加 connector，再在图形编排器里选择该 connector 作为目标。一条流水线可在同一次运行里既写
-数据流又向 connector egress。
+在 **流水线 → Connectors** 添加连接器，再在图形编排器里把它们选为目标。一条流水线可以在同一次运行里既写数据流又向连接器输出。调度流水线不能把事件路由回它自己的来源数据流。
 
-### 把源数据流从查询中隐藏
+### 把来源数据流从查询中隐藏
 
-将一个兜底源数据流扇出成每服务（或每租户）目标流时——例如用上面的 `route-by-service` preset——源数据流
-会继续堆积未分流的原始事件。要让查询和仪表盘只对准分流后的目标流，把源数据流标记为**不可查询**：打开
-**数据流 → _源数据流_ → 设置**，关闭 **可查询**。
+当一个兜底来源数据流扇出成每服务或每租户的目标流时，来源数据流会继续堆积原始事件。要让查询和仪表盘只对准路由后的数据流，把来源数据流标记为 **不可查询**：打开 **数据流 → 来源 → 设置**，关闭 **可查询**。
 
-不可查询的数据流照常采集并保留数据（也照常为本流水线供数），但会从查询选择器中隐藏，且 SQL 与 PromQL
-搜索都会以 `stream is not queryable` 拒绝。随时可以再打开开关。
+不可查询的数据流照常接收并保留数据，也照常为流水线供数。它会从查询选择器中隐藏，SQL 与 PromQL 搜索会以 `stream is not queryable` 拒绝它。随时可以再打开开关。
 
-## 调度与回看窗口
+### 定时与回看窗口
 
 | 字段 | 说明 |
 |---|---|
-| `cron` | 间隔简写：`every:30s`、`every:5m`、`every:1h`。 |
-| `lookback_secs` | 每次运行从源回看多久（默认 300）。 |
-| `enabled` | 不删除流水线即可开关调度。 |
+| `cron` | 间隔简写：`every:30s`、`every:5m` 或 `every:1h`。 |
+| `lookback_secs` | 每次运行从来源回看多久，默认 300。 |
+| `enabled` | 暂停或恢复调度，无需删除流水线。 |
 
-Runner 不解析标准 cron 表达式；不符合 `every:` 语法的计划会被跳过。
+Runner 不解析标准 cron 表达式。不符合 `every:` 语法的计划会被拒绝并返回 `400`：`scheduled pipelines require every:Ns/m/h and a positive lookback`。
 
-每次触发，runner 读取源的 `[now - lookback_secs, now]`，应用转换链并写出结果。每次运行都会记录——在流
-水线的 **运行** 标签页查看，或通过 `GET /api/v1/scheduled_pipelines/{id}/runs`（`state`、`scanned_rows`、
-`error`）。
+每次触发，runner 读取来源的 `[now - lookback_secs, now]`，应用转换链并写出结果。Runner 每 15 秒检查一次到期的流水线，因此很短的间隔按这个粒度运行。每次运行都会记录：可在流水线的 **运行** 标签页查看历史，也可用 `GET /api/v1/scheduled_pipelines/{id}/runs`，它返回 `state`、`scanned_rows` 与 `error`。
 
 <Note>
-  调度 runner 是单例：分布式集群下只在 **alert-manager**（或 **standalone**）节点运行，因此启用的流水线
-  每个间隔只触发一次，而非每节点一次。
+  定时 runner 是单例，只在 `alert` 角色上运行（`standalone` 包含该角色），因此启用的流水线每个间隔只触发一次，而不是每个节点一次。
 </Note>
 
-## 回填（Backfill）
+### 回填
 
 要按需处理历史窗口，提交一次回填：
 
@@ -111,22 +157,20 @@ Runner 不解析标准 cron 表达式；不符合 `every:` 语法的计划会被
 curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backfill \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
-  -d '{"start_micros": 1717200000000000, "end_micros": 1717286400000000}'
+  -d '{"start_micros": 1790000000000000, "end_micros": 1790086400000000}'
 ```
 
-窗口必须 **≤ 31 天**。请求返回 `202` 带 `job_id` 和监控 URL；回填走异步
-[search-job](/zh-Hans/distributed-deployment#async-search-job-pipeline) worker——读取源窗口、应用同一条
-转换链、写目标流并 egress。
+窗口不能超过 31 天。请求返回 `202`，并带有 `job_id` 与 `monitor` 路径。回填通过异步[搜索任务](/zh-Hans/distributed-deployment#异步搜索任务) worker 运行：读取来源窗口、应用同一条转换链、写入目标数据流并向连接器输出。
 
 ## 权限
 
 - `pipelines.read`：列出流水线并读取运行历史。
 - `pipelines.create`：创建流水线。
 - `pipelines.edit`：修改图、转换、调度或回看窗口。
-- `pipelines.pause`：启用或暂停调度执行。
+- `pipelines.pause`：启用或暂停流水线。
 - `pipelines.run`：提交回填任务。
 - `pipelines.delete`：删除流水线。
 
 <Card title="流水线 API" icon="code" href="/zh-Hans/api/intake/scheduled-pipelines">
-  通过 HTTP API 创建、更新、列出与回填调度流水线。
+  通过 HTTP API 创建、更新、列出与回填流水线。
 </Card>

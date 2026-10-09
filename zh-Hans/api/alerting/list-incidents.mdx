@@ -1,12 +1,85 @@
 ---
-title: "列出 incident"
-description: "列出告警 incident。"
+title: "列出事件"
+description: "列出告警事件，或读取单个事件的完整上下文。"
 ---
 
 ```http
 GET /api/v1/alerts/incidents
+GET /api/v1/alerts/incidents/{id}
 ```
 
-默认只返回 open 和 acknowledged incident。使用 `?scope=all&window_secs=604800` 查询近期历史；窗口会
-限制在 1 小时到 365 天之间，活动 incident 始终包含在内。列表项包含精简的关联摘要，以及
-`current_step`、`acknowledged_at`、`resolved_at` 等字段。读取需要 `alerts.read`。
+第一个调用按时间倒序列出事件，第二个调用返回单个事件。两个调用都需要 `alerts.read`。
+
+**列表的查询参数**
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `scope` | string | `active`（默认）返回状态为 `open` 或 `acknowledged` 的事件。`all` 返回窗口内创建的事件，以及所有活动事件，不论开启多久。 |
+| `window_secs` | integer | `scope=all` 的回看窗口。默认 `604800`（7 天）。取值限制在 3600 到 31536000 之间。 |
+
+列表项是精简形式：`triggering_query` 为 `null`，`trace_ids`、`host_ids` 与 `affected_services` 最多各保留一个值。完整记录请读取单个事件。
+
+<RequestExample>
+```bash cURL
+curl "http://localhost:5080/api/v1/alerts/incidents?scope=all&window_secs=86400" \
+  -H "authorization: Bearer $MS_JWT"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+[
+  {
+    "id": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "org_id": "<organization-id>",
+    "rule_id": "3KEDBLvTYO6DnWi8H9S9MNLpPT7",
+    "escalation_policy_id": "<policy-id>",
+    "status": "resolved",
+    "severity": "critical",
+    "summary": "High error rate · checkout",
+    "fingerprint": "2b7f5329675de7077c74ffa2646a36cd3adf16f80f523270332894d1ff630632",
+    "current_step": 0,
+    "current_loop": 0,
+    "current_step_started_at": 1790000000000000,
+    "assignees": [],
+    "labels": { "service": "checkout", "team": "checkout" },
+    "annotations": {},
+    "trace_ids": [],
+    "host_ids": [],
+    "affected_services": ["checkout"],
+    "triggering_query": null,
+    "created_at": 1790000000000000,
+    "acknowledged_at": 1790000060000000,
+    "acknowledged_by": "<user-id>",
+    "resolved_at": 1790000300000000,
+    "resolved_by": "<user-id>"
+  }
+]
+```
+</ResponseExample>
+
+## 事件字段
+
+| 字段 | 说明 |
+|---|---|
+| `id`、`org_id`、`rule_id` | 事件、组织与规则的标识符。 |
+| `escalation_policy_id` | 事件开启时从规则复制。 |
+| `status` | `open`、`acknowledged` 或 `resolved`。数据模型还有 `closed`，目前没有任何调用会设置它。 |
+| `severity` | `info`、`warning`、`error` 或 `critical`。 |
+| `summary` | 规则名称，后接最多两个受影响的服务，更多时以 `+N` 表示。 |
+| `fingerprint` | 规则 `id` 与 `labels` 的哈希。一条规则的每个指纹只有一个活动事件。 |
+| `current_step`、`current_loop`、`current_step_started_at` | 升级进度。步骤编号从 0 开始，时间单位为微秒。 |
+| `assignees` | 事件分配给的用户：当前升级步骤直接点名的目标（该步骤的 `user` 目标，以及每个 `schedule` 目标当前的值班人），加上确认事件的用户。第一个步骤运行之前为空。只指向团队的步骤会保留之前的负责人。 |
+| `labels`、`annotations` | 事件开启时的快照：规则的 `labels`，加上查询结果中的 `service` 与 `host`。之后修改规则不会改变它们。 |
+| `trace_ids`、`host_ids`、`affected_services` | 查询结果中 `trace_id`、`host` 与 `service` 列的值，已去重，各最多 10 个。 |
+| `triggering_query` | 包含 `language`、`statement` 与 `sample_values`。每个样本含以微秒表示的 `ts`（结果没有时间列时为 `0`）、`value` 与 `labels`。只有读取单个事件的调用会返回它。 |
+| `created_at` | 事件开启的时间，单位为微秒。 |
+| `acknowledged_at`、`acknowledged_by` | 最近一次确认的时间与用户。 |
+| `resolved_at`、`resolved_by` | 解决的时间与用户。评估器因规则不再命中而解决事件时，`resolved_by` 为 `null`。 |
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `403` | Token 缺少 `alerts.read`。 |
+| `404` | 事件不存在。 |

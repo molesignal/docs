@@ -1,92 +1,175 @@
 ---
 title: "快速开始"
-description: "几分钟内启动 MoleSignal、写入日志事件并完成查询。"
+description: "用 Docker Compose 启动本地 MoleSignal 沙箱，发送一条日志事件，并在网页界面中找到它。"
 ---
 
-本指南将在本地启动 MoleSignal，通过认证后的 HTTP API 写入一条日志事件并完成查询。
+本指南启动本地 MoleSignal 沙箱，发送一条日志事件，并通过网页界面和查询 API 找到这条事件。沙箱仅用于评估。
 
 ## 前置条件
 
-- **Docker** 与 **Docker Compose**（沙箱会拉起 Postgres + MinIO + MoleSignal）。
-- standalone profile 大约需要 2 GB 空闲内存。
+- **Docker** 与 **Docker Compose** v2。
+- 约 2 GB 空闲内存。
+- 本机空闲端口：`5080`（网页界面与 API）、`5082`、`5432`（PostgreSQL）、`9000` 与 `9001`（RustFS）。
 
 ## 启动沙箱
 
 <Steps>
-  <Step title="克隆并启动">
+  <Step title="克隆仓库并启动">
     ```bash
     git clone https://github.com/molesignal/molesignal
     cd molesignal
-
-    # 一条命令的沙箱：Postgres + MinIO + MoleSignal standalone
     docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
     ```
 
-    启动后：
+    首次启动需要下载或构建镜像，可能耗时数分钟。沙箱包含用于存放元数据的 PostgreSQL 17、兼容 S3 的对象存储 RustFS，以及一个运行全部角色并提供网页界面的 MoleSignal 进程。
 
-    - **UI：** [http://localhost:5080](http://localhost:5080)
-    - **S3 控制台（MinIO）：** [http://localhost:9001](http://localhost:9001) —— `minioadmin` / `minioadmin`
-  </Step>
-
-  <Step title="登录拿 token">
-    认证以获取 JWT 和对应的 `org_id`：
+    确认服务已就绪：
 
     ```bash
-    curl -X POST http://localhost:5080/api/v1/auth/signin \
+    curl http://localhost:5080/api/v1/healthz
+    ```
+
+    服务健康时返回 `{"status":"ok"}`。
+  </Step>
+
+  <Step title="登录网页界面">
+    打开 [http://localhost:5080](http://localhost:5080)，使用以下账号登录：
+
+    - **邮箱：** `admin@example.com`
+    - **密码：** `admin`
+
+    <Warning>
+      沙箱配置只会在首次启动时创建这个 root 账号。用于本地评估之外的任何场景前，必须替换该账号，参见[生产检查清单](/zh-Hans/production-checklist)。
+    </Warning>
+
+    RustFS 控制台位于 [http://localhost:9001](http://localhost:9001)，账号为 `rustfsadmin` / `rustfsadmin`。这些沙箱凭据并不安全。
+  </Step>
+
+  <Step title="获取访问 Token">
+    API 使用 Bearer Token。通过 API 登录，获得登录 Token（默认有效期 24 小时）和组织 id：
+
+    ```bash
+    RESP=$(curl -s -X POST http://localhost:5080/api/v1/auth/signin \
       -H 'content-type: application/json' \
-      -d '{"email":"admin@example.com","password":"admin"}'
+      -d '{"email":"admin@example.com","password":"admin"}')
+
+    export MS_JWT=$(echo "$RESP" | jq -r .token)
+    export MS_ORG=$(echo "$RESP" | jq -r .org_id)
     ```
 
-    响应中包含 JWT 与 `org_id`。导出两个值供后续步骤使用：
+    没有 `jq` 时，从响应中复制 `token` 与 `org_id` 并手工导出。
 
-    ```bash
-    export MS_JWT="<响应里的 jwt>"
-    export MS_ORG="<响应里的 org_id>"
-    ```
+    <Note>
+      运行时间超过登录 Token 有效期的发送端，请使用 API token 或接入 Token，参见[数据源](/zh-Hans/intake#接入-token)。
+    </Note>
   </Step>
 
-  <Step title="发送第一条数据">
-    原生 HTTP JSON 接入开箱即用，适配 `curl`、应用 SDK、Vector、Fluent Bit。时间戳为 Unix 纪元起
-    的微秒数，放在 `_timestamp` 字段。
+  <Step title="发送一条日志事件">
+    原生 HTTP JSON 接入接收一个记录数组。`_timestamp` 是自 Unix 纪元起的微秒数。数据流 `app` 会在首次写入时创建。
 
     ```bash
     curl -X POST http://localhost:5080/api/v1/intake/logs/app \
       -H "authorization: Bearer $MS_JWT" \
       -H 'content-type: application/json' \
-      -d '[{"_timestamp":1700000000000000,"level":"error","msg":"db pool exhausted","trace_id":"abc123"}]'
+      -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+    ```
+
+    响应会给出已接收的记录数：
+
+    ```json
+    {"accepted":1,"rejected":0,"errors":[]}
     ```
   </Step>
 
-  <Step title="查询事件">
-    通过 HTTP API 查询 `app` 日志流：
+  <Step title="在网页界面中找到这条事件">
+    1. 打开 **日志**。
+    2. 在数据流选择器中选择 `app`。
+    3. 时间范围保持 **近 1 小时**，选择 **查询**。
+
+    结果表会显示这条事件。选择该行即可查看其原始字段。
+  </Step>
+
+  <Step title="用 API 查询这条事件">
+    通过查询 API 执行同样的查找。始终传入有界的微秒 `time_range`；时间范围过宽时，规划器会把查询转成异步搜索任务。
 
     ```bash
+    NOW=$(date +%s)000000
+
     curl -X POST http://localhost:5080/api/v1/query \
       -H "authorization: Bearer $MS_JWT" \
       -H 'content-type: application/json' \
       -d "{\"org_id\":\"$MS_ORG\",\"language\":\"sql\",
-           \"statement\":\"SELECT * FROM app WHERE trace_id = 'abc123'\",
-           \"time_range\":{\"start\":0,\"end\":2000000000000000},
+           \"statement\":\"SELECT level, msg, trace_id FROM app WHERE trace_id = 'abc123'\",
+           \"time_range\":{\"start\":$((NOW - 3600000000)),\"end\":$((NOW + 60000000))},
            \"stream\":{\"name\":\"app\",\"stream_type\":\"logs\"}}"
     ```
 
-    结果包含 `columns`、`rows`、`scanned_rows` 和 `took_ms`。
+    响应包含 `columns`、`rows`、`scanned_rows` 与 `took_ms`：
+
+    ```json
+    {"columns":["level","msg","trace_id"],"rows":[["error","db pool exhausted","abc123"]],"scanned_rows":1,"took_ms":120}
+    ```
   </Step>
 </Steps>
+
+## 加载示例数据
+
+没有数据的工作区会显示空页面。加载一组小型的关联示例数据（日志、指标与链路共享 `trace_id`），即可体验跨信号调查：
+
+```bash
+curl -X POST http://localhost:5080/api/v1/onboarding/sample-data \
+  -H "authorization: Bearer $MS_JWT"
+```
+
+该请求会创建数据流 `sample_app_logs`、`sample_app_metrics` 与 `sample_app_traces`。网页界面中也可以执行同样的操作：在 **首页** 的设置横幅中选择 **完成设置**，再选择 **加载示例数据** 旁的 **加载**。所有设置步骤完成后，横幅会消失。
+
+## 发送 OpenTelemetry 数据
+
+任何 OpenTelemetry SDK 或 Collector 都可以通过 HTTP 发送 OTLP 数据。把导出端指向 `/api` 基础路径，导出端会自动追加 `/v1/logs`、`/v1/metrics` 与 `/v1/traces`：
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer $MS_JWT"
+export OTEL_SERVICE_NAME=checkout
+```
+
+除非用 `stream-name` 请求头指定其他数据流，遥测会写入各信号类型下名为 `default` 的数据流。Collector、Vector、Fluent Bit、Prometheus 与 SDK 的配置参见[数据源](/zh-Hans/intake)和[集成指南](/zh-Hans/integrations)。
+
+## 停止沙箱
+
+```bash
+# 停止容器并保留数据
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down
+
+# 停止容器并删除全部沙箱数据
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down -v
+```
+
+## 故障排查
+
+| 现象 | 原因与处理 |
+|---|---|
+| `healthz` 返回 `503` 与 `"status":"degraded"` | 某个子系统不健康，例如对象存储探测失败。查看 `reason` 字段，并检查 `rustfs` 容器。 |
+| 登录返回 `401` | root 账号只在首次启动时创建，早先运行遗留的数据库卷会保留旧密码。执行 `down -v` 重置沙箱。 |
+| 查询返回 `202` 与 `job_id` | 时间范围过宽（默认配置下约 13.9 小时或更长），规划器启动了异步搜索任务。缩小范围，发送 `Prefer: respond-sync`，或轮询 `GET /api/v1/query/jobs/{id}`，参见[查询](/zh-Hans/query#时间范围与异步任务)。 |
+| 查询返回 `422 missing field org_id` 或 `400 query.stream hint is required` | 同时传入 `org_id` 与 `stream` 对象。 |
+| 端口已被占用 | 停止占用端口的其他进程，或修改 `deploy/docker/docker-compose.yaml` 中发布的端口。 |
+| 宿主机无法访问 `4317` 上的 OTLP gRPC | 沙箱 Compose 文件没有发布 `4317`。在 `molesignal` 服务中添加 `4317:4317` 端口映射。 |
 
 ## 下一步
 
 <CardGroup cols={2}>
-  <Card title="从现有技术栈接入" icon="inbox" href="/zh-Hans/intake">
-    接入 OpenTelemetry、Prometheus、Loki JSON 发送端、Filebeat 与云数据源。
+  <Card title="接入自己的数据" icon="inbox" href="/zh-Hans/intake">
+    使用数据源页面、接入 Token 和兼容协议。
   </Card>
-  <Card title="跨信号关联" icon="link" href="/zh-Hans/correlation">
-    用共享上下文关联日志、指标、链路、性能剖析和 RUM。
+  <Card title="集成指南" icon="plug" href="/zh-Hans/integrations">
+    配置 OpenTelemetry Collector、Vector、Fluent Bit、Filebeat 与 Prometheus。
+  </Card>
+  <Card title="核心概念" icon="book" href="/zh-Hans/concepts">
+    了解信号、数据流、工作区与权限。
   </Card>
   <Card title="正式部署" icon="server" href="/zh-Hans/deployment">
-    从沙箱走向多角色或 Kubernetes 部署。
-  </Card>
-  <Card title="配置" icon="gear" href="/zh-Hans/configuration">
-    TOML 配置与 `MS_*` 环境变量覆盖。
+    从沙箱迁移到生产部署。
   </Card>
 </CardGroup>

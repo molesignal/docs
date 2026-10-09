@@ -1,29 +1,140 @@
 ---
-title: "追踪列表与追踪树"
-description: "列出 Trace 摘要，并按 trace_id 拉取完整 Span 树。"
+title: "链路列表与详情"
+description: "列出链路摘要，并读取单条链路的所有 Span。"
 ---
 
-列出 Trace 摘要：
+两个调用都读取组织的一个链路数据流：包含 `trace_id`、`span_id`、`service.name`、`name`、`start_time_unix_nano`、`end_time_unix_nano` 和 `status_code` 全部字段的数据流。名为 `default` 的数据流优先于其他符合条件的数据流，仍然相同时按数据流名称决定。组织没有这样的数据流时，结果为空。只有通过[尾部采样](/zh-Hans/configuration#链路捕获与尾部采样)保留下来的链路才能读取。
+
+两个调用都需要 `streams.query`，系统范围可使用 `sys.telemetry.read`。
+
+## 列出链路摘要
 
 ```http
 GET /api/v1/web/traces
 ```
 
-| 参数 | 必填 | 说明 |
+每条链路返回一条摘要，使用游标分页。数据流还没有链路摘要时，返回空页。
+
+**查询参数**
+
+| 参数 | 类型 | 说明 |
 |---|---|---|
-| `from` / `to` | 否 | Unix 微秒；默认最近 24 小时。 |
-| `q` | 否 | Trace 自由文本过滤。 |
-| `filters` | 否 | JSON 编码的结构化过滤条件。 |
-| `limit` | 否 | 默认 50，限制在 1–200。 |
+| `from`、`to` | integer | 以微秒表示的窗口。默认是最近 24 小时，截至当前。`to` 必须大于 `from`。 |
+| `q` | string | 不区分大小写的文本，必须出现在某个 Span 的 `trace_id`、`span_id`、服务、操作或状态中。最长 256 个字符。 |
+| `filters` | string | 过滤条件的 JSON 数组，见下文。 |
+| `sort` | string | `latest`（默认）、`earliest`、`duration_desc`、`duration_asc`、`span_count_desc` 或 `errors_desc`。 |
+| `limit` | integer | 页大小。默认 `20`。取值限制在 1 到 100 之间。 |
+| `cursor` | string | 之前某一页返回的 `next_cursor` 或 `previous_cursor`。 |
 
-每条结果包含 `trace_id`、服务、操作、开始时间、时长、Span 数与错误数。
+过滤条件是包含 `field`、`op` 和 `value` 的对象，一个请求最多带 32 个过滤条件。所有过滤条件必须同时匹配。
 
-拉取一棵 Trace 树：
+| 字段 | 类型 | 运算符 |
+|---|---|---|
+| `trace_id` | 文本 | `=`、`!=`、`contains` |
+| `duration_ns`、`span_count`、`error_count` | 整数 | `=`、`!=`、`>`、`>=`、`<`、`<=` |
+| `service`（或 `service_name`）、`operation`（或 `operation_name`）、`status` | 文本 | `=`、`!=`、`contains` |
+| 链路数据流的任何其他标量字段 | 取决于字段类型 | 文本：`=`、`!=`、`contains`。数字与时间戳：`=`、`!=`、`>`、`>=`、`<`、`<=`。布尔值：`=`、`!=`。 |
+
+运算符 `eq`、`ne` 和 `like` 分别是 `=`、`!=` 和 `contains` 的别名。JSON 字段不能用作过滤条件。
+
+`cursor` 会把页面绑定到签发它的查询。带着 `cursor` 重复请求，同时更换 `limit`、`sort`、`q` 或 `filters`，会返回 `400`。
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_JWT" \
+  --data-urlencode 'sort=duration_desc' \
+  --data-urlencode 'limit=2' \
+  --data-urlencode 'filters=[{"field":"service","op":"=","value":"checkout"}]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    {
+      "trace_id": "0af7651916cd43dd8448eb211c80319c",
+      "service": "checkout",
+      "operation": "GET /checkout",
+      "start_ns": 1790000000000000000,
+      "duration_ms": 180.0,
+      "span_count": 3,
+      "error_count": 1
+    }
+  ],
+  "next_cursor": null,
+  "previous_cursor": null,
+  "has_more": false
+}
+```
+</ResponseExample>
+
+每个条目通过根 Span 描述一条链路：根 Span 的 `service` 与 `operation`、以纳秒表示的开始时间、以毫秒表示的时长、Span 数量和错误 Span 数量。设置了 `next_cursor` 时，`has_more` 为 `true`。
+
+## 读取单条链路
 
 ```http
 GET /api/v1/web/trace/{trace_id}
 ```
 
-追踪树最多包含 100,000 个 Span，响应硬上限为 32 MiB；达到限制时返回
-`truncated=true`。两个端点都需要 `streams.query`，系统范围则可使用
-`sys.telemetry.read`。
+返回最近 24 小时内一条链路的所有 Span，按开始时间排序。`trace_id` 由 1 到 128 个字符组成，字符取自 `A-Z`、`a-z`、`0-9`、`-` 和 `_`。
+
+响应最多包含 100,000 个 Span，大小不超过 32 MiB。上限截断了 Span 列表时，`truncated` 为 `true`。
+
+<ResponseExample>
+```json 200
+{
+  "trace_id": "0af7651916cd43dd8448eb211c80319c",
+  "root_span_id": "b7ad6b7169203331",
+  "spans": [
+    {
+      "span_id": "53995c3f42cd8ad8",
+      "parent_span_id": "b7ad6b7169203331",
+      "service": "payments",
+      "operation": "POST /pay",
+      "start_ns": 1790000000020000000,
+      "end_ns": 1790000000160000000,
+      "duration_ns": 140000000,
+      "kind": 2,
+      "status": "ERROR",
+      "status_message": "upstream timeout",
+      "attributes": { "http.method": "POST", "http.status_code": "502" },
+      "events": [],
+      "links": [],
+      "sampling_reason": "error",
+      "partial": false,
+      "late": false,
+      "duplicate": false,
+      "conflict": false
+    }
+  ],
+  "truncated": false,
+  "partial": false,
+  "partial_reasons": [],
+  "sampling_reasons": ["error"],
+  "late_span_count": 0,
+  "duplicate_span_count": 0,
+  "conflict_span_count": 0
+}
+```
+</ResponseExample>
+
+示例只展示一个 Span 的主要字段。真实的 Span 还包含 `trace_flags`、`trace_state`、`resource`、`scope`、各个 `dropped_*_count` 计数器、`schema_version` 和 `semantic_conventions_version`。
+
+| 字段 | 说明 |
+|---|---|
+| `root_span_id` | 第一个没有父级的 Span。请根据 `span_id` 与 `parent_span_id` 构建树。 |
+| `spans[].status` | `OK`、`ERROR` 或 `UNSET`。 |
+| `spans[].attributes` | Span 属性，已与数据流中展开的属性列合并。 |
+| `spans[].sampling_reason` | 尾部采样器保留该链路的原因，例如 `error`。 |
+| `partial`、`partial_reasons` | 是否缺少 Span，以及原因。 |
+| `late_span_count`、`duplicate_span_count`、`conflict_span_count` | 迟到、重复或冲突的 Span 数量。 |
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 参数无效：`to` 不大于 `from`、过滤条件使用了未知的字段或运算符（`unsupported trace filter field: nope`）、游标与查询不匹配，或 `trace_id` 的字符或长度无效。 |
+| `403` | Token 缺少 `streams.query`。 |
+| `404` | 最近 24 小时内找不到该链路，或链路已被采样丢弃。 |

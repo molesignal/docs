@@ -1,6 +1,6 @@
 ---
 title: "Functions"
-description: "Create and test reusable transforms for use in pipelines."
+description: "Create and test reusable VRL and JavaScript transforms for use in pipelines."
 ---
 
 Functions package reusable event transformations. Open **Functions** to create, test, and maintain
@@ -10,23 +10,49 @@ function definitions independently of a pipeline.
 
 | Language | Availability | Best for |
 |---|---|---|
-| VRL | Always available | Parsing, normalization, filtering, redaction, and enrichment. |
-| JavaScript | Requires a build with `js-runtime` | Logic that is easier to express with JavaScript. |
+| VRL | Built in | Parsing, normalization, filtering, redaction, and enrichment. |
+| JavaScript | Built in | Logic that is easier to express with JavaScript. |
 | LLM | API-configurable; requires `llm_eval_enabled` and a model provider | Low-throughput classification or enrichment with model output. |
+
+Both VRL and JavaScript run inside the MoleSignal binary. Neither needs a setting or an extra install.
 
 MoleSignal validates and compiles a function during save. Invalid source does not become the active
 function.
 
-The current Functions workbench exposes VRL and JavaScript. LLM functions are an advanced API
+The Functions workbench exposes VRL and JavaScript. LLM functions are an advanced API
 workflow: the function source is the system instruction, the event is the model input, and
-`params_schema.output_field` selects the output field (default `_llm_eval`).
+`params_schema.output_field` selects the output field (default `_llm_eval`). Every matching event
+triggers a model call, so the setting `[functions].llm_eval_enabled` stays `false` by default. See
+[Configuration](/en-US/configuration#features-and-integrations).
+
+## Built-in presets
+
+Every organization sees these read-only VRL functions:
+
+| Function | What it does |
+|---|---|
+| `add-intake-time` | Adds an intake timestamp to help diagnose end-to-end latency. |
+| `normalize-logs` | Parses the JSON message, adds environment and cluster fields, and normalizes `level` to lowercase. |
+| `parse-key-value` | Parses a logfmt or `key=value` message into fields and merges them back into the event. |
+| `redact-email` | Replaces email addresses in `message` with a placeholder. |
+| `route-by-service` | Normalizes the service name and derives a per-service target stream (`logs_<service>`) as a routing hint. |
 
 ## Test before saving
 
-The function workbench contains the source editor and a JSON sample runner. The current
-`POST /api/v1/functions/run` execution path runs VRL samples. JavaScript receives save-time syntax
-validation when the runtime is compiled in, but unsaved JavaScript sample execution is not available
-through this endpoint. LLM functions run only as pipeline steps.
+The function workbench contains the source editor and a JSON sample runner. The runner calls
+`POST /api/v1/functions/run` with a language, a source, and a sample event, and returns the
+transformed event:
+
+```bash
+curl -X POST http://localhost:5080/api/v1/functions/run \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{"language":"vrl","source":".service = downcase!(string!(.service))","input":{"service":"Checkout"}}'
+```
+
+```json
+{ "output": { "service": "checkout" } }
+```
 
 Example VRL:
 
@@ -37,6 +63,31 @@ if exists(.customer_id) {
   .customer = lookup("customers", .customer_id)
 }
 ```
+
+## JavaScript functions
+
+The source runs once for every event. The global `molesignal` object carries the event and helpers:
+
+| Member | Purpose |
+|---|---|
+| `molesignal.fields` | The event as an object. Read it, change it, or assign a new object. |
+| `molesignal.set(name, value)` | Sets a field. |
+| `molesignal.del(name)` | Removes a field. |
+| `molesignal.now()` | The current time in microseconds since the Unix epoch. |
+| `molesignal.parse_json(text)` and `molesignal.encode_json(value)` | Convert between JSON text and values. |
+| `molesignal.sha256(text)` | The SHA-256 digest of the UTF-8 bytes of the text, as 64 lowercase hexadecimal characters. |
+
+```js
+molesignal.set("severity", String(molesignal.fields.level || "info").toUpperCase());
+molesignal.set("seen_at", molesignal.now());
+molesignal.del("level");
+```
+
+A JavaScript function runs in an isolated engine with these limits:
+
+- A run that takes longer than 50 ms stops with `js timeout 50ms`.
+- The heap of one function is limited to 32 MiB.
+- Network access, timers, and `TextEncoder` are not available.
 
 ## Use a function
 
@@ -50,7 +101,7 @@ breaking edit.
 
 - `functions.read` lists and opens functions.
 - `functions.create` and `functions.edit` manage definitions.
-- `functions.run` executes the VRL sample runner.
+- `functions.run` executes the sample runner.
 - `functions.delete` removes a definition.
 
 <CardGroup cols={2}>

@@ -1,39 +1,144 @@
 ---
 title: "创建规则"
-description: "创建告警规则。"
+description: "创建定时、实时或异常检测告警规则。"
 ---
 
 ```http
 POST /api/v1/alerts/rules
 ```
 
-规则的 `kind` 为 `scheduled`、`real_time` 或 `anomaly`。创建和修改规则需要
-`alerts.manage`。不同检测器的字段见[告警](/zh-Hans/alerting)。
+创建一条告警规则。该调用需要 `alerts.manage`。
+
+## 规则如何评估
+
+`alert` 角色每隔 `[alert].eval_interval_secs`（默认 30 秒）评估一次所有已启用的 `scheduled` 与 `anomaly` 规则。`real_time` 规则在接入路径上匹配，记录到达时就会开启事件。
+
+1. 评估器在 `now - period_secs` 到 `now` 的窗口内运行 `query.statement`。`sql` 语句由 SQL 引擎执行，`promql` 语句由 PromQL 引擎在 `now` 时刻作为即时查询执行。
+2. 评估器把第一行第一列读作数字。结果中没有数字时，规则不会命中。`promql` 结果的第一列是样本值 `value`，因此由第一条序列决定结果。请先把表达式聚合成一条序列，例如使用 `sum(...)`。
+3. 数字与 `trigger` 比较。`thresholds` 数组非空时，数字改为与每一档阈值比较。
+4. 条件连续命中 `for_periods` 次评估后，开启一个事件。一条规则同一时间最多有一个活动事件。`silence_secs` 大于 0 时，从该规则上一个事件创建起，经过这么多秒之前不会再开启新事件，即使上一个事件已经解决。
+5. 条件不再命中时，评估器会解决处于 `open` 状态的事件。已确认的事件保持已确认，直到用户将其解决。
+6. 每次评估完成后，评估器把时间写入 `last_eval_at`，把结果写入 `last_state`。查询失败或超时时，这两个字段保持不变。
+
+对 `scheduled` 与 `anomaly` 规则，调用不会检查数据流或语句是否有效。启用规则前，先运行[测试规则](/zh-Hans/api/alerting/test-rule)。`real_time` 规则在保存时按下面的限制检查。
+
+**请求体**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | 不能为空。名称会成为事件摘要。 |
+| `description` | string | 否 | 默认为空。 |
+| `enabled` | boolean | 否 | 默认 `true`。评估器跳过已停用的规则，测试与手动触发调用仍然可用。 |
+| `kind` | string | 否 | `scheduled`（默认）、`real_time` 或 `anomaly`。`real_time` 规则在接入路径上匹配，参见[实时规则](/zh-Hans/alerting#实时规则)。 |
+| `query` | object | 是 | 语句及其窗口，见下文。 |
+| `trigger` | object | 是 | 触发条件，见下文。 |
+| `thresholds` | array | 否 | `scheduled` 与 `real_time` 规则的严重程度分档。数组非空时，分档取代 `trigger` 的条件。`anomaly` 规则忽略分档。 |
+| `severity` | string | 否 | `info`、`warning`、`error` 或 `critical`。`thresholds` 为空时生效。 |
+| `anomaly_params` | object | `anomaly` 时必填 | 基线设置。其他类型会忽略。 |
+| `escalation_policy_id` | string | 否 | 默认 `default`，它是组织内名为 `default` 的升级策略的别名。显式指定的 id 必须属于该组织的某个策略，否则调用返回 `400`。参见[创建升级策略](/zh-Hans/api/alerting/create-escalation)。 |
+| `labels` | object | 否 | 字符串映射，会复制到事件。 |
+| `annotations` | object | 否 | 字符串映射，会复制到事件，例如 runbook 链接。 |
+
+**`query`**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `language` | string | 是 | `sql` 或 `promql`。语言决定由哪个引擎评估语句。`promql` 语句的时间窗口来自范围选择器，例如 `[5m]`，`period_secs` 只决定查询窗口。 |
+| `statement` | string | 是 | 不能为空。第一行第一列是被评估的值。`real_time` 规则使用 `SELECT count(*) FROM <stream> [WHERE <condition>]`。 |
+| `period_secs` | integer | 是 | 窗口长度，单位为秒。`real_time` 规则取 1 到 3600，并统计该窗口内匹配的记录数。 |
+| `stream` | object | 是 | `{ "name": "app", "stream_type": "logs" }`，即语句的主数据流。 |
+
+第一行中名为 `service`、`host` 和 `trace_id` 的列会丰富事件：新增 `service` 与 `host` 标签，并填充 `affected_services`、`host_ids` 与 `trace_ids`。
+
+**`trigger`**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `operator` | string | 是 | `gt`、`gte`、`lt`、`lte`、`eq` 或 `neq`。`real_time` 规则取 `gt` 或 `gte`。 |
+| `threshold` | number | 是 | 用于比较的值。 |
+| `for_periods` | integer | 是 | 开启事件前必须连续命中的评估次数。`0` 与 `1` 效果相同。`real_time` 规则取 `0` 或 `1`。 |
+| `silence_secs` | integer | 是 | 冷却时间，单位为秒。事件开启后，这条规则在这段时间内不会开启新事件，即使事件更早被解决。`0` 表示不设冷却。[手动触发](/zh-Hans/api/alerting/trigger-rule)不受它限制。 |
+
+`anomaly` 规则忽略 `operator` 与 `threshold`，仍使用 `for_periods`。带有 `thresholds` 的规则会忽略 `trigger` 的 `operator`、`threshold` 与 `for_periods`，但该对象仍是必填项。
+
+**`thresholds`**
+
+每一档包含 `severity`（`info`、`warning`、`error` 或 `critical`）、`operator`、`threshold` 与 `for_periods`。每一档独立统计连续命中次数。已触发的各档中，最高的严重程度决定事件的严重程度。已开启的事件升到更高的严重程度时，升级会从第一步重新开始。
+
+没有分档时，事件的严重程度依次取规则的 `severity`、名为 `severity` 的标签，最后是 `warning`。对于两者都没有的 `anomaly` 规则，偏离基线至少 10 倍时为 `critical`，至少 3 倍时为 `error`。
+
+**`anomaly_params`**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `algorithm` | string | 是 | `mad` 或 `ewma`。 |
+| `lookback_days` | integer | 是 | 1 到 30。按相同时刻对比的历史天数。 |
+| `k` | number | 是 | 偏离倍数，必须为正数。 |
+| `alpha` | number | 否 | `ewma` 的平滑系数，大于 0 且不超过 1，默认 `0.3`。 |
+| `weekly_seasonality` | boolean | 否 | 默认 `false`。只对比同一星期几，要求 `lookback_days` 不小于 7。 |
 
 <RequestExample>
-```json body
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
 {
   "name": "High error rate",
-  "description": "More than 100 errors in one minute",
+  "description": "More than 100 errors in five minutes",
   "enabled": true,
   "kind": "scheduled",
   "query": {
     "language": "sql",
     "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
-    "period_secs": 60,
+    "period_secs": 300,
     "stream": { "name": "app", "stream_type": "logs" }
   },
-  "trigger": {
-    "operator": "gt",
-    "threshold": 100,
-    "for_periods": 1,
-    "silence_secs": 300
+  "trigger": { "operator": "gt", "threshold": 100, "for_periods": 2, "silence_secs": 0 },
+  "severity": "critical",
+  "escalation_policy_id": "<policy-id>",
+  "labels": { "team": "checkout" }
+}
+EOF
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KEDBLvTYO6DnWi8H9S9MNLpPT7",
+  "org_id": "<organization-id>",
+  "name": "High error rate",
+  "description": "More than 100 errors in five minutes",
+  "enabled": true,
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
+    "period_secs": 300,
+    "stream": { "name": "app", "stream_type": "logs" }
   },
+  "trigger": { "operator": "gt", "threshold": 100.0, "for_periods": 2, "silence_secs": 0 },
+  "anomaly_params": null,
   "thresholds": [],
   "severity": "critical",
   "escalation_policy_id": "<policy-id>",
   "labels": { "team": "checkout" },
-  "annotations": {}
+  "annotations": {},
+  "last_eval_at": null,
+  "last_state": { "kind": "healthy" },
+  "created_at": 1790000000000000,
+  "updated_at": 1790000000000000
 }
 ```
-</RequestExample>
+</ResponseExample>
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | `name` 或 `query.statement` 为空，缺少 `query.stream`，`escalation_policy_id` 不属于该组织的任何策略，`anomaly` 规则的 `anomaly_params` 缺失或无效，或者 `real_time` 规则超出上述限制。响应为 JSON，错误码为 `invalid_argument`，消息例如 `anomaly detector not yet supported: prophet`。 |
+| `403` | Token 缺少 `alerts.manage`。 |
+| `422` | 必填字段缺失或取值类型错误，例如未知的 `operator`。响应为纯文本。 |
+
+控制台中的操作流程参见[告警与事件响应](/zh-Hans/alerting)。

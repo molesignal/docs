@@ -1,36 +1,44 @@
 ---
 title: "Execute a query"
-description: "Run SQL or PromQL against an organization-scoped telemetry stream."
+description: "Run SQL or PromQL against the streams of an organization."
 ---
 
 ```http
 POST /api/v1/query
 ```
 
+Runs a query and returns the rows, or starts an asynchronous search job for a large query. The call requires `streams.query`, or `sys.telemetry.read` for system telemetry.
+
 **Body**
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `org_id` | string | ✅ | Kept for request compatibility; the authenticated organization is authoritative. |
-| `language` | string | ✅ | `sql` or `promql`. |
-| `statement` | string | ✅ | Query text. |
-| `time_range` | object | ✅ | `{ "start": <microseconds>, "end": <microseconds> }` — microseconds. |
-| `stream` | object | — | `{ "name", "stream_type" }`; type is `logs`, `metrics`, `traces`, `profiles`, or `extend`. |
-| `limit` | integer | — | Row cap. |
+| `org_id` | string | Yes | Must be present, and the value is ignored. The authenticated organization applies. |
+| `language` | string | Yes | `sql` or `promql`. |
+| `statement` | string | Yes | The query text. |
+| `time_range` | object | Yes | `{ "start": <microseconds>, "end": <microseconds> }`. |
+| `stream` | object | For SQL | `{ "name": "app", "stream_type": "logs" }` names the primary table. Both fields are required, and the type is `logs`, `metrics`, `traces`, `profiles`, or `extend`. |
+| `limit` | integer | No | Row cap. |
 
-Execution requires `streams.query`; system telemetry queries may use `sys.telemetry.read`. Send
-`Accept: application/x-ndjson` to return one object per row followed by a `__meta__` record. Send
-`Prefer: respond-async` to receive a `202` search job instead. Add
-`?clusters=local,remote-name` for federated search.
+**Headers and query string**
+
+| Name | Effect |
+|---|---|
+| `Prefer: respond-async` | Always creates a search job and answers `202`. |
+| `Prefer: respond-sync` | Runs in the request even for a long range. |
+| `Accept: application/x-ndjson` | Streams one JSON object per row, then a `{"__meta__": ...}` record. |
+| `?clusters=local,remote` | Includes remote clusters in a federated search. |
 
 <RequestExample>
 ```bash cURL
+NOW=$(date +%s)000000
+
 curl -X POST http://localhost:5080/api/v1/query \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
   -d "{\"org_id\":\"$MS_ORG\",\"language\":\"sql\",
-       \"statement\":\"SELECT level, count(*) FROM app GROUP BY level\",
-       \"time_range\":{\"start\":0,\"end\":2000000000000000},
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"time_range\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
        \"stream\":{\"name\":\"app\",\"stream_type\":\"logs\"}}"
 ```
 </RequestExample>
@@ -38,10 +46,31 @@ curl -X POST http://localhost:5080/api/v1/query \
 <ResponseExample>
 ```json 200
 {
-  "columns": ["level", "count"],
-  "rows": [["error", 12]],
+  "columns": ["level", "n"],
+  "rows": [["error", 12], ["info", 40]],
   "scanned_rows": 10432,
   "took_ms": 18
 }
 ```
 </ResponseExample>
+
+A query whose estimated size reaches `[querier].auto_async_threshold_rows` answers `202`:
+
+```json
+{
+  "job_id": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+See [Query](/en-US/query#time-ranges-and-asynchronous-jobs) for the thresholds and the job endpoints.
+
+**Errors**
+
+| Status | Cause |
+|---|---|
+| `400` | The statement cannot be planned, the `stream` hint is missing for SQL (`query.stream hint is required`), or the query would read more rows than `[querier].max_scan_rows` allows. |
+| `503` | In a role-split cluster, no `querier` node is alive (`no querier node is available`). |
+| `403` | The stream does not exist in the organization (`stream not found: <name>`), or the token lacks `streams.query`. |
+| `422` | A body field is missing or has the wrong type, for example `org_id` or `stream_type`. The response is plain text. |

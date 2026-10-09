@@ -1,0 +1,74 @@
+---
+title: "故障排查"
+description: "常见启动失败、请求被拒绝、数据缺失，以及查询缓慢或转为异步的原因与解决办法。"
+---
+
+请先查看进程日志：启动失败的原因会打印在日志里，被拒绝的 HTTP 请求的响应体中带有说明信息。日志级别来自 `[telemetry].log_level` 或 `RUST_LOG`。
+
+## 启动
+
+| 现象 | 原因 | 解决办法 |
+|---|---|---|
+| `... password authentication failed for user` | DSN 中的用户或密码错误。 | 修正 `[meta_database].dsn`。 |
+| `... pool timed out while waiting for an open connection` | 节点无法访问 PostgreSQL。 | 检查主机、端口、防火墙以及 `sslmode` 要求。 |
+| `startup_ping put: ... SignatureDoesNotMatch` | 对象存储拒绝了凭据。 | 检查 `access_key` 与 `secret_key`，可用 `MS_OBJECT_STORE_ACCESS_KEY` 与 `MS_OBJECT_STORE_SECRET_KEY` 设置。 |
+| `startup_ping put: ... NoSuchBucket` | bucket 不存在。 | 创建 bucket，或修正 `[object_store].bucket`。 |
+| 反复出现 `Encountered transport error`，随后进程退出 | 端点不可达，或者没有凭据传到客户端。 | 检查 `endpoint`、DNS 与网络。凭据必须来自 `access_key` 与 `secret_key`。 |
+| `unknown field: found ...` | 严格检查的配置段中有拼写错误或不支持的键。 | 删除或更正该键，参见[配置](/zh-Hans/configuration#配置如何加载)。 |
+| `MS_SELF_TELEMETRY_CLUSTER_TOKEN must be set when split-role self intake is enabled` | 链路捕获或自采集开启时，没有 `intake` 角色的分角色节点启动时没有共享 Token。 | 在每个节点上设置相同的 Token。链路捕获默认开启，只关闭 `[telemetry.self_collect]` 不够。 |
+| `open Probe CA key` | `MS_CIPHER_KEY` 与加密该数据库的密钥不一致。 | 恢复原来的密钥，参见[生产检查清单](/zh-Hans/production-checklist)。 |
+| `migration ... was previously applied but is missing in the resolved migrations` 或 `... has been modified` | 二进制与数据库来自互不兼容的版本。 | 运行匹配的版本，或恢复备份，参见[升级](/zh-Hans/upgrade)。 |
+| `address already in use` | 其他进程占用了配置的端口。 | 修改端口。`[profiling].port` 与 `[probe].register_port` 的默认值都是 `5084`。 |
+| 环境变量中的设置没有生效 | 变量名包含点号、双下划线或拼写有误。 | 用单个下划线连接路径，例如 `MS_META_DATABASE_DSN`。 |
+
+## 登录
+
+| 现象 | 原因 | 解决办法 |
+|---|---|---|
+| `admin@example.com` 加 `admin` 被拒绝 | 数据库中已有用户，root 账号不会再次创建；或 `root_email` 与 `root_password` 为空。 | 使用已有账号登录。要创建 root 账号，请设置这两项并对空数据库启动。 |
+| 收不到密码重置邮件 | 没有配置 SMTP 或 `http.external_url`，请求会被接受，但不会发送任何内容。 | 设置 `[notify.smtp].host` 与 `[http].external_url`。 |
+| API 调用在一天之后开始返回 `401` | 登录 Token 在 `[auth].token_ttl_secs`（24 小时）之后过期。 | 自动化使用服务账号 Token，参见[身份与访问](/zh-Hans/identity)。 |
+
+## 发送数据
+
+| 现象 | 原因 | 解决办法 |
+|---|---|---|
+| `401` | Token 缺失、无效，或是已过期的登录 Token。 | 发送 `Authorization: Bearer <token>`，使用默认接入 Token 或服务账号 Token。 |
+| `403` | Token 没有 `streams.write` 权限，例如把 RUM Client Token 发到了接入路径。 | 使用具备 `streams.write` 权限的 Token。 |
+| `413` | 请求体超过 2 MiB。 | 发送更小的批次，并把代理的限制调到至少 2 MiB。 |
+| OTLP over HTTP 端点返回 `400` | 发送端压缩了请求体。 | 在 OpenTelemetry Collector 导出端设置 `compression: none`。 |
+| OTLP over HTTP 端点返回 `404` | 导出端的 endpoint 缺少 `/api` 基础路径，请求被发到了 `/v1/logs`。 | 使用 `http://host:5080/api` 作为 OTLP endpoint。 |
+| `429` 并带有 `Retry-After` | 触发了 `router` 角色对该组织的速率限制。 | 降低发送速率，或调高 `[router.rate_limit]`。 |
+| 原生 JSON 返回 `rejected` 记录 | 字段值与数据流的 schema 不一致，例如 `type mismatch on field level: expected Utf8, got Number`，响应会按下标列出原因。 | 发送数据流中该字段已有的类型。 |
+| `400` 并提示 `event #1 must be a JSON object` | 数组中包含不是 JSON 对象的元素，整个请求都会被拒绝。 | 发送由对象组成的数组。 |
+| Promtail 或 Grafana Alloy 无法推送 | Loki 端点只解码 JSON，而这些发送端使用 snappy 压缩的 protobuf。 | 改用 OpenTelemetry Collector、Vector 或 Fluent Bit 发送。 |
+| 记录已接收但查不到 | 查询使用了其他数据流名称或类型，或时间范围把它们排除在外。 | 检查数据流名称与信号类型，时间戳问题见下一节。 |
+
+## 数据缺失或异常
+
+- **时间戳。** `_timestamp` 是自 Unix 纪元起的微秒数。用秒、毫秒或纳秒表示的值，会把事件放到错误的年份或遥远的未来，对近期时间的查询找不到它们。省略 `_timestamp` 则使用服务端接收时间。
+- **时间范围。** 覆盖时间较长的查询会转为异步任务。交互式查询请使用有界的 `time_range`，参见[查询](/zh-Hans/query#时间范围与异步任务)。
+- **保留期。** 超过 `[compactor].retention_days` 或数据流自身保留期的数据会被删除。
+- **信号类型。** 数据流由名称和类型共同标识，`default` 可以同时存在于日志、指标和链路类型下。
+
+## 查询
+
+| 现象 | 原因 | 解决办法 |
+|---|---|---|
+| 响应为 `202`，并带有 `job_id` 与 `monitor` 路径 | 估算规模达到 `[querier].auto_async_threshold_rows`，查询作为异步搜索任务运行。在默认配置下，对应约 13.9 小时或更长的时间范围。 | 请求 `monitor` 路径直到任务完成，再获取其 `/results`；或缩小时间范围，或发送 `Prefer: respond-sync`，参见[查询](/zh-Hans/query#时间范围与异步任务)。 |
+| Flight SQL 客户端无法连接 | `[flight_sql]` 默认关闭。 | 设置 `enabled = true`，开放 `5083` 端口，并使用 API Token 认证。 |
+
+## 运维
+
+| 现象 | 原因 | 解决办法 |
+|---|---|---|
+| `GET /api/v1/healthz` 返回 `503` | WAL 正在重放，或对象存储不可达，响应体中带有 `reason`。 | 等待重放完成，或修复对象存储的连接。 |
+| WAL 目录持续增长 | 刷写失败，通常是对象存储不可达。 | 修复对象存储，intake 随后会刷写积压的数据。 |
+| Intake 返回 `429` 与 `intake buffer memory limit exceeded` | 进程的 buffer 占用超过 `[intake].max_buffer_memory_mb`，通常因为刷写持续失败。 | 从 `intake flush failed` 日志里找原因，修复对象存储或数据库。永远无法发布的行不再占用这个额度（见下面两行）。 |
+| 日志出现 `dataset no longer exists; buffered rows discarded` | 数据流被删除，或被删除后又重新创建，而它的行还在 buffer 里。这些行无处可去，intake 会丢弃它们并归还内存。计数器 `intake_flush_errors_total` 用 `stream_gone` 或 `dataset_gone` 两个 step 记录每次丢弃。 | 无需处理。数据重要的话请重新发送。 |
+| 写入返回 `503` 并带有 `fenced by a newer writer epoch` | 另一个进程用同一个 `[node].id` 发布了同一个数据集。被栅栏的进程无法发布数据，会丢弃内存中的行，并拒绝对该数据集的写入，它的 WAL 保留在磁盘上。计数器 `intake_flush_errors_total` 用 `writer_fenced` 这个 step 记录栅栏。 | 为每个进程设置唯一的 `[node].id`，并重启被栅栏的那个。参见[分角色部署](/zh-Hans/distributed-deployment)。 |
+| 定时的 PDF 或 PNG 报告失败 | 没有 Chrome，或 `[scheduled_reports.renderer].base_url` 无法访问网页界面。 | 使用自带 Chromium 的发布镜像，并把 `base_url` 设为节点能访问到的网页界面地址。 |
+| 接入片段显示了错误的主机 | 位于代理之后时 `http.external_url` 为空。 | 把 `[http].external_url` 设为对外地址并重启。 |
+| 查询返回 `503` 与 `no querier node is available` | 没有带 `querier` 角色且心跳足够新的节点。 | 启动 `querier` 节点，并确认 router 能访问它的 `advertise_addr`。参见[分角色部署](/zh-Hans/distributed-deployment#集群成员)。 |
+| 经 router 写入返回 `503` 与 `no intake node is available` | 没有带 `intake` 角色且心跳足够新的节点。 | 启动 `intake` 节点，并检查它的 `advertise_addr` 与 WAL 重放。参见[分角色部署](/zh-Hans/distributed-deployment#集群成员)。 |
+| 无法从宿主机访问 OTLP gRPC 端口 | Compose 文件没有发布 `4317` 端口。 | 添加 `4317:4317` 映射。 |

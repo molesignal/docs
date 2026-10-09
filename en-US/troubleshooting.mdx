@@ -1,0 +1,74 @@
+---
+title: "Troubleshooting"
+description: "Causes and fixes for common start-up failures, rejected requests, missing data, and slow or asynchronous queries."
+---
+
+Check the process log first. It prints the cause of a start-up failure, and the HTTP error body of a rejected request carries a message. The log level comes from `[telemetry].log_level` or `RUST_LOG`.
+
+## Start-up
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `... password authentication failed for user` | The DSN user or password is wrong. | Fix `[meta_database].dsn`. |
+| `... pool timed out while waiting for an open connection` | PostgreSQL is unreachable from the node. | Check the host, the port, the firewall, and `sslmode` requirements. |
+| `startup_ping put: ... SignatureDoesNotMatch` | The object store rejects the credentials. | Check `access_key` and `secret_key`. Set them with `MS_OBJECT_STORE_ACCESS_KEY` and `MS_OBJECT_STORE_SECRET_KEY`. |
+| `startup_ping put: ... NoSuchBucket` | The bucket does not exist. | Create the bucket or fix `[object_store].bucket`. |
+| Repeated `Encountered transport error` lines, then exit | The endpoint is unreachable, or no credentials reach the client. | Check `endpoint`, DNS, and the network. Credentials must come from `access_key` and `secret_key`. |
+| `unknown field: found ...` | A key in a strict section is misspelled or unsupported. | Remove or correct the key. See [Configuration](/en-US/configuration#how-configuration-is-loaded). |
+| `MS_SELF_TELEMETRY_CLUSTER_TOKEN must be set when split-role self intake is enabled` | A role-split node without the `intake` role starts without the shared token while trace capture or self-collection is on. | Set the same token on every node. Disabling `[telemetry.self_collect]` alone is not enough, because trace capture is on by default. |
+| `open Probe CA key` | `MS_CIPHER_KEY` differs from the key that encrypted the database. | Restore the original key. See [Production checklist](/en-US/production-checklist). |
+| `migration ... was previously applied but is missing in the resolved migrations` or `... has been modified` | The binary and the database come from incompatible versions. | Run the matching version, or restore a backup. See [Upgrade](/en-US/upgrade). |
+| `address already in use` | Another process uses a configured port. | Change the port. `[profiling].port` and `[probe].register_port` both default to `5084`. |
+| A setting from an environment variable has no effect | The variable name contains a dot, a double underscore, or a typo. | Join the path with single underscores, as in `MS_META_DATABASE_DSN`. |
+
+## Sign-in
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `admin@example.com` with `admin` is rejected | The database already had users, so the root account was not created again, or `root_email` and `root_password` were empty. | Sign in with an existing account. Set both values and start against an empty database to create the root account. |
+| The password reset email never arrives | SMTP or `http.external_url` is not configured. The request is accepted without sending anything. | Set `[notify.smtp].host` and `[http].external_url`. |
+| API calls start to fail with `401` after a day | Login tokens expire after `[auth].token_ttl_secs` (24 hours). | Use a service account token for automation. See [Identity and access](/en-US/identity). |
+
+## Sending data
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `401` | The token is missing, invalid, or an expired login token. | Send `Authorization: Bearer <token>` with a default intake token or a service account token. |
+| `403` | The token lacks `streams.write`, for example a RUM client token sent to an intake path. | Use a token with the `streams.write` permission. |
+| `413` | The request body exceeds 2 MiB. | Send smaller batches. Raise the limit of the proxy to at least 2 MiB. |
+| `400` from an OTLP over HTTP endpoint | The sender compressed the body. | Set `compression: none` on the OpenTelemetry Collector exporter. |
+| `404` from an OTLP over HTTP endpoint | The exporter endpoint omits the `/api` base path, so requests go to `/v1/logs`. | Use `http://host:5080/api` as the OTLP endpoint. |
+| `429` with `Retry-After` | The `router` role rate limit for the organization applies. | Slow down, or raise `[router.rate_limit]`. |
+| Native JSON reports `rejected` records | A field value does not match the stream schema, for example `type mismatch on field level: expected Utf8, got Number`. The response lists the reason per index. | Send the type that the stream already stores for the field. |
+| `400` with `event #1 must be a JSON object` | The array contains an element that is not a JSON object. The whole request is rejected. | Send an array of objects. |
+| Promtail or Grafana Alloy cannot push | The Loki endpoint decodes JSON only, and these senders use snappy-compressed protobuf. | Send through the OpenTelemetry Collector, Vector, or Fluent Bit. |
+| Records are accepted but not found | The query uses another stream name or type, or a time range that excludes them. | Check the stream name and signal type. See the next section for timestamps. |
+
+## Missing or odd data
+
+- **Timestamps.** `_timestamp` counts microseconds since the Unix epoch. A value in seconds, milliseconds, or nanoseconds places events in the wrong year or the far future, and queries over recent time do not return them. Omit `_timestamp` to use the server receive time.
+- **Time range.** A query that covers a long range becomes an asynchronous job. Use a bounded `time_range` for interactive queries. See [Query](/en-US/query#time-ranges-and-asynchronous-jobs).
+- **Retention.** Data older than `[compactor].retention_days`, or the retention of the stream, is deleted.
+- **Stream type.** A stream is identified by name and type. `default` can exist for logs, metrics, and traces at once.
+
+## Queries
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The response is `202` with a `job_id` and a `monitor` path | The estimated size reaches `[querier].auto_async_threshold_rows`, so the query runs as an asynchronous search job. With the defaults, that is a range of about 13.9 hours or more. | Request the `monitor` path until the job finishes, then fetch its `/results`. Or narrow the time range, or send `Prefer: respond-sync`. See [Query](/en-US/query#time-ranges-and-asynchronous-jobs). |
+| The Flight SQL client cannot connect | `[flight_sql]` is disabled by default. | Set `enabled = true`, expose port `5083`, and authenticate with an API token. |
+
+## Operations
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `GET /api/v1/healthz` returns `503` | The WAL is replaying, or the object store is unreachable. The body carries a `reason`. | Wait for the replay, or fix the object store connection. |
+| The WAL directory grows | Flushes fail, usually because the object store is unreachable. | Fix the object store. Intake flushes the backlog afterwards. |
+| Intake answers `429` with `intake buffer memory limit exceeded` | The buffers of the process hold more than `[intake].max_buffer_memory_mb`, usually because flushes keep failing. | Find the cause in the `intake flush failed` log lines, and fix the object store or the database. Rows that can never be published stop counting against the limit (see the next two rows). |
+| The log shows `dataset no longer exists; buffered rows discarded` | A stream was deleted, or deleted and created again, while rows of it were still buffered. Those rows have nowhere to go, so intake drops them and returns their memory. The counter `intake_flush_errors_total` records each discard under the step `stream_gone` or `dataset_gone`. | Nothing to fix. Send the data again if it matters. |
+| Writes answer `503` with `fenced by a newer writer epoch` | Another process publishes the same dataset under the same `[node].id`. The fenced process cannot publish its data, drops the rows it holds in memory, and refuses writes to that dataset. Its WAL stays on disk. The counter `intake_flush_errors_total` records the fencing under the step `writer_fenced`. | Give every process a unique `[node].id` and restart the fenced one. See [Role-based deployment](/en-US/distributed-deployment). |
+| Scheduled PDF or PNG reports fail | Chrome is missing, or `[scheduled_reports.renderer].base_url` does not reach the web UI. | Use the release image, which includes Chromium, and set `base_url` to the web UI address that the node can reach. |
+| Onboarding snippets show the wrong host | `http.external_url` is empty behind a proxy. | Set `[http].external_url` to the public address and restart. |
+| Queries answer `503` with `no querier node is available` | No node with the `querier` role has a recent heartbeat. | Start a `querier` node and check that its `advertise_addr` is reachable from the router. See [Role-based deployment](/en-US/distributed-deployment#cluster-membership). |
+| Writes through the router answer `503` with `no intake node is available` | No node with the `intake` role has a recent heartbeat. | Start an `intake` node and check its `advertise_addr` and WAL replay. See [Role-based deployment](/en-US/distributed-deployment#cluster-membership). |
+| The OTLP gRPC port is unreachable from the host | The Compose file does not publish port `4317`. | Add a `4317:4317` mapping. |

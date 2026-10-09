@@ -1,337 +1,572 @@
 ---
 title: "Configuration"
-description: "Configure the current single-crate service, ports, storage, workers, security, telemetry, and optional runtimes."
+description: "How MoleSignal loads configuration, which environment variables exist, and a reference of every setting with its default."
 ---
 
-Start MoleSignal with one TOML file:
+MoleSignal reads one TOML file and `MS_` environment variables. Start from the sample `conf/config.toml` that ships with each release. The sample lists every setting, and this page documents each one.
 
 ```bash
 molesignal --config /etc/molesignal/config.toml
 ```
 
-Configuration is applied in this order, with later sources overriding earlier ones:
+## How configuration is loaded
 
-1. built-in Rust defaults;
-2. the file passed through `--config`;
+Settings apply in this order. Later sources override earlier ones.
+
+1. Built-in defaults.
+2. The TOML file passed with `--config`.
 3. `MS_` environment variables.
 
-Structured environment names use a dot between sections:
+Restart the process after changing a setting. A running process logs changes to the file and does not apply them.
 
-```bash
-env 'MS_HTTP.PORT=5081' \
-    'MS_STORE.META.DSN=postgres://user:pass@db:5432/molesignal' \
-    molesignal --config /etc/molesignal/config.toml
-```
+<Note>
+  Most sections ignore keys that they do not define, so a typo has no effect and produces no warning. The sections `[meta_database]`, `[object_store]` (including `[object_store.retry]`), `[telemetry]` (including `[telemetry.trace]` and `[telemetry.self_collect]`), `[apm]`, `[probe]`, `[otlp_grpc]`, `[notify]`, and `[scheduled_reports.renderer]` reject unknown keys, so a typo stops the process at startup.
+</Note>
 
-The schema is defined under `src/config/`. The repository's maintained production-oriented sample
-is `conf/config.toml`; review the file when upgrading because newly added settings receive code defaults
-when absent.
+The **Default** column in the reference tables shows the value from the sample `conf/config.toml`. Where the built-in value used for a missing key differs, the description says so.
 
-## Secret-only values
+## Environment variables
 
-Keep these outside TOML when possible:
+Every setting has an environment variable. Write the `MS_` prefix, then each level of the setting path in upper case, joined by single underscores.
 
-| Environment variable | Purpose |
+| Setting | Environment variable |
 |---|---|
-| `MS_AUTH_JWT_SECRET_OVERRIDE` | Pin bootstrap JWT signing material when required by deployment policy. |
-| `MS_CIPHER_KEY` | Root material for the organization cipher-key store. |
-| `MS_SELF_TELEMETRY_CLUSTER_TOKEN` | Authenticate self-telemetry forwarding between split roles. |
-| `MS_AGENT_OPENAI_*` | Development fallback OpenAI key and base URL. |
-| `MS_AGENT_ANTHROPIC_*` | Development fallback Anthropic key and base URL. |
-| `MS_AGENT_COMPATIBLE_*` | Development fallback OpenAI-compatible key and base URL. |
+| `[http].port` | `MS_HTTP_PORT` |
+| `[meta_database].dsn` | `MS_META_DATABASE_DSN` |
+| `[cluster].advertise_addr` | `MS_CLUSTER_ADVERTISE_ADDR` |
+| `[node].roles` | `MS_NODE_ROLES` |
 
-Production Mole Agent providers should normally be created in **Mole Agent → Agent
-settings**. Provider keys are encrypted, write-only, and resolved from PostgreSQL before the
-environment fallback.
+Write lists in TOML syntax, for example `MS_NODE_ROLES='["intake","querier"]'`. Names that contain a dot or a double underscore are not recognized.
 
-## Node roles
+These variables are read separately from the settings:
 
-```toml
-[node]
-roles = ["standalone"]
-id = ""
-drain_timeout_secs = 30
-```
+| Variable | Purpose |
+|---|---|
+| `MS_CIPHER_KEY` | Root key for the secrets that MoleSignal encrypts in PostgreSQL. Provide 32 random bytes encoded as base64. Without it, the process falls back to an all-zero development key and logs a warning. Never change the key without running `rewrap-kek`. See [Production checklist](/en-US/production-checklist). |
+| `MS_AUTH_JWT_SECRET_OVERRIDE` | Pins the JWT signing secret instead of the one generated in PostgreSQL on first start. |
+| `MS_SELF_TELEMETRY_CLUSTER_TOKEN` | Shared secret that authenticates the trace candidates and self-telemetry that role-split nodes forward to each other. Set the same value on every role-split node while [trace capture](#trace-capture-and-tail-sampling) (on by default) or `[telemetry.self_collect]` is enabled. A node without the `intake` role refuses to start without it. |
+| `MS_AGENT_OPENAI_API_KEY`, `MS_AGENT_ANTHROPIC_API_KEY`, `MS_AGENT_COMPATIBLE_API_KEY` | Development fallback API keys for Mole Agent model providers. Each has a matching `_BASE_URL` variable. Configure production providers in the product instead. |
+| `RELEASE_CHANNEL` | Labels the deployment maturity: `alpha`, `beta`, `rc`, or `stable`. |
+| `RUST_LOG` | Overrides `[telemetry].log_level` when set. |
+| `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_ACCESS_KEY` | Azure Blob credentials for the `azure` object backend. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to the service account JSON for the `gcs` object backend. |
 
-Choose from `standalone`, `router`, `intake`, `querier`, `compactor`, and `alert_manager`.
-`standalone` composes the complete service. An empty `id` is generated at startup. Shutdown waits
-up to `drain_timeout_secs` for pending intake data to flush.
+## Minimal production settings
 
-## Network listeners
-
-| Default port | Section | Exposure |
-|---|---|---|
-| `5080` | `[http]` | Product HTTP API, UI proxy target, health, and metrics. |
-| `5082` | `[grpc]` | Trusted internal node, scan, and private intake protocols. |
-| `5083` | `[flight_sql]` | External authenticated Arrow Flight SQL; disabled by default. |
-| `4317` | `[otlp_grpc]` | External standard OTLP gRPC; enabled by default. |
-| `5084` | `[profiling]` | Node-local pprof diagnostics; disabled and loopback-only by default. |
-### HTTP and TLS
+A production node needs these settings at a minimum. The rest of the file can stay at its defaults.
 
 ```toml
 [http]
-bind = "0.0.0.0"
-port = 5080
-gzip = true
-external_url = ""
+external_url = "https://molesignal.example.com"
 
-[http.tls]
-enabled = false
-plain_port = 80
-port = 443
-acme_directory = "production"
-account_email = ""
-key_storage_dir = "/var/lib/molesignal/acme"
-issue_poll_secs = 60
-renewal_retry_secs = 21600
-```
+[meta_database]
+dsn = "postgres://molesignal:<password>@db.internal:5432/molesignal"
 
-Set `external_url` to the public origin when a reverse proxy changes the host or scheme. Enabling
-TLS starts the ACME HTTP-01 listener and rustls SNI endpoint.
-
-### Internal gRPC, Flight SQL, and OTLP
-
-```toml
-[grpc]
-bind = "0.0.0.0"
-port = 5082
-max_message_size_mb = 32
-
-[flight_sql]
-enabled = false
-bind = "0.0.0.0"
-port = 5083
-default_lookback_hours = 24
-max_message_size_mb = 32
-
-[otlp_grpc]
-enabled = true
-bind = "0.0.0.0"
-port = 4317
-max_message_size_mb = 32
-```
-
-Do not expose `5082` to untrusted networks. External OTLP and Flight SQL require bearer
-authentication; terminate TLS before public exposure.
-
-## Metadata and object storage
-
-Built-in development defaults use SQLite and the local filesystem. The repository sample uses
-PostgreSQL for metadata.
-
-```toml
-[store.meta]
-backend = "postgres"
-dsn = "postgres://molesignal:molesignal@db:5432/molesignal"
-max_connections = 16
-
-[store.object]
+[object_store]
 backend = "s3"
-root = ""
 bucket = "molesignal"
-region = "ap-southeast-1"
-endpoint = ""
-credentials_file = "/etc/molesignal/object-store.toml"
-multipart_threshold_mb = 32
-multipart_part_size_mb = 8
-range_threshold_mb = 16
-range_chunk_mb = 8
-max_concurrency = 8
-op_timeout_secs = 30
-health_probe_interval_secs = 30
+region = "us-east-1"
+endpoint = ""          # empty for AWS S3, the service URL for S3-compatible storage
+access_key = ""        # prefer MS_OBJECT_STORE_ACCESS_KEY
+secret_key = ""        # prefer MS_OBJECT_STORE_SECRET_KEY
 
-[store.object.retry]
-max_attempts = 4
-base_backoff_ms = 100
-max_backoff_ms = 5000
-jitter_ratio = 0.2
-```
-
-Object backends are `local`, `s3`, `azure`, and `gcs`. Credential precedence is environment,
-credentials file, then inline TOML. Use shared object storage and PostgreSQL for multi-node
-deployments.
-
-## Intake, WAL, query, and retention
-
-```toml
 [wal]
-dir = "./data/wal"
-segment_size_mb = 256
-flush_strategy = "batch"
-sync_level = "data"
-batch_max_pending = 64
-batch_max_delay_ms = 50
+dir = "/var/lib/molesignal/wal"
 
-[intake]
-buffer_max_mb = 256
-flush_interval_secs = 30
-flush_parallelism = 4
-
-[querier]
-concurrency = 0
-max_scan_rows = 100000000
-auto_async_threshold_rows = 50000000
-estimate_throughput_per_sec = 1000
-
-[compactor]
-interval_secs = 300
-target_mb = 512
-max_concurrent_groups = 4
-retention_days = 30
-downsample_after_days = 0
-downsample_interval_secs = 3600
+[auth]
+root_email = "admin@example.com"
+root_password = "<initial password>"
 ```
 
-`concurrency = 0` uses the available CPUs. A query estimate above
-`auto_async_threshold_rows` becomes an asynchronous search job; set the threshold to `0` to disable
-automatic conversion. Per-stream retention overrides the compactor default.
+Also set `MS_CIPHER_KEY` in the environment. See the [Production checklist](/en-US/production-checklist) for the full list of steps before going live.
+
+## Node
+
+`[node]` selects the roles that a process runs. See [Role-based deployment](/en-US/distributed-deployment).
+
+| Key | Default | Description |
+|---|---|---|
+| `roles` | `["standalone"]` | Roles to run: `standalone`, `router`, `intake`, `querier`, `compactor`, `alert`. `standalone` runs all of them in one process. |
+| `id` | empty | Node id, at most 64 characters. An empty value uses the OS hostname. Set a distinct id for every process when several run on one host. |
+| `drain_timeout_secs` | `30` | Time to wait for pending intake data to flush after `SIGTERM` or `SIGINT`. The process exits when the time elapses. |
+
+## Listeners
+
+### HTTP
+
+| Key | Default | Description |
+|---|---|---|
+| `bind` | `0.0.0.0` | Listen address. |
+| `port` | `5080` | HTTP port when `[http.tls]` is disabled. |
+| `gzip` | `true` | Compresses HTTP responses. Set `false` when a reverse proxy compresses. |
+| `external_url` | empty | Public origin, for example `https://molesignal.example.com`. When empty, the web UI uses the browser origin. Generated onboarding snippets use this value, and status page custom domains use it as the CNAME target. Restart after a change. |
+
+### HTTP TLS and ACME
+
+`[http.tls]` starts a TLS listener with automatic certificates from an ACME service such as Let's Encrypt.
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Master switch. All other keys are ignored when `false`. |
+| `plain_port` | `80` | Plain HTTP port for ACME HTTP-01 challenges and the redirect to HTTPS. |
+| `port` | `443` | HTTPS port. |
+| `acme_directory` | `production` | `production`, `staging` (Let's Encrypt staging), or a custom directory URL. |
+| `account_email` | empty | ACME account email. Let's Encrypt requires it. |
+| `key_storage_dir` | `/var/lib/molesignal/acme` | Directory for the ACME account key and the per-domain keys. |
+| `issue_poll_secs` | `60` | Interval for scanning domains that wait for a certificate. |
+| `renewal_retry_secs` | `21600` | Interval for renewal retries and expiry scans. |
+
+### Internal gRPC
+
+`[grpc]` carries node-to-node traffic. Keep the port on a trusted network.
+
+| Key | Default | Description |
+|---|---|---|
+| `bind` | `0.0.0.0` | Listen address. |
+| `port` | `5082` | Port. Also used by peers through `[cluster].advertise_addr`. |
+| `max_message_size_mb` | `32` | Largest gRPC message in MiB. |
+
+### OTLP gRPC
+
+`[otlp_grpc]` configures the OTLP gRPC receiver. The receiver has no enable switch and listens on every node that runs the `intake` role, including `standalone`.
+
+| Key | Default | Description |
+|---|---|---|
+| `bind` | `0.0.0.0` | Listen address. |
+| `port` | `4317` | Port. |
+| `max_message_size_mb` | `32` | Largest gRPC message in MiB. |
+
+### Arrow Flight SQL
+
+`[flight_sql]` serves SQL clients such as DBeaver, JDBC, and ADBC. Every call requires an API token. See [Database clients](/en-US/query/database-clients).
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Starts the listener. |
+| `bind` | `0.0.0.0` | Listen address. |
+| `port` | `5083` | Port. |
+| `default_lookback_hours` | `24` | Lookback window in hours for SQL that has no time filter. |
+| `max_message_size_mb` | `32` | Largest message in MiB. |
+
+### Probe Agent
+
+`[probe]` configures the registration and control endpoints for Probe Agents. The endpoints start on `standalone` and `alert` nodes. Registration uses server-authenticated TLS, and the control stream uses short-lived mutual TLS identities. See [Synthetic monitoring](/en-US/synthetics).
+
+| Key | Default | Description |
+|---|---|---|
+| `bind` | `0.0.0.0` | Listen address. |
+| `register_port` | `5084` | Registration port. Must differ from `control_port`. |
+| `control_port` | `5085` | Control stream port. |
+| `register_endpoint` | `https://localhost:5084` | Public `https://` URL that agents use to register. The one-time register command prints it. Set it behind a proxy or load balancer. |
+| `control_endpoint` | `https://localhost:5085` | Public `https://` URL of the control stream. |
+| `server_names` | `["localhost", "127.0.0.1"]` | DNS names and IP addresses in the server certificate. Include the public host names of the endpoints. |
+| `certificate_days` | `30` | Validity of issued certificates, from 1 to 365. |
+| `max_message_size_mb` | `32` | Largest message in MiB. |
+
+### pprof
+
+`[profiling]` starts a node-local pprof listener for diagnostics.
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Starts the listener. |
+| `bind` | `127.0.0.1` | Listen address. Must be a loopback address unless `allow_remote` is `true`. |
+| `port` | `5084` | Port. Change it when the Probe Agent registration port uses the same value on the same host. |
+| `allow_remote` | `false` | Allows a non-loopback `bind`. Remote exposure can leak runtime information. |
+
+## Storage
+
+### Metadata database
+
+`[meta_database]` configures the PostgreSQL database that holds metadata, identities, the file catalog, and product resources.
+
+| Key | Default | Description |
+|---|---|---|
+| `dsn` | `postgres://molesignal:molesignal@localhost:5432/molesignal` | PostgreSQL connection string. Replace the sample credentials. |
+| `min_connections` | `2` | Connections opened at startup. Limited to `max_connections`. |
+| `max_connections` | `16` | Connection pool limit. |
+
+MoleSignal applies its embedded schema migrations to the database on start. See [Upgrade](/en-US/upgrade).
+
+### Object storage
+
+`[object_store]` configures the store for Parquet files, search indexes, and profile blobs. Backends: `local`, `s3`, `azure`, `gcs`. Use `s3` for AWS S3 and S3-compatible services such as RustFS, Cloudflare R2, and Alibaba Cloud OSS.
+
+| Key | Default | Description |
+|---|---|---|
+| `backend` | `local` | `local`, `s3`, `azure`, or `gcs`. |
+| `root` | `./data/objects` | Directory of the `local` backend. Ignored by the other backends. |
+| `bucket` | empty | Bucket name for `s3` and `gcs`, container name for `azure`. Required for those backends. |
+| `region` | empty | S3 region. S3-compatible services state the value that they expect. |
+| `endpoint` | empty | S3 endpoint URL. Leave empty for AWS S3. Use `http://host:9000` style URLs for RustFS and similar services. |
+| `path_style` | `false` | `false` uses virtual-hosted addressing, which AWS S3 and Huawei Cloud OBS need. Set `true` for path-style addressing, which RustFS and most self-hosted services need. |
+| `access_key` | empty | S3 access key, or the Azure storage access key. |
+| `secret_key` | empty | S3 secret key. |
+| `credentials_file` | empty | Path of a file with the lines `access_key=<value>` and `secret_key=<value>`. See the order below. |
+| `multipart_threshold_mb` | `32` | Objects at least this large, in MiB, upload in parts. Manifest objects and writes with a version condition always upload in one request. The minimum is 1. |
+| `multipart_part_size_mb` | `8` | Size of one part of a multipart upload, in MiB, from 5 to 1024. Very large objects use larger parts so that an upload stays within 10,000 parts. |
+| `range_threshold_mb` | `16` | A read of a byte range at least this large, in MiB, splits into chunk requests that run in parallel. The minimum is 1. |
+| `range_chunk_mb` | `8` | Size of one chunk request, in MiB, from 1 to 1024. |
+| `max_concurrency` | `8` | Concurrent object store operations per process. |
+| `op_timeout_secs` | `30` | Timeout for waiting for a concurrency slot and for one backend operation. |
+| `health_probe_interval_secs` | `30` | Interval of the background write, read, and delete probe. The minimum is 5. |
+
+The S3 and Azure clients take their credentials from the first of these sources that provides both an access key and a secret key:
+
+1. The variables `MS_OBJECT_STORE_ACCESS_KEY` and `MS_OBJECT_STORE_SECRET_KEY`.
+2. The file that `credentials_file` names.
+3. The keys `access_key` and `secret_key`.
+
+The startup log reports the winner as `object_store_credentials_source`: `env`, `file`, `inline`, or `none`. Prefer an environment variable or a credentials file over `config.toml` for the secret.
+
+Every part of a multipart upload and every chunk of a ranged read is an object store operation that takes a concurrency slot, retries on its own, and shows in the `object_store_*` metrics. One transfer holds at most half of the slots, so large objects do not starve other operations.
+
+Transient errors of the cloud backends are retried with exponential backoff:
+
+| Key | Default | Description |
+|---|---|---|
+| `[object_store.retry].max_attempts` | `4` | Total attempts per operation. |
+| `[object_store.retry].base_backoff_ms` | `100` | First wait. |
+| `[object_store.retry].max_backoff_ms` | `5000` | Largest wait. |
+| `[object_store.retry].jitter_ratio` | `0.2` | Random jitter applied to each wait, from `0` to `1`. |
+
+### Write-ahead log
+
+`[wal]` configures the write-ahead log of nodes that run the `intake` role. Put the directory on a persistent local volume. See [Backup and restore](/en-US/backup-restore).
+
+| Key | Default | Description |
+|---|---|---|
+| `dir` | `./data/wal` | WAL directory. |
+| `segment_size_mb` | `256` | Segment size in MB. A full segment starts a new one. |
+| `flush_strategy` | `batch` | When to `fsync`. `none` never syncs and relies on the page cache. `every_write` syncs each record, which gives the strongest durability and the highest latency. `batch` syncs after `batch_max_pending` records or `batch_max_delay_ms`. |
+| `sync_level` | `data` | Depth of each sync. `none` skips it. `data` syncs file data. `all` also syncs metadata and the parent directory. |
+| `batch_max_pending` | `64` | Records that trigger a sync in `batch` mode. |
+| `batch_max_delay_ms` | `50` | Longest time between syncs in `batch` mode. |
+| `encrypt` | `false` | Encrypts each record payload with the root key (`MS_CIPHER_KEY`) before writing it to disk. Absent from the sample file. |
+| `max_replay_mb` | `512` | Memory limit for startup replay. Replay flushes once the limit is exceeded. |
+
+### Intake
+
+`[intake]` controls the in-memory buffers of an intake node.
+
+| Key | Default | Description |
+|---|---|---|
+| `buffer_max_mb` | `256` | Hard limit of the raw buffer of one stream. The adaptive threshold never exceeds it. |
+| `max_buffer_memory_mb` | `1024` | Total memory reserved by the active and detached buffers of the process. |
+| `flush_interval_secs` | `30` | Longest time between flushes. |
+| `flush_parallelism` | `4` | Concurrent flushes. |
+
+`[intake.rotation]` sizes the Parquet files adaptively:
+
+| Key | Default | Description |
+|---|---|---|
+| `adaptive_enabled` | `true` | Adjusts the next raw threshold of each stream from the encoded-to-raw ratio of finished files. |
+| `target_file_size_mb` | `128` | Target size of encoded Parquet files. |
+| `min_buffer_mb` | `16` | Lower limit of the adaptive threshold. |
+| `ewma_alpha` | `0.2` | Smoothing factor of the ratio, greater than 0 and at most 1. |
+
+`[intake.prometheus]` limits Prometheus `remote_write` input:
+
+| Key | Default | Description |
+|---|---|---|
+| `max_labels_per_series` | `64` | Labels per series, not counting `__name__`. |
+| `max_label_name_bytes` | `128` | Longest label name in UTF-8 bytes. |
+| `max_label_value_bytes` | `2048` | Longest label value in UTF-8 bytes. |
+| `max_samples_per_batch` | `16384` | Samples in one internal batch. |
+
+`[intake.prometheus.cardinality]` admits series on the consistent-hash intake node:
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Applies the limits. |
+| `max_active_series_per_process` | `1000000` | Active series per process. At least the organization limit. |
+| `max_active_series_per_org` | `200000` | Active series per organization. At least the metric limit. |
+| `max_active_series_per_metric` | `100000` | Active series per metric of one organization. |
+| `max_new_series_per_minute` | `20000` | New series that the process accepts per minute. |
+| `idle_ttl_secs` | `900` | A series idle for this long releases its capacity. |
+
+### Compaction and retention
+
+`[compactor]` merges files and applies retention. It runs on `standalone` and `compactor` nodes.
+
+| Key | Default | Description |
+|---|---|---|
+| `interval_secs` | `300` | Time between compaction rounds. |
+| `target_mb` | `512` | Target Parquet size after compaction in MiB. |
+| `max_concurrent_groups` | `4` | Streams that one node processes at the same time in one round. |
+| `retention_days` | `30` | Retention for streams that do not set their own. A per-stream retention overrides it. |
+| `downsample_after_days` | `0` | Downsamples metrics older than this many days into time buckets. `0` disables it. |
+| `downsample_interval_secs` | `3600` | Width of the downsampling bucket. |
+
+### Catalog maintenance
+
+The `[storage.*]` sections control background maintenance of the file catalog and the object store.
+
+| Key | Default | Description |
+|---|---|---|
+| `[storage.catalog].seal_after_hours` | `168` | Writes an immutable manifest for a partition this many hours after it ends. `0` disables sealing. |
+| `[storage.catalog].manifest_cache_bytes` | `268435456` | Memory for the manifest cache. |
+| `[storage.catalog].interval_secs` | `300` | Sealing interval. |
+| `[storage.catalog].batch_size` | `64` | Partitions per round. |
+| `[storage.index].enabled` | `true` | Builds and rebuilds search indexes. |
+| `[storage.index].interval_secs` | `30` | Interval. |
+| `[storage.index].batch_size` | `64` | Files per round. |
+| `[storage.index].max_concurrency` | `2` | Concurrent index builds. |
+| `[storage.index].retry_after_secs` | `300` | Wait before retrying a failed build. |
+| `[storage.gc].enabled` | `true` | Deletes objects that the catalog no longer references. |
+| `[storage.gc].interval_secs` | `30` | Interval. |
+| `[storage.gc].grace_period_secs` | `3600` | Every object waits this long in the delete queue. Before the final delete, the catalog reference and the checksum are checked again. |
+| `[storage.gc].lease_secs` | `900` | Lease on a claimed delete batch. |
+| `[storage.gc].batch_size` | `128` | Objects per round. |
+| `[storage.gc].max_concurrency` | `4` | Concurrent deletes. |
+| `[storage.reconciler].enabled` | `true` | Compares the catalog with the object store. |
+| `[storage.reconciler].interval_secs` | `300` | Interval. |
+| `[storage.reconciler].batch_size` | `256` | Objects per round. |
+| `[storage.reconciler].orphan_grace_secs` | `86400` | Age after which an unreferenced object counts as an orphan. |
+| `[storage.reconciler].verify_checksums` | `true` | Verifies object checksums while reconciling. |
+
+## Query
+
+### Limits and asynchronous jobs
+
+| Key | Default | Description |
+|---|---|---|
+| `[querier].concurrency` | `0` | Query engine parallelism. `0` uses the number of CPUs. |
+| `[querier].max_scan_rows` | `100000000` | Largest number of rows that one query may read: the rows of the files that the query has to read plus the rows in memory buffers. A larger query is rejected with `400` before it reads data. A PromQL query applies the limit to each selector. `0` removes the limit. |
+| `[querier].auto_async_threshold_rows` | `50000000` | Queries whose estimated rows exceed the value become asynchronous search jobs. `0` disables the conversion. |
+| `[querier].estimate_throughput_per_sec` | `1000` | Conservative rows-per-second figure that the size estimate uses. |
+| `[search].max_result_rows` | `0` | Row cap for queries without `LIMIT` that are not aggregations. `0` disables the cap. Absent from the sample file. |
+| `[search_jobs].workers` | `2` | Search jobs that run at the same time on one node. |
+| `[search_jobs].idle_poll_secs` | `2` | Initial fallback polling delay. It backs off while idle. |
+| `[search_jobs].cleanup_interval_secs` | `3600` | Interval for removing expired jobs. |
+
+### Admission control
+
+`[search.admission]` limits concurrent queries per workgroup. All values default to `0` or empty, which means no limit. The section is absent from the sample file.
+
+| Key | Description |
+|---|---|
+| `default_max_concurrent` | Per-node limit for workgroups without an entry in `groups`. |
+| `groups` | Table that maps a workgroup name to its per-node limit. |
+| `role_map` | Table that maps a role (`owner`, `admin`, `editor`, `viewer`) to a workgroup. Unmapped roles use `default`. |
+| `cluster_default_max_concurrent` | Soft cluster-wide limit for workgroups without an entry in `cluster_groups`. |
+| `cluster_groups` | Table that maps a workgroup name to its cluster-wide soft limit. |
+| `cluster_sync_interval_secs` | Interval for publishing node load. `0` uses 5. |
+| `cluster_stale_secs` | Nodes silent for longer drop out of the cluster view. `0` uses 30. |
+
+### Caches
+
+Each layer is an LRU cache with a time-to-live. A capacity of `0` disables the layer. Hit ratios appear at `/metrics` as `cache_<layer>_hit_ratio`.
+
+| Section | Default capacity | Default TTL | Holds |
+|---|---|---|---|
+| `[cache.index_handle]` | `10000` | `600` s | Opened search index handles. |
+| `[cache.query_result]` | `1000` | `60` s | Results of SQL over closed time windows. |
+| `[cache.tantivy_result]` | `1000000` | `600` s | Term counts that prune files. |
+| `[cache.tantivy_footer]` | `100000` | `3600` s | Index footers that save range reads. |
+
+Each section takes `capacity` and `ttl_secs`.
+
+`[cache.object]` caches byte ranges of remote objects on local disk. The `local` object backend bypasses it.
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Enables the cache. A `max_bytes` of `0` also disables it. |
+| `root` | `./data/cache/objects` | Cache directory. |
+| `max_bytes` | `10737418240` | Largest cache size, 10 GiB. |
+| `block_size_bytes` | `4194304` | Block size, from 1 MiB to 16 MiB. |
+| `min_free_bytes` | `1073741824` | Free disk space to keep, 1 GiB. |
+| `max_concurrent_fetches` | `16` | Concurrent block fetches. Must be greater than zero. |
+| `max_concurrent_fetches_per_object` | `4` | Concurrent fetches for one object. Must be greater than zero. |
+
+### Incremental range cache
+
+`[search.stream_agg_cache]` caches closed windows of range PromQL queries such as `rate(metric[5m])`, so a dashboard refresh recomputes only the newest window. It is disabled by default.
+
+| Key | Default | Description |
+|---|---|---|
+| `capacity` | `0` | Number of cached query fingerprints. `0` disables the cache. |
+| `ttl_secs` | `300` | Entry lifetime. Covers late data beyond `safe_lookback_secs`. |
+| `safe_lookback_secs` | `300` | Only windows that end before now minus this value are cached. |
+| `max_series_per_query` | `10000` | Series cached per fingerprint. `0` removes the limit. |
 
 ## Cluster and rate limits
 
-```toml
-[cluster]
-advertise_addr = "127.0.0.1:5082"
-heartbeat_interval_secs = 5
-peer_timeout_secs = 15
+| Key | Default | Description |
+|---|---|---|
+| `[cluster].advertise_addr` | `127.0.0.1:5082` | Address of the internal gRPC port that peers use. Written to the `cluster_nodes` table. Set it to an address that every peer can reach. |
+| `[cluster].heartbeat_interval_secs` | `5` | Heartbeat interval. |
+| `[cluster].peer_timeout_secs` | `15` | A peer without a heartbeat for this long counts as gone. A new compactor node also waits this long before it takes work. |
+| `[router.rate_limit].intake_qps` | `1000` | Intake requests per second for each organization on the `router` role. `0` removes the limit. |
+| `[router.rate_limit].query_qps` | `100` | Query requests per second for each organization on the `router` role. `0` removes the limit. |
+| `[router.rate_limit].burst_multiplier` | `2` | Token bucket capacity as a multiple of the rate. |
 
-[router.rate_limit]
-intake_qps = 1000
-query_qps = 100
-burst_multiplier = 2
-```
+The rate limit applies to the `router` role only, and each router replica counts separately. See [Role-based deployment](/en-US/distributed-deployment#rate-limiting).
 
-Set `advertise_addr` to an address reachable by every peer. A rate of `0` disables that limit.
-Remote cluster definitions and organization mappings are managed in the database, not this block.
+## Alerting and email
 
-## Alerts and email
+| Key | Default | Description |
+|---|---|---|
+| `[alert].eval_interval_secs` | `30` | Rule evaluation interval. |
+| `[alert].dispatch_interval_secs` | `10` | Escalation dispatcher interval. |
+| `[alert].eval_timeout_secs` | `10` | Timeout for one rule evaluation. A timeout increments `alert_rule_eval_timeout_total` and does not block the next round. |
+| `[alert].default_ack_timeout_secs` | `300` | `ack_timeout_secs` of an escalation step that leaves the field out. The value is saved with the step, so a later change does not alter saved steps. |
 
-```toml
-[alert_manager]
-eval_interval_secs = 30
-dispatch_interval_secs = 10
-eval_timeout_secs = 10
-default_ack_timeout_secs = 300
+`[notify.smtp]` configures platform email such as sign-up approval. Notification channels of type email keep their own credentials as encrypted connectors. SMTP stays disabled while `host` is empty.
 
-[notify.smtp]
-host = ""
-port = 587
-username = ""
-password = ""
-from = "molesignal@example.com"
-tls = "starttls"
-timeout_secs = 10
-```
-
-SMTP is enabled when `host` is non-empty. Slack, webhook channels, notification templates,
-schedules, and escalation policies are organization resources managed through the UI or API.
+| Key | Default | Description |
+|---|---|---|
+| `host` | empty | SMTP server. A non-empty value enables SMTP. |
+| `port` | `587` | Port. The built-in value `0` falls back to `587`. |
+| `username` | empty | Login name. Leave empty for no authentication. |
+| `password` | empty | Login password. Used only when `username` is set. |
+| `from` | `molesignal@example.com` | Sender address. Required when SMTP is enabled. The built-in value is empty. |
+| `tls` | `starttls` | `none`, `starttls`, or `tls`. |
+| `timeout_secs` | `10` | Connection and send timeout. The built-in value `0` means 1 second. |
 
 ## Authentication
 
-```toml
-[auth]
-token_ttl_secs = 86400
-issuer = "molesignal"
-root_email = ""
-root_password = ""
-```
+| Key | Default | Description |
+|---|---|---|
+| `token_ttl_secs` | `86400` | Default lifetime of login tokens (JWT) and API tokens, 24 hours. |
+| `root_email` | `admin@example.com` | Email of the root account. The built-in value is empty. |
+| `root_password` | `admin` | Password of the root account. The built-in value is empty. Replace the sample value. |
 
-JWT signing keys are persisted in PostgreSQL. The old `[auth].jwt_secret` setting is ignored and
-should be removed.
+MoleSignal creates the root account on the first start, when the database holds no users and both values are set. Changing `root_password` later does not change the password of an existing account. Change it in the web UI instead. At every start, the account with `root_email` becomes the platform administrator, so `root_email` must belong to an existing user.
 
-## Self-observability and profiling
+The JWT signing secret is generated on first start and stored in PostgreSQL. The `[auth].jwt_secret` key from older releases is ignored. Use `MS_AUTH_JWT_SECRET_OVERRIDE` to pin a secret, and `POST /api/v1/auth/jwt/rotate` to rotate it.
 
-Process logs use `[telemetry]`. Tail sampling, protected `_sys` intake, external trace export, and
-the pprof listener use these nested sections:
+## Self-observability
 
-```toml
-[telemetry]
-log_level = "info"
-log_format = "text"
-log_output = "console"
+Process logs and self-collected telemetry use `[telemetry]`. See [Self-observability](/en-US/self-observability).
 
-[telemetry.self_collect]
-enabled = false
-retention_days = 7
-metrics_retention_days = 7
-traces_retention_days = 7
-profiles_retention_days = 7
-metrics_enabled = true
-metrics_interval_secs = 15
-queue_capacity = 8192
+| Key | Default | Description |
+|---|---|---|
+| `[telemetry].log_level` | `info,tantivy=warn` | Log filter in `EnvFilter` syntax. The built-in value is `info`. `RUST_LOG` overrides it. |
+| `[telemetry].log_format` | `text` | `text` or `json`. |
+| `[telemetry].log_output` | `console` | `console` or `file`. |
+| `[telemetry].log_directory` | `logs` | Directory of log files when `log_output` is `file`. |
+| `[telemetry].log_rotation` | `daily` | `minutely`, `hourly`, `daily`, or `never`. |
+| `[telemetry].log_max_files` | `7` | Rotated files to keep. |
 
-[telemetry.trace]
-enabled = true
-force_disabled = false
-filter = "info"
-deployment_environment = "production"
-normal_sample_ratio = 0.10
-development_sample_ratio = 1.0
-decision_window_secs = 30
+The last three keys are commented out in the sample file. The values shown apply when `log_output` is `file`.
 
-[telemetry.trace.external]
-endpoint = ""
-protocol = "grpc"
-timeout_ms = 5000
-queue_capacity = 8192
-batch_size = 256
-gzip = false
-allow_self_export = false
+### Self-collected telemetry
 
-[profiling]
-enabled = false
-bind = "127.0.0.1"
-port = 5084
-allow_remote = false
-```
+`[telemetry.self_collect]` writes the metrics, traces, and profiles of the process into the reserved `_molesignal` stream family.
 
-The complete tail limits, slow thresholds, per-signal retention, exporter TLS, and profile schedule
-are shown in `conf/config.toml`. See [Self-observability](/en-US/self-observability) before changing
-these settings.
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Master switch. The built-in value is `false`. Traces also require `[telemetry.trace].enabled`. |
+| `retention_days` | `7` | Shared retention, from 1 to 3650. |
+| `metrics_retention_days` | `7` | Retention of metrics, from 1 to 3650. |
+| `traces_retention_days` | `7` | Retention of traces, from 1 to 3650. |
+| `profiles_retention_days` | `7` | Retention of profiles, from 1 to 3650. |
+| `metrics_enabled` | `true` | Collects process metrics. |
+| `metrics_interval_secs` | `15` | Metrics collection interval. |
+| `queue_capacity` | `8192` | Bounded in-memory queue of each signal. |
+| `batch_max_events` | `256` | Largest batch. |
+| `batch_max_delay_ms` | `1000` | Longest wait to fill a batch. |
+| `flush_timeout_secs` | `5` | Time to flush the queues on shutdown. |
+| `profiles_enabled` | `false` | Collects process profiles. |
+| `profile_kinds` | `["cpu"]` | `cpu`, `heap`, or both. |
+| `profile_interval_secs` | `600` | Profile interval. |
+| `profile_duration_secs` | `10` | Length of one CPU profile, from 1 to 120. |
 
-## Search jobs, cache, and cold metadata
+### Trace capture and tail sampling
 
-The following sections tune query admission and operational storage:
+`[telemetry.trace]` controls the spans that the service records about itself and the tail sampler that decides which traces to keep.
 
-- `[search.admission]` sets node and cluster concurrency by workgroup.
-- `[search] max_result_rows` guards unbounded non-aggregate results.
-- `[search.stream_agg_cache]` caches closed PromQL windows; `capacity = 0` disables the cache.
-- `[search_jobs]` controls worker count, idle polling, and cleanup.
-- `[cache.*]` sizes FileMeta, Parquet metadata, query-result, Tantivy, footer, and cold-dump caches.
-- `[cache.disk_cache] max_size_gb = 0` disables the local Parquet cache.
-- `[storage.file_meta_dump]` moves old FileMeta partitions to object storage.
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Default switch for capture and tail sampling. The runtime policy can still change while `force_disabled` is `false`. |
+| `force_disabled` | `false` | Highest-priority deployment switch. The runtime policy at `/api/v1/system/telemetry` cannot override it. |
+| `filter` | `info` | `EnvFilter` for span capture and export. Independent of `RUST_LOG` and `log_level`. |
+| `deployment_environment` | `production` | Environment label. `development`, `dev`, and `test` use `development_sample_ratio`. Other values use `normal_sample_ratio`. |
+| `normal_sample_ratio` | `0.10` | Base sampling ratio of normal traces outside development, from 0.0 to 1.0. |
+| `development_sample_ratio` | `1.0` | Base sampling ratio in development environments, from 0.0 to 1.0. |
+| `decision_window_secs` | `30` | Time that the sampler aggregates a trace before deciding, from 5 to 120. |
+| `root_grace_millis` | `1000` | Time to wait for late child spans after the root span ends. |
+| `decision_cache_secs` | `300` | Lifetime of a sampling decision. At least `decision_window_secs`. |
+| `tail_max_traces` | `10000` | Undecided traces that the sampler may hold. |
+| `tail_memory_bytes` | `268435456` | Memory limit for undecided traces. |
+| `max_spans_per_trace` | `1000` | Spans kept per trace. |
+| `max_attributes_per_span` | `128` | Attributes kept per span. |
+| `max_events_per_span` | `128` | Events kept per span. |
+| `max_links_per_span` | `128` | Links kept per span. |
+| `max_string_bytes` | `4096` | Longest attribute, event, or link string in UTF-8 bytes. |
+| `shutdown_timeout_secs` | `10` | Time to stop the pipeline on shutdown. |
 
-Use the canonical sample for the full cache keys and defaults.
+`[telemetry.trace.slow_thresholds]` marks spans as slow, in milliseconds: `http_ms = 1000`, `query_ms = 5000`, `batch_intake_ms = 2000`, `database_ms = 200`, `object_store_ms = 500`, `external_ms = 1000`, `background_ms = 30000`.
 
-## Functions, reports, and Agent
+`[telemetry.trace.external]` exports traces to an external OTLP receiver. It stays off while `endpoint` is empty.
 
-```toml
-[functions]
-llm_eval_enabled = false
+| Key | Default | Description |
+|---|---|---|
+| `endpoint` | empty | OTLP receiver address. |
+| `protocol` | `grpc` | `grpc` or `http/protobuf`. The value is never inferred from the URL. |
+| `timeout_ms` | `5000` | Connection and export timeout. |
+| `queue_capacity` | `8192` | Export queue capacity. |
+| `batch_size` | `256` | Traces per batch. |
+| `gzip` | `false` | Compresses the payload. |
+| `allow_self_export` | `false` | Allows export to this MoleSignal cluster. Disabled to prevent loops. |
+| `headers` | none | OTLP headers. Reference secrets with `env:NAME` or `secret:NAME` and never write the value. |
+| `custom_ca_file` | none | CA file for the HTTPS server certificate. |
+| `client_certificate_file` | none | mTLS client certificate. Set together with `client_key_file`. |
+| `client_key_file` | none | mTLS client key. Set together with `client_certificate_file`. |
 
-[scheduled_reports.renderer]
-enabled = false
-base_url = "http://127.0.0.1:5173"
-concurrent_renders = 2
-render_timeout_secs = 30
-viewport_width = 1280
-viewport_height = 800
+### APM
 
-[agent]
-enabled = false
-default_provider = "openai"
-```
+`[apm]` controls the application performance monitoring projection. It starts on nodes that own trace candidates or run the `alert` role rollup. See [APM](/en-US/apm).
 
-VRL is always available. JavaScript requires a build with `js-runtime` and has no separate runtime
-configuration switch. `llm_eval_enabled` permits per-event model evaluation in pipelines and can
-increase intake latency and cost.
+| Key | Default | Description |
+|---|---|---|
+| `queue_capacity` | `65536` | Input queue, from 1024 to 1048576. |
+| `flush_interval_ms` | `5000` | Aggregate flush interval, from 100 to 60000. |
+| `flush_max_snapshots` | `10000` | Snapshots per flush, from 1 to 100000. |
+| `shutdown_drain_secs` | `10` | Time to drain the queue on shutdown, from 1 to 300. |
+| `late_grace_secs` | `300` | Time that late trace data is still accepted. Greater than 0 and shorter than the hot retention. |
+| `hot_retention_hours` | `24` | Retention of high-resolution data, from 1 to 168. |
+| `rollup_retention_days` | `30` | Retention of rollups, from 1 to 3650. |
+| `max_query_range_days` | `30` | Longest range of one APM query. At most `rollup_retention_days`. |
+| `max_exemplars_per_bucket` | `3` | Exemplars per aggregate bucket, from 1 to 16. |
+| `max_error_samples_per_group` | `8` | Error samples per group, from 1 to 64. |
+| `[apm.histogram].schema_version` | `1` | Version of the latency bucket definition. Increase it whenever `boundaries_ms` changes. |
+| `[apm.histogram].boundaries_ms` | `[1, 2, 4, …, 60000]` | Finite latency bucket bounds in milliseconds. Strictly increasing, from 2 to 64 values. `+Inf` is added automatically. |
+| `[apm.version_comparison].min_requests_per_version` | `1000` | Requests that a version needs to join version comparison. |
 
-PDF and PNG reports require an enabled renderer and reachable Web `base_url`.
+`[apm.cardinality]` caps distinct values recorded per hour, each from 1 to 100000: `services_per_org_hour = 200`, `transactions_per_service_hour = 32`, `dependencies_per_service_hour = 16`, `error_groups_per_service_hour = 16`, `versions_per_service_hour = 16`, `instances_per_service_hour = 256`.
 
-`[agent].enabled` is a local development unlock. Model providers, prompts, tools, MCP servers, and approval policy
-are stored in PostgreSQL and managed in the product.
+## Features and integrations
 
-## Database-managed settings
+| Key | Default | Description |
+|---|---|---|
+| `[functions].llm_eval_enabled` | `false` | Allows `llm` pipeline steps. Every matching event triggers one model call, so cost and latency grow with intake volume. Use it on low-volume streams only. |
+| `[mmdb].license_key` | empty | MaxMind GeoLite2 license key for runtime refresh. When empty, the bundled database stays in use. |
+| `[mmdb].db_path` | `/usr/share/molesignal/mmdb/GeoLite2-City.mmdb` | GeoIP database. Point it at a writable path to enable refresh. |
+| `[mmdb].refresh_interval_secs` | `604800` | Refresh interval, 7 days. |
 
-Do not add removed TOML sections for SSO or product policy. OIDC/SAML providers, signup and sharing
-policy, remote clusters, domains, cipher keys, model pricing, Agent settings, channels, and
-most other organization configuration are stored in PostgreSQL and changed through the UI or API.
+The release binary includes the JavaScript function runtime and VRL. Neither needs a setting. See [Functions](/en-US/functions).
+
+Scheduled reports in PDF or PNG form render pages with headless Chrome:
+
+| Key | Default | Description |
+|---|---|---|
+| `[scheduled_reports.renderer].base_url` | `http://127.0.0.1:5173` | Origin that headless Chrome loads report pages from. Must be an absolute `http` or `https` URL. The default points at the development server of the web UI, so set the address of the web UI that the node can reach. |
+| `[scheduled_reports.renderer].concurrent_renders` | `2` | Concurrent renders. `0` counts as 1, and values above 4 become 4. |
+| `[scheduled_reports.renderer].render_timeout_secs` | `30` | Timeout of one render. `0` counts as 30, and values above 60 become 60. |
+| `[scheduled_reports.renderer].viewport_width` | `1280` | Viewport width in pixels. |
+| `[scheduled_reports.renderer].viewport_height` | `800` | Viewport height in pixels. |
+
+When Chrome is unavailable, PDF and PNG exports return an error and no placeholder file.
+
+## Settings stored in the database
+
+These settings live in PostgreSQL, and the web UI or API changes them. They have no TOML keys:
+
+- SSO providers (OIDC, SAML, and LDAP).
+- Remote clusters for federated queries.
+- Status page domains and certificates.
+- Notification channels, schedules, and escalation policies.
+- Mole Agent model providers, prompts, tools, and approval policy.
+- Organization cipher keys, field masking rules, and sharing policy.

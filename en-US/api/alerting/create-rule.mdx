@@ -1,39 +1,144 @@
 ---
-title: "Create rule"
-description: "Create an alert rule."
+title: "Create a rule"
+description: "Create a scheduled, real-time, or anomaly alert rule."
 ---
 
 ```http
 POST /api/v1/alerts/rules
 ```
 
-A rule's `kind` is `scheduled`, `real_time`, or `anomaly`. Creating and changing rules requires
-`alerts.manage`. See [Alerting](/en-US/alerting) for detector-specific fields.
+Creates an alert rule. The call requires `alerts.manage`.
+
+## How a rule evaluates
+
+The `alert` role evaluates every enabled `scheduled` and `anomaly` rule every `[alert].eval_interval_secs`, 30 seconds by default. A `real_time` rule is matched on the intake path and opens its incident as records arrive.
+
+1. The evaluator runs `query.statement` over the window from `now - period_secs` to `now`. A `sql` statement runs in the SQL engine. A `promql` statement runs in the PromQL engine as an instant query at `now`.
+2. The evaluator reads the first column of the first row as a number. A result without a number never matches. A `promql` result lists the sample `value` first, so the first series decides. Aggregate the expression to one series, for example with `sum(...)`.
+3. The number is compared with `trigger`, or with every tier of `thresholds` when that array is not empty.
+4. After the condition matches on `for_periods` consecutive evaluations, an incident opens. A rule has at most one active incident at a time. When `silence_secs` is above 0, the rule opens no new incident until that many seconds have passed since the previous incident of the rule was created, even when the previous one is already resolved.
+5. When the condition stops matching, the evaluator resolves the open incident. An acknowledged incident stays acknowledged until a user resolves it.
+6. After every completed evaluation, the evaluator stores the time in `last_eval_at` and the outcome in `last_state`. A query that fails or times out leaves both fields unchanged.
+
+For `scheduled` and `anomaly` rules, the call does not check that the stream or the statement is valid. Run [Test a rule](/en-US/api/alerting/test-rule) before enabling a rule. A `real_time` rule is checked against the limits below when it is saved.
+
+**Body**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | string | Yes | Must not be empty. The name becomes the incident summary. |
+| `description` | string | No | Default empty. |
+| `enabled` | boolean | No | Default `true`. The evaluator skips a disabled rule. The test and trigger calls still work. |
+| `kind` | string | No | `scheduled` (default), `real_time`, or `anomaly`. A `real_time` rule is matched on the intake path. See [Real-time rules](/en-US/alerting#real-time-rules). |
+| `query` | object | Yes | The statement and its window. See below. |
+| `trigger` | object | Yes | The condition. See below. |
+| `thresholds` | array | No | Severity tiers for `scheduled` and `real_time` rules. When not empty, the tiers replace the condition of `trigger`. An `anomaly` rule ignores tiers. |
+| `severity` | string | No | `info`, `warning`, `error`, or `critical`. Applies when `thresholds` is empty. |
+| `anomaly_params` | object | For `anomaly` | Baseline settings. Ignored for the other kinds. |
+| `escalation_policy_id` | string | No | Default `default`, an alias for the escalation policy named `default` in the organization. An explicit id must belong to a policy of the organization, or the call answers `400`. See [Create an escalation policy](/en-US/api/alerting/create-escalation). |
+| `labels` | object | No | String map copied to incidents. |
+| `annotations` | object | No | String map copied to incidents, for example a runbook link. |
+
+**`query`**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `language` | string | Yes | `sql` or `promql`. The language decides the engine that evaluates the statement. The window of a `promql` statement comes from range selectors such as `[5m]`, because `period_secs` only sets the query window. |
+| `statement` | string | Yes | Must not be empty. The first column of the first row is the evaluated value. A `real_time` rule takes `SELECT count(*) FROM <stream> [WHERE <condition>]`. |
+| `period_secs` | integer | Yes | Window length in seconds. A `real_time` rule takes 1 through 3600 and counts the matching records of that window. |
+| `stream` | object | Yes | `{ "name": "app", "stream_type": "logs" }`. The primary stream of the statement. |
+
+Columns named `service`, `host`, and `trace_id` in the first row enrich the incident. Such columns add the `service` and `host` labels and fill `affected_services`, `host_ids`, and `trace_ids`.
+
+**`trigger`**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `operator` | string | Yes | `gt`, `gte`, `lt`, `lte`, `eq`, or `neq`. A `real_time` rule takes `gt` or `gte`. |
+| `threshold` | number | Yes | The value to compare with. |
+| `for_periods` | integer | Yes | Consecutive evaluations that must match before an incident opens. `0` behaves like `1`. A `real_time` rule takes `0` or `1`. |
+| `silence_secs` | integer | Yes | Cool-down in seconds. After an incident opens, the rule opens no new incident for this long, even when the incident is resolved sooner. `0` turns the cool-down off. A [manual trigger](/en-US/api/alerting/trigger-rule) ignores it. |
+
+An `anomaly` rule ignores `operator` and `threshold` and still uses `for_periods`. A rule with `thresholds` ignores `operator`, `threshold`, and `for_periods` of `trigger`, but the object stays required.
+
+**`thresholds`**
+
+Each tier has `severity` (`info`, `warning`, `error`, or `critical`), `operator`, `threshold`, and `for_periods`. A tier counts its own consecutive matches. The highest severity among the tiers that fired sets the incident severity. When an open incident rises to a higher severity, escalation restarts at the first step.
+
+Without tiers, the severity of an incident is the rule `severity`, then a `severity` label, then `warning`. For an `anomaly` rule without either, a deviation of at least 10 times the baseline gives `critical`, and at least 3 times gives `error`.
+
+**`anomaly_params`**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `algorithm` | string | Yes | `mad` or `ewma`. |
+| `lookback_days` | integer | Yes | 1 through 30. The number of previous days compared at the same time of day. |
+| `k` | number | Yes | Deviation multiplier. Must be positive. |
+| `alpha` | number | No | Smoothing factor for `ewma`, greater than 0 and at most 1. Default `0.3`. |
+| `weekly_seasonality` | boolean | No | Default `false`. Compares only the same weekday and requires `lookback_days` of at least 7. |
 
 <RequestExample>
-```json body
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
 {
   "name": "High error rate",
-  "description": "More than 100 errors in one minute",
+  "description": "More than 100 errors in five minutes",
   "enabled": true,
   "kind": "scheduled",
   "query": {
     "language": "sql",
     "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
-    "period_secs": 60,
+    "period_secs": 300,
     "stream": { "name": "app", "stream_type": "logs" }
   },
-  "trigger": {
-    "operator": "gt",
-    "threshold": 100,
-    "for_periods": 1,
-    "silence_secs": 300
+  "trigger": { "operator": "gt", "threshold": 100, "for_periods": 2, "silence_secs": 0 },
+  "severity": "critical",
+  "escalation_policy_id": "<policy-id>",
+  "labels": { "team": "checkout" }
+}
+EOF
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KEDBLvTYO6DnWi8H9S9MNLpPT7",
+  "org_id": "<organization-id>",
+  "name": "High error rate",
+  "description": "More than 100 errors in five minutes",
+  "enabled": true,
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
+    "period_secs": 300,
+    "stream": { "name": "app", "stream_type": "logs" }
   },
+  "trigger": { "operator": "gt", "threshold": 100.0, "for_periods": 2, "silence_secs": 0 },
+  "anomaly_params": null,
   "thresholds": [],
   "severity": "critical",
   "escalation_policy_id": "<policy-id>",
   "labels": { "team": "checkout" },
-  "annotations": {}
+  "annotations": {},
+  "last_eval_at": null,
+  "last_state": { "kind": "healthy" },
+  "created_at": 1790000000000000,
+  "updated_at": 1790000000000000
 }
 ```
-</RequestExample>
+</ResponseExample>
+
+**Errors**
+
+| Status | Cause |
+|---|---|
+| `400` | `name` or `query.statement` is empty, `query.stream` is missing, `escalation_policy_id` names no policy of the organization, the `anomaly_params` of an `anomaly` rule are missing or invalid, or a `real_time` rule breaks the limits above. The response is JSON with the code `invalid_argument` and a message such as `anomaly detector not yet supported: prophet`. |
+| `403` | The token lacks `alerts.manage`. |
+| `422` | A required field is missing or a value has the wrong type, for example an unknown `operator`. The response is plain text. |
+
+See [Alerting and incident response](/en-US/alerting) for the console workflow.

@@ -1,6 +1,6 @@
 ---
 title: "Streamed query"
-description: "NDJSON chunked query response."
+description: "Stream the rows of a query as NDJSON."
 ---
 
 ```http
@@ -8,9 +8,39 @@ GET  /api/v1/query/stream
 POST /api/v1/query/stream
 ```
 
-Always returns an NDJSON chunked response. The `GET` form takes query params (`sql`, `stream`,
-`stream_type`, `from`, `to`, `limit`); the `POST` form takes the same body as
-[Execute a query](/en-US/api/query/execute). Disable proxy buffering at the ingress
-(`proxy_buffering off`) so chunks flush promptly. Each row is a JSON object keyed by column name;
-the final line contains `{"__meta__":{"scanned_rows":...,"took_ms":...}}`. This endpoint requires
-`streams.query`, or `sys.telemetry.read` in system scope.
+Always answers with chunked NDJSON (`application/x-ndjson`). Each line is a JSON object keyed by column name, and the final line is `{"__meta__":{"scanned_rows":...,"took_ms":...}}`. The endpoint never turns a query into an asynchronous job. The call requires `streams.query`, or `sys.telemetry.read` in the system scope.
+
+The `POST` form takes the same body as [Execute a query](/en-US/api/query/execute). The `GET` form takes query parameters:
+
+| Param | Required | Notes |
+|---|---|---|
+| `sql` | Yes | The statement. A missing value answers `400`. |
+| `stream` | Yes | The primary stream name. |
+| `stream_type` | Yes | `logs`, `metrics`, `traces`, `profiles`, or `extend`. |
+| `from`, `to` | Yes | Time range in microseconds. |
+| `limit` | No | Row cap. |
+
+<RequestExample>
+```bash cURL
+NOW=$(date +%s)000000
+
+curl -G http://localhost:5080/api/v1/query/stream \
+  -H "authorization: Bearer $MS_JWT" \
+  --data-urlencode "sql=SELECT level, msg FROM app ORDER BY _timestamp DESC" \
+  --data-urlencode "stream=app" \
+  --data-urlencode "stream_type=logs" \
+  --data-urlencode "from=$((NOW-3600000000))" \
+  --data-urlencode "to=$((NOW+60000000))" \
+  --data-urlencode "limit=3"
+```
+</RequestExample>
+
+<ResponseExample>
+```text 200
+{"level":"info","msg":"fine"}
+{"level":"error","msg":"db pool exhausted"}
+{"__meta__":{"scanned_rows":5,"took_ms":173}}
+```
+</ResponseExample>
+
+Disable response buffering at the proxy (`proxy_buffering off`) so rows arrive as they are produced, and allow long reads. Stop reading to cancel the stream.

@@ -1,34 +1,110 @@
 ---
-title: "Create escalation policy"
-description: "Multi-step escalation with on-call rotations."
+title: "Create an escalation policy"
+description: "Define ordered notification steps for incidents."
 ---
 
 ```http
 POST /api/v1/alerts/escalations
 ```
 
-A multi-step policy: each step has typed targets and `ack_timeout_secs`. Targets can reference a
-user, team, or on-call schedule, together with notification channel ids.
+Creates an escalation policy. A policy lists ordered steps. Each step notifies its targets and waits for an acknowledgement. The call requires `alerts.manage`.
 
-```json
+## How escalation works
+
+1. The `alert` role checks active incidents every `[alert].dispatch_interval_secs`, 10 seconds by default. Only incidents with the status `open` advance. Acknowledging an incident stops escalation.
+2. A step with `min_severity` applies only to incidents of that severity or higher. Steps that do not apply are skipped.
+3. Every target of the current step receives a notification event. [Notification channels](/en-US/notification-channels) decide how the message is delivered. The `assignees` of the incident become the users that the step names directly: its `user` targets and the on-call user of each `schedule` target. A step that targets only teams keeps the earlier assignees.
+4. When `ack_timeout_secs` passes without an acknowledgement, the next applicable step starts.
+5. After the last applicable step times out, a policy with `repeat` set to `true` starts again at the first step until `max_loops` passes are complete.
+
+A rule picks a policy with `escalation_policy_id`. A rule without one uses `default`, an alias for the policy of the organization whose name is `default`, compared without regard to case. When escalation starts, the incident stores the real id of that policy, so renaming the policy later does not move an open incident to another policy. When the organization has no policy named `default`, the incidents of such a rule never escalate, although the triggered event still reaches notification policies. Create a policy named `default`, or point the rule at a policy id.
+
+**Body**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | string | Yes | Must not be empty. |
+| `steps` | array | No | Default empty. A policy without steps notifies nobody. |
+| `repeat` | boolean | No | Default `false`. Start again after the last step. |
+| `max_loops` | integer | No | Default `1`. The total number of passes through the steps when `repeat` is `true`. A value below 1 becomes 1. |
+
+A step has these fields:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `targets` | array | Yes | The recipients of the step, all notified together. |
+| `ack_timeout_secs` | integer | No | Seconds to wait for an acknowledgement before the next step. A step that leaves it out gets `[alert].default_ack_timeout_secs` (300 by default), which is saved with the step. |
+| `min_severity` | string | No | `info`, `warning`, `error`, or `critical`. The step applies to incidents at or above this severity. Omit it to apply to every incident. |
+
+A target selects its recipients with `kind`:
+
+| `kind` | Extra field | Recipients |
+|---|---|---|
+| `user` | `user_id` | One user. |
+| `team` | `team_id` | The members of a team. |
+| `schedule` | `schedule_id` | The user on call in an on-call schedule. |
+
+The call does not check that the referenced user, team, or schedule exists.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/escalations \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "Primary operations",
+    "steps": [
+      { "targets": [{ "kind": "user", "user_id": "<user-id>" }],
+        "ack_timeout_secs": 300 },
+      { "targets": [{ "kind": "team", "team_id": "<team-id>" }],
+        "ack_timeout_secs": 900,
+        "min_severity": "critical" }
+    ],
+    "repeat": true,
+    "max_loops": 2
+  }'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
 {
+  "id": "3KED3sy8RBNYIdLayGZN0bp2IIY",
+  "org_id": "<organization-id>",
   "name": "Primary operations",
   "steps": [
     {
-      "targets": [
-        {
-          "kind": "schedule",
-          "schedule_id": "<schedule-id>",
-          "channel_ids": ["<channel-id>"]
-        }
-      ],
+      "targets": [{ "kind": "user", "user_id": "<user-id>" }],
       "ack_timeout_secs": 300,
-      "min_severity": "warning"
+      "min_severity": null
+    },
+    {
+      "targets": [{ "kind": "team", "team_id": "<team-id>" }],
+      "ack_timeout_secs": 900,
+      "min_severity": "critical"
     }
   ],
   "repeat": true,
   "max_loops": 2
 }
 ```
+</ResponseExample>
 
-Creation requires `alerts.manage`.
+**Errors**
+
+| Status | Cause |
+|---|---|
+| `400` | `name` is empty. |
+| `403` | The token lacks `alerts.manage`. |
+| `422` | A field is missing or invalid, for example a target `kind` other than `user`, `team`, or `schedule`, or an unknown `min_severity`. The response is plain text. |
+
+## Other policy routes
+
+| Operation | Endpoint | Permission |
+|---|---|---|
+| List | `GET /api/v1/alerts/escalations` | `alerts.read` |
+| Get | `GET /api/v1/alerts/escalations/{id}` | `alerts.read` |
+| Replace | `PUT /api/v1/alerts/escalations/{id}` | `alerts.manage` |
+| Delete | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.manage` |
+
+`PUT` takes the body of the create call and replaces the policy. `DELETE` answers the plain text `deleted`, and an unknown id answers `404`. Deleting a policy does not check the rules that reference it. Those rules stop escalating.

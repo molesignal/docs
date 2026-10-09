@@ -1,28 +1,70 @@
 ---
-title: "OpenTelemetry（OTLP）"
-description: "通过 OTLP HTTP 或 gRPC exporter 接入。"
+title: "OpenTelemetry (OTLP)"
+description: "用 OTLP HTTP 或 gRPC 导出端发送日志、指标与链路。"
 ---
 
-把任意 OpenTelemetry SDK 或 Collector 指向 MoleSignal。
+把 OpenTelemetry SDK 或 Collector 指向 MoleSignal。两种传输方式都需要具备 `streams.write` 权限的 Bearer 凭据。
 
-| 传输 | 端点 |
+| 传输方式 | 端点 |
 |---|---|
-| OTLP HTTP | `POST /api/v1/logs`、`/api/v1/metrics`、`/api/v1/traces` |
-| OTLP gRPC | `:4317` |
+| OTLP over HTTP | `POST /api/v1/logs`、`POST /api/v1/metrics`、`POST /api/v1/traces` |
+| OTLP over gRPC | `:4317` |
+
+`5082` 端口是受信任的集群内部端口，不是 OTLP 接收端。
+
+## OTLP over HTTP
+
+把导出端的 endpoint 设为 `/api` 基础路径，导出端会自己追加 `/v1/logs`、`/v1/metrics` 与 `/v1/traces`。
+
+| 请求头 | 说明 |
+|---|---|
+| `Authorization` | `Bearer <token>`。 |
+| `Content-Type` | `application/x-protobuf` 或 `application/json`。JSON 编码把 64 位整数写成字符串，MoleSignal 对字符串和数字一视同仁。 |
+| `stream-name` | 可选，目标数据流，默认为 `default`。 |
+
+请求体不能被压缩，压缩的请求体会返回 `400`，请在导出端关闭压缩。请求体上限为 2 MiB。成功的请求返回 `200` 与 `{"partialSuccess":null}`。
 
 <RequestExample>
-```yaml OTel Collector
+```yaml OpenTelemetry Collector
 exporters:
-  otlphttp:
-    endpoint: http://localhost:5080/api/v1
+  otlphttp/molesignal:
+    endpoint: http://localhost:5080/api
+    compression: none
     headers:
-      authorization: "Bearer ${MS_JWT}"
-  otlp:
-    endpoint: localhost:4317
-    headers:
-      authorization: "Bearer ${MS_JWT}"
+      authorization: "Bearer ${env:MS_TOKEN}"
+```
+
+```bash SDK 环境变量
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer ${MS_TOKEN}"
 ```
 </RequestExample>
 
-端口 `5082` 保留给可信内部集群 gRPC，不是 OTLP receiver。两种传输都需要具备 `streams.write` 的
-Bearer 凭据。可通过可选的 `stream-name` header 覆盖默认数据流。
+## OTLP over gRPC
+
+`:4317` 上的接收端提供日志、指标、链路与 Profile 四个服务，不带 TLS。通过 gRPC metadata 发送 `authorization: Bearer <token>` 与可选的 `stream-name`。流量离开可信网络时，请在该端口前面终止 TLS。
+
+```yaml
+exporters:
+  otlp/molesignal:
+    endpoint: localhost:4317
+    tls:
+      insecure: true
+    headers:
+      authorization: "Bearer ${env:MS_TOKEN}"
+```
+
+## 存储字段
+
+资源与记录的属性会成为保留原始键名的顶层字段。日志、Span 与指标的列参见[存储字段](/zh-Hans/query#存储字段)。
+
+## 错误
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 请求体被压缩，或不是有效的 OTLP。 |
+| `401` | Token 缺失或无效。 |
+| `403` | Token 缺少 `streams.write`。 |
+| `404` | 导出端 endpoint 缺少 `/api`，请求到达了 `/v1/logs`。 |
+| `413` | 请求体超过 2 MiB。 |

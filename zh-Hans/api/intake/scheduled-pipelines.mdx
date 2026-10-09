@@ -1,22 +1,87 @@
 ---
 title: "管理流水线"
-description: "列出、查看、编辑、运行、暂停和删除定时流水线。"
+description: "列出、查看、编辑、运行、暂停与删除流水线。"
 ---
 
+| 操作 | 端点 | 权限 |
+|---|---|---|
+| 列出 | `GET /api/v1/scheduled_pipelines` | `pipelines.read` |
+| 创建 | `POST /api/v1/scheduled_pipelines` | `pipelines.create` |
+| 查看 | `GET /api/v1/scheduled_pipelines/{id}` | `pipelines.read` |
+| 更新 | `PUT /api/v1/scheduled_pipelines/{id}` | `pipelines.edit`，修改 `enabled` 时还需要 `pipelines.pause` |
+| 删除 | `DELETE /api/v1/scheduled_pipelines/{id}` | `pipelines.delete` |
+| 运行历史 | `GET /api/v1/scheduled_pipelines/{id}/runs` | `pipelines.read` |
+| 回填 | `POST /api/v1/scheduled_pipelines/{id}/backfill` | `pipelines.run` |
+
+## 列出
+
+列表返回每条流水线，以及最近一次运行的状态和 24 小时汇总：
+
+<ResponseExample>
+```json 200
+[
+  {
+    "id": "3KBHcb6imgQq7FXBsROGTIRHOyg",
+    "name": "normalize-app",
+    "source_stream": "app_raw",
+    "target_stream": "app",
+    "function_steps": { "mode": "scheduled", "signal_type": "logs", "steps": [ ... ] },
+    "cron": "every:5m",
+    "lookback_secs": 300,
+    "enabled": true,
+    "last_run_at_micros": 1790000000000000,
+    "last_run_state": "succeeded",
+    "last_run_started_at_micros": 1790000000000000,
+    "last_run_finished_at_micros": 1790000000250000,
+    "last_run_scanned_rows": 1200,
+    "last_run_error": null,
+    "runs_24h": 288,
+    "succeeded_runs_24h": 288,
+    "failed_runs_24h": 0
+  }
+]
+```
+</ResponseExample>
+
+## 更新与删除
+
+`PUT` 的请求体与[创建流水线](/zh-Hans/api/intake/create-pipeline)相同，并替换整个配置。只修改 `enabled` 需要 `pipelines.pause`，其他修改需要 `pipelines.edit`。`DELETE` 返回 `{"deleted": true}`。
+
+## 运行历史
+
 ```http
-GET  /api/v1/scheduled_pipelines
-POST /api/v1/scheduled_pipelines
+GET /api/v1/scheduled_pipelines/{id}/runs?limit=50&before_micros=<cursor>
 ```
 
-定时流水线按间隔表达式（`every:Ns/m/h`）运行。创建需要 `pipelines.create`。
+按时间倒序返回定时流水线的运行记录，包含 `id`、`state`、`started_at_micros`、`finished_at_micros`、`scanned_rows` 与 `error`。实时流水线不产生运行记录。
+
+## 回填
 
 ```http
-GET    /api/v1/scheduled_pipelines/{id}
-PUT    /api/v1/scheduled_pipelines/{id}
-DELETE /api/v1/scheduled_pipelines/{id}
-GET    /api/v1/scheduled_pipelines/{id}/runs
-POST   /api/v1/scheduled_pipelines/{id}/backfill
+POST /api/v1/scheduled_pipelines/{id}/backfill
 ```
 
-查看流水线及运行历史需要 `pipelines.read`，修改配置需要 `pipelines.edit`，切换 `enabled` 需要
-`pipelines.pause`，提交回填需要 `pipelines.run`，删除需要 `pipelines.delete`。回填窗口不能超过 31 天。
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `start_micros` | integer | 窗口的开始时间，单位微秒。 |
+| `end_micros` | integer | 窗口的结束时间，必须大于 `start_micros`，且窗口不能超过 31 天。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backfill \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{"start_micros": 1790000000000000, "end_micros": 1790086400000000}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 202
+{
+  "job_id": "3KE6epTrWXts1oa2ePEKIHKxG19",
+  "monitor": "/api/v1/query/jobs/3KE6epTrWXts1oa2ePEKIHKxG19"
+}
+```
+</ResponseExample>
+
+实时流水线会返回 `400`（`realtime pipelines do not support backfill`）。用 `monitor` 路径跟踪任务，参见[查询](/zh-Hans/query#时间范围与异步任务)。

@@ -1,21 +1,72 @@
 ---
 title: "跨信号关联"
-description: "为跨信号跳转预填过滤与时间。"
+description: "计算在信号之间跳转时使用的过滤条件、时间范围和查询预填。"
 ---
 
 ```http
-GET /api/v1/web/correlation/{from_kind}/{to_kind}
+GET /api/v1/web/correlation/{from_kind}/{to_kind}?ctx=<base64url-json>
 ```
 
-为 `metric ↔ trace ↔ log ↔ host` 跳转做服务端的过滤条件与时间范围预填。
+计算网页界面在用户从一个信号跳转到另一个信号时应用的过滤条件、时间范围和查询预填，例如从链路跳转到它的日志。该调用需要 `streams.query`，系统范围可使用 `sys.telemetry.read`。
 
 **参数**
 
 | 参数 | 位置 | 必填 | 说明 |
 |---|---|---|---|
-| `from_kind` | path | ✅ | `trace` / `metric` / `log` / `host` |
-| `to_kind` | path | ✅ | `trace` / `metric` / `log` / `host` |
-| `ctx` | query | ✅ | 源信号上下文的 base64-url JSON |
+| `from_kind` | path | 是 | 跳转的起点信号：`trace`、`metric`、`log` 或 `host`。 |
+| `to_kind` | path | 是 | 跳转的目标信号：`trace`、`metric`、`log` 或 `host`。 |
+| `ctx` | query | 是 | 描述源信号的 JSON 对象，使用不带填充的 base64url 编码。 |
 
-通过 `GET /api/v1/web/correlation/providers` 获取已启用的方向列表。两个路由都需要
-`streams.query`，系统范围可使用 `sys.telemetry.read`。
+`ctx` 对象接受以下可选键：
+
+| 键 | 类型 | 说明 |
+|---|---|---|
+| `trace_id` | string | 源信号所属的链路。 |
+| `service` | string | 一个服务名称。 |
+| `services` | array | 服务名称列表。 |
+| `host` | string | 主机名。 |
+| `time_range` | object | `{ "from": "<RFC 3339>", "to": "<RFC 3339>" }`。默认是最近一分钟。 |
+
+## 支持的跳转
+
+| 起点 → 目标 | 过滤条件 | 预填 |
+|---|---|---|
+| `trace` → `log` | 来自 `services` 的 `service`，以及 `trace_id` | 无。 |
+| `trace` → `metric` | 来自 `services` 的 `service` | `promql`：`rate(http_requests_total{service="<第一个服务>"}[1m])` |
+| `trace` → `host` | 来自 `host` 的 `host` | 无。 |
+| `metric` → `trace` | 来自 `services` 的 `service`，以及服务图为第一个服务报告的 `peer_service` | 无。 |
+| `metric` → `log` | 来自 `services` 的 `service` | 无。 |
+| `log` → `trace` | `trace_id` 与 `service` | 无。 |
+| `log` → `metric` | 来自 `services` 或 `service` 的 `service` | `promql`：`rate(log_records_total{service="<service>"}[1m])` |
+| `host` → `trace` | 来自 `host` 的 `host.name` | 无。 |
+
+只涉及一个服务的过滤条件使用运算符 `eq`，涉及多个服务时使用 `in`。其他所有组合（包括未知的类型）都返回 `200`，带有时间范围，但没有过滤条件。
+
+<RequestExample>
+```bash cURL
+CTX=$(printf '%s' '{"trace_id":"0af7651916cd43dd8448eb211c80319c","services":["checkout","payments"],"time_range":{"from":"2026-10-04T10:00:00Z","to":"2026-10-04T10:05:00Z"}}' | base64 | tr -d '\n=' | tr '+/' '-_')
+
+curl "http://localhost:5080/api/v1/web/correlation/trace/log?ctx=$CTX" \
+  -H "authorization: Bearer $MS_JWT"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "time_range": { "from": "2026-10-04T10:00:00Z", "to": "2026-10-04T10:05:00Z" },
+  "filters": [
+    { "field": "service", "op": "in", "value": ["checkout", "payments"] },
+    { "field": "trace_id", "op": "eq", "value": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "prefill": {}
+}
+```
+</ResponseExample>
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | `ctx` 缺失、不是有效的 base64url，或无法解码为 JSON。缺少 `ctx` 时响应为纯文本，其他原因返回 `invalid_argument`，消息为 `invalid ctx base64: ...` 或 `invalid ctx json: ...`。 |
+| `403` | Token 缺少 `streams.query`。 |

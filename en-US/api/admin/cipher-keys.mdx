@@ -1,21 +1,102 @@
 ---
 title: "Cipher keys"
-description: "Read and rotate organization field-encryption keys."
+description: "List, create, rotate, and delete the field-encryption keys of an organization."
 ---
 
-Organization cipher keys use AES-256-GCM. Key material must decode to exactly 32 bytes and is never
-returned by read APIs.
+Cipher keys encrypt the fields that streams mark as encrypted. Every key is a 32-byte AES-256-GCM key. MoleSignal wraps the key material with the root key from `MS_CIPHER_KEY` and never returns it. See [Security](/en-US/security#field-level-encryption).
 
-| Method and path | Permission | Purpose |
+New encrypted values always use the latest version of the default key `__field_default__`, which MoleSignal creates when a stream first needs it. Other named keys, and the earlier versions of every key, keep decrypting the values written with those keys.
+
+| Operation | Endpoint | Permission |
 |---|---|---|
-| `GET /api/v1/cipher_keys` | `org.settings.read` | List key metadata. |
-| `GET /api/v1/cipher_keys/{name}` | `org.settings.read` | Read the latest version metadata. |
-| `POST /api/v1/cipher_keys` | `org.settings.manage` | Create a named key from `key_material_b64`. |
-| `POST /api/v1/cipher_keys/{name}/rotate` | `org.settings.manage` | Add a new version and keep historical decryption. |
-| `DELETE /api/v1/cipher_keys/{name}` | `org.settings.manage` | Delete a named key. |
-| `POST /api/v1/field_encryption/rotate` | `org.settings.manage` | Generate and rotate the default field-encryption DEK. |
+| List keys | `GET /api/v1/cipher_keys` | `org.settings.read` |
+| Get a key | `GET /api/v1/cipher_keys/{name}` | `org.settings.read` |
+| Create a key | `POST /api/v1/cipher_keys` | `org.settings.manage` |
+| Rotate a key | `POST /api/v1/cipher_keys/{name}/rotate` | `org.settings.manage` |
+| Delete a key | `DELETE /api/v1/cipher_keys/{name}` | `org.settings.manage` |
+| Rotate the default key | `POST /api/v1/field_encryption/rotate` | `org.settings.manage` |
+
+## Key metadata
+
+The list, get, create, and rotate calls return the metadata of key versions. The list returns every version of every key, newest version first within a name.
+
+```json
+{
+  "id": "3KEZizkQsvBwoWQihNO6OdxRiSf",
+  "name": "payments-key",
+  "alg": "aes-256-gcm",
+  "version": 1,
+  "created_at_micros": 1790000000000000,
+  "rotated_at_micros": null
+}
+```
+
+`rotated_at_micros` is `null` for a key that was never rotated. The get call returns the latest version.
+
+## Create a key
+
+```http
+POST /api/v1/cipher_keys
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | string | Yes | The key name. A name that already exists answers `409`, and the message points to the rotate call. |
+| `key_material_b64` | string | Yes | 32 random bytes in standard base64 with padding. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/cipher_keys \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d "{\"name\": \"payments-key\", \"key_material_b64\": \"$(openssl rand -base64 32)\"}"
+```
+</RequestExample>
+
+The response is the key metadata shown above.
+
+## Rotate a key
+
+```http
+POST /api/v1/cipher_keys/{name}/rotate
+```
+
+The body holds `key_material_b64`, as in the create call. The call adds a version with the new material and keeps the earlier versions for decryption. Rotating a name that does not exist answers `404`. Create the key first with the create call.
+
+## Delete a key
+
+```http
+DELETE /api/v1/cipher_keys/{name}
+```
+
+Deletes every version of the named key and answers `{"deleted": true}`. A name that does not exist answers `404`. The call does not check whether stored data still depends on the key.
 
 <Warning>
-  Review encrypted-field dependencies before deleting a key. See
-  [Security → Field-level encryption](/en-US/security#field-level-encryption).
+  Values that were encrypted with a deleted key cannot be decrypted again. Check the encrypted
+  fields that depend on a key before deleting it.
 </Warning>
+
+## Rotate the default key
+
+```http
+POST /api/v1/field_encryption/rotate
+```
+
+Generates new key material on the server, adds a new version of `__field_default__`, and refreshes the decryption cache right away. New writes use the new version, and existing values stay readable. When the organization has no default key yet, the call creates it as version 1. The body is empty, and the response holds the identifier and the version of the new key:
+
+```json
+{
+  "key_id": "3KEZj3uxMx5OOFX6NiYv3VFnfmD",
+  "version": 2
+}
+```
+
+**Errors**
+
+| Status | Cause |
+|---|---|
+| `400` | `key_material_b64` is not valid base64 or does not decode to exactly 32 bytes (`key_material must be 32 bytes, got 5`). |
+| `403` | The token lacks the permission of the call. |
+| `404` | The get, rotate, or delete call found no key with that name. |
+| `409` | A key with that name already exists. |
+| `422` | A required field is missing. The response is plain text. |

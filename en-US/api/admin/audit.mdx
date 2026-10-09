@@ -1,17 +1,104 @@
 ---
 title: "Audit log"
-description: "Query the audit trail."
+description: "Query the audit trail of sensitive operations."
 ---
 
 ```http
 GET /api/v1/audit
 ```
 
-Security-relevant and product mutation paths record audit events. Reading organization audit data
-requires `audit.read`.
+Returns the audit events of the organization, newest first, with cursor pagination. The call requires `audit.read`.
 
-**Query parameters:** `from`, `to`, `actor_kind`, `actor`, `action`, `target_kind`, `target_id`,
-`limit`, and opaque `cursor`. `from` and `to` accept epoch microseconds or relative values such as
-`now`, `now-30m`, and `now-7d`. The response is `{ "items": [...], "next_cursor": "..." }`.
+The audit trail records sensitive lifecycle operations. It does not record every change. The action names of the current release start with these prefixes:
 
-System-scope audit uses `GET /api/v1/system/audit` and requires `sys.telemetry.read`.
+| Prefix | Operations |
+|---|---|
+| `agent.` | Mole Agent model providers, prompts, tools and tool calls, MCP servers, approvals, chats, investigations, and executions. |
+| `iam.` | Role bindings, relationships, and cross-organization grants. |
+| `resource_share.` | Creating, rotating, revoking, and opening share links, and failed passwords. |
+| `status_page.` | Status pages, components, automation rules, and logos. |
+| `synthetic.` | Synthetic monitoring locations, agents, and agent tokens. |
+| `schedule.` | On-call schedules and overrides. |
+| `trace_debug_token.` | Using a trace debug token. |
+| `dashboard.` | Dashboards created from an AI draft. |
+
+Changes to streams, alert rules, incidents, and connectors are not recorded.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `from`, `to` | string | The time window. Each value is epoch microseconds or a relative value: `now`, or `now-<N><unit>` with the unit `s`, `m`, `h`, or `d`, such as `now-30m`. |
+| `actor_kind` | string | The kind of principal, for example `user`. |
+| `actor` | string | The principal identifier. |
+| `action` | string | An exact action name, such as `agent.model_provider.created`. |
+| `target_kind`, `target_id` | string | The kind and identifier of the target. |
+| `limit` | integer | Page size. Default `50`. The value is clamped to 1 through 200. |
+| `cursor` | string | The `next_cursor` of the previous page. The value is opaque. |
+
+<RequestExample>
+```bash cURL
+curl "http://localhost:5080/api/v1/audit?from=now-7d&action=agent.model_provider.created&limit=20" \
+  -H "authorization: Bearer $MS_JWT"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    {
+      "id": "3KBEDj1km2xMIl8L8kBo5Oj8ITK",
+      "org_id": "<organization-id>",
+      "actor_kind": "user",
+      "actor_id": "<user-id>",
+      "action": "agent.model_provider.created",
+      "target_kind": "agent_model_provider",
+      "target_id": "3KBEDlgsqf25jrSsf9CuoeC4vJ1",
+      "ip": null,
+      "user_agent": null,
+      "payload": {
+        "name": "Example provider",
+        "enabled": true,
+        "key_set": true,
+        "provider": "openai_compatible",
+        "key_last4": "0000",
+        "default_model": "<model-name>"
+      },
+      "ts_micros": 1790000000000000
+    }
+  ],
+  "next_cursor": null
+}
+```
+</ResponseExample>
+
+**Response**
+
+| Field | Notes |
+|---|---|
+| `items[].actor_kind`, `items[].actor_id` | The principal that made the change. |
+| `items[].action` | The action name, such as `iam.role_binding.create`. |
+| `items[].target_kind`, `items[].target_id` | The affected object. Both can be `null`. |
+| `items[].ip`, `items[].user_agent` | The client address and user agent, when the operation records these values. Both can be `null`. |
+| `items[].payload` | Operation details. Payloads exclude secrets, prompt bodies, and tool results. |
+| `items[].ts_micros` | The event time in microseconds. |
+| `next_cursor` | The cursor of the next page, or `null` on the last page. |
+
+**Errors**
+
+| Status | Cause |
+|---|---|
+| `400` | `from` or `to` is neither a number nor a valid relative value (`unparseable time: yesterday`, `bad time unit in: now-3x`), or `cursor` is invalid. |
+| `403` | The token lacks `audit.read`. |
+
+## Related audit routes
+
+| Endpoint | Permission | Purpose |
+|---|---|---|
+| `GET /api/v1/system/audit` | `sys.telemetry.read`, in the system scope | The same query for the audit events of the system organization. These events cover operations such as enabling or disabling an organization and changing the trace policy. |
+| `GET /api/v1/agent/audit/chat/{id}` | `audit.read` | The full transcript of a Mole Agent chat: the `chat` record and its `messages`, with prompt hashes, token counts, and evidence. An unknown chat answers `404`. |
+
+<Warning>
+  A chat transcript contains the questions of users and the answers of the model. Grant `audit.read` only to accounts that may read this content.
+</Warning>

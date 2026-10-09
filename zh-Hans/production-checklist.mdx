@@ -1,0 +1,110 @@
+---
+title: "生产检查清单"
+description: "MoleSignal 存放真实数据之前需要替换的配置和需要完成的检查：密钥、存储、网络、持久性与运维。"
+---
+
+Compose 沙箱与示例文件 `conf/config.toml` 以快速上手为先。部署存放真实数据之前，请逐项完成本页的内容。
+
+## 替换沙箱默认值
+
+| 项目 | 沙箱默认值 | 生产环境 |
+|---|---|---|
+| root 账号 | `admin@example.com`，密码 `admin` | 首次启动之前，在 `[auth]` 中设置唯一的邮箱和强密码。 |
+| `MS_CIPHER_KEY` | 未设置（全零开发密钥），或 Compose 文件中固定的开发密钥 | 保存在密钥管理系统中的 32 字节随机密钥。 |
+| PostgreSQL 凭据 | `molesignal` / `molesignal` | 专用的数据库和用户，密码由系统生成。 |
+| 对象存储凭据 | `rustfsadmin` / `rustfsadmin` | 仅限该 bucket 的专用 access key。 |
+| 对象存储后端 | 容器卷中的 RustFS | 具备持久性的 `s3`、`azure` 或 `gcs`。 |
+| `[http].external_url` | 空 | 对外的 HTTPS 地址。 |
+| TLS | 关闭 | 终止 TLS 的代理，或 `[http.tls]`。 |
+| `[wal].dir` | `./data/wal` | 持久化卷。 |
+| 镜像标签 | `latest` | 固定的版本标签，例如 `26.1.0.0`。 |
+
+## 检查清单
+
+<Steps>
+  <Step title="准备 PostgreSQL 与对象存储">
+    使用 PostgreSQL 17 并开启自动备份，为 MoleSignal 创建专用的数据库和用户。
+
+    让 `[meta_database].max_connections` 乘以节点数之后，仍低于 PostgreSQL 的 `max_connections` 上限。
+
+    在与节点相同的区域创建私有 bucket。不要添加让对象过期的生命周期规则，保留策略与对象删除都由 MoleSignal 自己执行。
+  </Step>
+  <Step title="生成并保管加密密钥">
+    `MS_CIPHER_KEY` 是 MoleSignal 保存在 PostgreSQL 中的密文的根密钥，覆盖 API Token、分享链接、远程集群 Token、通知连接器凭据、Mole Agent 服务商密钥、拨测密钥以及组织字段密钥。生成一次：
+
+    ```bash
+    openssl rand -base64 32
+    ```
+
+    把该值保存在密钥管理系统中，并让每个节点使用同一个值。请把它与数据库分开备份。只恢复数据库而没有该密钥，这些密文将无法读取。
+
+    <Warning>
+      不要原地更换密钥，否则用旧密钥加密的数据将无法读取。轮换密钥时，先停止所有写入，把新值导出为 `MS_CIPHER_KEY`，再用旧密钥运行离线命令：
+
+      ```bash
+      molesignal --config /etc/molesignal/config.toml rewrap-kek --old-key "<旧密钥，base64>"
+      ```
+
+      命令会重新加密所有受影响的列，并按表输出处理的行数。核对行数无误后，再停用旧密钥。
+    </Warning>
+
+    没有设置 `MS_CIPHER_KEY` 就启动过的部署使用的是全零开发密钥。要把这样的部署迁移到真实密钥，把 `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=` 作为 `--old-key` 传入。
+  </Step>
+  <Step title="保护 root 账号">
+    root 账号在空数据库首次启动时，根据 `[auth].root_email` 与 `[auth].root_password` 创建。请在首次启动之前设置这两项。之后再修改 `root_password`，不会改变已有账号的密码。
+
+    密码重置以及 **账号设置 → 安全与登录 → 修改密码** 都通过邮件完成，需要配置 `[notify.smtp]` 与 `[http].external_url`。缺少它们时不会发送任何邮件，请在依赖这些功能之前配置好。
+
+    每次启动时，邮箱为 `root_email` 的账号都会成为平台管理员，请保持 `root_email` 指向一个已存在的用户。
+  </Step>
+  <Step title="不要把密钥放进代码仓库">
+    通过环境变量或密钥管理系统传入数据库 DSN、对象存储密钥和 `MS_CIPHER_KEY`，使用 `MS_META_DATABASE_DSN`、`MS_OBJECT_STORE_ACCESS_KEY` 与 `MS_OBJECT_STORE_SECRET_KEY`，并让 `config.toml` 中对应的键保持为空。
+
+    可以用 `MS_AUTH_JWT_SECRET_OVERRIDE` 固定 JWT 签名密钥，否则 MoleSignal 会在首次启动时在 PostgreSQL 中生成一个。用 `POST /api/v1/auth/jwt/rotate` 轮换，该接口需要 `sys.settings.manage` 权限。用已退役密钥签发的 Token 在 24 小时内仍然有效。
+  </Step>
+  <Step title="只暴露需要的端口">
+    | 端口 | 暴露范围 |
+    |---|---|
+    | `5080` | 公开，位于 TLS 之后。 |
+    | `4317` | 仅在终止 TLS 的代理之后公开。 |
+    | `5082` | 只在私有网络内开放，该端口承载不带认证的节点间流量。 |
+    | `5083` | 可选；有 SQL 客户端连接时开放，位于 TLS 之后。 |
+    | `5084`、`5085` | 仅当 Probe Agent 运行在节点之外时需要。 |
+
+    把 `[http].external_url` 设为对外地址。接入片段、密码重置邮件与状态页域名都会使用它。
+  </Step>
+  <Step title="终止 TLS 并配置代理">
+    在反向代理中终止 TLS，或启用 `[http.tls]` 使用 ACME 自动证书。
+
+    把代理的请求体限制设为至少 2 MiB，因为 MoleSignal 接受的请求体上限就是这个大小。对 `/api/v1/query/stream` 关闭响应缓冲并允许长时间读取，项目自带的 nginx 参考配置对该路径使用 600 秒超时。
+
+    把 `/metrics` 限制为内部访问。只有发送端需要时，才公开接入路径 `/api/v1/_bulk`、`/api/v1/_kinesis_firehose`、`/api/v1/_cloudflare` 与 `/api/v1/_heroku`。
+  </Step>
+  <Step title="保护预写日志">
+    在每个运行 `intake` 角色的节点上，把持久化的本地卷挂载到 `[wal].dir`。默认的 `flush_strategy = "batch"` 与 `sync_level = "data"` 每 64 条记录或 50 毫秒同步一次。不允许丢失任何记录时，使用 `every_write` 加 `sync_level = "all"`，代价是更高的延迟。
+
+    让进程在退出时有时间排空数据：把编排系统的终止宽限时间设为大于 `[node].drain_timeout_secs`（默认 30 秒）。
+  </Step>
+  <Step title="设置保留期">
+    `[compactor].retention_days` 默认为 30。没有单独设置保留期的数据流，超过这个期限的数据会被删除。请在数据积累之前调高该值，或为各数据流单独设置保留期，参见[数据流](/zh-Hans/streams)。
+  </Step>
+  <Step title="只运行一个 alert 节点">
+    `alert` 角色只运行一个实例。`compactor` 角色可以运行多个实例，节点之间按数据流与组织分工。`standalone` 节点已经包含这两个角色。除非必须拆分角色，否则使用 `standalone`，拆分之前请阅读[分角色部署](/zh-Hans/distributed-deployment)。
+  </Step>
+  <Step title="监控部署">
+    用 Prometheus 抓取 `/metrics`。探测 `GET /api/v1/healthz`：该端点公开，在 WAL 重放期间或对象存储不可达时返回 `503`。容器镜像已经把这项检查作为 `HEALTHCHECK`。
+
+    保持 `[telemetry.self_collect]` 启用，让服务记录自身的指标、链路与 Profile，并基于这些指标创建告警规则，参见[自身可观测性](/zh-Hans/self-observability)。
+  </Step>
+  <Step title="规划备份与升级">
+    按[备份与恢复](/zh-Hans/backup-restore)备份 PostgreSQL、对象存储和加密密钥，并在依赖备份之前演练一次恢复。第一次变更版本之前，请阅读[升级](/zh-Hans/upgrade)。
+  </Step>
+</Steps>
+
+## 上线前验证
+
+- 从对外地址访问 `GET /api/v1/healthz` 返回 `200`。
+- 启动日志报告了 `object_store_credentials_source`，且没有出现 `MS_CIPHER_KEY missing`。
+- 用服务账号 Token 发送的测试记录能在查询中看到。
+- 默认登录 `admin@example.com` 加密码 `admin` 被拒绝。
+- 把最新的 PostgreSQL 备份恢复到临时数据库可以成功。

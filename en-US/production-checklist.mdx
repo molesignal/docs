@@ -1,0 +1,110 @@
+---
+title: "Production checklist"
+description: "Settings to replace and checks to run before MoleSignal stores real data: secrets, storage, network, durability, and operations."
+---
+
+The Compose sandbox and the sample `conf/config.toml` favor a fast start. Work through this page before a deployment holds real data.
+
+## Replace the sandbox defaults
+
+| Item | Sandbox default | Production |
+|---|---|---|
+| Root account | `admin@example.com` with password `admin` | Set a unique email and a strong password in `[auth]` before the first start. |
+| `MS_CIPHER_KEY` | Unset (an all-zero development key), or a fixed development key in the Compose file | A random 32-byte key kept in a secret manager. |
+| PostgreSQL credentials | `molesignal` / `molesignal` | A dedicated database and user with a generated password. |
+| Object storage credentials | `rustfsadmin` / `rustfsadmin` | A dedicated access key limited to the bucket. |
+| Object backend | RustFS in a container volume | `s3`, `azure`, or `gcs` with durable storage. |
+| `[http].external_url` | Empty | The public HTTPS address. |
+| TLS | Off | A TLS-terminating proxy or `[http.tls]`. |
+| `[wal].dir` | `./data/wal` | A persistent volume. |
+| Image tag | `latest` | A pinned version tag such as `26.1.0.0`. |
+
+## Checklist
+
+<Steps>
+  <Step title="Provision PostgreSQL and object storage">
+    Use PostgreSQL 17 with automated backups. Create a dedicated database and user for MoleSignal.
+
+    Keep `[meta_database].max_connections` multiplied by the number of nodes below the `max_connections` limit of PostgreSQL.
+
+    Create a private bucket in the same region as the nodes. Do not add lifecycle rules that expire objects. MoleSignal applies retention and deletes objects itself.
+  </Step>
+  <Step title="Generate and store the cipher key">
+    `MS_CIPHER_KEY` is the root key for the secrets that MoleSignal stores in PostgreSQL: API tokens, share links, remote cluster tokens, notification connector credentials, Mole Agent provider keys, synthetic monitoring secrets, and organization field keys. Generate it once:
+
+    ```bash
+    openssl rand -base64 32
+    ```
+
+    Store the value in a secret manager and give the same value to every node. Back it up separately from the database. A database restore without the key leaves those secrets unreadable.
+
+    <Warning>
+      Never replace the key in place. Data that was encrypted with the old key becomes unreadable. To rotate the key, stop all writes, export the new value as `MS_CIPHER_KEY`, and run the offline command with the old key:
+
+      ```bash
+      molesignal --config /etc/molesignal/config.toml rewrap-kek --old-key "<old key, base64>"
+      ```
+
+      The command re-encrypts every affected column and prints the number of rows per table. Verify the counts before retiring the old key.
+    </Warning>
+
+    A deployment that started without `MS_CIPHER_KEY` used an all-zero development key. Pass `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=` as `--old-key` to move such a deployment to a real key.
+  </Step>
+  <Step title="Secure the root account">
+    The root account is created on the first start of an empty database, from `[auth].root_email` and `[auth].root_password`. Set both before that first start. Later changes to `root_password` do not change the password of the existing account.
+
+    Password reset and **Account settings → Security & sign-in → Change password** work by email. They need `[notify.smtp]` and `[http].external_url`. Without them, no email is sent. Configure both before relying on them.
+
+    The account with `root_email` becomes the platform administrator at every start. Keep `root_email` set to an existing user.
+  </Step>
+  <Step title="Keep secrets out of the repository">
+    Pass the database DSN, the object storage keys, and `MS_CIPHER_KEY` through environment variables or a secret manager. Use `MS_META_DATABASE_DSN`, `MS_OBJECT_STORE_ACCESS_KEY`, and `MS_OBJECT_STORE_SECRET_KEY`. Leave the matching keys in `config.toml` empty.
+
+    Optionally pin the JWT signing secret with `MS_AUTH_JWT_SECRET_OVERRIDE`. Otherwise MoleSignal generates one in PostgreSQL on the first start. Rotate it with `POST /api/v1/auth/jwt/rotate`, which needs the `sys.settings.manage` permission. Tokens signed with the retired secret stay valid for 24 hours.
+  </Step>
+  <Step title="Expose the right ports">
+    | Port | Exposure |
+    |---|---|
+    | `5080` | Public, behind TLS. |
+    | `4317` | Public only behind a TLS-terminating proxy. |
+    | `5082` | Private network only. The port carries unauthenticated node-to-node traffic. |
+    | `5083` | Optional, behind TLS, when SQL clients connect. |
+    | `5084`, `5085` | Only when Probe Agents run outside the node. |
+
+    Set `[http].external_url` to the public address. Onboarding snippets, password reset emails, and status page domains use it.
+  </Step>
+  <Step title="Terminate TLS and configure the proxy">
+    Terminate TLS in a reverse proxy or enable `[http.tls]` for automatic ACME certificates.
+
+    Set the proxy body limit to at least 2 MiB, because MoleSignal accepts request bodies up to that size. For `/api/v1/query/stream`, disable response buffering and allow long reads. The reference nginx configuration of the project uses a 600-second timeout for that path.
+
+    Restrict `/metrics` to internal callers. Expose the intake paths `/api/v1/_bulk`, `/api/v1/_kinesis_firehose`, `/api/v1/_cloudflare`, and `/api/v1/_heroku` only when a sender needs them.
+  </Step>
+  <Step title="Protect the write-ahead log">
+    Mount a persistent local volume at `[wal].dir` on every node that runs the `intake` role. The default `flush_strategy = "batch"` with `sync_level = "data"` syncs every 64 records or 50 ms. Use `every_write` with `sync_level = "all"` when no record may be lost at the cost of latency.
+
+    Give the process time to drain on shutdown. Set the termination grace period of the orchestrator above `[node].drain_timeout_secs`, which defaults to 30 seconds.
+  </Step>
+  <Step title="Set retention">
+    `[compactor].retention_days` defaults to 30. Data older than that is deleted from every stream without its own retention. Raise the value or set retention per stream before data accumulates. See [Streams](/en-US/streams).
+  </Step>
+  <Step title="Run one alert node">
+    Run exactly one instance of the `alert` role. The `compactor` role can run several instances, which divide the work by stream and by organization. A `standalone` node already includes both roles. Use `standalone` unless splitting roles is required, and read [Role-based deployment](/en-US/distributed-deployment) before splitting.
+  </Step>
+  <Step title="Monitor the deployment">
+    Scrape `/metrics` with Prometheus. Probe `GET /api/v1/healthz`, which is public and answers `503` while the WAL replays or the object store is unreachable. The container image already runs this check as its `HEALTHCHECK`.
+
+    Keep `[telemetry.self_collect]` enabled so the service records its own metrics, traces, and profiles. Create alert rules on those metrics. See [Self-observability](/en-US/self-observability).
+  </Step>
+  <Step title="Plan backups and upgrades">
+    Back up PostgreSQL, the object store, and the cipher key as described in [Backup and restore](/en-US/backup-restore). Rehearse a restore before relying on it. Read [Upgrade](/en-US/upgrade) before the first version change.
+  </Step>
+</Steps>
+
+## Verify before go-live
+
+- `GET /api/v1/healthz` returns `200` from the public address.
+- The startup log reports `object_store_credentials_source` and does not print `MS_CIPHER_KEY missing`.
+- A test record sent with a service account token appears in a query.
+- The default sign-in `admin@example.com` with password `admin` is rejected.
+- Restoring the latest PostgreSQL backup into a scratch database succeeds.

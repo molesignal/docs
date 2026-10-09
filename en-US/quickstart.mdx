@@ -1,93 +1,175 @@
 ---
 title: "Quickstart"
-description: "Start MoleSignal, send a log event, and query the event in a few minutes."
+description: "Run a local MoleSignal sandbox with Docker Compose, send a log event, and find it in the web UI."
 ---
 
-This guide starts MoleSignal locally, sends a log event, and queries the event through the authenticated
-HTTP API.
+This guide starts a local MoleSignal sandbox, sends one log event, and finds the event in the web UI and through the query API. The sandbox is for evaluation only.
 
 ## Prerequisites
 
-- **Docker** and **Docker Compose** (the sandbox brings up Postgres + MinIO + MoleSignal).
-- About 2 GB of free RAM for the standalone profile.
+- **Docker** with **Docker Compose** v2.
+- About 2 GB of free memory.
+- Free local ports: `5080` (web UI and API), `5082`, `5432` (PostgreSQL), `9000` and `9001` (RustFS).
 
-## Run the sandbox
+## Start the sandbox
 
 <Steps>
-  <Step title="Clone and start">
+  <Step title="Clone the repository and start the stack">
     ```bash
     git clone https://github.com/molesignal/molesignal
     cd molesignal
-
-    # 1-command sandbox: Postgres + MinIO + MoleSignal standalone
     docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
     ```
 
-    After startup completes:
+    The first start downloads or builds the images, which can take several minutes. The stack contains PostgreSQL 17 for metadata, RustFS as S3-compatible object storage, and one MoleSignal process that runs every role and serves the web UI.
 
-    - **UI:** [http://localhost:5080](http://localhost:5080)
-    - **S3 admin (MinIO):** [http://localhost:9001](http://localhost:9001) — `minioadmin` / `minioadmin`
-  </Step>
-
-  <Step title="Log in and get a token">
-    Authenticate to obtain a JWT and `org_id`:
+    Check that the server is ready:
 
     ```bash
-    curl -X POST http://localhost:5080/api/v1/auth/signin \
+    curl http://localhost:5080/api/v1/healthz
+    ```
+
+    A healthy server returns `{"status":"ok"}`.
+  </Step>
+
+  <Step title="Sign in to the web UI">
+    Open [http://localhost:5080](http://localhost:5080) and sign in with:
+
+    - **Email:** `admin@example.com`
+    - **Password:** `admin`
+
+    <Warning>
+      The sandbox configuration creates this root account on the first start only. Replace the account before any use beyond a local evaluation. See [Production checklist](/en-US/production-checklist).
+    </Warning>
+
+    The RustFS console is available at [http://localhost:9001](http://localhost:9001) with `rustfsadmin` / `rustfsadmin`. These sandbox credentials are not secure.
+  </Step>
+
+  <Step title="Get an access token">
+    The API accepts a bearer token. Sign in through the API to get a login token (valid for 24 hours by default) and the organization id:
+
+    ```bash
+    RESP=$(curl -s -X POST http://localhost:5080/api/v1/auth/signin \
       -H 'content-type: application/json' \
-      -d '{"email":"admin@example.com","password":"admin"}'
+      -d '{"email":"admin@example.com","password":"admin"}')
+
+    export MS_JWT=$(echo "$RESP" | jq -r .token)
+    export MS_ORG=$(echo "$RESP" | jq -r .org_id)
     ```
 
-    The response contains the JWT and `org_id`. Export both values for the next steps:
+    Without `jq`, copy `token` and `org_id` from the response and export them manually.
 
-    ```bash
-    export MS_JWT="<jwt-from-response>"
-    export MS_ORG="<org_id-from-response>"
-    ```
+    <Note>
+      Use an API token or an intake token for senders that run longer than the login token lifetime. See [Datasource](/en-US/intake#intake-tokens).
+    </Note>
   </Step>
 
-  <Step title="Send the first data">
-    Native HTTP JSON intake works with `curl`, an app SDK, Vector, or Fluent Bit out of the box.
-    Timestamps are microseconds since the Unix epoch.
+  <Step title="Send a log event">
+    Native HTTP JSON intake takes an array of records. `_timestamp` holds microseconds since the Unix epoch. The stream `app` is created on the first write.
 
     ```bash
     curl -X POST http://localhost:5080/api/v1/intake/logs/app \
       -H "authorization: Bearer $MS_JWT" \
       -H 'content-type: application/json' \
-      -d '[{"_timestamp":1700000000000000,"level":"error","msg":"db pool exhausted","trace_id":"abc123"}]'
+      -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+    ```
+
+    The response reports the accepted records:
+
+    ```json
+    {"accepted":1,"rejected":0,"errors":[]}
     ```
   </Step>
 
-  <Step title="Query the event">
-    Query the `app` log stream over the HTTP API:
+  <Step title="Find the event in the web UI">
+    1. Open **Logs**.
+    2. Select the stream `app` in the stream selector.
+    3. Keep the time range at **Last 1 hour** and select **Run**.
+
+    The result table shows the event. Select the row to inspect its original fields.
+  </Step>
+
+  <Step title="Query the event with the API">
+    Run the same lookup through the query API. Always send a bounded `time_range` in microseconds; a very wide range makes the planner turn the query into an asynchronous search job.
 
     ```bash
+    NOW=$(date +%s)000000
+
     curl -X POST http://localhost:5080/api/v1/query \
       -H "authorization: Bearer $MS_JWT" \
       -H 'content-type: application/json' \
       -d "{\"org_id\":\"$MS_ORG\",\"language\":\"sql\",
-           \"statement\":\"SELECT * FROM app WHERE trace_id = 'abc123'\",
-           \"time_range\":{\"start\":0,\"end\":2000000000000000},
+           \"statement\":\"SELECT level, msg, trace_id FROM app WHERE trace_id = 'abc123'\",
+           \"time_range\":{\"start\":$((NOW - 3600000000)),\"end\":$((NOW + 60000000))},
            \"stream\":{\"name\":\"app\",\"stream_type\":\"logs\"}}"
     ```
 
-    The result includes `columns`, `rows`, `scanned_rows`, and `took_ms`.
+    The response contains `columns`, `rows`, `scanned_rows`, and `took_ms`:
+
+    ```json
+    {"columns":["level","msg","trace_id"],"rows":[["error","db pool exhausted","abc123"]],"scanned_rows":1,"took_ms":120}
+    ```
   </Step>
 </Steps>
+
+## Load sample data
+
+A workspace without data shows empty pages. Load a small, correlated demo set (logs, metrics, and traces that share `trace_id` values) to try cross-signal investigation:
+
+```bash
+curl -X POST http://localhost:5080/api/v1/onboarding/sample-data \
+  -H "authorization: Bearer $MS_JWT"
+```
+
+The request creates the streams `sample_app_logs`, `sample_app_metrics`, and `sample_app_traces`. The same action is available in the web UI: on **Home**, select **Complete setup** in the setup banner, then select **Load** next to **Load sample data**. The banner disappears after every setup step is complete.
+
+## Send OpenTelemetry data
+
+OTLP over HTTP works with any OpenTelemetry SDK or Collector. Point the exporter at the `/api` base path; the exporter appends `/v1/logs`, `/v1/metrics`, and `/v1/traces`:
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer $MS_JWT"
+export OTEL_SERVICE_NAME=checkout
+```
+
+Telemetry lands in the stream `default` of each signal type unless a `stream-name` header selects another stream. See [Datasource](/en-US/intake) and [Integration guides](/en-US/integrations) for Collector, Vector, Fluent Bit, Prometheus, and SDK setups.
+
+## Stop the sandbox
+
+```bash
+# Stop the containers and keep the data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down
+
+# Stop the containers and delete all sandbox data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down -v
+```
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `healthz` returns `503` with `"status":"degraded"` | A subsystem is unhealthy, for example the object store probe. Read the `reason` field and check the `rustfs` container. |
+| Sign-in returns `401` | The root account is created only on the first start. A database volume from an earlier run keeps the earlier password. Run `down -v` to reset the sandbox. |
+| The query returns `202` with a `job_id` | The time range is too wide (about 13.9 hours or more with the defaults), so the planner started an asynchronous search job. Narrow the range, send `Prefer: respond-sync`, or poll `GET /api/v1/query/jobs/{id}`. See [Query](/en-US/query#time-ranges-and-asynchronous-jobs). |
+| The query returns `422 missing field org_id` or `400 query.stream hint is required` | Send both `org_id` and the `stream` object. |
+| A port is already in use | Stop the other process, or change the published ports in `deploy/docker/docker-compose.yaml`. |
+| OTLP gRPC on `4317` is unreachable from the host | The sandbox Compose file does not publish `4317`. Add a `4317:4317` port mapping to the `molesignal` service. |
 
 ## Next steps
 
 <CardGroup cols={2}>
-  <Card title="Data intake from an existing stack" icon="inbox" href="/en-US/intake">
-    Connect OpenTelemetry, Prometheus, Loki JSON senders, Filebeat, and cloud sources.
+  <Card title="Connect real data" icon="inbox" href="/en-US/intake">
+    Use the Datasource page, intake tokens, and compatible protocols.
   </Card>
-  <Card title="Cross-signal correlation" icon="link" href="/en-US/correlation">
-    Connect logs, metrics, traces, profiles, and RUM with shared context.
+  <Card title="Integration guides" icon="plug" href="/en-US/integrations">
+    Configure the OpenTelemetry Collector, Vector, Fluent Bit, Filebeat, and Prometheus.
+  </Card>
+  <Card title="Core concepts" icon="book" href="/en-US/concepts">
+    Learn signals, streams, workspaces, and permissions.
   </Card>
   <Card title="Deploy for real" icon="server" href="/en-US/deployment">
-    Move from the sandbox to a multi-role or Kubernetes deployment.
-  </Card>
-  <Card title="Configuration" icon="gear" href="/en-US/configuration">
-    TOML config and `MS_*` environment overrides.
+    Move from the sandbox to a production deployment.
   </Card>
 </CardGroup>

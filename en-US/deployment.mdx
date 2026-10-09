@@ -1,99 +1,142 @@
 ---
-title: "Deployment & architecture"
-description: "From a single-binary sandbox to a multi-role Kubernetes cluster."
+title: "Deploy MoleSignal"
+description: "Requirements, deployment options, ports, and health checks for running MoleSignal outside the sandbox."
 ---
 
-MoleSignal is a **single binary** that serves every role; process configuration selects active roles.
-The same binary supports a one-command sandbox or a horizontally scaled cluster.
+MoleSignal ships as one binary and one container image. Configuration selects which [roles](/en-US/distributed-deployment) a process runs: a single process can run everything, or the roles can be split across processes. Every deployment needs two external services: PostgreSQL and object storage.
 
-## Architecture
+## Requirements
 
-```mermaid
-flowchart LR
-  subgraph intake [Intake]
-    A["Agents / collectors<br/>OTel · Vector · …"] -->|HTTP / gRPC| R["Router<br/>routing + rate limit"]
-    R -->|"consistent hashing (org, stream)"| ING["Intake"]
-    ING --> WB["Durable log<br/>+ in-memory buffer"]
-    WB -->|periodic flush| CF["Columnar files<br/>+ search index"]
-  end
+| Component | Requirement |
+|---|---|
+| PostgreSQL | Stores metadata, identities, the file catalog, and product resources. PostgreSQL is the only supported metadata database. The Compose sandbox and the Kubernetes manifests use PostgreSQL 17. |
+| Object storage | Stores Parquet files, search indexes, and profile blobs. Use `s3` (AWS S3 or an S3-compatible service such as RustFS, Cloudflare R2, or Alibaba Cloud OSS), `azure`, or `gcs`. The `local` backend is for a single node and for development. |
+| Compute | Linux on x86-64 or arm64 with the container image (`linux/amd64` and `linux/arm64`). The sandbox needs about 2 GB of memory. |
+| Intake disk | A persistent local volume for the write-ahead log (WAL) on every node that runs the `intake` role. |
 
-  subgraph storage [Shared storage]
-    OS[("Object storage")]
-    MS[("Metadata store")]
-  end
+Memory and disk use depend on the ingest volume, the number of active streams, and the cache settings in [Configuration](/en-US/configuration). Size from observed usage: the **Home** page shows raw and compressed intake volume, and the process exposes Prometheus metrics at `/metrics`. See the [Production checklist](/en-US/production-checklist).
 
-  subgraph query [Query]
-    UI["Web console / API"] -->|query| Q["Querier"]
-    Q -->|distributed scan across peers| QP["Querier peers"]
-  end
+## Container image
 
-  CF --> OS
-  CF -. partition metadata .-> MS
-  QP --> OS
-  Q -. partition pruning .-> MS
+The image is published as `ghcr.io/molesignal/molesignal`. Each release publishes a version tag (for example `26.1.0.0`) and a channel tag (for example `alpha`). Pin the version tag in production.
+
+```bash
+docker pull ghcr.io/molesignal/molesignal:26.1.0.0
 ```
 
-Logs, metrics, and traces use typed Parquet streams in the same object-storage data plane. Profile
-metadata uses the same organization and query model while pprof blobs remain in object storage.
-
-## Node roles
-
-| Role | Responsibilities | State |
-|---|---|---|
-| `standalone` | HTTP API + all workers in one process | — |
-| `router` | Reverse proxy + rate limiting | stateless |
-| `intake` | Data intake + durable write-ahead log + buffer + periodic flush to columnar files | local log (≤ flush window) |
-| `querier` | Distributed scan endpoint + query execution | stateless |
-| `compactor` | Periodic file merge + retention cleanup | stateless |
-| `alert_manager` | Rule evaluation, escalation, reports, RCA maintenance, and connector runners | stateless |
-
-Roles are selected with the `[node].roles` config (or `MS_NODE.ROLES`). Only the intake holds
-local state — a WAL within the flush window — so every other role scales freely.
+The same image serves every role. The runtime variable `RELEASE_CHANNEL` (`alpha`, `beta`, `rc`, or `stable`) labels the deployment maturity and does not change the binary. The web UI is embedded in the binary and served on the HTTP port.
 
 ## Deployment options
 
 <Tabs>
   <Tab title="Docker Compose">
-    The repo ships two profiles:
+    The repository ships `deploy/docker/docker-compose.yaml` with two profiles. Both start PostgreSQL 17 and RustFS, and run the MoleSignal image from `ghcr.io/molesignal/molesignal`.
 
     ```bash
-    # Everything in one process — great for evaluation
+    # Everything in one process: serves the complete product
     docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
 
-    # Separate roles — closer to production
+    # One container per role
     docker compose -f deploy/docker/docker-compose.yaml --profile multirole up
     ```
 
-    The checked-in Compose file publishes `5080` and internal `5082`, but not external OTLP gRPC
-    `4317`. To send OTLP gRPC from the host, add a `4317:4317` mapping to the standalone or
-    intake service. Do not use `5082` as a substitute.
+    The `multirole` profile deploys one container per role. The router publishes the web UI and the HTTP API on `5080` and the OTLP gRPC receiver on `4317`. See [Role-based deployment](/en-US/distributed-deployment).
 
-    <Warning>
-      `connector` is not a current runtime role. If the checkout still contains a legacy
-      `molesignal-connector` service, remove the legacy service; connector runners are owned by `alert_manager`.
-    </Warning>
+    The standalone service publishes `5080` and `5082`. It does not publish the OTLP gRPC port `4317`. To send OTLP gRPC from the host, add a `4317:4317` mapping to the service.
+
+    The Compose file is a sandbox: it uses default credentials, a development cipher key, and a development `MS_SELF_TELEMETRY_CLUSTER_TOKEN` for the `multirole` profile. Replace them before storing real data. See the [Production checklist](/en-US/production-checklist). The sandbox bucket is private.
+  </Tab>
+  <Tab title="Binary and systemd">
+    Install the release binary and the configuration file, then run MoleSignal as a systemd service.
+
+    ```bash
+    sudo useradd --system --home-dir /var/lib/molesignal \
+      --shell /usr/sbin/nologin molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo install -d -o root -g molesignal -m 0750 /etc/molesignal
+    sudo install -o root -g molesignal -m 0640 \
+      conf/config.toml /etc/molesignal/config.toml
+    sudo install -Dm644 deploy/systemd/molesignal.service \
+      /etc/systemd/system/molesignal.service
+    ```
+
+    Set the runtime channel in `/etc/molesignal/molesignal.env`:
+
+    ```ini
+    RELEASE_CHANNEL=alpha
+    ```
+
+    Edit `/etc/molesignal/config.toml` for PostgreSQL, object storage, and secrets, then start the service:
+
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now molesignal
+    sudo systemctl status molesignal
+    ```
+
+    The unit uses `/var/lib/molesignal` as its state directory and grants `CAP_NET_BIND_SERVICE` so that the built-in TLS listener can bind ports `80` and `443`.
   </Tab>
   <Tab title="Kubernetes">
-    Manifests live in [`deploy/k8s/`](https://github.com/molesignal/molesignal/tree/main/deploy/k8s).
-    The same image serves all roles; set `MS_NODE.ROLES` per Deployment/StatefulSet. The intake
-    runs as a StatefulSet with a PVC for the WAL; every other component is a stateless Deployment.
+    The manifests in [`deploy/k8s/`](https://github.com/molesignal/molesignal/tree/main/deploy/k8s) use one image for every role. They reference the placeholder image `molesignal:dev`. Replace it with `ghcr.io/molesignal/molesignal:<version>` in every workload.
+
+    The manifests do not include PostgreSQL or object storage. Provide PostgreSQL 17 under the service name `postgresql` (or edit `meta_database.dsn` in the ConfigMap) and any S3-compatible object store (edit `object_store` in the ConfigMap).
+
+    The manifests deploy the role-split topology: the `router` workload serves the web UI and the HTTP API, and the other workloads run the data and background roles. To run one process that carries every role instead, start from `40-intake.yaml` (a StatefulSet with a persistent volume for the WAL), set `MS_NODE_ROLES` to `["standalone"]`, add the Service port `5080`, and probe `/api/v1/healthz`.
+
+    | Workload | Kind | Replicas | Role |
+    |---|---|---|---|
+    | `router` | Deployment | 2 | `router`: the web UI, the HTTP API, and OTLP gRPC |
+    | `intake` | StatefulSet | 2 | `intake`, with a 20 Gi persistent volume per replica for the WAL |
+    | `querier` | Deployment | 2 | `querier` |
+    | `compactor` | Deployment | 1 | `compactor`, replicas can be added |
+    | `alert` | Deployment | 1 | `alert`, single instance |
+
+    Split-role nodes authenticate the trace candidates and self-telemetry that they forward to each other with a shared `MS_SELF_TELEMETRY_CLUSTER_TOKEN`. Trace capture is on by default, so every workload reads the same value from the `self_telemetry_cluster_token` key of `molesignal-secret`. Create the namespace, the configuration, and the secret, then apply the workloads:
+
+    ```bash
+    kubectl apply -f 00-namespace.yaml
+    kubectl apply -f 10-configmap.yaml
+    kubectl create secret generic molesignal-secret -n molesignal \
+      --from-literal=object_store_access_key="<access-key>" \
+      --from-literal=object_store_secret_key="<secret-key>" \
+      --from-literal=cipher_key="$(openssl rand -base64 32)" \
+      --from-literal=self_telemetry_cluster_token="$(openssl rand -base64 32)" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    ```
+
+    The workloads select their role with the `MS_NODE_ROLES` environment variable. Check the cluster through the router:
+
+    ```bash
+    kubectl -n molesignal port-forward svc/router 5080:5080
+    curl http://127.0.0.1:5080/api/v1/healthz
+    ```
+
+    The web UI is embedded in the binary. Expose port `5080` of the `router` workload through an Ingress or load balancer.
+
+    The `router` workload serves the full API on `5080`, and its readiness probe requests `GET /api/v1/healthz`. Every other workload serves a health, readiness, and metrics listener on `5080` and uses `GET /api/v1/readyz` as its readiness probe. For `intake`, the listener starts after WAL replay, so a ready pod accepts writes.
   </Tab>
 </Tabs>
 
-## Dependencies
+See [Role-based deployment](/en-US/distributed-deployment) for roles, scaling, and high availability.
 
-- **Postgres** — metadata, IAM, streams, alerts, reports, Agent resources, and cluster state.
-- **Object store** — `local`, `s3` (and S3-compatible: MinIO, R2, Aliyun OSS), `azure`, or `gcs`.
+## Ports
 
-## Operations
+| Port | Purpose | Exposure |
+|---|---|---|
+| `5080` | Web UI, HTTP API, `/metrics`, and the health endpoint. On every role except `router` and `standalone`, only health, readiness, and metrics. | Public behind TLS on `router` and `standalone`. Private on the other roles. |
+| `4317` | OTLP gRPC receiver. Plain gRPC without TLS. | Public only behind a TLS-terminating proxy or inside a trusted network. |
+| `5082` | Internal gRPC for node-to-node traffic: write forwarding, query forwarding, and scan shards | Private. Never expose. |
+| `5083` | Arrow Flight SQL for database clients. Disabled by default. | Optional, behind TLS. |
+| `5084`, `5085` | Probe Agent registration and control for synthetic monitoring private locations | Only when Probe Agents run outside the node. |
+| `80`, `443` | Built-in TLS listener with automatic certificates, when `[http.tls].enabled` is `true` | Public. |
 
-- **Single binary**, same image for all roles.
-- **Prometheus `/metrics`** with fixed-cardinality cache, object-store, intake, query, alerting, and
-  self-observability metrics.
-- **Health probes** — `/api/v1/readyz` gates traffic on WAL replay; `/api/v1/healthz` separately
-  reports subsystem degradation, including object-storage probes.
-- **TLS + ACME** — optional automatic certificates via `[http.tls]` (HTTP-01 challenge, Let's Encrypt).
-- **External protocols** — HTTP `5080`, OTLP gRPC `4317`, optional Flight SQL `5083`; keep internal
-  gRPC `5082` private.
+## Health and metrics
 
-See [Configuration](/en-US/configuration) for the full settings reference.
+- `GET /api/v1/healthz` is public. It returns `200` with `{"status":"ok"}`, or `503` with a `reason` while the intake WAL replays or when the object store is unreachable. Use it for container and load balancer probes.
+- `GET /metrics` is public and returns Prometheus metrics. Restrict it at the proxy or network layer.
+- `GET /api/v1/readyz` and `GET /api/v1/version` require a bearer token on a `standalone` or `router` node. `version` returns the version, commit, build id, release channel, and edition.
+- A node in a role-split cluster that does not serve the full API answers `GET /api/v1/healthz`, `GET /api/v1/readyz`, and `GET /metrics` without authentication on the same port.
+
+See [Self-observability](/en-US/self-observability) for the metrics and the built-in telemetry of the service itself.

@@ -1,19 +1,18 @@
 ---
-title: "Scheduled pipelines"
+title: "Pipelines"
 sidebarTitle: "Pipelines"
-description: "Read a source stream on a schedule, apply a VRL transform chain, and write the result to a target stream or external connector."
+description: "Transform and route events as they arrive, or on a schedule over data that is already stored."
 ---
 
-A **scheduled pipeline** reads a source stream over a time window, applies an ordered chain of VRL
-transforms, and writes the output to a target stream (standard intake) — optionally fanning the same
-events out to external **connectors** (S3, Kafka). Pipelines run on a simplified interval schedule,
-or on demand as a **backfill** over a historical window.
+A **pipeline** transforms events with an ordered chain of steps and writes the result to a target stream. A step is a [VRL](/en-US/functions) transform or the built-in routing step. A pipeline runs in one of two modes:
 
-<Note>
-  Scheduled pipelines transform data **after intake**, as a recurring job. To transform events on
-  the intake hot path instead, attach a [function](/en-US/functions) to
-  the intake step.
-</Note>
+| | Realtime | Scheduled |
+|---|---|---|
+| When it runs | During intake, before an event is stored. | On an interval, over a time window of data that is already stored. |
+| Signals | Logs. | Logs, metrics, and traces. |
+| Source and sink | One source stream and one stream sink. | One source stream, a target stream, and optional connectors. |
+| Typical use | Normalize, redact, and route logs into streams as they arrive. | Enrich, aggregate, or copy stored data, and backfill history. |
+| Backfill and run history | Not available. | Available. |
 
 <Frame caption="Scheduled pipeline">
   <img src="/images/architecture/pipeline_en_light.svg" alt="Scheduled pipeline" className="block dark:hidden" />
@@ -22,43 +21,46 @@ or on demand as a **backfill** over a historical window.
 
 ## Build a pipeline in the graph editor
 
-Open **Pipelines → New** to lay out the flow on a canvas: **source → transform → sink**. Nodes are
-draggable, handles support connections, and the editor validates the graph during layout
-(missing source/sink, a transform without a name or script, duplicate stream names, a source that
-also appears as a sink). The first source and first stream sink are saved as the pipeline's
-`source_stream` and `target_stream`.
+Open **Pipelines → New** to lay out the flow on a canvas: **source → transform → sink**. Nodes are draggable, handles support connections, and the editor validates the graph during layout: a missing source or sink, a transform without a name or script, duplicate stream names, and a source that also appears as a sink. The first source and the first stream sink are saved as the `source_stream` and the `target_stream` of the pipeline.
 
 | Node | Meaning |
 |---|---|
-| **Source** | The stream the pipeline reads from each run. |
-| **Transform** | One VRL step. Steps run in order, top to bottom. |
-| **Sink** | A target stream (standard intake) or an external connector. |
+| **Source** | The stream that the pipeline reads. |
+| **Transform** | One step. Steps run in order, top to bottom. |
+| **Sink** | A target stream, written through standard intake, or an external connector. |
 
-## Transforms
+## Steps
 
-Each transform is a [VRL](/en-US/functions) script. The transform inspector supports reuse of a
-**built-in preset** or any saved [function](/en-US/functions) from the **reuse** picker. Selecting
-an entry fills the step script, which remains editable inline.
+### VRL transforms
+
+Each transform is a [VRL](/en-US/functions) script. The transform inspector can reuse a **built-in preset** or any saved [function](/en-US/functions) from the **reuse** picker. Selecting an entry fills the script, which stays editable.
 
 Built-in presets ship with every instance and are read-only:
 
 | Preset | Effect |
 |---|---|
-| `normalize-logs` | Parse the JSON `message`, add environment/cluster fields, lowercase `level`. |
-| `route-by-service` | Normalize `service` and derive a per-service target stream name (`logs_<service>`). |
-| `parse-key-value` | Parse a `logfmt` / `key=value` message and merge the fields into the event. |
+| `normalize-logs` | Parse the JSON `message`, add environment and cluster fields, and lowercase `level`. |
+| `route-by-service` | Normalize `service` and derive a per-service stream name (`logs_<service>`) as a routing hint. |
+| `parse-key-value` | Parse a `logfmt` or `key=value` message and merge the fields into the event. |
 | `redact-email` | Replace email addresses in `message` with a placeholder. |
 | `add-intake-time` | Stamp an intake timestamp to help debug end-to-end latency. |
 
 <Tip>
-  Presets and saved functions share one catalog, with both types on the **Functions** page. Built-in
-  presets are badged and read-only; use **Copy script** to create a custom function.
+  Presets and saved functions share one catalog on the **Functions** page. Presets are read-only. Use **Copy script** to create a custom function.
 </Tip>
+
+### Routing
+
+The built-in routing step chooses the target stream of each event. Both modes support it. A route is one of:
+
+- a **Fixed stream**;
+- **Route by field**, which writes to the stream named by a field of the event. An optional **Stream prefix** is prepended, and the **Fallback stream** receives events whose field is missing, not a string, or not a valid stream name.
+
+The route reads the fields as they are when the step runs, and later steps do not change a decision that was already made. When several routing steps run, the last result wins. A stream name has 1 to 255 characters from ASCII letters, digits, `_`, `-`, and `.`. Names such as `.` and `..`, and the protected `_molesignal`, are rejected. Missing streams are created on the first write.
 
 ### Extend tables
 
-An **extend table** is a key → record lookup table available to a transform. Open **Extend tables**,
-create a table, add rows (a key plus named fields), and perform the lookup from VRL:
+An **extend table** is a key-to-record lookup table available to a transform. Open **Extend tables**, create a table, add rows (a key plus named fields), and perform the lookup from VRL:
 
 ```ruby
 # enrich each event with the service's owning team
@@ -67,51 +69,87 @@ create a table, add rows (a key plus named fields), and perform the lookup from 
 
 Lookups happen in memory and add no query cost to the run.
 
-## Sinks and connector egress
+## Realtime pipelines
 
-A sink is either a **target stream** (the default — events are written through standard intake and
-become queryable) or an external **connector**:
+A realtime pipeline processes each log event during intake, before the event is stored. Create it in the graph editor by setting **Execution mode** to **Realtime**, or through the API:
+
+```bash
+curl -X POST http://localhost:5080/api/v1/scheduled_pipelines \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "route-app-logs",
+    "source_stream": "default",
+    "target_stream": "default",
+    "cron": "",
+    "lookback_secs": 300,
+    "enabled": true,
+    "function_steps": {
+      "mode": "realtime",
+      "signal_type": "logs",
+      "sources": ["default"],
+      "sinks": ["default"],
+      "retain_source": false,
+      "steps": [
+        { "transform_name": "lowercase-level", "kind": "vrl",
+          "script": ".level = downcase!(string!(.level))" },
+        { "transform_name": "route-by-app", "kind": "builtin", "operation": "route",
+          "routing": { "kind": "field", "field": "appname", "prefix": "app_", "fallback": "default" } }
+      ]
+    }
+  }'
+```
+
+An event with `appname` set to `checkout` reaches the stream `app_checkout`. An event without `appname` goes to the fallback stream `default`.
+
+Behavior to plan for:
+
+- Each event runs through the steps in order. A step that fails, or a result that is not an object, rejects that event. The intake response lists it, for example `{"index":1,"reason":"realtime transform `needs-level` failed"}`, and the other events of the batch are accepted.
+- **Also retain in source stream** keeps the original event in the source stream next to the transformed copy. It is off by default. When the source and the target are the same stream, only the transformed event is written.
+- Only one realtime pipeline can be enabled per source stream. A second one fails with `409`. The pipeline supports logs only.
+- A change of configuration applies to later batches. A batch that has already started keeps the configuration it read.
+- The output of a pipeline does not trigger another pipeline.
+- Writes to several target streams are not atomic. A retry of the whole batch can duplicate events in streams that already succeeded, so the pipeline does not promise exactly-once delivery.
+- A realtime pipeline records no runs and cannot be backfilled. In the list, the status **Ready for intake** means that the configuration is enabled, not that data has arrived.
+
+## Scheduled pipelines
+
+A scheduled pipeline reads a source stream over a time window, applies the chain, and writes the output to a target stream. It can also fan the same events out to connectors.
+
+### Sinks and connector egress
+
+A sink is either a **target stream** (the default, written through standard intake and queryable) or an external **connector**:
 
 | Connector | Payload |
 |---|---|
 | **S3** | Batched JSON Lines `PUT` to `s3://<bucket>/<prefix><id>.jsonl`. |
-| **Kafka** | One JSON record produced per event to the configured topic. |
+| **Kafka** | One JSON record per event to the configured topic. |
 
-Add connectors under **Pipelines → Connectors**, then select connectors as sinks in the graph editor. A
-pipeline can write to a stream and egress to connectors in the same run.
+Add connectors under **Pipelines → Connectors**, then select them as sinks in the graph editor. A pipeline can write to a stream and egress to connectors in the same run. A scheduled pipeline cannot route events back into its own source stream.
 
 ### Hide the source stream from queries
 
-When fanning a catch-all source stream out into per-service or per-tenant target streams — for
-example with the `route-by-service` preset above — the source stream keeps accumulating the raw,
-unrouted events. To keep queries and dashboards pointed only at the routed streams, mark the source
-stream **non-queryable**: open **Streams → _source_ → Settings** and turn **Queryable** off.
+When a catch-all source stream fans out into per-service or per-tenant target streams, the source keeps accumulating the raw events. To keep queries and dashboards on the routed streams only, mark the source stream **non-queryable**: open **Streams → source → Settings** and turn **Queryable** off.
 
-A non-queryable stream still accepts and retains data and feeds the pipeline, but the stream is
-hidden from the query stream selectors and rejected by SQL and PromQL search with `stream is not
-queryable`. Flip the toggle back on at any time.
+A non-queryable stream still accepts and retains data and feeds the pipeline. It is hidden from the query stream selectors, and SQL and PromQL searches reject it with `stream is not queryable`. Turn the toggle on again at any time.
 
-## Schedule and lookback
+### Schedule and lookback
 
 | Field | Notes |
 |---|---|
-| `cron` | Interval shorthand: `every:30s`, `every:5m`, `every:1h`. |
-| `lookback_secs` | How far back each run reads from the source (default 300). |
-| `enabled` | Toggle the schedule without deleting the pipeline. |
+| `cron` | Interval shorthand: `every:30s`, `every:5m`, or `every:1h`. |
+| `lookback_secs` | How far back each run reads from the source. The default is 300. |
+| `enabled` | Pauses or resumes the schedule without deleting the pipeline. |
 
-The runner does not parse standard cron expressions. A schedule outside the supported `every:`
-syntax is skipped.
+The runner does not parse standard cron expressions. A schedule outside the `every:` syntax is rejected with `400`: `scheduled pipelines require every:Ns/m/h and a positive lookback`.
 
-On each tick the runner reads `[now - lookback_secs, now]` from the source, applies the chain, and
-writes the output. Every run is recorded — view history under the pipeline's **Runs** tab, or via
-`GET /api/v1/scheduled_pipelines/{id}/runs` (`state`, `scanned_rows`, `error`).
+On each tick the runner reads `[now - lookback_secs, now]` from the source, applies the chain, and writes the output. The runner checks for due pipelines every 15 seconds, so very short intervals run at that granularity. Every run is recorded: view the history in the **Runs** tab of the pipeline, or with `GET /api/v1/scheduled_pipelines/{id}/runs`, which returns `state`, `scanned_rows`, and `error`.
 
 <Note>
-  The schedule runner is a singleton and runs only on the **alert-manager**
-  (or **standalone**) node, so enabled pipelines fire once per interval rather than once per node.
+  The schedule runner is a singleton. It runs only on the `alert` role, which `standalone` includes, so an enabled pipeline fires once per interval and not once per node.
 </Note>
 
-## Backfill
+### Backfill
 
 To process a historical window on demand, submit a backfill:
 
@@ -119,22 +157,20 @@ To process a historical window on demand, submit a backfill:
 curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backfill \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
-  -d '{"start_micros": 1717200000000000, "end_micros": 1717286400000000}'
+  -d '{"start_micros": 1790000000000000, "end_micros": 1790086400000000}'
 ```
 
-The window must be **≤ 31 days**. The request returns `202` with a `job_id` and a monitor URL; the
-backfill runs through the async [search-job](/en-US/distributed-deployment#async-search-job-pipeline)
-worker — read the source window, apply the same transform chain, write the target stream and egress.
+The window must not exceed 31 days. The request returns `202` with a `job_id` and a `monitor` path. The backfill runs through the asynchronous [search job](/en-US/distributed-deployment#asynchronous-search-jobs) worker: it reads the source window, applies the same chain, writes the target stream, and egresses to connectors.
 
 ## Permissions
 
-- `pipelines.read` lists pipelines and reads pipeline run history.
+- `pipelines.read` lists pipelines and reads run history.
 - `pipelines.create` creates a pipeline.
-- `pipelines.edit` changes the pipeline graph, transforms, schedule, or lookback.
-- `pipelines.pause` enables or pauses scheduled execution.
+- `pipelines.edit` changes the graph, the transforms, the schedule, or the lookback.
+- `pipelines.pause` enables or pauses a pipeline.
 - `pipelines.run` submits a backfill.
 - `pipelines.delete` deletes a pipeline.
 
 <Card title="Pipeline API" icon="code" href="/en-US/api/intake/scheduled-pipelines">
-  Create, update, list, and backfill scheduled pipelines over the HTTP API.
+  Create, update, list, and backfill pipelines over the HTTP API.
 </Card>

@@ -1,28 +1,36 @@
 ---
 title: "原生 JSON 接入"
-description: "以 JSON 向流 POST 记录。"
+description: "以 JSON 形式向数据流 POST 记录。"
 ---
 
 ```http
 POST /api/v1/intake/{type}/{stream}
 ```
 
-`{type}` 为 `logs`、`metrics` 或 `traces`。POST 单条记录对象或数组。流在首次写入时创建，schema 随
-字段出现演进。时间戳为 Unix 纪元起的微秒（`_timestamp`）。
+向数据流 POST 一个记录对象，或一组记录。数据流在首次写入时创建，schema 会随新字段出现而演进。该调用需要 `streams.write` 权限，默认接入 Token 以及具备写入角色的服务账号 Token 都可以使用。
 
 **路径参数**
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
-| `type` | string | `logs` / `metrics` / `traces` |
-| `stream` | string | 流名，如 `app` |
+| `type` | string | `logs`、`metrics` 或 `traces`，其他值返回 `404`。 |
+| `stream` | string | 数据流名称，可包含字母、数字、`_`、`-` 与 `.`。名称 `_molesignal` 为保留名称，返回 `403`。 |
+
+**请求体**
+
+一个 JSON 对象，或一组 JSON 对象，每个元素都必须是对象。请求体上限为 2 MiB，并且不会被解压，因此不要向该端点发送 `Content-Encoding: gzip`。
+
+| 字段 | 说明 |
+|---|---|
+| `_timestamp` | 事件时间，自 Unix 纪元起的微秒数。缺省时使用服务端接收时间。 |
+| 其他任意字段 | 作为数据流的字段保存。之后的记录必须使用数据流中该字段已有的类型。 |
 
 <RequestExample>
 ```bash cURL
 curl -X POST http://localhost:5080/api/v1/intake/logs/app \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
-  -d '[{"_timestamp":1700000000000000,"level":"error","msg":"db pool exhausted","trace_id":"abc123"}]'
+  -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
 ```
 </RequestExample>
 
@@ -32,5 +40,24 @@ curl -X POST http://localhost:5080/api/v1/intake/logs/app \
 ```
 </ResponseExample>
 
-`402` 表示订阅、试用或每日摄取额度阻止写入；`413` 表示组织存储配额已超；`429` 表示触发
-摄取限流。该接口需要 `streams.write`。
+与 schema 冲突的记录会单独被拒绝，同一批中的其他记录仍会被接收：
+
+```json
+{
+  "accepted": 1,
+  "rejected": 1,
+  "errors": [
+    { "index": 0, "reason": "type mismatch on field `level`: expected Utf8, got Number" }
+  ]
+}
+```
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 数据流名称无效、JSON 无效，或数组元素不是对象（`event #1 must be a JSON object`）。 |
+| `401` | Token 缺失或无效。 |
+| `403` | Token 缺少 `streams.write`，或数据流为 `_molesignal`。 |
+| `413` | 请求体超过 2 MiB。 |
+| `429` | 触发了 router 的速率限制。 |

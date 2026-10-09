@@ -1,0 +1,87 @@
+---
+title: "Backup and restore"
+description: "What to back up, how to keep PostgreSQL and object storage consistent, and how to restore a MoleSignal deployment."
+---
+
+MoleSignal keeps state in PostgreSQL, in object storage, on the intake WAL volume, and in configuration and secrets. Back up each of them, and rehearse a restore before relying on the backups.
+
+## What to back up
+
+| State | Holds | Backup |
+|---|---|---|
+| PostgreSQL | Users, organizations, tokens, streams, dashboards, alert rules, and the file catalog that maps streams to objects | Required |
+| Object storage | Parquet data files, search indexes, and profile blobs | Required |
+| `MS_CIPHER_KEY` | The root key for secrets in PostgreSQL | Required. Store it apart from the database backup. |
+| Configuration | `config.toml`, environment variables, and `MS_AUTH_JWT_SECRET_OVERRIDE` when used | Required |
+| WAL volume (`[wal].dir`) | Records that are not yet flushed to object storage | Optional. Holds only records that are not flushed yet. |
+| ACME directory (`[http.tls].key_storage_dir`) | ACME account key and domain keys | Optional. Certificates can be issued again. |
+| Cache directory (`[cache.object].root`) | Local copy of remote object ranges | Do not back up. |
+
+## Keep the database and the objects consistent
+
+The file catalog in PostgreSQL references objects in the bucket. A flush uploads an object first and records it in the catalog afterwards. Compaction and retention remove a catalog reference first, and the garbage collector deletes the object later, after `[storage.gc].grace_period_secs` (default 3600 seconds).
+
+Use this order for a consistent backup:
+
+1. Take the PostgreSQL backup.
+2. Copy the bucket right afterwards, and finish within the grace period.
+
+A copy that completes within the grace period contains every object that the database backup references. If the copy takes longer, raise `grace_period_secs` before the backup, or enable bucket versioning and restore the objects as of the time of the database backup.
+
+## Back up PostgreSQL
+
+Use the backup features of the PostgreSQL service, such as scheduled snapshots with point-in-time recovery. For a self-managed database, a logical dump works for small deployments:
+
+```bash
+pg_dump --format=custom --file=molesignal.dump "postgres://molesignal@db.internal:5432/molesignal"
+```
+
+## Back up object storage
+
+Use bucket replication or versioning of the provider. A scheduled copy to a second bucket also works:
+
+```bash
+aws s3 sync s3://molesignal s3://molesignal-backup
+```
+
+For an S3-compatible service such as RustFS, add `--endpoint-url`. Back up with credentials that cannot delete from the backup bucket.
+
+## Restore
+
+<Steps>
+  <Step title="Stop every node">
+    Stop all MoleSignal processes so that nothing writes while the data is replaced.
+  </Step>
+  <Step title="Restore PostgreSQL">
+    Restore the backup into an empty database:
+
+    ```bash
+    pg_restore --no-owner --dbname "postgres://molesignal@db.internal:5432/molesignal" molesignal.dump
+    ```
+  </Step>
+  <Step title="Restore the objects">
+    Copy the backup into the bucket that the nodes use. Restore the bucket to the time of the database backup or later.
+
+    The reconciler queues objects that the restored catalog does not reference as orphans, and the garbage collector deletes them after `[storage.reconciler].orphan_grace_secs` (default 24 hours). Copy newer objects elsewhere first if they may still be needed.
+  </Step>
+  <Step title="Restore secrets and configuration">
+    Provide the configuration and the same `MS_CIPHER_KEY` that the backed-up deployment used. A node with a different key cannot decrypt the stored secrets and fails to start with an error such as `open Probe CA key`.
+  </Step>
+  <Step title="Restore the WAL volume if available">
+    Mount the WAL volume at `[wal].dir`. Intake replays it on start. Without the volume, records that were not flushed at the time of the failure are lost.
+  </Step>
+  <Step title="Start and verify">
+    Start the nodes and wait for `GET /api/v1/healthz` to return `200`. Sign in, open a stream, and run a query over the restored range.
+
+    Check `/metrics` for `storage_reconciler_issues_total` with `reason="missing"`. Such entries mean that the catalog references objects that are not in the bucket.
+  </Step>
+</Steps>
+
+## Failure scenarios
+
+| Lost | Effect | Recovery |
+|---|---|---|
+| WAL volume of an intake node | Records not yet flushed are lost. | Start the node with an empty volume. |
+| PostgreSQL | All metadata is lost, and the objects are unreachable. | Restore the latest backup. Data written after that backup cannot be recovered, because its objects have no catalog entry. |
+| Bucket | Queries over the lost range fail. | Restore the bucket. Catalog entries without objects appear as `missing` in `/metrics`. |
+| `MS_CIPHER_KEY` | Stored secrets cannot be decrypted, and nodes fail to start. | Restore the key from the secret manager. Without it, the encrypted columns cannot be recovered. |

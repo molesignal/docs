@@ -1,36 +1,27 @@
 ---
 title: "Architecture"
-description: "How MoleSignal's single Rust crate, adapters, data plane, storage, workers, and web application fit together."
+description: "How the MoleSignal binary, PostgreSQL, object storage, roles, and background workers fit together."
 ---
 
-MoleSignal ships as one Rust service with role-based composition and one React web application.
-The Rust code remains a single crate while enforcing module boundaries.
+MoleSignal is one Rust binary that embeds the web application. The `[node].roles` setting decides which responsibilities a process carries. Two external services hold all durable state: PostgreSQL and object storage.
 
-## Layering
+## Components
 
-| Layer | Responsibility |
+| Component | Responsibility |
 |---|---|
-| `domain` | Entities, policies, value objects, and repository/service ports. |
-| `app` | Use cases and orchestration that depend on domain ports. |
-| `infra` | Postgres, object storage, query, runtime, notification, and external adapters. |
-| `api` | HTTP/gRPC protocols, authentication, authorization, and DTO conversion. |
-| `bootstrap` | Role startup and dependency composition. |
-| `shared` | Stable cross-cutting contracts such as IDs, time, health, and tracing. |
-| `web` | Capability-aware product routes, query workspaces, administration, and visualization. |
+| HTTP API and web UI | Port `5080`. Serves the product API, the embedded web application, `/metrics`, and the health endpoint. |
+| Intake | Receives telemetry over HTTP and OTLP gRPC (`4317`), validates it, applies masking and pipelines, and writes it to the WAL and an in-memory buffer. |
+| Write-ahead log (WAL) | Local, durable log of records that are not yet flushed. Replayed on start. |
+| Object storage | Parquet data files, search index sidecars, sealed partition manifests, profile blobs, exports, and large Agent evidence. |
+| PostgreSQL | Metadata: identities, organizations, streams and schemas, the file catalog, product resources, and job state. |
+| Query engine | Apache DataFusion over Arrow. Runs SQL and PromQL-compatible queries, prunes files with catalog metadata and search indexes, and merges local and federated scans. |
+| Search jobs | Durable asynchronous queries that querier nodes claim from PostgreSQL. |
+| Compactor | Merges files, applies retention, and maintains the catalog, indexes, and object garbage. |
+| Alert | Evaluates rules, drives escalations, renders scheduled reports, and runs connectors. |
+| Probe runner | Executes synthetic monitors. A standalone node runs a built-in one, and external Probe Agents connect on ports `5084` and `5085`. |
+| Mole Agent | Investigates issues through the shared tool catalog, with the permissions of the signed-in user. |
 
-Infrastructure depends inward on domain and application contracts. Domain code does not depend on
-Axum, SQLx, object-store clients, or web DTOs.
-
-## Composition
-
-`src/bootstrap/bootstrap.rs` owns the `build_state` orchestration entry point. Cohesive builders
-remain directly under `src/bootstrap/`—`core`, `storage`, `query`, `iam`, `alerting`,
-`agent`, `tracing`, and `platform`—while role lifecycle and worker startup live in the
-dedicated `roles/` and `workers/` modules.
-
-The top-level `AppState` exposes the core application services and grouped feature states:
-alerting, IAM, telemetry, storage, cluster, platform, and Agent. This keeps route access
-feature-oriented instead of flattening every infrastructure repository into one global container.
+There is no Kafka, Redis, or consensus service. Caches live in process memory and on local disk.
 
 ## Runtime roles
 
@@ -38,62 +29,76 @@ The `[node].roles` setting composes one or more roles into the process:
 
 | Role | Main responsibility |
 |---|---|
-| `standalone` | All APIs and workers for a compact deployment. |
-| `router` | Entry routing, rate limiting, and cluster-aware forwarding. |
-| `intake` | Intake validation, pipeline, masking, WAL, buffers, and Parquet flush. |
-| `querier` | DataFusion, PromQL, search jobs, and distributed query. |
-| `compactor` | File compaction, retention, and cold metadata maintenance. |
-| `alert_manager` | Rule evaluation, schedules, escalation, and delivery dispatch. |
+| `standalone` | All APIs, the web UI, and all workers in one process. |
+| `router` | The full HTTP API and web UI, rate limiting, and forwarding of writes to intake nodes and of queries to querier nodes. |
+| `intake` | Validation, pipelines, masking, WAL, buffers, and flush to Parquet. |
+| `querier` | Query execution for requests that other nodes forward, and asynchronous search jobs. |
+| `compactor` | File compaction, retention, and storage maintenance. |
+| `alert` | Rule evaluation, schedules, escalation, delivery dispatch, and connectors. |
 
-The same binary and configuration model serve every role. Changing roles requires restart.
+The same binary and configuration model serve every role, and changing roles requires a restart. See [Role-based deployment](/en-US/distributed-deployment).
 
 ## Data path
 
 ```text
 sender
   -> protocol receiver
-  -> auth + IAM + quota
+  -> authentication + IAM
   -> schema / masking / pipeline
   -> WAL + Arrow buffer
-  -> Parquet + Tantivy metadata
-  -> object storage
+  -> Parquet + search index
+  -> object storage + catalog row in PostgreSQL
 
 query
   -> planner + organization rewrite
-  -> metadata and index pruning
+  -> catalog and index pruning
   -> DataFusion / PromQL
-  -> local or Flight-distributed execution
+  -> local or federated scan
   -> rows / NDJSON / async search job
 ```
 
-Postgres stores metadata and product resources. Object storage holds Parquet, profile blobs,
-exports, and large Agent evidence. Local disk is used for the WAL and optional caches.
+A flush uploads the files first and records them in the catalog afterwards, then truncates the flushed WAL segments. A query reads the catalog to find the files that overlap its time range and stream, so only those files are fetched from object storage.
 
-## Control and worker planes
+## What lives where
 
-Background workers handle compaction, alert evaluation, pipeline runs, search jobs, reports,
-service-graph aggregation, trials, ACME, and telemetry maintenance. Ownership follows the selected
-role so duplicate processes do not all perform the same job.
+| Location | Content |
+|---|---|
+| PostgreSQL | Metadata and the file catalog. |
+| Object storage | `artifacts/v1/...` data and index files, `manifests/v1/...` sealed partition manifests, and other blobs such as profiles and session replays. Objects are grouped by organization, signal type, dataset, and time partition. |
+| Local disk of an intake node | The WAL and, optionally, caches under `./data/cache`. |
+
+Streams and organizations are logical: a stream is a dataset in object storage and a row of metadata in PostgreSQL, and an organization is a prefix and a scope that the query planner enforces.
+
+## Background workers
+
+| Worker | Runs on | Default interval |
+|---|---|---|
+| Heartbeat, stale node sweep | Every node | 5 seconds, 60 seconds |
+| Object store health probe | Every node | 30 seconds |
+| Intake flush | `intake` | 30 seconds or buffer threshold |
+| Compaction and retention | `compactor` | 300 seconds |
+| Catalog sealing, index build, garbage collection, reconciliation | `compactor` | 30 to 300 seconds |
+| Alert evaluation and escalation dispatch | `alert` | 30 seconds, 10 seconds |
+| Scheduled reports | `alert` | Every 60 seconds a tick checks due reports |
+| Search jobs | Nodes that serve the API | Claimed on demand |
+| ACME issue and renewal | Nodes that terminate TLS | 60 seconds, 6 hours |
+| Self-telemetry collection | Every node | 15 seconds for metrics |
+
+Ownership follows the selected role, so duplicate processes do not all perform the same job. Several `compactor` nodes divide their work by stream and by organization. See [Role-based deployment](/en-US/distributed-deployment#work-division-between-compactor-nodes). See [Configuration](/en-US/configuration) for every interval.
 
 ## Authorization
 
-Authentication produces an IAM context. Authorization reads database-backed permissions, roles,
-resource relationships, and explicit cross-organization grants. Resource handlers load the target,
-verify organization ownership, and authorize the requested action before mutation.
+Authentication produces an IAM context. Authorization reads database-backed permissions, roles, resource relationships, and explicit cross-organization grants. Resource handlers load the target, verify organization ownership, and authorize the requested action before a change. See [Security and multi-tenancy](/en-US/security).
 
-## Web architecture
+## Web application
 
-The React router defines every product route. Product IA metadata and the capability snapshot
-control discovery. A hidden route is still protected by the backend permission check.
-
-Query pages share time context and correlation contracts. Settings and IAM use separate
-organization and system scopes.
+The web application ships inside the binary and shares the HTTP port. The capability snapshot controls which menu items appear. A hidden item is still protected by the permission check of the backend.
 
 <CardGroup cols={2}>
   <Card title="Core concepts" icon="diagram-project" href="/en-US/concepts">
     Learn signals, streams, organizations, and storage.
   </Card>
-  <Card title="Distributed deployment" icon="server" href="/en-US/distributed-deployment">
-    Deploy roles across Docker Compose or Kubernetes.
+  <Card title="Role-based deployment" icon="server" href="/en-US/distributed-deployment">
+    Run roles in separate processes.
   </Card>
 </CardGroup>

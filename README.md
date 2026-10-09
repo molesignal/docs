@@ -30,19 +30,18 @@ The preview is available at `http://localhost:3000`.
 Run these checks before publishing:
 
 ```bash
+mint validate
 mint broken-links
 mint a11y
-node -e "JSON.parse(require('fs').readFileSync('docs.json', 'utf8'))"
 ```
 
 API behavior must match the current MoleSignal source:
 
-- HTTP routes: `molesignal/src/api/http/routes/`
-- Web routes and feature access: `molesignal/web/src/routes/` and
-  `molesignal/web/src/product/`
-- Runtime configuration: `molesignal/conf/config.toml` and
-  `molesignal/src/config/`
-- OpenAPI source: `molesignal/docs/api/openapi.yaml`
+- HTTP routes: `bin/molesignal/src/api/http/routes/`
+- Error shapes: `crates/core/kernel/src/error.rs`
+- Web routes and feature access: `web/src/routes/` and `web/src/product/`
+- UI labels: `web/src/i18n/`
+- Runtime configuration: `conf/config.toml` and `crates/core/settings/src/config/`
 
 ## Writing conventions
 

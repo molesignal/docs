@@ -1,0 +1,79 @@
+---
+title: "Upgrade"
+description: "How to move a MoleSignal deployment to a new version: backups, schema migrations, procedures per deployment type, and rollback."
+---
+
+MoleSignal is pre-1.0. Release notes on the [Changelog](/en-US/changelog) page list the changes of each version. Read them before upgrading, and treat every upgrade as a change that needs a backup.
+
+## Before upgrading
+
+1. Read the release notes of every version between the current one and the target.
+2. Back up PostgreSQL and the object store. See [Backup and restore](/en-US/backup-restore).
+3. Note the running version. `molesignal --version` prints it, and `GET /api/v1/version` returns the version, commit, build id, release channel, and edition. The request needs a bearer token.
+4. Rehearse the upgrade against a restored copy of the database when the deployment is critical.
+
+## How schema changes apply
+
+The binary embeds its database migrations and applies them to PostgreSQL on every start, before it serves traffic. A migration failure stops the process. A lock in PostgreSQL serializes migrations, so several nodes that start at the same time are safe. The applied versions are recorded in the `_molesignal_schema_meta` table.
+
+Migrations only move forward:
+
+- A binary that is older than the database refuses to start with `migration <version> was previously applied but is missing in the resolved migrations`.
+- A binary that carries a changed copy of an applied migration refuses to start with `migration <version> was previously applied but has been modified`. Pre-release builds can change their baseline schema, so a database created by one build is not guaranteed to open with another.
+
+To go back to an older version, restore the database and the objects from a backup taken before the upgrade.
+
+## Procedures
+
+<Tabs>
+  <Tab title="Docker Compose">
+    Edit the `image` tag in the Compose file, then pull and recreate the container:
+
+    ```bash
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone pull
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up -d
+    ```
+
+    Keep the named volumes. They hold PostgreSQL data, RustFS data, and the WAL.
+  </Tab>
+  <Tab title="Binary and systemd">
+    Stop the service, replace the binary, and start it again:
+
+    ```bash
+    sudo systemctl stop molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo systemctl start molesignal
+    sudo journalctl -u molesignal -n 50
+    ```
+
+    Compare `conf/config.toml` of the new release with the installed file. New settings take their built-in defaults when absent, but a changed default can matter.
+  </Tab>
+  <Tab title="Kubernetes">
+    Change the image tag in the manifests and apply them:
+
+    ```bash
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    kubectl -n molesignal rollout status statefulset/intake
+    ```
+
+    Set `terminationGracePeriodSeconds` above `[node].drain_timeout_secs` so that pods can flush before they stop.
+  </Tab>
+</Tabs>
+
+A process that receives `SIGTERM` or `SIGINT` waits up to `[node].drain_timeout_secs` for pending data to flush, and then exits. Records that remain in the WAL are replayed when the node starts.
+
+## Role-split clusters
+
+A role-split cluster shares one schema. A running node of an older version keeps using the new schema until it restarts, and the versions are not guaranteed to be compatible. Upgrade all nodes in one maintenance window:
+
+1. Stop the `router` nodes, then the `intake` and `querier` nodes, then `compactor` and `alert`.
+2. Start one node of the new version and wait for `GET /api/v1/healthz` to return `200`. That node applies the migrations.
+3. Start the remaining nodes.
+
+## Verify the upgrade
+
+- The log shows no migration error, and `GET /api/v1/healthz` returns `200`.
+- `GET /api/v1/version` returns the new version.
+- A query over recent data returns rows, and new records arrive.
+- `/metrics` shows no growth of `storage_reconciler_issues_total`.

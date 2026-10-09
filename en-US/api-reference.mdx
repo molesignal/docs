@@ -1,11 +1,9 @@
 ---
 title: "API introduction"
-description: "Base URLs, authentication, permissions, request conventions, streaming, and error handling."
+description: "Base URLs, authentication, permissions, request conventions, pagination, streaming, and error handling."
 ---
 
-MoleSignal exposes a versioned HTTP API. Product endpoints normally use `/api/v1`; probes,
-Prometheus metrics, public share links, and selected compatibility protocols also use top-level
-paths.
+MoleSignal exposes a versioned HTTP API. Product endpoints use `/api/v1`. The health probe, Prometheus metrics, public share links, and a few compatibility protocols also use other paths.
 
 ## Base URL
 
@@ -15,99 +13,131 @@ For a local instance:
 http://localhost:5080/api/v1
 ```
 
-In production, replace the host with the externally reachable URL configured for the deployment.
+In production, replace the host with the public address of the deployment, which is the `[http].external_url` value.
 
-## Bearer authentication
+## Authentication
 
-Protected endpoints accept a login JWT or an API token:
+Protected endpoints accept a bearer token in the `Authorization` header:
 
 ```http
 Authorization: Bearer <token>
 ```
 
-API tokens use `ms_<prefix>_<secret>`. Authentication creates an IAM context containing the
-subject, active organization or platform scope, and effective permissions.
+| Token | How to get it | Lifetime |
+|---|---|---|
+| Login token (JWT) | `POST /api/v1/auth/signin` with an email and a password. See [Log in](/en-US/api/auth/login). | 24 hours by default. |
+| API token | **Identity & Access → API tokens**, or [Issue an API token](/en-US/api/auth/issue-token). Tokens look like `ms_<prefix>_<secret>`. | Until revoked, or until the chosen expiry. |
+| Default intake token | `GET /api/v1/auth/tokens/default`. Limited to `streams.write`. | Does not expire. |
+| RUM client token | `GET /api/v1/auth/tokens/rum?application_id=<id>`. Limited to `rum.write`. | Does not expire. |
+
+Use an API token for scripts and collectors. A login token expires and breaks the sender that uses it. See [Datasource](/en-US/intake#intake-tokens) for the intake tokens.
+
+Authentication builds an IAM context with the subject, the active organization or platform scope, and the effective permissions. The organization of a request always comes from that context. Request bodies cannot select another organization.
 
 ## Public and self-authenticating routes
 
-Routes that cannot use a normal organization bearer token validate a route-specific narrow
-credential or policy. Current examples include:
+A few routes cannot use an organization bearer token. They validate a narrower credential or a policy instead:
 
 - sign-in, signup policy, and password reset;
-- health and Prometheus metrics;
+- `GET /api/v1/healthz` and the top-level `/metrics`;
 - public resource-share exchange and share-session requests;
 - signed file downloads and public avatars;
-- Stripe and push-connector webhooks.
+- push connector endpoints, which validate a push token.
 
-Do not treat a public route as unrestricted. The handler validates signup policy, a share token,
-download token, signature, or connector credential.
+A public route is not unrestricted. Its handler checks the signup policy, a share token, a download token, a signature, or the connector credential.
 
 ## Authorization
 
-A protected endpoint can require several conditions:
+An endpoint can require one or more of these conditions:
 
 - an organization permission such as `streams.query`;
 - a platform permission such as `sys.telemetry.read`;
-- ownership, a resource relationship, or a cross-organization grant;
-- an active organization or billing state.
+- ownership of a resource, a relationship to it, or a cross-organization grant.
 
-Use `GET /api/v1/iam/capabilities` to inspect the current subject's effective snapshot. Do not infer
-access from a role label or hidden navigation item.
+`GET /api/v1/iam/capabilities` returns the effective permissions of the current subject. Do not infer access from a role name or from a visible menu item.
 
 ## Requests
 
-- Most bodies use JSON with `Content-Type: application/json`.
-- Compatibility intake endpoints use protocol-native payloads, including Protobuf, NDJSON, or
-  compressed request bodies.
-- Fields ending in `_micros` contain Unix time in microseconds.
-- Native telemetry records use `_timestamp`; follow the endpoint schema when converting SDK time.
-- Path ids and stream names must be URL-encoded when inserted into a URL.
-- Organization scope comes from the authenticated IAM context, not a model- or browser-supplied
-  organization id.
+- Most bodies are JSON with `Content-Type: application/json`.
+- Compatibility intake endpoints use the payload of their protocol, such as Protobuf, NDJSON, or a gzip-compressed body.
+- Intake request bodies larger than 2 MiB are rejected with `413`.
+- Fields that end in `_micros` hold Unix time in microseconds. Native telemetry records use `_timestamp`, also in microseconds.
+- URL-encode path ids and stream names.
 
-## Query and long-running responses
+## Responses and errors
 
-The query family supports regular JSON, NDJSON streaming, running-query control, and asynchronous
-search jobs. Streaming callers should handle partial network delivery and client cancellation.
+A successful response is JSON unless the endpoint streams or downloads a file. An error response has a status code and a JSON body with a machine-readable `error` code and a `message`:
 
-Large Agent evidence, generated reports, profile blobs, and exports can be stored as files
-and downloaded through a scoped token rather than embedded in JSON.
+```json
+{
+  "error": "unauthorized",
+  "message": "unauthorized: missing Authorization Bearer token"
+}
+```
 
-## Errors
+A `validation_failed` error adds an `issues` array with one entry per invalid field.
 
-API errors use an HTTP status and a JSON error message. Common statuses are:
+| Status | `error` | Meaning |
+|---|---|---|
+| `400` | `invalid_argument`, `validation_failed` | The request or one of its parameters is invalid. |
+| `401` | `unauthorized` | The token is missing, malformed, invalid, or expired. |
+| `403` | `forbidden` | The permission, relationship, or scope is missing. |
+| `404` | `not_found` | The resource does not exist or is not visible in the authorized scope. |
+| `409` | `conflict` | A state or uniqueness conflict. |
+| `413` | `payload_too_large` | The body exceeds the limit. |
+| `429` | `resource_exhausted` | A rate limit applies. Honor the `Retry-After` header when present. |
+| `499` | `cancelled` | The request was cancelled. |
+| `503` | `unavailable` | A dependency is unavailable. |
+| `500` | `internal` | An internal failure. The body carries the message `internal error`, and the details stay in the server log. |
+
+A request whose body cannot be parsed fails before it reaches the endpoint. That response is plain text instead of JSON:
 
 | Status | Meaning |
 |---|---|
-| `400` | Invalid request or unsupported parameter. |
-| `401` | Missing, invalid, expired, or route-specific credential. |
-| `402` | Organization service is paused by billing or trial policy. |
-| `403` | Permission, resource relationship, or scope is missing. |
-| `404` | Resource is absent or not visible in the authorized scope. |
-| `409` | State or uniqueness conflict. |
-| `413` | Payload or storage limit exceeded. |
-| `429` | Rate limit exceeded. |
-| `500` | Internal failure; use request and trace ids for correlation. |
+| `400` | The body is not valid JSON. |
+| `415` | The request lacks `Content-Type: application/json`. |
+| `422` | A field is missing or has the wrong type. The text names the field. |
 
-Responses can include `X-Request-Id` and `X-Trace-Id`. Include both identifiers when reporting a server-side
-failure.
+Every response carries the headers `X-Request-Id` and `X-Trace-Id`. Include both when reporting a server-side failure.
+
+## Pagination
+
+Endpoints that can return many rows accept `limit` and `cursor`. Such a response carries `items` and `next_cursor`. Pass `next_cursor` as `cursor` to read the next page, and stop when it is empty. Other list endpoints return the complete list. See the page of each endpoint.
+
+## Query and long-running work
+
+The query family returns regular JSON, streams NDJSON, and runs long queries as asynchronous search jobs. A query that is too large answers `202` with a `job_id` and a `monitor` path. Streaming callers must handle partial delivery and cancel the request when the result is no longer needed. See [Query](/en-US/query).
+
+Large artifacts such as generated reports, profile blobs, and exports are delivered as files through a scoped download token instead of inside a JSON body.
 
 ## Browse the API
 
-<CardGroup cols={2}>
-  <Card title="Current API catalog" icon="list" href="/en-US/api/catalog">
-    Map route families to product capabilities and authorization.
+<CardGroup cols={3}>
+  <Card title="API catalog" icon="list" href="/en-US/api/catalog">
+    Route families, their purpose, and the protecting permissions.
   </Card>
-  <Card title="Authentication recipes" icon="key" href="/en-US/api/auth/login">
+  <Card title="Authentication" icon="key" href="/en-US/api/auth/login">
     Sign in and manage API tokens.
   </Card>
-  <Card title="Intake recipes" icon="inbox" href="/en-US/api/intake/native-json">
+  <Card title="Intake" icon="inbox" href="/en-US/api/intake/native-json">
     Send native JSON and protocol-compatible telemetry.
   </Card>
-  <Card title="Query recipes" icon="magnifying-glass" href="/en-US/api/query/execute">
+  <Card title="Query" icon="magnifying-glass" href="/en-US/api/query/execute">
     Run SQL, PromQL-compatible, streaming, and saved queries.
   </Card>
-  <Card title="Alerting recipes" icon="bell" href="/en-US/api/alerting/list-rules">
+  <Card title="APM" icon="gauge-high" href="/en-US/api/apm">
+    Read service, transaction, dependency, and error metrics.
+  </Card>
+  <Card title="Streams" icon="database" href="/en-US/api/streams/list">
+    Create, inspect, and configure streams.
+  </Card>
+  <Card title="Alerting" icon="bell" href="/en-US/api/alerting/list-rules">
     Manage rules, incidents, channels, and escalations.
+  </Card>
+  <Card title="Correlation and web" icon="diagram-project" href="/en-US/api/web/correlation">
+    Search, topology, traces, and cross-signal jumps.
+  </Card>
+  <Card title="Platform and administration" icon="shield-halved" href="/en-US/api/admin/audit">
+    Audit log, cipher keys, and health.
   </Card>
 </CardGroup>

@@ -1,34 +1,110 @@
 ---
 title: "创建升级策略"
-description: "多级升级，含轮值排班。"
+description: "为事件定义有序的通知步骤。"
 ---
 
 ```http
 POST /api/v1/alerts/escalations
 ```
 
-多步策略的每一步包含带类型的 targets 与 `ack_timeout_secs`。目标可引用用户、团队或值班排班，并附带通知
-渠道 id。
+创建一条升级策略。策略由有序的步骤组成，每一步通知自己的目标并等待确认。该调用需要 `alerts.manage`。
 
-```json
+## 升级如何工作
+
+1. `alert` 角色每隔 `[alert].dispatch_interval_secs`（默认 10 秒）检查一次活动事件。只有状态为 `open` 的事件会推进。确认事件会停止升级。
+2. 设置了 `min_severity` 的步骤只适用于该严重程度及以上的事件。不适用的步骤会被跳过。
+3. 当前步骤的每个目标都会收到一条通知事件。消息如何投递由[通知渠道](/zh-Hans/notification-channels)决定。
+4. `ack_timeout_secs` 过后仍未确认时，开始下一个适用的步骤。
+5. 最后一个适用步骤超时后，`repeat` 为 `true` 的策略会从第一步重新开始，直到完成 `max_loops` 轮。
+
+规则通过 `escalation_policy_id` 选择策略。没有指定时规则使用 `default`，它是组织内名称为 `default` 的策略的别名，比较时不区分大小写。升级开始时，事件会保存该策略的真实 id，因此之后给策略改名不会让已开启的事件换到别的策略。组织里没有名为 `default` 的策略时，这类规则的事件不会升级，但触发事件仍会发送给通知策略。请创建一个名为 `default` 的策略，或者把规则指向某个策略 id。
+
+**请求体**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | 不能为空。 |
+| `steps` | array | 否 | 默认为空。没有步骤的策略不会通知任何人。 |
+| `repeat` | boolean | 否 | 默认 `false`。最后一步之后重新开始。 |
+| `max_loops` | integer | 否 | 默认 `1`。`repeat` 为 `true` 时遍历步骤的总轮数。小于 1 的值按 1 处理。 |
+
+步骤包含以下字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `targets` | array | 是 | 该步骤的接收人，一起收到通知。 |
+| `ack_timeout_secs` | integer | 否 | 进入下一步之前等待确认的秒数。省略该字段的步骤取 `[alert].default_ack_timeout_secs`（默认 300），并随步骤一起保存。 |
+| `min_severity` | string | 否 | `info`、`warning`、`error` 或 `critical`。步骤适用于该严重程度及以上的事件。省略则适用于所有事件。 |
+
+目标通过 `kind` 选择接收人：
+
+| `kind` | 额外字段 | 接收人 |
+|---|---|---|
+| `user` | `user_id` | 一位用户。 |
+| `team` | `team_id` | 团队成员。 |
+| `schedule` | `schedule_id` | 值班排班中的当前值班人。 |
+
+调用不会检查所引用的用户、团队或排班是否存在。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/escalations \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "Primary operations",
+    "steps": [
+      { "targets": [{ "kind": "user", "user_id": "<user-id>" }],
+        "ack_timeout_secs": 300 },
+      { "targets": [{ "kind": "team", "team_id": "<team-id>" }],
+        "ack_timeout_secs": 900,
+        "min_severity": "critical" }
+    ],
+    "repeat": true,
+    "max_loops": 2
+  }'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
 {
+  "id": "3KED3sy8RBNYIdLayGZN0bp2IIY",
+  "org_id": "<organization-id>",
   "name": "Primary operations",
   "steps": [
     {
-      "targets": [
-        {
-          "kind": "schedule",
-          "schedule_id": "<schedule-id>",
-          "channel_ids": ["<channel-id>"]
-        }
-      ],
+      "targets": [{ "kind": "user", "user_id": "<user-id>" }],
       "ack_timeout_secs": 300,
-      "min_severity": "warning"
+      "min_severity": null
+    },
+    {
+      "targets": [{ "kind": "team", "team_id": "<team-id>" }],
+      "ack_timeout_secs": 900,
+      "min_severity": "critical"
     }
   ],
   "repeat": true,
   "max_loops": 2
 }
 ```
+</ResponseExample>
 
-创建需要 `alerts.manage`。
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | `name` 为空。 |
+| `403` | Token 缺少 `alerts.manage`。 |
+| `422` | 字段缺失或无效，例如目标的 `kind` 不是 `user`、`team` 或 `schedule`，或 `min_severity` 未知。响应为纯文本。 |
+
+## 其他策略路由
+
+| 操作 | 端点 | 权限 |
+|---|---|---|
+| 列出 | `GET /api/v1/alerts/escalations` | `alerts.read` |
+| 读取 | `GET /api/v1/alerts/escalations/{id}` | `alerts.read` |
+| 替换 | `PUT /api/v1/alerts/escalations/{id}` | `alerts.manage` |
+| 删除 | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.manage` |
+
+`PUT` 的请求体与创建调用相同，并替换整条策略。`DELETE` 返回纯文本 `deleted`，`id` 不存在时返回 `404`。删除策略时不会检查引用它的规则，这些规则会停止升级。

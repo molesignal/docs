@@ -1,21 +1,72 @@
 ---
 title: "Cross-signal correlation"
-description: "Prefill filters and time for cross-signal jumps."
+description: "Compute the filters, time range, and query prefill for a jump between signals."
 ---
 
 ```http
-GET /api/v1/web/correlation/{from_kind}/{to_kind}
+GET /api/v1/web/correlation/{from_kind}/{to_kind}?ctx=<base64url-json>
 ```
 
-Server-side prefill of filters and time range for `metric ↔ trace ↔ log ↔ host` jumps.
+Computes the filters, time range, and query prefill that the web UI applies when a user jumps from one signal to another, for example from a trace to its logs. The call requires `streams.query`, or `sys.telemetry.read` in the system scope.
 
 **Parameters**
 
 | Param | In | Required | Notes |
 |---|---|---|---|
-| `from_kind` | path | ✅ | `trace` / `metric` / `log` / `host` |
-| `to_kind` | path | ✅ | `trace` / `metric` / `log` / `host` |
-| `ctx` | query | ✅ | base64-url JSON blob of the source signal context |
+| `from_kind` | path | Yes | The signal the jump starts from: `trace`, `metric`, `log`, or `host`. |
+| `to_kind` | path | Yes | The signal the jump leads to: `trace`, `metric`, `log`, or `host`. |
+| `ctx` | query | Yes | A JSON object that describes the source signal, encoded as base64url without padding. |
 
-Discover the enabled direction list with `GET /api/v1/web/correlation/providers`. Both routes
-require `streams.query`, or `sys.telemetry.read` in system scope.
+The `ctx` object accepts these optional keys:
+
+| Key | Type | Notes |
+|---|---|---|
+| `trace_id` | string | The trace of the source signal. |
+| `service` | string | One service name. |
+| `services` | array | Service names. |
+| `host` | string | A host name. |
+| `time_range` | object | `{ "from": "<RFC 3339>", "to": "<RFC 3339>" }`. The default is the last minute. |
+
+## Supported jumps
+
+| From → to | Filters | Prefill |
+|---|---|---|
+| `trace` → `log` | `service` from `services`, and `trace_id` | None. |
+| `trace` → `metric` | `service` from `services` | `promql`: `rate(http_requests_total{service="<first service>"}[1m])` |
+| `trace` → `host` | `host` from `host` | None. |
+| `metric` → `trace` | `service` from `services`, and a `peer_service` that the service graph reports for the first service | None. |
+| `metric` → `log` | `service` from `services` | None. |
+| `log` → `trace` | `trace_id` and `service` | None. |
+| `log` → `metric` | `service` from `services` or `service` | `promql`: `rate(log_records_total{service="<service>"}[1m])` |
+| `host` → `trace` | `host.name` from `host` | None. |
+
+A filter on one service uses the operator `eq`, and a filter on several services uses `in`. Every other combination, including an unknown kind, answers `200` with the time range and no filters.
+
+<RequestExample>
+```bash cURL
+CTX=$(printf '%s' '{"trace_id":"0af7651916cd43dd8448eb211c80319c","services":["checkout","payments"],"time_range":{"from":"2026-10-04T10:00:00Z","to":"2026-10-04T10:05:00Z"}}' | base64 | tr -d '\n=' | tr '+/' '-_')
+
+curl "http://localhost:5080/api/v1/web/correlation/trace/log?ctx=$CTX" \
+  -H "authorization: Bearer $MS_JWT"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "time_range": { "from": "2026-10-04T10:00:00Z", "to": "2026-10-04T10:05:00Z" },
+  "filters": [
+    { "field": "service", "op": "in", "value": ["checkout", "payments"] },
+    { "field": "trace_id", "op": "eq", "value": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "prefill": {}
+}
+```
+</ResponseExample>
+
+**Errors**
+
+| Status | Cause |
+|---|---|
+| `400` | `ctx` is missing, is not valid base64url, or does not decode to JSON. A missing `ctx` answers plain text, and the other causes answer `invalid_argument` with the message `invalid ctx base64: ...` or `invalid ctx json: ...`. |
+| `403` | The token lacks `streams.query`. |

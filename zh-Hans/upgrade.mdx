@@ -1,0 +1,79 @@
+---
+title: "升级"
+description: "如何把 MoleSignal 部署升级到新版本：备份、schema 迁移、各部署方式的步骤以及回滚。"
+---
+
+MoleSignal 目前处于 1.0 之前的阶段。每个版本的变更记录在[更新日志](/zh-Hans/changelog)页面中。升级前请先阅读，并把每次升级都当作需要先备份的变更。
+
+## 升级之前
+
+1. 阅读当前版本到目标版本之间每个版本的发布说明。
+2. 备份 PostgreSQL 与对象存储，参见[备份与恢复](/zh-Hans/backup-restore)。
+3. 记下正在运行的版本。`molesignal --version` 会输出版本号，`GET /api/v1/version` 返回版本、commit、构建 id、发布通道与版本类型，该请求需要 Bearer Token。
+4. 部署比较关键时，先在数据库的恢复副本上演练一次升级。
+
+## schema 变更如何生效
+
+二进制内嵌了数据库迁移，每次启动时都会在提供服务之前把它们应用到 PostgreSQL。迁移失败会让进程退出。PostgreSQL 中的锁会串行化迁移，因此多个节点同时启动是安全的。已应用的版本记录在 `_molesignal_schema_meta` 表中。
+
+迁移只能向前：
+
+- 比数据库更旧的二进制会拒绝启动，并报 `migration <version> was previously applied but is missing in the resolved migrations`。
+- 携带了已应用迁移的修改版本的二进制会拒绝启动，并报 `migration <version> was previously applied but has been modified`。预发布构建可能修改基线 schema，因此某个构建创建的数据库不保证能被另一个构建打开。
+
+要回到旧版本，需要用升级之前的备份恢复数据库和对象。
+
+## 升级步骤
+
+<Tabs>
+  <Tab title="Docker Compose">
+    修改 Compose 文件中 `image` 的标签，然后拉取并重建容器：
+
+    ```bash
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone pull
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up -d
+    ```
+
+    保留命名卷，它们保存着 PostgreSQL 数据、RustFS 数据和 WAL。
+  </Tab>
+  <Tab title="二进制与 systemd">
+    停止服务，替换二进制，再启动：
+
+    ```bash
+    sudo systemctl stop molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo systemctl start molesignal
+    sudo journalctl -u molesignal -n 50
+    ```
+
+    把新版本的 `conf/config.toml` 与已安装的文件对比。缺少的新配置项会使用内置默认值，但默认值的变化可能产生影响。
+  </Tab>
+  <Tab title="Kubernetes">
+    修改清单中的镜像标签并应用：
+
+    ```bash
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    kubectl -n molesignal rollout status statefulset/intake
+    ```
+
+    把 `terminationGracePeriodSeconds` 设为大于 `[node].drain_timeout_secs`，让 Pod 在停止之前有时间刷写数据。
+  </Tab>
+</Tabs>
+
+进程收到 `SIGTERM` 或 `SIGINT` 后，最多等待 `[node].drain_timeout_secs` 让待处理的数据刷写完成，然后退出。仍留在 WAL 中的记录会在节点启动时重放。
+
+## 分角色集群
+
+分角色集群共用同一个 schema。旧版本的节点在重启之前会继续使用新的 schema，而且不同版本之间不保证兼容。请在同一个维护窗口内升级所有节点：
+
+1. 先停止 `router` 节点，再停止 `intake` 与 `querier` 节点，最后停止 `compactor` 与 `alert`。
+2. 启动一个新版本的节点，等待 `GET /api/v1/healthz` 返回 `200`，该节点会应用迁移。
+3. 启动其余节点。
+
+## 验证升级
+
+- 日志中没有迁移错误，且 `GET /api/v1/healthz` 返回 `200`。
+- `GET /api/v1/version` 返回新版本。
+- 对近期数据的查询能返回行，新记录也在持续到达。
+- `/metrics` 中 `storage_reconciler_issues_total` 没有增长。

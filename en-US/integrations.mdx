@@ -1,0 +1,209 @@
+---
+title: "Integration guides"
+description: "Send telemetry from the OpenTelemetry Collector, OpenTelemetry SDKs, Vector, Fluent Bit, and Prometheus."
+---
+
+These guides cover the most common senders. The **Datasource** page generates the same configuration with the real endpoint and token already filled in, and covers more platforms. See [Datasource](/en-US/intake).
+
+Replace `molesignal.example.com` with the address of the deployment, and `MS_TOKEN` with an [intake token](/en-US/intake#intake-tokens). Use `http://localhost:5080` for the Docker Compose sandbox.
+
+## OpenTelemetry Collector
+
+The Collector `otlphttp` exporter treats `endpoint` as a base URL and appends `/v1/logs`, `/v1/metrics`, and `/v1/traces`. Set `endpoint` to the `/api` path so the requests reach `/api/v1/logs`, `/api/v1/metrics`, and `/api/v1/traces`.
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+processors:
+  batch:
+    send_batch_size: 500
+    send_batch_max_size: 500
+
+exporters:
+  otlphttp/molesignal:
+    endpoint: https://molesignal.example.com/api
+    compression: none
+    headers:
+      authorization: "Bearer ${env:MS_TOKEN}"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+```
+
+<Warning>
+  Keep `compression: none`. The `otlphttp` exporter compresses with gzip by default, and OTLP over HTTP rejects compressed request bodies with `400`. A request body above 2 MiB is rejected with `413`, so keep `send_batch_max_size` small enough for the record size. Lower it when the exporter logs `413`.
+</Warning>
+
+To send over gRPC, use the `otlp` exporter. The port `4317` serves plain gRPC, so set `tls.insecure: true` unless a proxy terminates TLS:
+
+```yaml
+exporters:
+  otlp/molesignal:
+    endpoint: molesignal.example.com:4317
+    tls:
+      insecure: true
+    headers:
+      authorization: "Bearer ${env:MS_TOKEN}"
+```
+
+Add `stream-name: <stream>` to `headers` to write to a stream other than `default`. The header applies to every signal that uses the exporter. Define one exporter per stream when signals need separate streams.
+
+## OpenTelemetry SDKs
+
+Every OpenTelemetry SDK reads the standard environment variables. Point `OTEL_EXPORTER_OTLP_ENDPOINT` at the `/api` path and send OTLP over HTTP:
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://molesignal.example.com/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer ${MS_TOKEN}"
+export OTEL_SERVICE_NAME=checkout
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment=production
+```
+
+SDK exporters do not compress by default. Keep `OTEL_EXPORTER_OTLP_COMPRESSION` unset or `none`.
+
+<Tabs>
+  <Tab title="Python">
+    ```bash
+    pip install opentelemetry-distro opentelemetry-exporter-otlp
+    opentelemetry-bootstrap -a install
+
+    opentelemetry-instrument python app.py
+    ```
+  </Tab>
+  <Tab title="Node.js">
+    ```bash
+    npm i @opentelemetry/api @opentelemetry/auto-instrumentations-node
+
+    NODE_OPTIONS="--require @opentelemetry/auto-instrumentations-node/register" node server.js
+    ```
+  </Tab>
+  <Tab title="Java">
+    ```bash
+    java -javaagent:opentelemetry-javaagent.jar \
+      -Dotel.service.name=checkout \
+      -Dotel.exporter.otlp.protocol=http/protobuf \
+      -Dotel.exporter.otlp.endpoint=https://molesignal.example.com/api \
+      -Dotel.exporter.otlp.headers="authorization=Bearer ${MS_TOKEN}" \
+      -jar app.jar
+    ```
+  </Tab>
+  <Tab title="Go">
+    The Go trace exporter takes the full signal URL:
+
+    ```go
+    exp, _ := otlptracehttp.New(ctx,
+      otlptracehttp.WithEndpointURL("https://molesignal.example.com/api/v1/traces"),
+      otlptracehttp.WithHeaders(map[string]string{"authorization": "Bearer " + token}),
+    )
+    tp := trace.NewTracerProvider(trace.WithBatcher(exp))
+    otel.SetTracerProvider(tp)
+    ```
+  </Tab>
+</Tabs>
+
+## Vector
+
+Send logs to native HTTP JSON intake with the `http` sink. Events without a `_timestamp` field receive the time the server accepted them.
+
+```yaml
+sources:
+  host_journald:
+    type: journald
+    current_boot_only: true
+
+sinks:
+  molesignal_logs:
+    type: http
+    inputs: [host_journald]
+    uri: https://molesignal.example.com/api/v1/intake/logs/default
+    encoding: { codec: json }
+    auth: { strategy: bearer, token: "${MS_TOKEN}" }
+```
+
+## Fluent Bit
+
+Use the `http` output with the JSON format:
+
+```ini
+[INPUT]
+    Name        tail
+    Path        /var/log/nginx/access.log
+    Parser      nginx
+    Tag         nginx.access
+
+[OUTPUT]
+    Name        http
+    Match       nginx.*
+    Host        molesignal.example.com
+    Port        443
+    URI         /api/v1/intake/logs/default
+    Format      json
+    Header      Authorization Bearer ${MS_TOKEN}
+    tls         On
+```
+
+Set `Port` to `5080` and `tls` to `Off` for the Docker Compose sandbox.
+
+### Kubernetes
+
+Run Fluent Bit as a DaemonSet that tails `/var/log/containers`. Open **Datasource → Kubernetes** for the complete manifests with the endpoint and token filled in. The output section of the Fluent Bit configuration is the same `http` output as above, with `Match kube.*`.
+
+## Prometheus
+
+Add MoleSignal as a remote write target. Keep Prometheus scraping and storing locally while the target is evaluated:
+
+```yaml
+remote_write:
+  - url: https://molesignal.example.com/api/v1/prometheus/api/v1/write
+    authorization:
+      credentials: "${MS_TOKEN}"
+```
+
+Each series is written to the metrics stream named after its `__name__`. Query the data with PromQL. See the [PromQL support matrix](/en-US/query/promql-subset) for the supported functions.
+
+## Scripts and custom senders
+
+Send an array of JSON records with `curl` or any HTTP client:
+
+```bash
+curl -X POST https://molesignal.example.com/api/v1/intake/logs/app \
+  -H "authorization: Bearer ${MS_TOKEN}" \
+  -H 'content-type: application/json' \
+  -d '[{"level":"info","service":"billing","msg":"invoice created"}]'
+```
+
+Batch records to stay below the 2 MiB request limit, and send `_timestamp` in microseconds when the original event time matters.
+
+## Verify the data
+
+1. Open **Home** and check that the stream is **Healthy** in **Priority streams**.
+2. Open **Streams** to confirm the stream name, type, and last received time.
+3. Open **Logs**, **Metrics**, or **Traces** and select the stream.
+
+If nothing arrives, check the sender log for `401` (missing or expired token), `403` (token without `streams.write`), `400` (compressed OTLP request body), and `413` (request body above 2 MiB). See [Troubleshooting](/en-US/troubleshooting).
+
+## Moving from another stack
+
+| From | What carries over |
+|---|---|
+| Prometheus | Keep Prometheus and add a `remote_write` target. PromQL covers a subset of the language, so check the [support matrix](/en-US/query/promql-subset) before moving alert rules. |
+| Grafana | Import dashboard JSON on **Dashboards**. Unsupported visualizations fall back to a time series panel. See [Dashboards](/en-US/dashboards). |
+| Loki | Point Vector or Fluent Bit at native HTTP JSON intake. Promtail and Grafana Alloy cannot send to the Loki endpoint. |
+| Elasticsearch | Senders that speak the `_bulk` protocol can be re-pointed at `/api/v1/_bulk`. Queries use SQL instead of Elasticsearch query DSL. |

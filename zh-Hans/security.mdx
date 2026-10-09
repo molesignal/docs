@@ -3,7 +3,7 @@ title: "安全与多租户"
 description: "租户隔离、访问能力授权、平台范围、Token、审计、共享、Secret 与字段加密。"
 ---
 
-MoleSignal 在 API 与数据平面执行租户和授权控制，位置低于 Web 导航。
+MoleSignal 在 API 与数据面执行租户和授权控制，位置低于 Web 导航。
 
 ## 租户隔离
 
@@ -21,13 +21,15 @@ MoleSignal 接受：
 - 形如 `ms_<prefix>_<secret>` 的 API Token；
 - 用于窄范围公开或集成路由的专用自验证 Token。
 
+用户可以用密码登录，也可以通过管理员在 **身份与访问 → SSO 服务商** 中配置的 OIDC、SAML 或 LDAP 服务商登录。
+
 API Token 前缀用于查找，Secret 以哈希形式保存。完整 Token 只在创建时显示。
 
 身份验证后，服务器会解析数据库中的权限、角色、绑定、资源关系与目标所有权。详见[身份与访问](/zh-Hans/identity)。
 
 ## JWT 签名密钥
 
-JWT 签名密钥会引导写入数据库。元数据端点不会返回原始密钥字节。
+JWT 签名密钥会在首次启动时引导写入数据库。元数据端点不会返回原始密钥字节。轮换之后，新的 Token 用新密钥签发，用已退役密钥签发的 Token 在 24 小时内仍然有效。
 
 列出或轮换签名密钥需要平台权限 `sys.settings.manage`：
 
@@ -52,9 +54,9 @@ POST /api/v1/auth/jwt/rotate
 
 ## 字段级加密
 
-组织加密密钥支持 AES-256-GCM 字段加密。加密根密钥来自 `MS_CIPHER_KEY`；具名密钥材料创建后不会返回。
+创建数据流时把字段标记为加密字段。MoleSignal 会在值写入 Parquet 之前用 AES-256-GCM 加密它们，普通查询返回的是密文，SQL 用 `decrypt(field)` 还原明文，参见[数据流](/zh-Hans/streams#加密字段)。
 
-在采集阶段使用 VRL 加密函数，并在已授权查询路径中进行匹配解密。读取密钥元数据需要 `org.settings.read`；创建、轮换或删除密钥需要 `org.settings.manage`。
+组织数据密钥由 `MS_CIPHER_KEY` 中的加密根密钥封装，密钥材料创建后不会返回。读取密钥元数据需要 `org.settings.read`；创建、轮换或删除密钥需要 `org.settings.manage`。
 
 <Warning>
   丢失 `MS_CIPHER_KEY` 可能导致加密字段无法恢复。请使用密钥管理器保存，并独立于 PostgreSQL 与对象存储备份。
@@ -62,16 +64,20 @@ POST /api/v1/auth/jwt/rotate
 
 ## Secret 与遥测卫生
 
-- 将数据库、对象存储、SMTP、SSO、模型供应商与 Webhook 凭据存入密钥管理器。
+- 将数据库、对象存储、SMTP、SSO、模型服务商与 Webhook 凭据存入密钥管理器。
 - 外部链路导出的敏感请求头使用 `env:` 或 `secret:` 引用。
 - 将内部 gRPC `5082` 保留在可信网络；该端口包含集群协议。
 - 为外部 HTTP、OTLP gRPC `4317` 与 Flight SQL `5083` 配置 TLS。
 - 除非远程诊断受到明确保护，否则让 pprof Listener 只绑定回环地址。
 - 后端链路不会记录请求体、SQL 值、凭据、提示词、模型输出与工具参数。
 
-## 限流与服务控制
+## 速率与大小限制
 
-Router 对每个组织执行采集与查询令牌桶。存储与每日采集限额也可以来自部署策略。订阅暂停可以返回 `402`；限流返回 `429`；超大或受存储限额约束的写入可以返回 `413`。
+`router` 角色对每个组织的接入与查询请求执行令牌桶限流，并返回带 `Retry-After` 响应头的 `429`，`standalone` 节点不应用这些限制，参见[分角色部署](/zh-Hans/distributed-deployment#速率限制)。超过 2 MiB 的接入请求体会被拒绝并返回 `413`。
+
+## 生产环境加固
+
+在真实数据到达之前，请替换沙箱的默认值：root 账号、`MS_CIPHER_KEY`、数据库与对象存储凭据，参见[生产检查清单](/zh-Hans/production-checklist)。
 
 <Card title="自身可观测性" icon="heart-pulse" href="/zh-Hans/self-observability">
   配置受保护的 `_sys` 遥测、尾采样与节点本地诊断。

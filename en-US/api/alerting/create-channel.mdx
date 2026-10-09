@@ -3,19 +3,50 @@ title: "Manage notification connectors"
 description: "Create, inspect, update, test, and delete notification connectors."
 ---
 
-Notification connectors store organization-scoped credentials for SMTP, Slack, Lark, and generic
-webhook delivery. Creating, updating, testing, or deleting a connector requires `alerts.manage`.
-Listing and reading connectors requires `alerts.read`.
+A connector stores the credentials and transport settings of one notification provider for an organization. Listing and reading connectors requires `alerts.read`. Creating, updating, testing, and deleting a connector requires `alerts.manage`.
 
-## List supported types
+| Operation | Endpoint |
+|---|---|
+| List connector types | `GET /api/v1/notify/connector-types` |
+| List connectors | `GET /api/v1/notify/connectors` |
+| Create a connector | `POST /api/v1/notify/connectors` |
+| Get a connector | `GET /api/v1/notify/connectors/{id}` |
+| Update a connector | `PUT /api/v1/notify/connectors/{id}` |
+| Test a connector | `POST /api/v1/notify/connectors/{id}/test` |
+| Delete a connector | `DELETE /api/v1/notify/connectors/{id}` |
 
-```http
-GET /api/v1/notify/connector-types
+## Connector types
+
+The type list returns `connector_type` and the `capabilities` of every type that the running backend registers. The types are `email_smtp`, `lark_app`, `lark_webhook`, `slack_app`, `slack_webhook`, and `webhook`.
+
+```json
+[
+  {
+    "connector_type": "slack_webhook",
+    "capabilities": {
+      "direct_user": false,
+      "group": true,
+      "rich_text": true,
+      "interactive": false,
+      "acknowledgement": false,
+      "attachments": false
+    }
+  }
+]
 ```
 
-The response describes the capabilities of each connector type registered by the running backend.
-Current types are `email_smtp`, `slack_app`, `slack_webhook`, `lark_app`, `lark_webhook`, and
-`webhook`.
+The `config` object of a connector depends on its type. Every `timeout_secs` defaults to 10 and accepts 1 through 60. URLs must be absolute `http` or `https` URLs.
+
+| `connector_type` | `config` keys |
+|---|---|
+| `email_smtp` | `host` and `from` (required), `port` (default `587`), `username`, `password`, `tls` (`none`, `starttls` by default, or `tls`), `timeout_secs` |
+| `slack_app` | `bot_token` (required), `api_base_url` (default `https://slack.com/api`), `timeout_secs` |
+| `slack_webhook` | `webhook_url` (required), `timeout_secs` |
+| `lark_app` | `app_id` and `app_secret` (required), `api_base_url`, `receive_id_type` (`open_id` by default, `user_id`, `union_id`, `email`, or `chat_id`), `timeout_secs` |
+| `lark_webhook` | `webhook_url` (required), `secret`, `timeout_secs` |
+| `webhook` | `url` (required), `method` (`post` by default, `put`, or `patch`), `headers`, `timeout_secs` |
+
+[Notification channels](/en-US/notification-channels) explains each provider and its targets.
 
 ## Create a connector
 
@@ -23,33 +54,46 @@ Current types are `email_smtp`, `slack_app`, `slack_webhook`, `lark_app`, `lark_
 POST /api/v1/notify/connectors
 ```
 
-```json
-{
-  "name": "Operations Slack",
-  "connector_type": "slack_webhook",
-  "config": {
-    "webhook_url": "https://hooks.slack.com/services/T000/B000/secret",
-    "timeout_secs": 10
-  },
-  "enabled": true
-}
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | string | Yes | Unique within the organization. |
+| `connector_type` | string | Yes | One of the types above. The type cannot change later. `type` is accepted as an alias. |
+| `config` | object | Yes | The settings of the type. |
+| `enabled` | boolean | No | Default `true`. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/notify/connectors \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "Operations webhook",
+    "connector_type": "webhook",
+    "config": {
+      "url": "https://hooks.example.com/molesignal",
+      "method": "post",
+      "headers": { "Authorization": "Bearer <token>" },
+      "timeout_secs": 5
+    }
+  }'
 ```
+</RequestExample>
 
-The API returns `201 Created`. The response includes the connector ID, capabilities, status, test
-metadata, and timestamps. Sensitive config fields are masked:
-
-```json
+<ResponseExample>
+```json 201
 {
-  "id": "3J4connector",
-  "organization_id": "3J4organization",
-  "name": "Operations Slack",
-  "connector_type": "slack_webhook",
+  "id": "3KEDlokKjNmves95sRzL8tXpflY",
+  "organization_id": "<organization-id>",
+  "name": "Operations webhook",
+  "connector_type": "webhook",
   "config": {
-    "webhook_url": "***",
-    "timeout_secs": 10
+    "url": "***",
+    "method": "post",
+    "headers": "***",
+    "timeout_secs": 5
   },
   "capabilities": {
-    "direct_user": false,
+    "direct_user": true,
     "group": true,
     "rich_text": true,
     "interactive": false,
@@ -60,19 +104,25 @@ metadata, and timestamps. Sensitive config fields are masked:
   "status": "unknown",
   "last_tested_at": null,
   "last_test_status": null,
-  "last_test_error": null
+  "last_test_error": null,
+  "created_at": 1790000000000000,
+  "updated_at": 1790000000000000
 }
 ```
+</ResponseExample>
 
-## List and read connectors
+MoleSignal encrypts the whole `config` at rest. Responses replace the value of every key that holds a credential with `***`. These keys are `url`, `webhook_url`, `headers`, and every key that ends in `password`, `secret`, or `token`. Other keys, such as `host`, `from`, and `timeout_secs`, stay readable.
+
+`status` is `unknown` until the first test, then `connected` or `error`. `last_test_status` is `success` or `failed`. Routing skips a connector with the status `error` until a later test succeeds.
+
+## List and get connectors
 
 ```http
 GET /api/v1/notify/connectors
 GET /api/v1/notify/connectors/{id}
 ```
 
-MoleSignal encrypts the complete `config` object at rest. Responses mask passwords, secrets,
-tokens, URLs, and header objects with `***`.
+The list returns an array of connectors in the shape above. An unknown `id` answers `404`.
 
 ## Update a connector
 
@@ -80,20 +130,26 @@ tokens, URLs, and header objects with `***`.
 PUT /api/v1/notify/connectors/{id}
 ```
 
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | string | Yes | The new name. |
+| `config` | object | No | The new settings. Omit it to keep the stored configuration. |
+| `enabled` | boolean | No | Default `true`. An omitted value enables the connector. |
+
+Send `***` for a masked key to keep the stored secret, or send a new plaintext value to replace it:
+
 ```json
 {
-  "name": "Operations Slack",
+  "name": "Operations webhook",
   "config": {
-    "webhook_url": "***",
-    "timeout_secs": 20
+    "url": "***",
+    "method": "post",
+    "headers": "***",
+    "timeout_secs": 8
   },
   "enabled": true
 }
 ```
-
-`connector_type` is immutable after creation. Send an unchanged masked value as `***` to keep the
-stored secret, or replace the mask with a new plaintext value. Omit `config` to leave the whole
-configuration unchanged.
 
 ## Test a connector
 
@@ -101,20 +157,27 @@ configuration unchanged.
 POST /api/v1/notify/connectors/{id}/test
 ```
 
-```json
+Sends one message through the connector. A disabled connector cannot run a test.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `target_type` | string | Yes | `direct_user`, `fixed_address`, `fixed_group`, or `webhook`. Each connector type accepts a subset, for example `email_smtp` accepts `direct_user` and `fixed_address`. |
+| `target` | string | Yes | The recipient: an address, a provider identifier, a group, or a URL, depending on `target_type`. |
+| `message` | object | No | `title`, `text`, `markdown`, and `html`. The defaults are a generic title and text. |
+
+<ResponseExample>
+```json 200
 {
-  "target_type": "fixed_group",
-  "target": "operations",
-  "message": {
-    "title": "MoleSignal connector test",
-    "text": "Notification delivery is working.",
-    "markdown": "**Notification delivery is working.**"
-  }
+  "sent": true,
+  "tested_at_micros": 1790000000000000,
+  "elapsed_ms": 3,
+  "provider_message_id": "req-1",
+  "error": null
 }
 ```
+</ResponseExample>
 
-The target must be compatible with the connector. A successful or failed test updates `status`,
-`last_tested_at`, `last_test_status`, and `last_test_error`. A disabled connector cannot run a test.
+A delivery failure still answers `200`, with `sent` set to `false` and the reason in `error`, for example `unavailable: webhook request failed`. The test also updates `status`, `last_tested_at`, `last_test_status`, and `last_test_error` of the connector.
 
 ## Delete a connector
 
@@ -122,9 +185,13 @@ The target must be compatible with the connector. A successful or failed test up
 DELETE /api/v1/notify/connectors/{id}
 ```
 
-Successful deletion returns `204 No Content`. If a user endpoint, notification policy, or fallback
-route still references the connector, the API returns a conflict. Move all references before
-deletion.
+A successful delete answers `204` without a body. While a user endpoint, a notification policy, or a fallback route still references the connector, the call answers `409` with `notify connector is referenced by user endpoints, policies, or default routes`. Move the references first.
 
-See [Notification channels and delivery](/en-US/notification-channels) for provider config fields,
-target types, and routing operations.
+## Errors
+
+| Status | Cause |
+|---|---|
+| `400` | The `config` is invalid for the type, the type is unsupported (`unsupported connector type: pagerduty`), the target does not fit the connector, or the connector is disabled. |
+| `404` | The connector does not exist. |
+| `409` | Another connector in the organization already uses the name, or the connector is still referenced on delete. |
+| `422` | A field is missing or a value is invalid, for example an unknown `target_type`. The response is plain text. |

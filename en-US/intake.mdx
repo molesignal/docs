@@ -1,79 +1,138 @@
 ---
-title: "Data intake"
+title: "Datasource"
 sidebarTitle: "Datasource"
-description: "Native and protocol-compatible intake for OpenTelemetry, Prometheus, logs, cloud senders, and application events."
+description: "Connect telemetry with the Datasource page, intake tokens, and the native, OpenTelemetry, Prometheus, Loki, and Elasticsearch protocols."
 ---
 
-MoleSignal supports native and protocol-compatible intake, so many existing agents and SDKs can
-send data with little or no adaptation. Every endpoint is authenticated with
-`Authorization: Bearer <jwt>` (or an API token
-— see [Security](/en-US/security)), except the push [connectors](/en-US/connectors), which use a
-connector token.
+Every signal enters MoleSignal through the intake API. The **Datasource** page in the web UI generates the endpoint, token, and configuration snippet for each source. The same protocols can be configured by hand.
 
-## Supported protocols
+## Datasource page
 
-| Protocol | Endpoint | Compatible sender |
-|---|---|---|
-| OTLP gRPC | `:4317` | OpenTelemetry SDK / Collector |
-| OTLP HTTP | `POST /api/v1/logs`, `/metrics`, `/traces` | OTel HTTP exporter |
-| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus / VictoriaMetrics |
-| Elasticsearch `_bulk` | `POST /api/v1/_bulk` | Filebeat, Vector ES sink, Logstash |
-| Loki JSON push | `POST /api/v1/loki/api/v1/push` | Clients that can send the Loki JSON request shape |
-| Kinesis Firehose | `POST /api/v1/_kinesis_firehose` | AWS Firehose |
-| Cloudflare Logpush | `POST /api/v1/_cloudflare` | Cloudflare Logpush |
-| Heroku log drain | `POST /api/v1/_heroku` | Heroku |
-| Native HTTP JSON | `POST /api/v1/intake/{type}/{stream}` | curl / app SDK |
+Open **Datasource** to onboard a source:
 
-<Note>
-  Kinesis Firehose, Cloudflare Logpush, and Heroku log drains are configured per source — see the
-  [Connectors](/en-US/connectors) guide.
-</Note>
+1. Search the catalog or filter it by category: **Recommended**, **Infrastructure**, **Cloud**, **Databases**, **Messaging**, **Apps & languages**, **Security**, and **Custom**. The signal tabs (**Logs**, **Metrics**, **Traces**, **Profiles**) narrow the list further.
+2. Select a source such as Kubernetes, a Linux host, AWS, an OpenTelemetry SDK, or Web RUM.
+3. Follow the four setup steps:
+   - **Prepare connection details** shows the endpoint and the token to use.
+   - **Deploy collector** shows commands and configuration with the real endpoint and token already filled in.
+   - **Verify data receipt** shows whether data has arrived. **Verify connection** checks once, and the status also refreshes every 30 seconds.
+   - **Complete setup** finishes the guide.
+
+The endpoint comes from `http.external_url` when it is set, and from the address of the browser otherwise. Set `http.external_url` behind a reverse proxy so generated snippets point at the public address. See [Configuration](/en-US/configuration).
+
+## Intake tokens
+
+Senders authenticate with a bearer token: `Authorization: Bearer <token>`.
+
+| Token | Permission | Created by | Use |
+|---|---|---|---|
+| Default intake token (`ms_…`) | `streams.write` only | Datasource page, or `GET /api/v1/auth/tokens/default` | Collectors, agents, and SDK exporters that send logs, metrics, and traces. Does not expire. |
+| RUM client token (`msrum_…`) | `rum.write` only, bound to one application | Datasource page for Web RUM and mobile RUM sources, or `GET /api/v1/auth/tokens/rum?application_id=<id>` | Browser and mobile code. The token is visible to end users. |
+| Personal or service account token (`ms_…`) | The permissions of the chosen role | **Identity & Access → API tokens** | Automation, scripts, and MCP clients. |
+| Login token (JWT) | The permissions of the signed-in user | `POST /api/v1/auth/signin` | Interactive use. Expires after 24 hours by default (`[auth].token_ttl_secs`). |
+
+Use the default intake token or a service account token for senders that run continuously. A login token stops working when it expires and takes down every sender that uses it. Revoke a token from **Identity & Access → API tokens** to stop it immediately.
+
+The **Datasource** page creates a RUM client token when an application id is entered. An application id contains 1 to 128 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`. Use the same id as `applicationId` in the SDK. See [Browser RUM SDK](/en-US/rum/browser-sdk).
+
+## Endpoints and protocols
+
+| Protocol | Endpoint | Compatible senders | Target stream |
+|---|---|---|---|
+| Native HTTP JSON | `POST /api/v1/intake/{logs,metrics,traces}/{stream}` | `curl`, application code, Vector `http` sink, Fluent Bit `http` output | The `{stream}` path segment |
+| OTLP over HTTP | `POST /api/v1/logs`, `/api/v1/metrics`, `/api/v1/traces` | OpenTelemetry SDKs and Collector | `stream-name` header, otherwise `default` |
+| OTLP over gRPC | `:4317` | OpenTelemetry SDKs and Collector | `stream-name` metadata, otherwise `default` |
+| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus, VictoriaMetrics, any remote_write v1 sender | One metrics stream per metric name |
+| Elasticsearch `_bulk` | `POST /api/v1/_bulk` | Filebeat, Logstash, Vector `elasticsearch` sink | `_index` of each action, otherwise `stream-name` header, otherwise `default` |
+| Loki push (JSON) | `POST /api/v1/loki/api/v1/push` | Senders that can POST the Loki JSON shape | `stream-name` header, otherwise `default` |
+| Kinesis Firehose, Cloudflare Logpush, Heroku | `/api/v1/_kinesis_firehose`, `/api/v1/_cloudflare`, `/api/v1/_heroku` | AWS, Cloudflare, Heroku | Configured on the connector. See [Connectors](/en-US/connectors). |
+
+All endpoints except the push connectors require a bearer token with the `streams.write` permission. The organization comes from the token and never appears in a URL.
+
+### Limits that affect senders
+
+- **Request size.** A request body larger than 2 MiB is rejected with `413`. Keep batches below that size.
+- **Compression.** OTLP over HTTP does not accept compressed request bodies and answers `400`. Disable compression in the sender; the OpenTelemetry Collector `otlphttp` exporter compresses with gzip by default and needs `compression: none`. Elasticsearch `_bulk`, Loki push, and the push connectors accept `Content-Encoding: gzip`.
+- **Loki encoding.** Only the JSON request shape is decoded. Promtail and Grafana Alloy send snappy-compressed protobuf by default and cannot send to this endpoint.
+- **Rate limit.** The `router` role limits requests per organization and answers `429` with a `Retry-After` header. A `standalone` node does not apply this limit. See [Role-based deployment](/en-US/distributed-deployment#rate-limiting).
+- **Reserved stream.** The stream name `_molesignal` is reserved for the service's own telemetry and rejects public intake.
+
+## Streams and schema
+
+A stream is created on its first write, and the schema evolves as new fields appear. A stream is identified by its name and signal type, so `default` can exist for logs, metrics, and traces at the same time. See [Streams](/en-US/streams).
+
+Every event has a timestamp in microseconds since the Unix epoch. Native JSON and Elasticsearch `_bulk` read the `_timestamp` field. An event without `_timestamp` receives the time the server accepted it.
 
 ## Native HTTP JSON
 
-The simplest path. POST an array of records to `intake/{logs,metrics,traces}/{stream}`. Timestamps
-are microseconds since the Unix epoch, in the `_timestamp` field.
+Post an array of records to `/api/v1/intake/{logs,metrics,traces}/{stream}`:
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/intake/logs/app \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
-  -d '[{"_timestamp":1700000000000000,"level":"error","msg":"db pool exhausted","trace_id":"abc123"}]'
+  -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
 ```
 
-The stream is created on first write, and the schema evolves as new fields appear.
+The response reports how many records were accepted and rejected, with a reason per rejected index:
+
+```json
+{"accepted":1,"rejected":0,"errors":[]}
+```
 
 ## OpenTelemetry
 
+Point an OpenTelemetry SDK or Collector at the `/api` base path. The exporter appends `/v1/logs`, `/v1/metrics`, and `/v1/traces`, which map to `/api/v1/logs`, `/api/v1/metrics`, and `/api/v1/traces`.
+
 <Tabs>
-  <Tab title="OTLP HTTP">
-    Point the OTel HTTP exporter at MoleSignal:
+  <Tab title="OTLP over HTTP">
+    SDK environment variables:
+
+    ```bash
+    export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+    export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer ${MS_TOKEN}"
+    ```
+
+    OpenTelemetry Collector:
 
     ```yaml
     exporters:
-      otlphttp:
-        endpoint: http://localhost:5080/api/v1
+      otlphttp/molesignal:
+        endpoint: http://localhost:5080/api
+        compression: none
         headers:
-          authorization: "Bearer ${MS_JWT}"
+          authorization: "Bearer ${env:MS_TOKEN}"
     ```
 
-    Logs, metrics, and traces post to `/api/v1/logs`, `/api/v1/metrics`, and `/api/v1/traces`.
+    Send protobuf (`application/x-protobuf`), the default encoding of the SDKs and the Collector. Logs, metrics, and traces also accept JSON (`application/json`). Add a `stream-name` header to select a stream other than `default`. The header applies to every signal sent through that exporter.
   </Tab>
-  <Tab title="OTLP gRPC">
-    The external standard OTLP gRPC receiver listens on port `4317` by default:
+  <Tab title="OTLP over gRPC">
+    The OTLP gRPC receiver listens on port `4317` and serves the logs, metrics, traces, and profiles services. It does not terminate TLS. Terminate TLS in front of it for traffic that leaves a trusted network.
+
+    ```bash
+    export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+    export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer ${MS_TOKEN}"
+    ```
+
+    OpenTelemetry Collector:
 
     ```yaml
     exporters:
-      otlp:
+      otlp/molesignal:
         endpoint: localhost:4317
+        tls:
+          insecure: true
         headers:
-          authorization: "Bearer ${MS_JWT}"
+          authorization: "Bearer ${env:MS_TOKEN}"
     ```
 
-    Port `5082` is reserved for trusted internal cluster gRPC and must not be used as the public
-    OTLP endpoint.
+    Remove `insecure: true` when a TLS-terminating proxy fronts the port. Port `5082` is the internal cluster gRPC port and is not an OTLP receiver.
   </Tab>
 </Tabs>
+
+OTLP metrics are stored as one event per data point. See the [metric storage contract](/en-US/query#otlp-metric-fields) for the stored fields.
 
 ## Prometheus remote_write
 
@@ -83,49 +142,47 @@ Add MoleSignal as a remote write target in `prometheus.yml`:
 remote_write:
   - url: http://localhost:5080/api/v1/prometheus/api/v1/write
     authorization:
-      credentials: "${MS_JWT}"
+      credentials: "${MS_TOKEN}"
 ```
 
-## Loki and Elasticsearch
+Each series becomes a row in the metrics stream named after its `__name__`. Other labels become fields. Native histograms and metric metadata are skipped, and exemplars are stored beside the samples.
 
-<CodeGroup>
-```text Loki push
-POST /api/v1/loki/api/v1/push
-# JSON request shape only; snappy-protobuf is not decoded.
+## Elasticsearch bulk
+
+Senders that speak the Elasticsearch bulk protocol work without a Loki or OTLP dependency:
+
+```bash
+curl -X POST http://localhost:5080/api/v1/_bulk \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/x-ndjson' \
+  --data-binary $'{"index":{"_index":"app"}}\n{"level":"info","msg":"hello"}\n'
 ```
 
-```text Elasticsearch _bulk
-POST /api/v1/_bulk
-# Works with Filebeat, Logstash, and the Vector ES sink.
+The `_index` of each action selects the target stream. Without it, the `stream-name` header applies, and then `default`.
+
+## Loki push
+
+The endpoint accepts the Loki JSON request shape:
+
+```json
+{"streams":[{"stream":{"service":"checkout","level":"error"},"values":[["1700000000000000000","payment failed"]]}]}
 ```
-</CodeGroup>
 
-The Loki endpoint accepts `{"streams":[{"stream":{...},"values":[["<unix_nano>","<line>"]]}]}`.
-Set `stream-name` to choose the MoleSignal log stream. Configure senders for JSON rather than the
-default Loki snappy-protobuf encoding.
+Labels become fields, the log line becomes the `message` field, and the nanosecond timestamp is converted to microseconds. The response is `204`. Select the target stream with the `stream-name` header.
 
-## Pipeline functions
+## Related pages
 
-**Pipeline functions** transform events on the intake hot path through reusable transforms attached
-to a pipeline step. The runtime supports:
-
-- **VRL** — always available. Compiled per `(function_id, updated_at)` with the `vrl::compiler`
-  stdlib (`del`, `parse_json`, `to_int`, `match`, `encrypt`/`decrypt`, …).
-- **JavaScript** — opt-in, built on `deno_core` (V8). JavaScript is available only when the binary
-  is built with `--features js-runtime`; there is no runtime TOML switch.
-- **LLM evaluation** — API-configurable for low-throughput pipelines when
-  `[functions].llm_eval_enabled = true` and the organization has an enabled model provider. Each
-  event triggers a model request.
-
-<Warning>
-  The JS isolate is deliberately minimal: no `fetch`, no `setTimeout`, no `import`, no `npm`. Each
-  event gets a 50 ms wall-clock budget and a 32 MiB heap. Anything beyond a single synchronous pass
-  is unsupported by design.
-</Warning>
-
-```js
-// Lowercase a `severity` field into a new `level` field.
-molesignal.set("level", molesignal.fields.severity.toLowerCase());
-// Drop a sensitive field.
-molesignal.del("pw");
-```
+<CardGroup cols={2}>
+  <Card title="Integration guides" icon="plug" href="/en-US/integrations">
+    Complete configurations for the OpenTelemetry Collector, Vector, Fluent Bit, Filebeat, Prometheus, and Kubernetes.
+  </Card>
+  <Card title="Pipelines" icon="code-branch" href="/en-US/pipelines">
+    Route, normalize, redact, and enrich events as they arrive or on a schedule.
+  </Card>
+  <Card title="Connectors" icon="inbox" href="/en-US/connectors">
+    Receive Kinesis Firehose, Cloudflare Logpush, and Heroku log drains.
+  </Card>
+  <Card title="Identity & access" icon="key" href="/en-US/identity">
+    Create service accounts and manage API tokens.
+  </Card>
+</CardGroup>

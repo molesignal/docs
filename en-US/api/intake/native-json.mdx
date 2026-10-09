@@ -1,29 +1,36 @@
 ---
 title: "Native JSON intake"
-description: "POST records as JSON to a stream."
+description: "Post records as JSON to a stream."
 ---
 
 ```http
 POST /api/v1/intake/{type}/{stream}
 ```
 
-`{type}` is `logs`, `metrics`, or `traces`. Post a single record object or an array. The stream is
-created on first write, and the schema evolves as fields appear. Timestamps are microseconds since the
-Unix epoch (`_timestamp`).
+Posts one record object or an array of records to a stream. The stream is created on the first write, and the schema evolves as new fields appear. The call requires the permission `streams.write`. The default intake token and service account tokens with a write role work.
 
 **Path parameters**
 
 | Param | Type | Notes |
 |---|---|---|
-| `type` | string | `logs` / `metrics` / `traces` |
-| `stream` | string | Stream name, e.g. `app` |
+| `type` | string | `logs`, `metrics`, or `traces`. Another value answers `404`. |
+| `stream` | string | Stream name with letters, numbers, `_`, `-`, and `.`. The name `_molesignal` is reserved and answers `403`. |
+
+**Body**
+
+A JSON object, or an array of JSON objects. Every element must be an object. The request body is limited to 2 MiB and is not decompressed, so do not send `Content-Encoding: gzip` to this endpoint.
+
+| Field | Notes |
+|---|---|
+| `_timestamp` | Event time in microseconds since the Unix epoch. When absent, the server receive time applies. |
+| any other field | Stored as a field of the stream. A later record must use the same type as the stream already stores for the field. |
 
 <RequestExample>
 ```bash cURL
 curl -X POST http://localhost:5080/api/v1/intake/logs/app \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
-  -d '[{"_timestamp":1700000000000000,"level":"error","msg":"db pool exhausted","trace_id":"abc123"}]'
+  -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
 ```
 </RequestExample>
 
@@ -33,6 +40,24 @@ curl -X POST http://localhost:5080/api/v1/intake/logs/app \
 ```
 </ResponseExample>
 
-`402` means the subscription, trial, or daily intake allowance blocks the write. `413`
-means the organization storage quota is exceeded; `429` means the intake rate limit was hit. This
-endpoint requires `streams.write`.
+A record that conflicts with the schema is rejected on its own, and the rest of the batch is accepted:
+
+```json
+{
+  "accepted": 1,
+  "rejected": 1,
+  "errors": [
+    { "index": 0, "reason": "type mismatch on field `level`: expected Utf8, got Number" }
+  ]
+}
+```
+
+**Errors**
+
+| Status | Cause |
+|---|---|
+| `400` | Invalid stream name, invalid JSON, or an array element that is not an object (`event #1 must be a JSON object`). |
+| `401` | Missing or invalid token. |
+| `403` | The token lacks `streams.write`, or the stream is `_molesignal`. |
+| `413` | The body exceeds 2 MiB. |
+| `429` | The router rate limit applies. |

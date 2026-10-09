@@ -1,19 +1,101 @@
 ---
 title: "加密密钥"
-description: "读取并轮换组织字段加密密钥。"
+description: "列出、创建、轮换和删除组织的字段加密密钥。"
 ---
 
-组织加密密钥使用 AES-256-GCM。密钥材料必须解码为准确的 32 字节，并且读取 API 永远不会返回原文。
+加密密钥用于加密数据流中标记为加密的字段。每个密钥都是 32 字节的 AES-256-GCM 密钥。MoleSignal 使用 `MS_CIPHER_KEY` 提供的根密钥包装密钥材料，并且从不返回它。参见[安全](/zh-Hans/security#字段级加密)。
 
-| 方法与路径 | 权限 | 用途 |
+新写入的加密值始终使用默认密钥 `__field_default__` 的最新版本，该密钥在数据流首次需要时由 MoleSignal 创建。其他具名密钥以及每个密钥的早期版本，继续负责解密用它们写入的值。
+
+| 操作 | 端点 | 权限 |
 |---|---|---|
-| `GET /api/v1/cipher_keys` | `org.settings.read` | 列出密钥元数据。 |
-| `GET /api/v1/cipher_keys/{name}` | `org.settings.read` | 读取最新版本元数据。 |
-| `POST /api/v1/cipher_keys` | `org.settings.manage` | 使用 `key_material_b64` 创建具名密钥。 |
-| `POST /api/v1/cipher_keys/{name}/rotate` | `org.settings.manage` | 增加新版本并保留历史解密能力。 |
-| `DELETE /api/v1/cipher_keys/{name}` | `org.settings.manage` | 删除具名密钥。 |
-| `POST /api/v1/field_encryption/rotate` | `org.settings.manage` | 生成并轮换默认字段加密 DEK。 |
+| 列出密钥 | `GET /api/v1/cipher_keys` | `org.settings.read` |
+| 读取密钥 | `GET /api/v1/cipher_keys/{name}` | `org.settings.read` |
+| 创建密钥 | `POST /api/v1/cipher_keys` | `org.settings.manage` |
+| 轮换密钥 | `POST /api/v1/cipher_keys/{name}/rotate` | `org.settings.manage` |
+| 删除密钥 | `DELETE /api/v1/cipher_keys/{name}` | `org.settings.manage` |
+| 轮换默认密钥 | `POST /api/v1/field_encryption/rotate` | `org.settings.manage` |
+
+## 密钥元数据
+
+列表、读取、创建和轮换调用返回密钥版本的元数据。列表返回每个密钥的所有版本，同一名称下最新版本在前。
+
+```json
+{
+  "id": "3KEZizkQsvBwoWQihNO6OdxRiSf",
+  "name": "payments-key",
+  "alg": "aes-256-gcm",
+  "version": 1,
+  "created_at_micros": 1790000000000000,
+  "rotated_at_micros": null
+}
+```
+
+从未轮换过的密钥，`rotated_at_micros` 为 `null`。读取调用返回最新版本。
+
+## 创建密钥
+
+```http
+POST /api/v1/cipher_keys
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | 密钥名称。名称已存在时返回 `409`，消息会指向轮换调用。 |
+| `key_material_b64` | string | 是 | 32 个随机字节，使用带填充的标准 base64 编码。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/cipher_keys \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d "{\"name\": \"payments-key\", \"key_material_b64\": \"$(openssl rand -base64 32)\"}"
+```
+</RequestExample>
+
+响应是上文所示的密钥元数据。
+
+## 轮换密钥
+
+```http
+POST /api/v1/cipher_keys/{name}/rotate
+```
+
+请求体与创建调用一样包含 `key_material_b64`。调用会用新的材料增加一个版本，并保留早期版本用于解密。轮换一个不存在的名称会返回 `404`。请先用创建调用新建密钥。
+
+## 删除密钥
+
+```http
+DELETE /api/v1/cipher_keys/{name}
+```
+
+删除该名称下的所有版本，并返回 `{"deleted": true}`。名称不存在时返回 `404`。调用不会检查已存储的数据是否仍依赖该密钥。
 
 <Warning>
-  删除密钥前请检查加密字段依赖。详见[安全 → 字段级加密](/zh-Hans/security#字段级加密)。
+  用已删除的密钥加密的值无法再解密。删除密钥之前，请先检查依赖它的加密字段。
 </Warning>
+
+## 轮换默认密钥
+
+```http
+POST /api/v1/field_encryption/rotate
+```
+
+在服务端生成新的密钥材料，为 `__field_default__` 增加一个新版本，并立即刷新解密缓存。新的写入使用新版本，已有的值保持可读。组织还没有默认密钥时，调用会把它创建为版本 1。请求体为空，响应包含新密钥的标识符与版本：
+
+```json
+{
+  "key_id": "3KEZj3uxMx5OOFX6NiYv3VFnfmD",
+  "version": 2
+}
+```
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | `key_material_b64` 不是有效的 base64，或没有解码为恰好 32 字节（`key_material must be 32 bytes, got 5`）。 |
+| `403` | Token 缺少该调用所需的权限。 |
+| `404` | 读取、轮换或删除调用没有找到该名称的密钥。 |
+| `409` | 已存在同名密钥。 |
+| `422` | 缺少必填字段。响应为纯文本。 |
