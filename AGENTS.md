@@ -4,6 +4,7 @@
 
 - This is the bilingual documentation site of MoleSignal, built on [Mintlify](https://mintlify.com).
 - Pages are MDX files with YAML frontmatter. English pages live in `en-US/` and Simplified Chinese pages in `zh-Hans/`.
+- Mintlify pairs pages across languages only when the folder is named after a language code it knows, and `en-US` is not one. A page without a link to its counterpart leaves the other language greyed out in the language switcher. Every page therefore carries a frontmatter link to its counterpart: `"zh-Hans_link": "/zh-Hans/<path>"` in `en-US/` pages and `"en_link": "/en-US/<path>"` in `zh-Hans/` pages. Drop the `.mdx` extension and a trailing `/index`. Add both links when adding a page pair, and open the switcher in `mint dev` to check them.
 - Navigation, branding, redirects, and the 404 page live in `docs.json`.
 - `changelog.js` renders the Changelog page from GitHub releases. `style.css` and `sidebar-toggle.js` hold the site customizations.
 - Diagrams are rendered SVG files in `images/architecture/` with light and dark variants for each language.
