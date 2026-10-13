@@ -1,12 +1,12 @@
 ---
 title: "链路列表与详情"
-description: "列出链路摘要，并读取单条链路的所有 Span。"
+description: "列出链路摘要，按时间统计链路数量，并读取单条链路的所有 Span。"
 "en_link": "/en-US/api/web/trace"
 ---
 
-两个调用都读取组织的一个链路数据流：包含 `trace_id`、`span_id`、`service.name`、`name`、`start_time_unix_nano`、`end_time_unix_nano` 和 `status_code` 全部字段的数据流。名为 `default` 的数据流优先于其他符合条件的数据流，仍然相同时按数据流名称决定。组织没有这样的数据流时，结果为空。只有通过[尾部采样](/zh-Hans/configuration#链路捕获与尾部采样)保留下来的链路才能读取。
+所有调用都读取组织的一个链路数据流：包含 `trace_id`、`span_id`、`service.name`、`name`、`start_time_unix_nano`、`end_time_unix_nano` 和 `status_code` 全部字段的数据流。名为 `default` 的数据流优先于其他符合条件的数据流，仍然相同时按数据流名称决定。组织没有这样的数据流时，结果为空。只有通过[尾部采样](/zh-Hans/configuration#链路捕获与尾部采样)保留下来的链路才能读取。
 
-两个调用都需要 `streams.query`，系统范围可使用 `sys.telemetry.read`。
+所有调用都需要 `streams.query`，系统范围可使用 `sys.telemetry.read`。
 
 ## 列出链路摘要
 
@@ -24,7 +24,7 @@ GET /api/v1/web/traces
 | `q` | string | 不区分大小写的文本，必须出现在某个 Span 的 `trace_id`、`span_id`、服务、操作或状态中。最长 256 个字符。 |
 | `filters` | string | 过滤条件的 JSON 数组，见下文。 |
 | `sort` | string | `latest`（默认）、`earliest`、`duration_desc`、`duration_asc`、`span_count_desc` 或 `errors_desc`。 |
-| `limit` | integer | 页大小。默认 `20`。取值限制在 1 到 100 之间。 |
+| `limit` | integer | 页大小。默认 `20`。取值限制在 1 到 5000 之间。 |
 | `cursor` | string | 之前某一页返回的 `next_cursor` 或 `previous_cursor`。 |
 
 过滤条件是包含 `field`、`op` 和 `value` 的对象，一个请求最多带 32 个过滤条件。所有过滤条件必须同时匹配。
@@ -72,6 +72,63 @@ curl -G "http://localhost:5080/api/v1/web/traces" \
 </ResponseExample>
 
 每个条目通过根 Span 描述一条链路：根 Span 的 `service` 与 `operation`、以纳秒表示的开始时间、以毫秒表示的时长、Span 数量和错误 Span 数量。设置了 `next_cursor` 时，`has_more` 为 `true`。
+
+## 按时间统计链路数量
+
+```http
+GET /api/v1/web/traces/histogram
+```
+
+按链路的开始时间，把列表查询匹配的每一条链路统计到时间桶中。该调用使用与列表相同的窗口、`q` 和 `filters`，匹配的链路也相同。时间桶由调用方指定。
+
+**查询参数**
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `from`、`to` | integer | 以微秒表示的窗口，两者都必填。`to` 必须大于 `from`。 |
+| `q`、`filters` | string | 与列表相同。 |
+| `bucket_micros` | integer | 一个时间桶的长度，单位为微秒。不小于 `1000`。 |
+| `origin_micros` | integer | 第一个时间桶的起点，单位为微秒。不晚于 `from`。 |
+
+从 `origin_micros` 到 `to`，一个请求最多覆盖 512 个时间桶。
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces/histogram" \
+  -H "authorization: Bearer $MS_JWT" \
+  --data-urlencode 'from=1790000100000000' \
+  --data-urlencode 'to=1790003700000000' \
+  --data-urlencode 'bucket_micros=900000000' \
+  --data-urlencode 'origin_micros=1790000100000000' \
+  --data-urlencode 'filters=[{"field":"service","op":"=","value":"checkout"}]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "bucket_micros": 900000000,
+  "origin_micros": 1790000100000000,
+  "buckets": [
+    { "start_micros": 1790000100000000, "total": 42, "errors": 3 },
+    { "start_micros": 1790001900000000, "total": 17, "errors": 0 }
+  ],
+  "split": true
+}
+```
+</ResponseExample>
+
+`buckets` 只列出包含链路的时间桶，按时间从早到晚排列。`total` 是在该时间桶内开始的链路数量。`errors` 是其中至少有一个错误 Span 的链路数量。
+
+统计读取链路摘要；过滤条件作用于 Span 字段时，还会读取 Span。列表对每条链路只返回一条摘要。写入重试导致同一条摘要存了两份时，统计会计两次。
+
+无法统计时，调用仍返回 `200`。此时 `buckets` 为空，`unavailable` 给出原因。
+
+| `unavailable` | 原因 |
+|---|---|
+| `time_budget` | 统计耗时超过 20 秒。 |
+| `busy` | 该角色正在运行的查询已达到 [`[search.admission]`](/zh-Hans/configuration) 允许的数量。 |
+| `scan_limit` | 窗口内的行数超过了 `[querier].max_scan_rows` 允许单次查询读取的数量。 |
 
 ## 读取单条链路
 
@@ -136,6 +193,6 @@ GET /api/v1/web/trace/{trace_id}
 
 | 状态码 | 原因 |
 |---|---|
-| `400` | 参数无效：`to` 不大于 `from`、过滤条件使用了未知的字段或运算符（`unsupported trace filter field: nope`）、游标与查询不匹配，或 `trace_id` 的字符或长度无效。 |
+| `400` | 参数无效：`to` 不大于 `from`、过滤条件使用了未知的字段或运算符（`unsupported trace filter field: nope`）、游标与查询不匹配，或 `trace_id` 的字符或长度无效。统计时还包括：缺少窗口或时间桶参数、`bucket_micros` 小于 `1000`、`origin_micros` 晚于 `from`，或请求覆盖的时间桶超过 512 个。 |
 | `403` | Token 缺少 `streams.query`。 |
 | `404` | 最近 24 小时内找不到该链路，或链路已被采样丢弃。 |

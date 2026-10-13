@@ -1,12 +1,12 @@
 ---
 title: "Trace list and details"
-description: "List trace summaries, and read the spans of one trace."
+description: "List trace summaries, count them over time, and read the spans of one trace."
 "zh-Hans_link": "/zh-Hans/api/web/trace"
 ---
 
-Both calls read one traces stream of the organization: the stream that has all of the fields `trace_id`, `span_id`, `service.name`, `name`, `start_time_unix_nano`, `end_time_unix_nano`, and `status_code`. A stream named `default` wins over other streams that qualify, and the stream name breaks the remaining ties. An organization without such a stream gets empty results. Only traces that survived [tail sampling](/en-US/configuration#trace-capture-and-tail-sampling) are readable.
+All calls read one traces stream of the organization: the stream that has all of the fields `trace_id`, `span_id`, `service.name`, `name`, `start_time_unix_nano`, `end_time_unix_nano`, and `status_code`. A stream named `default` wins over other streams that qualify, and the stream name breaks the remaining ties. An organization without such a stream gets empty results. Only traces that survived [tail sampling](/en-US/configuration#trace-capture-and-tail-sampling) are readable.
 
-Both calls require `streams.query`, or `sys.telemetry.read` in the system scope.
+All calls require `streams.query`, or `sys.telemetry.read` in the system scope.
 
 ## List trace summaries
 
@@ -24,7 +24,7 @@ Returns one summary per trace, with cursor pagination. A stream that has no trac
 | `q` | string | Case-insensitive text that must appear in the `trace_id`, `span_id`, service, operation, or status of a span. Up to 256 characters. |
 | `filters` | string | A JSON array of filters. See below. |
 | `sort` | string | `latest` (default), `earliest`, `duration_desc`, `duration_asc`, `span_count_desc`, or `errors_desc`. |
-| `limit` | integer | Page size. Default `20`. The value is clamped to 1 through 100. |
+| `limit` | integer | Page size. Default `20`. The value is clamped to 1 through 5000. |
 | `cursor` | string | The `next_cursor` or `previous_cursor` of an earlier page. |
 
 A filter is an object with `field`, `op`, and `value`, and a request carries at most 32 filters. All filters must match.
@@ -72,6 +72,63 @@ curl -G "http://localhost:5080/api/v1/web/traces" \
 </ResponseExample>
 
 Each item describes a trace by its root: the `service` and `operation` of the root span, the start time in nanoseconds, the duration in milliseconds, the number of spans, and the number of error spans. `has_more` is `true` when `next_cursor` is set.
+
+## Count traces over time
+
+```http
+GET /api/v1/web/traces/histogram
+```
+
+Counts every trace that a list query matches, in time buckets, by the start time of the trace. The call takes the window, `q`, and `filters` of the list, and matches the same traces. The caller chooses the buckets.
+
+**Query parameters**
+
+| Param | Type | Notes |
+|---|---|---|
+| `from`, `to` | integer | The window in microseconds. Both are required. `to` must be greater than `from`. |
+| `q`, `filters` | string | The same as for the list. |
+| `bucket_micros` | integer | The length of one bucket in microseconds. At least `1000`. |
+| `origin_micros` | integer | The start of the first bucket in microseconds. Not after `from`. |
+
+A request covers at most 512 buckets from `origin_micros` to `to`.
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces/histogram" \
+  -H "authorization: Bearer $MS_JWT" \
+  --data-urlencode 'from=1790000100000000' \
+  --data-urlencode 'to=1790003700000000' \
+  --data-urlencode 'bucket_micros=900000000' \
+  --data-urlencode 'origin_micros=1790000100000000' \
+  --data-urlencode 'filters=[{"field":"service","op":"=","value":"checkout"}]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "bucket_micros": 900000000,
+  "origin_micros": 1790000100000000,
+  "buckets": [
+    { "start_micros": 1790000100000000, "total": 42, "errors": 3 },
+    { "start_micros": 1790001900000000, "total": 17, "errors": 0 }
+  ],
+  "split": true
+}
+```
+</ResponseExample>
+
+`buckets` lists only the buckets that hold a trace, oldest first. `total` is the number of traces that started in the bucket. `errors` is the number of those traces with at least one error span.
+
+The count reads the trace summaries, and the spans when a filter is on a span field. The list returns one summary for each trace. A summary that a retried write stored twice counts twice.
+
+When the count is not available, the call still answers `200`. `buckets` is then empty, and `unavailable` gives the reason.
+
+| `unavailable` | Cause |
+|---|---|
+| `time_budget` | The count took longer than 20 seconds. |
+| `busy` | The role already runs as many queries as [`[search.admission]`](/en-US/configuration) allows. |
+| `scan_limit` | The window holds more rows than `[querier].max_scan_rows` allows one query to read. |
 
 ## Read one trace
 
@@ -136,6 +193,6 @@ The example shows one span with its main fields. A real span also carries `trace
 
 | Status | Cause |
 |---|---|
-| `400` | A parameter is invalid: `to` is not greater than `from`, a filter uses an unknown field or operator (`unsupported trace filter field: nope`), the cursor does not match the query, or the `trace_id` has invalid characters or length. |
+| `400` | A parameter is invalid: `to` is not greater than `from`, a filter uses an unknown field or operator (`unsupported trace filter field: nope`), the cursor does not match the query, or the `trace_id` has invalid characters or length. For the count: the window or a bucket parameter is missing, `bucket_micros` is under `1000`, `origin_micros` is after `from`, or the request covers more than 512 buckets. |
 | `403` | The token lacks `streams.query`. |
 | `404` | The trace is not found in the last 24 hours, or was sampled out. |

@@ -1,0 +1,366 @@
+---
+title: "Status page webhook subscriptions"
+description: "Subscribe an HTTPS endpoint to a public status page: confirmation, request format, payload fields, retries, and unsubscribing."
+"zh-Hans_link": "/zh-Hans/status-page-webhooks"
+---
+
+A webhook subscription sends each published change of a public status page to an HTTPS endpoint as
+a JSON `POST` request. Use it to mirror the status of a service into a chat room, a ticketing
+system, or an internal status board.
+
+Read [Status pages](/en-US/status-pages) first for components, incidents, maintenance, and the
+subscriber management view.
+
+## How a subscription works
+
+<Steps>
+  <Step title="Register the endpoint">
+    Submit the endpoint URL on the public page or over the API. The subscription starts as
+    pending.
+  </Step>
+  <Step title="Receive the confirmation request">
+    MoleSignal sends one `status_page_subscription_confirmation` request to the endpoint. The
+    endpoint must answer with a 2xx status, otherwise the registration fails.
+  </Step>
+  <Step title="Confirm with the token">
+    Open the `confirm_url` from the request, or send the `token` to the confirmation endpoint. The
+    subscription becomes active.
+  </Step>
+  <Step title="Receive updates">
+    Each change published after the confirmation is delivered as one request. Changes published
+    before the confirmation are not sent.
+  </Step>
+</Steps>
+
+## Endpoint requirements
+
+| Requirement | Rule |
+|---|---|
+| Page visibility | Public pages only. A private page accepts verified email subscriptions only. |
+| Scheme | `https` only. |
+| Credentials | The URL cannot contain a user name or a password. |
+| Host | `localhost`, `*.localhost`, and `*.local` are rejected. The host must resolve to a public IP address. Private, loopback, link-local, carrier-grade NAT, and documentation ranges are rejected. |
+| Length | 3 to 2048 characters, without control characters. |
+| Response | Any 2xx status within 10 seconds. Redirects are not followed, so a 3xx response is a failure. |
+
+MoleSignal resolves the host again for every delivery and applies the same address rules each
+time.
+
+## Subscribe
+
+On the public page, select **Subscribe**, set **Delivery channel** to **Webhook**, enter the
+endpoint URL, and select **Send confirmation**.
+
+Over the API, send the request to the origin that serves the status page:
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<slug>/subscriptions" \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "webhook", "target": "https://hooks.example.com/status"}'
+```
+
+The call needs no authentication. A successful registration returns `202 Accepted`:
+
+```json
+{
+  "accepted": true,
+  "confirmation_required": true
+}
+```
+
+| Case | Result |
+|---|---|
+| New endpoint | The confirmation request is sent. |
+| Endpoint that is already active | `202` is returned and nothing is sent. |
+| Endpoint that received a confirmation request less than 10 minutes ago | `202` is returned and no second confirmation request is sent. |
+| Pending or unsubscribed endpoint after those 10 minutes | A new confirmation request is sent with a new token. Earlier tokens stop working. |
+| Confirmation request not answered with 2xx | The call fails with `503` and the error code `unavailable`. Register again once the endpoint is fixed. |
+| URL that breaks an endpoint requirement | The call fails with `400` and the error code `invalid_argument`. |
+| Page with 10,000 pending or active subscribers | The call fails with `429` and the error code `resource_exhausted`. |
+
+<Note>
+  Subscription links are built from `http.external_url`, or from the custom domain of the page when
+  one is active. Registration fails with `503` while `http.external_url` is empty.
+</Note>
+
+## Request format
+
+Every request to the endpoint has the same shape.
+
+| Property | Value |
+|---|---|
+| Method | `POST` |
+| `Content-Type` | `application/json` |
+| `User-Agent` | `MoleSignal-Status-Page/1.0` |
+| Body | One JSON object. The `type` field names the payload. |
+| Timeout | 10 seconds |
+| Success | Any 2xx status. The response body is ignored. |
+
+Requests carry no signature header. To recognize genuine requests, include a hard-to-guess value in
+the path or the query string of the registered URL, and reject requests that lack it. The
+management view shows a webhook target as scheme and host only, such as
+`https://hooks.example.com/***`.
+
+Route on `type`. Ignore unknown fields and unknown `type` values, so that the endpoint keeps working
+when a payload gains a field.
+
+## Confirmation request
+
+MoleSignal sends this payload once per registration:
+
+```json
+{
+  "type": "status_page_subscription_confirmation",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "confirm_url": "https://status.example.com/status/acme-cloud#subscription_action=confirm&subscription_token=<token>",
+  "unsubscribe_url": "https://status.example.com/status/acme-cloud#subscription_action=unsubscribe&subscription_token=<token>",
+  "token": "<token>"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `status_page_subscription_confirmation`. |
+| `page_name` | string | Name of the status page. |
+| `page_slug` | string | Slug of the status page. Use it in the API paths below. |
+| `confirm_url` | string | Page address that confirms the subscription when opened in a browser. |
+| `unsubscribe_url` | string | Page address that ends the subscription when opened in a browser. |
+| `token` | string | Subscription token. It confirms the subscription and later ends it. |
+
+Confirm the subscription by opening `confirm_url`, or by sending the token:
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/confirm" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+A confirmed subscription returns `200 OK`:
+
+```json
+{
+  "accepted": true,
+  "confirmation_required": false
+}
+```
+
+A token that is unknown, replaced by a later registration, or already used to unsubscribe returns
+`400` with the error code `invalid_argument`.
+
+<Warning>
+  Store the token. Update payloads do not repeat it, and it is the only credential that lets the
+  endpoint owner end the subscription.
+</Warning>
+
+## Update payloads
+
+All timestamps are integers in microseconds since the Unix epoch, in UTC. Component names, incident
+titles, and messages are sent exactly as the page team wrote them and are not translated.
+
+### Incident and maintenance updates
+
+MoleSignal sends `incident_update` for every update published on an incident or on maintenance.
+Planned maintenance uses the same payload with `incident_kind` set to `maintenance`. Drafts send
+nothing.
+
+| Event | When the request is sent | `status` |
+|---|---|---|
+| Incident | The incident is published. | The status chosen at publication, usually `investigating`. |
+| Incident | Each later update. | `investigating`, `identified`, `in_progress`, or `monitoring`. |
+| Incident | The incident is resolved. | `resolved` |
+| Maintenance | The maintenance is published. | Usually `scheduled`. |
+| Maintenance | The scheduled maintenance is edited: its title, planned time, components, or message. | `scheduled` |
+| Maintenance | The work starts: by itself at the planned start time, or when the team marks it as started. | `in_progress` |
+| Maintenance | The team completes or cancels the work. | `completed` or `cancelled` |
+
+An incident update:
+
+```json
+{
+  "type": "incident_update",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "incident_id": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "incident_kind": "incident",
+  "title": "Elevated error rates on the public API",
+  "impact": "major",
+  "status": "identified",
+  "message": "A configuration change to the edge proxies is rejecting a share of requests. The change is being rolled back.",
+  "occurred_at": 1779529680000000,
+  "started_at": 1779529260000000,
+  "ended_at": null,
+  "component_names": ["Public API", "Web dashboard"]
+}
+```
+
+A maintenance announcement:
+
+```json
+{
+  "type": "incident_update",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "incident_id": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "incident_kind": "maintenance",
+  "title": "Database upgrade in the EU region",
+  "impact": "maintenance",
+  "status": "scheduled",
+  "message": "The primary database of the EU region is upgraded on May 25 from 10:00 to 10:30 UTC. Writes can take a few seconds longer during the switch-over.",
+  "occurred_at": 1779443280000000,
+  "started_at": 1779703200000000,
+  "ended_at": null,
+  "component_names": ["EU region"]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `incident_update`. |
+| `page_name` | string | Name of the status page. |
+| `page_slug` | string | Slug of the status page. |
+| `incident_id` | string | Identifier of the incident or the maintenance. It stays the same across all its updates. |
+| `incident_kind` | string | `incident` for an unplanned event, `maintenance` for planned work. |
+| `title` | string | Title of the incident or the maintenance when the update was published. |
+| `impact` | string | `minor`, `major`, or `critical` for an incident. `maintenance` for planned work. |
+| `status` | string | Status that this update sets. See the table below. |
+| `message` | string | Text of the update. |
+| `occurred_at` | integer | Time the update was published. |
+| `started_at` | integer | Planned start time of the maintenance. Start time of the incident. |
+| `ended_at` | integer or null | Time the incident was resolved, or the maintenance was completed or cancelled. `null` until then. |
+| `component_names` | array of strings | Names of the affected components that the page shows, in page order. Hidden and archived components are left out. Empty when none is left. |
+
+| `incident_kind` | `status` values | Final status |
+|---|---|---|
+| `incident` | `investigating`, `identified`, `in_progress`, `monitoring`, `resolved` | `resolved` |
+| `maintenance` | `scheduled`, `in_progress`, `completed`, `cancelled` | `completed` or `cancelled` |
+
+For maintenance, `started_at` is the planned start time, in every update. It changes when the team
+reschedules the maintenance. After the work starts it still holds the planned time: the actual
+start is the `occurred_at` of the `in_progress` update. Maintenance has no planned end time, so
+`ended_at` is `null` until the work is completed or cancelled.
+
+<Note>
+  With automatic start on, which is the default, MoleSignal publishes the `in_progress` update at
+  the planned start time and sends it as an `incident_update`. With automatic start off, nothing is
+  sent at that time: the next request follows the next update that the team publishes.
+</Note>
+
+### Maintenance reminders
+
+MoleSignal sends `maintenance_reminder` before scheduled maintenance starts. The lead time is set
+on each maintenance and is 60 minutes by default. A reminder is not an update: it does not appear
+in the timeline of the maintenance.
+
+```json
+{
+  "type": "maintenance_reminder",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "incident_id": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "title": "Database upgrade in the EU region",
+  "occurred_at": 1779699600000000,
+  "started_at": 1779703200000000,
+  "component_names": ["EU region"]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `maintenance_reminder`. |
+| `page_name` | string | Name of the status page. |
+| `page_slug` | string | Slug of the status page. |
+| `incident_id` | string | Identifier of the maintenance. It is the same as in the `incident_update` payloads of that maintenance. |
+| `title` | string | Title of the maintenance when the reminder was sent. |
+| `occurred_at` | integer | Time the reminder was sent. |
+| `started_at` | integer | Planned start time of the maintenance. |
+| `component_names` | array of strings | Names of the affected components that the page shows, in page order. Hidden and archived components are left out. |
+
+One reminder is sent for each planned start time, so rescheduled maintenance is reminded of again
+before its new start time. No reminder is sent when the maintenance was announced or rescheduled
+after its reminder time, when its lead time is `0`, or when it has left the `scheduled` status.
+
+### Component status changes
+
+MoleSignal sends `component_status_changed` when the status of a component that the page shows is
+changed. The status a component is created with sends nothing. Hidden and archived components send
+nothing.
+
+```json
+{
+  "type": "component_status_changed",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "component_id": "2xZqD1hWk9TfM5vBn7QsR3yLgUe",
+  "component_name": "Public API",
+  "status": "degraded_performance",
+  "occurred_at": 1779529440000000
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `component_status_changed`. |
+| `page_name` | string | Name of the status page. |
+| `page_slug` | string | Slug of the status page. |
+| `component_id` | string | Identifier of the component. It stays the same when the component is renamed. |
+| `component_name` | string | Name of the component when its status changed. |
+| `status` | string | New status: `operational`, `degraded_performance`, `partial_outage`, `major_outage`, or `maintenance`. |
+| `occurred_at` | integer | Time the new status took effect. |
+
+An incident does not send `component_status_changed` for the components it affects. The
+`incident_update` payload names them in `component_names`.
+
+<Note>
+  A component that is hidden when a change is published is not named to subscribers. Its status
+  changes send nothing, and `incident_update` leaves it out of `component_names`. An incident or
+  maintenance that affects only hidden components is still sent, with an empty `component_names`.
+  Hiding or showing a component sends nothing by itself.
+</Note>
+
+## Delivery and retries
+
+| Behavior | Detail |
+|---|---|
+| Latency | A delivery normally starts within 30 seconds of the change. |
+| Attempts | Up to 5 per update. |
+| Retry delays | 1 minute, 5 minutes, 30 minutes, then 2 hours after each failed attempt. |
+| Failure | Anything other than a 2xx status within 10 seconds, including a redirect. |
+| Give up | After the fifth failed attempt the delivery is marked failed and is not sent again. |
+| Guarantee | At least once. A delivery can arrive more than once and out of order. |
+
+A retried delivery repeats the same body. Payloads carry no delivery identifier, so deduplicate on
+`type`, `incident_id` or `component_id`, and `occurred_at`. Order the updates of one incident by
+`occurred_at`.
+
+Updates are no longer queued for the endpoint once the subscription ends, the page is archived, or
+the page is switched to private.
+
+Page managers find each delivery under **Status pages → Subscribers → Deliveries**, with its
+attempts, state, and last error. Delivered and failed records are removed after the delivery
+retention of the page: 30, 60, 90, 180, or 365 days.
+
+## Unsubscribe
+
+Open `unsubscribe_url` from the confirmation request, or send the token:
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/unsubscribe" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+The call returns `200 OK` with `"accepted": true`. Deliveries that are still waiting for the
+endpoint are cancelled.
+
+A user with `status_pages.manage` can also revoke a subscriber under **Status pages → Subscribers**,
+or select **Resend confirmation** for a pending one. Resending issues a new token.
+
+<CardGroup cols={2}>
+  <Card title="Status pages" icon="signal" href="/en-US/status-pages">
+    Create pages, publish incidents and maintenance, and manage subscribers.
+  </Card>
+  <Card title="Webhook notification connectors" icon="webhook" href="/en-US/alert-webhook-channels">
+    Send alert notifications to Slack, Lark, or a generic webhook.
+  </Card>
+</CardGroup>
