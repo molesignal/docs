@@ -59,6 +59,10 @@ curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<slug>/subscription
   -d '{"channel": "webhook", "target": "https://hooks.example.com/status"}'
 ```
 
+To hear only about some components, add `component_ids` with the `id` of each component, as the
+public page lists them at `GET /api/v1/public/status-pages/<slug>`. Leave it out, or send an empty
+list, for the whole page. A group is not a component that can be chosen: name the components in it.
+
 The call needs no authentication. A successful registration returns `202 Accepted`:
 
 ```json
@@ -71,7 +75,7 @@ The call needs no authentication. A successful registration returns `202 Accepte
 | Case | Result |
 |---|---|
 | New endpoint | The confirmation request is sent. |
-| Endpoint that is already active | `202` is returned and nothing is sent. |
+| Endpoint that is already active | `202` is returned and a `status_page_subscription_manage` request is sent. The chosen components and the token stay as they are. |
 | Endpoint that received a confirmation request less than 10 minutes ago | `202` is returned and no second confirmation request is sent. |
 | Pending or unsubscribed endpoint after those 10 minutes | A new confirmation request is sent with a new token. Earlier tokens stop working. |
 | Confirmation request not answered with 2xx | The call fails with `503` and the error code `unavailable`. Register again once the endpoint is fixed. |
@@ -114,7 +118,9 @@ MoleSignal sends this payload once per registration:
   "page_name": "Acme Cloud",
   "page_slug": "acme-cloud",
   "confirm_url": "https://status.example.com/status/acme-cloud#subscription_action=confirm&subscription_token=<token>",
+  "manage_url": "https://status.example.com/status/acme-cloud#subscription_action=manage&subscription_token=<token>",
   "unsubscribe_url": "https://status.example.com/status/acme-cloud#subscription_action=unsubscribe&subscription_token=<token>",
+  "components": ["Public API"],
   "token": "<token>"
 }
 ```
@@ -125,7 +131,9 @@ MoleSignal sends this payload once per registration:
 | `page_name` | string | Name of the status page. |
 | `page_slug` | string | Slug of the status page. Use it in the API paths below. |
 | `confirm_url` | string | Page address that confirms the subscription when opened in a browser. |
+| `manage_url` | string | Page address that opens **Manage subscription**, where the components can be changed. |
 | `unsubscribe_url` | string | Page address that ends the subscription when opened in a browser. |
+| `components` | array of strings | Names of the components the subscription hears about. Empty for the whole page. |
 | `token` | string | Subscription token. It confirms the subscription and later ends it. |
 
 Confirm the subscription by opening `confirm_url`, or by sending the token:
@@ -153,10 +161,38 @@ A token that is unknown, replaced by a later registration, or already used to un
   endpoint owner end the subscription.
 </Warning>
 
+## Manage request
+
+When an endpoint that is already active is registered again, MoleSignal sends it the link that
+manages the subscription instead of a new confirmation, at most once every 10 minutes:
+
+```json
+{
+  "type": "status_page_subscription_manage",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "manage_url": "https://status.example.com/status/acme-cloud#subscription_action=manage&subscription_token=<token>",
+  "unsubscribe_url": "https://status.example.com/status/acme-cloud#subscription_action=unsubscribe&subscription_token=<token>",
+  "components": [],
+  "token": "<token>"
+}
+```
+
+The fields are those of the confirmation request without `confirm_url`.
+
 ## Update payloads
 
 All timestamps are integers in microseconds since the Unix epoch, in UTC. Component names, incident
 titles, and messages are sent exactly as the page team wrote them and are not translated.
+
+A subscription that chose components receives only the updates that name one of them. An update
+published with **Notify subscribers** off sends nothing. Every update payload also carries the links
+of the subscription:
+
+| Field | Type | Description |
+|---|---|---|
+| `manage_url` | string | Page address that opens **Manage subscription**. |
+| `unsubscribe_url` | string | Page address that ends the subscription. |
 
 ### Incident and maintenance updates
 
@@ -188,6 +224,7 @@ An incident update:
   "status": "identified",
   "message": "A configuration change to the edge proxies is rejecting a share of requests. The change is being rolled back.",
   "occurred_at": 1779529680000000,
+  "next_update_at": 1779531480000000,
   "started_at": 1779529260000000,
   "ended_at": null,
   "component_names": ["Public API", "Web dashboard"]
@@ -208,6 +245,7 @@ A maintenance announcement:
   "status": "scheduled",
   "message": "The primary database of the EU region is upgraded on May 25 from 10:00 to 10:30 UTC. Writes can take a few seconds longer during the switch-over.",
   "occurred_at": 1779443280000000,
+  "next_update_at": null,
   "started_at": 1779703200000000,
   "ended_at": null,
   "component_names": ["EU region"]
@@ -226,6 +264,7 @@ A maintenance announcement:
 | `status` | string | Status that this update sets. See the table below. |
 | `message` | string | Text of the update. |
 | `occurred_at` | integer | Time the update was published. |
+| `next_update_at` | integer or null | Time by which the update promises the next one. `null` when it promises none. |
 | `started_at` | integer | Planned start time of the maintenance. Start time of the incident. |
 | `ended_at` | integer or null | Time the incident was resolved, or the maintenance was completed or cancelled. `null` until then. |
 | `component_names` | array of strings | Names of the affected components that the page shows, in page order. Hidden and archived components are left out. Empty when none is left. |
@@ -317,6 +356,44 @@ An incident does not send `component_status_changed` for the components it affec
   maintenance that affects only hidden components is still sent, with an empty `component_names`.
   Hiding or showing a component sends nothing by itself.
 </Note>
+
+### Postmortems
+
+MoleSignal sends `postmortem_published` when the postmortem of a resolved incident is published, or
+its revision is published, with **Notify subscribers** on.
+
+```json
+{
+  "type": "postmortem_published",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "incident_id": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "title": "Elevated error rates on the public API",
+  "impact": "major",
+  "revision": false,
+  "occurred_at": 1779616080000000,
+  "started_at": 1779529260000000,
+  "ended_at": 1779533520000000,
+  "component_names": ["Public API"],
+  "postmortem": "## What happened\n\nA configuration change to the edge proxies rejected a share of requests.",
+  "incident_url": "https://status.example.com/status/acme-cloud/incidents/2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "manage_url": "https://status.example.com/status/acme-cloud#subscription_action=manage&subscription_token=<token>",
+  "unsubscribe_url": "https://status.example.com/status/acme-cloud#subscription_action=unsubscribe&subscription_token=<token>"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Always `postmortem_published`. |
+| `incident_id` | string | Identifier of the incident, as in its `incident_update` payloads. |
+| `title` | string | Title of the incident. |
+| `impact` | string | `minor`, `major`, or `critical`. |
+| `revision` | boolean | `true` when a revised text replaces a published one. |
+| `occurred_at` | integer | Time the postmortem was published. |
+| `postmortem` | string | The postmortem in Markdown, as written. |
+| `incident_url` | string | Address of the incident on the public page. |
+
+`page_name`, `page_slug`, `started_at`, `ended_at`, and `component_names` are as in `incident_update`.
 
 ## Delivery and retries
 

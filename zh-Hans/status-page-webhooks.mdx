@@ -50,6 +50,8 @@ curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<slug>/subscription
   -d '{"channel": "webhook", "target": "https://hooks.example.com/status"}'
 ```
 
+只想接收部分组件的更新时，加上 `component_ids`，填写各组件的 `id`（见公开页面接口 `GET /api/v1/public/status-pages/<slug>` 列出的组件）。不传或传空数组表示整个页面。分组不能被选择，请填写组内的组件。
+
 该调用无需认证。登记成功返回 `202 Accepted`：
 
 ```json
@@ -62,7 +64,7 @@ curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<slug>/subscription
 | 情况 | 结果 |
 |---|---|
 | 新端点 | 发送确认请求。 |
-| 已生效的端点 | 返回 `202`，不发送任何请求。 |
+| 已生效的端点 | 返回 `202`，并发送一次 `status_page_subscription_manage` 请求。已选的组件与 Token 保持不变。 |
 | 10 分钟内已收到过确认请求的端点 | 返回 `202`，不会再次发送确认请求。 |
 | 超过 10 分钟后，待确认或已退订的端点 | 携带新 Token 重新发送确认请求。之前的 Token 随即失效。 |
 | 确认请求没有得到 2xx 响应 | 调用失败，返回 `503` 与错误码 `unavailable`。修复端点后重新登记。 |
@@ -100,7 +102,9 @@ curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<slug>/subscription
   "page_name": "Acme Cloud",
   "page_slug": "acme-cloud",
   "confirm_url": "https://status.example.com/status/acme-cloud#subscription_action=confirm&subscription_token=<token>",
+  "manage_url": "https://status.example.com/status/acme-cloud#subscription_action=manage&subscription_token=<token>",
   "unsubscribe_url": "https://status.example.com/status/acme-cloud#subscription_action=unsubscribe&subscription_token=<token>",
+  "components": ["公共 API"],
   "token": "<token>"
 }
 ```
@@ -111,7 +115,9 @@ curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<slug>/subscription
 | `page_name` | string | 状态页名称。 |
 | `page_slug` | string | 状态页 Slug。用于下文的 API 路径。 |
 | `confirm_url` | string | 在浏览器中打开即可确认订阅的页面地址。 |
+| `manage_url` | string | 打开**管理订阅**的页面地址，可在其中修改组件。 |
 | `unsubscribe_url` | string | 在浏览器中打开即可结束订阅的页面地址。 |
+| `components` | array of strings | 订阅接收的组件名称。订阅整个页面时为空数组。 |
 | `token` | string | 订阅 Token。用于确认订阅，之后也用于退订。 |
 
 打开 `confirm_url`，或发送 Token 来确认订阅：
@@ -137,9 +143,34 @@ Token 不存在、已被之后的登记替换，或已用于退订时，返回 `
   请保存好 Token。更新 Payload 不会再次携带它，而它是端点所有者结束订阅的唯一凭证。
 </Warning>
 
+## 管理订阅请求
+
+为已经生效的端点再次登记时，MoleSignal 发送的是管理订阅的链接，而不是新的确认请求，10 分钟内最多一次：
+
+```json
+{
+  "type": "status_page_subscription_manage",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "manage_url": "https://status.example.com/status/acme-cloud#subscription_action=manage&subscription_token=<token>",
+  "unsubscribe_url": "https://status.example.com/status/acme-cloud#subscription_action=unsubscribe&subscription_token=<token>",
+  "components": [],
+  "token": "<token>"
+}
+```
+
+字段与确认请求相同，只是没有 `confirm_url`。
+
 ## 更新 Payload
 
 所有时间戳均为整数，表示自 Unix 纪元起的微秒数（UTC）。组件名称、事件标题与消息保持页面团队写入时的原文，不做翻译。
+
+选择了组件的订阅，只接收涉及其中某个组件的更新。关闭**通知订阅者**发布的更新不发送任何请求。每个更新 Payload 还带有订阅自身的链接：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `manage_url` | string | 打开**管理订阅**的页面地址。 |
+| `unsubscribe_url` | string | 结束订阅的页面地址。 |
 
 ### 事件与维护更新
 
@@ -169,6 +200,7 @@ Token 不存在、已被之后的登记替换，或已用于退订时，返回 `
   "status": "identified",
   "message": "边缘代理的一次配置变更导致部分请求被拒绝，正在回滚该变更。",
   "occurred_at": 1779529680000000,
+  "next_update_at": 1779531480000000,
   "started_at": 1779529260000000,
   "ended_at": null,
   "component_names": ["公共 API", "Web 控制台"]
@@ -189,6 +221,7 @@ Token 不存在、已被之后的登记替换，或已用于退订时，返回 `
   "status": "scheduled",
   "message": "欧洲区域的主数据库将于 5 月 25 日 10:00 至 10:30（UTC）升级。切换期间写入可能延迟数秒。",
   "occurred_at": 1779443280000000,
+  "next_update_at": null,
   "started_at": 1779703200000000,
   "ended_at": null,
   "component_names": ["欧洲区域"]
@@ -207,6 +240,7 @@ Token 不存在、已被之后的登记替换，或已用于退订时，返回 `
 | `status` | string | 该条更新设置的状态。见下表。 |
 | `message` | string | 更新正文。 |
 | `occurred_at` | integer | 该条更新的发布时间。 |
+| `next_update_at` | integer 或 null | 该条更新承诺的下次更新时间。没有承诺时为 `null`。 |
 | `started_at` | integer | 维护的计划开始时间；事件的开始时间。 |
 | `ended_at` | integer 或 null | 事件解决的时间，或维护完成、取消的时间。在此之前为 `null`。 |
 | `component_names` | array of strings | 页面上显示的受影响组件的名称，按页面顺序排列。已隐藏与已归档的组件不会列出。没有可列出的组件时为空数组。 |
@@ -283,6 +317,43 @@ Token 不存在、已被之后的登记替换，或已用于退订时，返回 `
 <Note>
   变更发布时处于隐藏状态的组件，不会出现在发给订阅者的内容中。它的状态变更不发送请求，`incident_update` 的 `component_names` 也不会列出它。只影响已隐藏组件的事件或维护仍会发送，`component_names` 为空数组。隐藏或重新显示组件这一操作本身不发送请求。
 </Note>
+
+### 事故复盘
+
+已解决事件的复盘发布时，或复盘修订发布时，只要打开了**通知订阅者**，MoleSignal 就发送 `postmortem_published`。
+
+```json
+{
+  "type": "postmortem_published",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "incident_id": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "title": "公共 API 错误率升高",
+  "impact": "major",
+  "revision": false,
+  "occurred_at": 1779616080000000,
+  "started_at": 1779529260000000,
+  "ended_at": 1779533520000000,
+  "component_names": ["公共 API"],
+  "postmortem": "## 发生了什么\n\n边缘代理的一次配置变更拒绝了部分请求。",
+  "incident_url": "https://status.example.com/status/acme-cloud/incidents/2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "manage_url": "https://status.example.com/status/acme-cloud#subscription_action=manage&subscription_token=<token>",
+  "unsubscribe_url": "https://status.example.com/status/acme-cloud#subscription_action=unsubscribe&subscription_token=<token>"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | 固定为 `postmortem_published`。 |
+| `incident_id` | string | 事件的标识，与该事件的 `incident_update` Payload 中的一致。 |
+| `title` | string | 事件标题。 |
+| `impact` | string | `minor`、`major` 或 `critical`。 |
+| `revision` | boolean | 用修订后的内容替换已发布的内容时为 `true`。 |
+| `occurred_at` | integer | 复盘的发布时间。 |
+| `postmortem` | string | 原样的 Markdown 复盘。 |
+| `incident_url` | string | 公开页面上该事件的地址。 |
+
+`page_name`、`page_slug`、`started_at`、`ended_at` 与 `component_names` 的含义同 `incident_update`。
 
 ## 投递与重试
 
