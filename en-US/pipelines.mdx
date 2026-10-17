@@ -5,14 +5,14 @@ description: "Transform and route events as they arrive, or on a schedule over d
 "zh-Hans_link": "/zh-Hans/pipelines"
 ---
 
-A **pipeline** transforms events with an ordered chain of steps and writes the result to a target stream. A step is a [VRL](/en-US/functions) transform or the built-in routing step. A pipeline runs in one of two modes:
+A **pipeline** transforms events with an ordered chain of steps and writes the result to target streams. A step is a [VRL](/en-US/functions) transform or the built-in routing step. A pipeline runs in one of two modes:
 
 | | Realtime | Scheduled |
 |---|---|---|
-| When it runs | During intake, before an event is stored. | On an interval, over a time window of data that is already stored. |
+| When it runs | During intake, before an event is stored. | On an interval, over stored data. Each run continues where the previous one stopped. |
 | Signals | Logs. | Logs, metrics, and traces. |
-| Source and sink | One source stream and one stream sink. | One source stream, a target stream, and optional connectors. |
-| Typical use | Normalize, redact, and route logs into streams as they arrive. | Enrich, aggregate, or copy stored data, and backfill history. |
+| Source and sink | One source stream and one stream sink. | Up to 8 source streams, up to 8 target streams, and optional connectors. |
+| Typical use | Normalize, redact, and route logs into streams as they arrive. | Enrich, filter, sample, or copy stored data, and backfill history. |
 | Backfill and run history | Not available. | Available. |
 
 <Frame caption="Scheduled pipeline">
@@ -26,25 +26,32 @@ Open **Pipelines** and select **New pipeline**. The editor has three parts.
 
 **Settings.** Name the pipeline, choose the signal type, and set the **Execution mode** to
 **Realtime** or **Scheduled**. A scheduled pipeline also takes **Run every**, the interval between
-runs, and **Read the last**, the window that each run reads.
+runs, **First run reads back**, how far back the first run reads, and **Wait for late events**, how
+long the latest events are left to arrive before a run reads them. The row below them holds
+**Retry a failed run**, **Retry a failed delivery**, **Dead letter stream**, and **Dedupe by field**.
+See [Schedule and read positions](#schedule-and-read-positions) and
+[Retries and dead letters](#retries-and-dead-letters).
 
 **Flow.** The flow shows the pipeline in the order in which an event passes through it:
 
 | Node | Meaning |
 |---|---|
-| **Source** | The stream that the pipeline reads. |
+| **Source** | The streams that the pipeline reads. In a scheduled pipeline, **Add source** adds one. |
 | **Processing** | The steps, in the order in which they run. **Add step** adds one. |
-| **Destinations** | The target stream, written through standard intake, and optional external connectors. **Add connector** adds one. |
+| **Destinations** | The streams that the pipeline writes through standard intake, and optional external connectors. In a scheduled pipeline, **Add destination** adds a **Stream** or a **Connector**. |
 
 Select a node to edit it. The head of the flow shows **Valid**, the number of entries that are left
 to fill in, or the issues that block a save: a missing source or destination, a step without a name
-or a script, and a destination that is also the source. The source and the target stream are saved
-as the `source_stream` and the `target_stream` of the pipeline.
+or a script, and a destination that is also a source. The first source and the first destination
+stream are saved as the `source_stream` and the `target_stream` of the pipeline, and the full lists
+as `sources` and `sinks` in `function_steps`.
 
 **Test.** Run one sample event through every step before saving. Nothing is stored. Edit the
-**Sample event**, or take a recent event from the source stream, then select **Run test**. The
-result shows the event after each step and the stream that it would be written to. When the
-pipeline runs, an event that fails a step is skipped and counted as an error.
+**Sample event**, or take a recent event from a source stream, then select **Run test**. With
+several sources, **Sample from** names the source that the steps see as `%source_stream`. The
+result shows the event after each step, and the stream that it would be written to or the step that
+dropped it. When the pipeline runs, an event that fails a step counts as failed and goes to the
+dead letter stream when there is one.
 
 Select **Create pipeline** to save. On a saved pipeline, **More** opens the run history, a
 backfill, and deletion.
@@ -59,10 +66,11 @@ backfill, and deletion.
 |---|---|
 | Parse | **Parse JSON**, **Parse key=value**, and **Extract with regex**. |
 | Fields | **Rename field**, **Remove fields**, **Set field**, **Mask field**, **Change case**, and **Convert type**. |
+| Events | **Filter events** and **Sample**. See [Filter and sample](#filter-and-sample). |
 | Routing | **Route to stream**. See [Routing](#routing). |
 | Code | **Custom VRL**. |
 
-A parse step or a field step is filled in as a form and runs as VRL. **Show generated VRL**
+A parse, field, or event step is filled in as a form and runs as VRL. **Show generated VRL**
 displays the script, and **Edit as VRL** turns the step into a **Custom VRL** step.
 
 A **Custom VRL** step is a [VRL](/en-US/functions) script. **Start from a saved function** fills
@@ -83,6 +91,32 @@ Built-in presets ship with every instance and are read-only:
   Presets and saved functions share one catalog on the **Functions** page. Presets are read-only. Select **Start from this** on a preset to create a function of the organization.
 </Tip>
 
+### Filter and sample
+
+**Filter events** and **Sample** drop events on purpose with the VRL `abort` statement. A dropped
+event goes to no destination and to no dead letter stream. A run counts it as dropped, not as
+failed.
+
+- **Filter events** tests one field, and **Events that match** sets the action: **Keep, drop the rest** or **Drop**. A test compares the value with text or a regular expression, checks whether the field exists, or compares numbers. A numeric test matches a number, or text that reads as one.
+- **Sample** keeps the **Share to keep (%)**, a number above 0 and up to 100. With **Sample by field (optional)**, the events that share a value of the field are kept or dropped together, such as all the spans of one trace. Without it, each event is kept at random.
+
+A **Custom VRL** step drops an event the same way, in both modes:
+
+```ruby
+# drop health checks
+if .path == "/healthz" {
+  abort
+}
+```
+
+In a scheduled pipeline, a step reads the stream that the event was read from as
+`%source_stream`. The value does not become a field of the event unless a step copies it:
+
+```ruby
+# keep the name of the stream that each event came from
+.origin = %source_stream
+```
+
 ### Routing
 
 The built-in routing step chooses the target stream of each event. Both modes support it. A route is one of:
@@ -91,6 +125,8 @@ The built-in routing step chooses the target stream of each event. Both modes su
 - **Route by field**, which writes to the stream named by a field of the event. An optional **Stream prefix** is prepended, and the **Fallback stream** receives events whose field is missing, not a string, or not a valid stream name.
 
 The route reads the fields as they are when the step runs, and later steps do not change a decision that was already made. When several routing steps run, the last result wins. A stream name has 1 to 255 characters from ASCII letters, digits, `_`, `-`, and `.`. Names such as `.` and `..`, and the protected `_molesignal`, are rejected. Missing streams are created on the first write.
+
+In a scheduled pipeline, the route replaces only the first target stream. Every further target stream takes every event, whatever the route picks. A route cannot lead back into a stream that the pipeline reads: a **Fixed stream** or a **Fallback stream** that is a source is rejected on save with `400`, and an event whose field names a source counts as failed and goes to the dead letter stream.
 
 ### Extend tables
 
@@ -140,6 +176,7 @@ Behavior to plan for:
 
 - Each event runs through the steps in order. A step that fails, or a result that is not an object, rejects that event. The intake response lists it, for example `{"index":1,"reason":"realtime transform `needs-level` failed"}`, and the other events of the batch are accepted.
 - **Also retain in source stream** keeps the original event in the source stream next to the transformed copy. It is off by default. When the source and the target are the same stream, only the transformed event is written.
+- A step that runs `abort` drops the event on purpose. Nothing is routed, and the intake response counts the event as accepted without an error. When the source and the target differ, **Also retain in source stream** still keeps the original event.
 - Only one realtime pipeline can be enabled per source stream. A second one fails with `409`. The pipeline supports logs only.
 - A change of configuration applies to later batches. A batch that has already started keeps the configuration it read.
 - The output of a pipeline does not trigger another pipeline.
@@ -148,20 +185,25 @@ Behavior to plan for:
 
 ## Scheduled pipelines
 
-A scheduled pipeline reads a source stream over a time window, applies the chain, and writes the output to a target stream. It can also fan the same events out to connectors.
+A scheduled pipeline reads its source streams on an interval, applies the chain, and writes the output to its target streams. It can also deliver the same events to connectors.
 
 ### Sinks and connector egress
 
-A sink is either a **target stream** (the default, written through standard intake and queryable) or an external **connector**:
+A scheduled pipeline writes up to 8 **target streams** through standard intake, where the events are queryable, and delivers to external **connectors**:
+
+- Every event goes to the first target stream, the `target_stream`, unless a routing step picks another stream.
+- Every further target stream takes every event that comes through the steps.
+- Every connector receives every event that comes through the steps.
 
 | Connector | Payload |
 |---|---|
 | **S3** | Batched JSON Lines `PUT` to `s3://<bucket>/<prefix><id>.jsonl`. |
 | **Kafka** | One JSON record per event to the configured topic. |
+| **HTTP / Webhook** | Batches sent to the configured URL with `POST` or `PUT`, as NDJSON or a JSON array. |
 
-Add connectors under **Pipelines → Connectors**, then add them to the **Destinations** of the flow with **Add connector**. A pipeline can write to a stream and egress to connectors in the same run. A scheduled pipeline cannot route events back into its own source stream.
+Add connectors under **Pipelines → Connectors**, then add them to the **Destinations** of the flow with **Add destination → Connector**. A pipeline writes its streams and delivers to its connectors in the same run. A pipeline cannot write a stream that it reads: a target stream that is also a source is rejected with `409`.
 
-The target stream does not have to exist beforehand. The first write creates it with a schema inferred from the output, and later runs add new fields the way any other stream does. An event whose field type conflicts with the schema of an existing target stream is rejected on its own: the other events of the run are still written, and the reason is logged as a warning. If the target stream rejects every event, the run fails and the reason appears in its `error`. A backfill writes the target stream the same way.
+A target stream does not have to exist beforehand. The first write creates it with a schema inferred from the output, and later runs add new fields the way any other stream does. An event whose field type conflicts with the schema of an existing target stream is rejected on its own: it counts as failed and goes to the dead letter stream, and the other events of the run are still written. When a target stream rejects every event of a run and the pipeline has no dead letter stream, the run fails and the reason appears in its `error`. A backfill writes the same way.
 
 ### Hide the source stream from queries
 
@@ -169,25 +211,83 @@ When a catch-all source stream fans out into per-service or per-tenant target st
 
 A non-queryable stream still accepts and retains data and feeds the pipeline. It is hidden from the query stream selectors, and SQL and PromQL searches reject it with `stream is not queryable`. Turn the toggle on again at any time.
 
-### Schedule and lookback
+### Schedule and read positions
 
-| Field | Notes |
-|---|---|
-| `cron` | Interval shorthand: `every:30s`, `every:5m`, or `every:1h`. |
-| `lookback_secs` | How far back each run reads from the source. The default is 300. |
-| `enabled` | Pauses or resumes the schedule without deleting the pipeline. |
+| Field | Editor | Notes |
+|---|---|---|
+| `cron` | **Run every** | Interval shorthand: `every:30s`, `every:5m`, or `every:1h`. |
+| `lookback_secs` | **First run reads back** | How far back the first run of a source reads. The default is 300. |
+| `function_steps.delay_secs` | **Wait for late events** | Seconds that the latest stretch of time is left for late events before a run reads it. 0 to 3600, default 60. |
+| `enabled` | **Run on schedule** | Pauses or resumes the schedule without deleting the pipeline. |
 
 The runner does not parse standard cron expressions. A schedule outside the `every:` syntax is rejected with `400`: `scheduled pipelines require every:Ns/m/h and a positive lookback`.
 
-On each tick the runner reads `[now - lookback_secs, now]` from the source, applies the chain, and writes the output. The runner checks for due pipelines every 15 seconds, so very short intervals run at that granularity. Every run is recorded: view the history in the **Run history** tab of the pipeline, or with `GET /api/v1/scheduled_pipelines/{id}/runs`, which returns `state`, `scanned_rows`, and `error`.
+The pipeline keeps a read position for each source: the time before which the events of that source have been handled. Each run reads every source from its read position up to the time of the run minus the wait for late events, applies the chain, and writes the output. The read position then moves to where the run stopped reading, and the next run starts there. An event that arrives within the wait is read once. An event that arrives later, with a timestamp that a run has already passed, is not read, so raise **Wait for late events** for a source that receives late data.
+
+- The first run of a source reads back `lookback_secs`. A source that is added later starts the same way.
+- A run reads at most the longest of the interval, `lookback_secs`, and one hour of each source. A source that is further behind runs again at the next check, a stretch at a time, until it catches up.
+- Enabling a paused pipeline starts over: the first run reads back `lookback_secs` from the time of the run, whatever was read before the pause. Submit a [backfill](#backfill) to process the time outside that window.
+
+The runner checks for due pipelines every 15 seconds, so very short intervals run at that granularity.
 
 <Note>
   The schedule runner runs on the `alert` role, which `standalone` includes. With several `alert` nodes, each pipeline belongs to one node, so an enabled pipeline fires once per interval and not once per node. See [Role-based deployment](/en-US/distributed-deployment#work-division-between-alert-nodes).
 </Note>
 
+### Retries and dead letters
+
+| Field | Editor | Notes |
+|---|---|---|
+| `function_steps.retry.run_retries` | **Retry a failed run** | More attempts at a window whose read or write failed. 0 to 10, default 3. |
+| `function_steps.retry.delivery_retries` | **Retry a failed delivery** | More attempts at a connector delivery within the run. 0 to 10, default 3. |
+| `function_steps.dead_letter_stream` | **Dead letter stream** | The logs stream that keeps the events that could not be processed, written, or delivered. Optional. |
+| `function_steps.dedupe_field` | **Dedupe by field** | Drops an event whose value of this field was already seen in the same run. Optional. |
+
+When the read of a source or a write to a stream fails, for example because storage is unavailable, the read position of that source stays where it was:
+
+- The same window is tried again after 30 seconds, then after twice as long each time, up to the interval.
+- A retry writes only to the destinations that did not take the window before.
+- When the retries run out, the window is skipped. The read position moves past it, and the `warning` of the run names the source and the stretch of time that was not processed.
+- A failure that every attempt would meet again, such as an invalid configuration, holds the read position without a retry. Each regular run reads from the same place again, so nothing is skipped while the pipeline is being fixed.
+
+A connector delivery that fails is tried again within the run, after 1 second and then twice as long each time, up to 30 seconds. Events that the connector still does not take go to the dead letter stream. A later run, a retry of the window included, does not deliver them again.
+
+The dead letter stream is a logs stream whatever the signal of the pipeline, so dead letters are read in **Logs**. It cannot be a stream that the pipeline reads or writes. Each dead letter is the event with these fields added:
+
+| Field | Content |
+|---|---|
+| `dead_letter_pipeline` | The name of the pipeline. |
+| `dead_letter_stage` | `transform` when a step failed on the event or routed it into a source, `write` when a target stream rejected it, and `deliver` when a connector did not take it. |
+| `dead_letter_reason` | What went wrong. |
+| `dead_letter_source` | The stream that the event was read from. |
+| `dead_letter_destination` | The stream or the connector that did not take the event. Set for `write` and `deliver`. |
+
+A `transform` dead letter keeps the event as it was read. A `write` or `deliver` dead letter keeps the event as it was sent. Without a dead letter stream, these events count as failed and are not kept.
+
+**Dedupe by field** works after the steps, within one run and across all sources: the first event with a value of the field is kept, and later events with the same value are dropped. Events without the field are all kept. A name such as `user.id` reaches into nested objects when the event has no field with that literal name.
+
+### Run history
+
+Every run that reads a window is recorded. Open the history in the **Run history** tab of the pipeline, with **More → History** in the editor, or with `GET /api/v1/scheduled_pipelines/{id}/runs`.
+
+| Column | Content |
+|---|---|
+| **State** | The state of the run, with the attempt when the run retried a failed window. |
+| **Started** and **Duration** | When the run started and how long it took. |
+| **Events** | How many events the run read, and how many of them were written, dropped, or failed. |
+| **Problems** | The `error` of a failed run, or the `warning` of a run that went through with problems, such as rejected or undelivered events and skipped windows. |
+
+Every event that a run reads ends in one count:
+
+- **written**: every destination that it was meant for took it.
+- **dropped**: a step dropped it with `abort`, or **Dedupe by field** removed it.
+- **failed**: a step failed on it, it was routed into a source, or a destination did not take it.
+
+A run fails when a window failed, when a target stream took none of its events and there is no dead letter stream, or when the pipeline cannot run at all. While a retry is planned, the history page names the source that failed and the time of the next attempt.
+
 ### Backfill
 
-To process a historical window on demand, submit a backfill:
+To process a historical window on demand, open **More → Backfill** in the editor, set **From** and **To**, and select **Submit backfill**. Or submit it through the API:
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backfill \
@@ -196,7 +296,9 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backf
   -d '{"start_micros": 1790000000000000, "end_micros": 1790086400000000}'
 ```
 
-The window must not exceed 31 days. The request returns `202` with a `job_id` and a `monitor` path. The backfill runs through the asynchronous [search job](/en-US/distributed-deployment#asynchronous-search-jobs) worker: it reads the source window, applies the same chain, writes the target stream, and egresses to connectors.
+The window must not exceed 31 days. The request returns `202` with one job per source, each with a `job_id` and a `monitor` path. Each job runs through the asynchronous [search job](/en-US/distributed-deployment#asynchronous-search-jobs) worker: it reads its source over the window, applies the same chain, and writes, delivers, and keeps dead letters the way a run does.
+
+A backfill leaves the read positions where they are, so the scheduled runs read what they would have read without it. A backfill window that overlaps time that runs already processed writes those events again.
 
 ## Permissions
 

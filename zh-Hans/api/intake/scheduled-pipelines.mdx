@@ -26,11 +26,15 @@ description: "列出、查看、编辑、运行、暂停与删除流水线。"
     "name": "normalize-app",
     "source_stream": "app_raw",
     "target_stream": "app",
-    "function_steps": { "mode": "scheduled", "signal_type": "logs", "steps": [ ... ] },
+    "function_steps": { "mode": "scheduled", "signal_type": "logs", "sources": ["app_raw", "nginx_raw"], "steps": [ ... ] },
     "cron": "every:5m",
     "lookback_secs": 300,
     "enabled": true,
     "last_run_at_micros": 1790000000000000,
+    "read_until_micros": { "app_raw": 1789999940000000, "nginx_raw": 1789999940000000 },
+    "retry": null,
+    "created_at_micros": 1789900000000000,
+    "updated_at_micros": 1789900000000000,
     "last_run_state": "succeeded",
     "last_run_started_at_micros": 1790000000000000,
     "last_run_finished_at_micros": 1790000000250000,
@@ -44,9 +48,51 @@ description: "列出、查看、编辑、运行、暂停与删除流水线。"
 ```
 </ResponseExample>
 
+每一项包含[查看](#查看)返回的字段、最近一次运行的 `last_run_state`、`last_run_started_at_micros`、`last_run_finished_at_micros`、`last_run_scanned_rows`（它读入的事件数）与 `last_run_error`，以及过去 24 小时的运行次数。
+
+## 查看
+
+```http
+GET /api/v1/scheduled_pipelines/{id}
+```
+
+返回流水线，以及每个来源的读取位点和已计划的重试：
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KBHcb6imgQq7FXBsROGTIRHOyg",
+  "name": "normalize-app",
+  "source_stream": "app_raw",
+  "target_stream": "app",
+  "function_steps": { "mode": "scheduled", "signal_type": "logs", "sources": ["app_raw", "nginx_raw"], "steps": [ ... ] },
+  "cron": "every:5m",
+  "lookback_secs": 300,
+  "enabled": true,
+  "last_run_at_micros": 1790000000000000,
+  "read_until_micros": { "app_raw": 1789999940000000, "nginx_raw": 1789999640000000 },
+  "retry": {
+    "source": "nginx_raw",
+    "attempt": 2,
+    "next_at_micros": 1790000030000000,
+    "error": "read: <reason>"
+  },
+  "created_at_micros": 1789900000000000,
+  "updated_at_micros": 1789900000000000
+}
+```
+</ResponseExample>
+
+| 字段 | 说明 |
+|---|---|
+| `read_until_micros` | 每个来源的读取位点，单位微秒。该来源在这个时间之前的事件都已处理。还没有读取过的来源不出现在这里。 |
+| `retry` | 最早一次已计划的失败窗口重试，没有时为 `null`。`source` 是来源，`attempt` 是这次重试将是第几次尝试，`next_at_micros` 是重试的时间，`error` 是上一次尝试失败的原因。 |
+
+参见[定时与读取位点](/zh-Hans/pipelines#定时与读取位点)和[重试与死信](/zh-Hans/pipelines#重试与死信)。
+
 ## 更新与删除
 
-`PUT` 的请求体与[创建流水线](/zh-Hans/api/intake/create-pipeline)相同，并替换整个配置。只修改 `enabled` 需要 `pipelines.pause`，其他修改需要 `pipelines.edit`。`DELETE` 返回 `{"deleted": true}`。
+`PUT` 的请求体与[创建流水线](/zh-Hans/api/intake/create-pipeline)相同，并替换整个配置。只修改 `enabled` 需要 `pipelines.pause`，其他修改需要 `pipelines.edit`。把 `enabled` 从 `false` 改为 `true` 会重置读取位点，每个来源重新往回读 `lookback_secs`。`DELETE` 返回 `{"deleted": true}`。
 
 ## 运行历史
 
@@ -54,7 +100,42 @@ description: "列出、查看、编辑、运行、暂停与删除流水线。"
 GET /api/v1/scheduled_pipelines/{id}/runs?limit=50&before_micros=<cursor>
 ```
 
-按时间倒序返回定时流水线的运行记录，包含 `id`、`state`、`started_at_micros`、`finished_at_micros`、`scanned_rows` 与 `error`。实时流水线不产生运行记录。
+按时间倒序返回定时流水线的运行记录。实时流水线不产生运行记录。
+
+<ResponseExample>
+```json 200
+[
+  {
+    "id": "3KE7Yq0d3jvXm5cJ8r2bWQzN1aP",
+    "pipeline_id": "3KBHcb6imgQq7FXBsROGTIRHOyg",
+    "state": "succeeded",
+    "started_at_micros": 1790000000000000,
+    "finished_at_micros": 1790000000250000,
+    "scanned_rows": 1200,
+    "written_rows": 1150,
+    "dropped_rows": 48,
+    "failed_rows": 2,
+    "attempt": 1,
+    "error": null,
+    "warning": "stream `app` rejected 2 event(s): <reason>"
+  }
+]
+```
+</ResponseExample>
+
+| 字段 | 说明 |
+|---|---|
+| `state` | `running`、`succeeded`、`failed` 或 `cancelled`。 |
+| `started_at_micros`、`finished_at_micros` | 运行的开始与结束时间。运行进行中时 `finished_at_micros` 为 `null`。 |
+| `scanned_rows` | 这次运行从各来源读入的事件数。 |
+| `written_rows` | 每个目标都收下的事件数。 |
+| `dropped_rows` | 被步骤用 `abort` 丢弃或被去重去掉的事件数。 |
+| `failed_rows` | 步骤处理失败、被路由到来源，或某个目标没有收下的事件数。 |
+| `attempt` | 第一次尝试为 `1`。运行重试了失败的窗口时更大。 |
+| `error` | 运行失败的原因：失败的窗口及已计划的重试，或在没有死信数据流时某个目标数据流一条事件都没有收下。 |
+| `warning` | 没有让运行失败的问题，例如处理失败的事件、被拒收或投递不成功的事件，或重试用完后被跳过的窗口。 |
+
+`scanned_rows` 等于 `written_rows`、`dropped_rows` 与 `failed_rows` 之和。
 
 ## 回填
 
@@ -79,10 +160,22 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backf
 <ResponseExample>
 ```json 202
 {
-  "job_id": "3KE6epTrWXts1oa2ePEKIHKxG19",
-  "monitor": "/api/v1/query/jobs/3KE6epTrWXts1oa2ePEKIHKxG19"
+  "jobs": [
+    {
+      "source": "app_raw",
+      "job_id": "3KE6epTrWXts1oa2ePEKIHKxG19",
+      "monitor": "/api/v1/query/jobs/3KE6epTrWXts1oa2ePEKIHKxG19"
+    },
+    {
+      "source": "nginx_raw",
+      "job_id": "3KE6eqAbXq0n2yLr7VvTq9cUo4D",
+      "monitor": "/api/v1/query/jobs/3KE6eqAbXq0n2yLr7VvTq9cUo4D"
+    }
+  ]
 }
 ```
 </ResponseExample>
 
-实时流水线会返回 `400`（`realtime pipelines do not support backfill`）。用 `monitor` 路径跟踪任务，参见[查询](/zh-Hans/query#时间范围与异步任务)。
+回填为每个来源各提交一个搜索任务。每个任务在窗口内读取它的来源、应用各步骤，并像定时运行一样写入、投递和保存死信。流水线的读取位点不变。用每个任务的 `monitor` 路径跟踪它，参见[查询](/zh-Hans/query#时间范围与异步任务)。
+
+实时流水线会返回 `400`（`realtime pipelines do not support backfill`）。

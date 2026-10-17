@@ -15,11 +15,11 @@ Creates a pipeline. The path keeps the name `scheduled_pipelines` for both modes
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `name` | string | Yes | Pipeline name. |
-| `source_stream` | string | Yes | The stream that the pipeline reads. |
-| `target_stream` | string | Yes | The stream that the pipeline writes. It must differ from the source, or the call answers `409`. |
-| `function_steps` | object | Yes | The steps and the mode. See below. |
+| `source_stream` | string | Yes | The first stream that the pipeline reads. |
+| `target_stream` | string | Yes | The first stream that the pipeline writes. In a scheduled pipeline, a stream that the pipeline reads answers `409`. |
+| `function_steps` | object | Yes | The steps, the mode, and the settings of a scheduled pipeline. See below. |
 | `cron` | string | Yes | `every:30s`, `every:5m`, or `every:1h` for a scheduled pipeline. An empty string for a realtime pipeline. |
-| `lookback_secs` | integer | No | Seconds that each scheduled run reads back. Default 300. |
+| `lookback_secs` | integer | No | Seconds that the first scheduled run of a source reads back. Default 300. A scheduled pipeline needs a positive value. |
 | `enabled` | boolean | No | Default `true`. |
 
 `function_steps` fields:
@@ -29,8 +29,13 @@ Creates a pipeline. The path keeps the name `scheduled_pipelines` for both modes
 | `mode` | `scheduled` (default) or `realtime`. |
 | `signal_type` | `logs`, `metrics`, or `traces`. A realtime pipeline supports `logs` only. |
 | `steps` | Ordered steps. A VRL step has `transform_name`, `script`, and `kind` set to `vrl`. A routing step has `kind` set to `builtin`, `operation` set to `route`, and a `routing` object. |
-| `sources`, `sinks` | Stream names. Required for a realtime pipeline. |
-| `sink_connectors` | Scheduled only. Ids of the connectors that also receive the output. |
+| `sources` | The streams to read. `source_stream` is read first, and a scheduled pipeline also reads every other stream in the list, up to 8 in all. A realtime pipeline accepts only `[source_stream]`. |
+| `sinks` | The streams to write. `target_stream` comes first, and every other stream in the list takes every event, up to 8 in all. A realtime pipeline accepts only `[target_stream]`. |
+| `sink_connectors` | Scheduled only. Ids of the connectors that receive every event. |
+| `delay_secs` | Scheduled only. Seconds that the latest stretch of time is left for late events before a run reads it. 0 to 3600, default 60. |
+| `retry` | Scheduled only. `run_retries`, the further attempts at a window whose read or write failed, and `delivery_retries`, the further attempts at a connector delivery. Each 0 to 10, default 3. |
+| `dead_letter_stream` | Scheduled only. The logs stream for events that could not be processed, written, or delivered. It cannot be a stream that the pipeline reads or writes. |
+| `dedupe_field` | Scheduled only. Within one run, an event whose value of this field was already seen is dropped. |
 | `retain_source` | Realtime only. Keeps the original event in the source stream. |
 
 <RequestExample>
@@ -43,10 +48,15 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines \
     "source_stream": "app_raw",
     "target_stream": "app",
     "function_steps": {
-      "language": "vrl",
+      "mode": "scheduled",
       "signal_type": "logs",
+      "sources": ["app_raw", "nginx_raw"],
+      "sinks": ["app", "app_archive"],
+      "delay_secs": 60,
+      "retry": { "run_retries": 3, "delivery_retries": 3 },
+      "dead_letter_stream": "pipeline_dead_letters",
       "steps": [
-        { "transform_name": "normalize-level",
+        { "transform_name": "normalize-level", "kind": "vrl",
           "script": ".level = downcase!(string!(.level))" }
       ]
     },
@@ -64,11 +74,13 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines \
   "name": "normalize-app",
   "source_stream": "app_raw",
   "target_stream": "app",
-  "function_steps": { "language": "vrl", "signal_type": "logs", "steps": [ ... ] },
+  "function_steps": { "mode": "scheduled", "signal_type": "logs", "sources": ["app_raw", "nginx_raw"], "steps": [ ... ] },
   "cron": "every:5m",
   "lookback_secs": 300,
   "enabled": true,
   "last_run_at_micros": null,
+  "read_until_micros": {},
+  "retry": null,
   "created_at_micros": 1790000000000000,
   "updated_at_micros": 1790000000000000
 }
@@ -79,7 +91,7 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines \
 
 | Status | Cause |
 |---|---|
-| `400` | A schedule outside `every:Ns/m/h`, a non-positive lookback, or a realtime pipeline for a signal other than logs. |
-| `409` | The source and the target stream are the same, or a realtime pipeline is already enabled for the source stream. |
+| `400` | A schedule outside `every:Ns/m/h`, a non-positive lookback, a realtime pipeline for a signal other than logs, a VRL step that does not compile, an invalid stream name, more than 8 streams to read or to write, a routing step whose fixed stream or fallback stream is a source, a dead letter stream that the pipeline reads or writes, or `delay_secs` or a retry count out of range. |
+| `409` | A scheduled pipeline that would write a stream that it reads, or a realtime pipeline that is already enabled for the source stream. |
 
-See [Pipelines](/en-US/pipelines) for the realtime mode and the routing step.
+See [Pipelines](/en-US/pipelines) for the realtime mode, the routing step, read positions, and retries.

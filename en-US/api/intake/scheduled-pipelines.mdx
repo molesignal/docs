@@ -26,11 +26,15 @@ The list returns every pipeline with the state of its latest run and a 24-hour s
     "name": "normalize-app",
     "source_stream": "app_raw",
     "target_stream": "app",
-    "function_steps": { "mode": "scheduled", "signal_type": "logs", "steps": [ ... ] },
+    "function_steps": { "mode": "scheduled", "signal_type": "logs", "sources": ["app_raw", "nginx_raw"], "steps": [ ... ] },
     "cron": "every:5m",
     "lookback_secs": 300,
     "enabled": true,
     "last_run_at_micros": 1790000000000000,
+    "read_until_micros": { "app_raw": 1789999940000000, "nginx_raw": 1789999940000000 },
+    "retry": null,
+    "created_at_micros": 1789900000000000,
+    "updated_at_micros": 1789900000000000,
     "last_run_state": "succeeded",
     "last_run_started_at_micros": 1790000000000000,
     "last_run_finished_at_micros": 1790000000250000,
@@ -44,9 +48,51 @@ The list returns every pipeline with the state of its latest run and a 24-hour s
 ```
 </ResponseExample>
 
+Each item carries the fields of [Get](#get), the latest run as `last_run_state`, `last_run_started_at_micros`, `last_run_finished_at_micros`, `last_run_scanned_rows` (the events that it read), and `last_run_error`, and the counts of runs over the past 24 hours.
+
+## Get
+
+```http
+GET /api/v1/scheduled_pipelines/{id}
+```
+
+Returns the pipeline with the read position of each source and the planned retry:
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KBHcb6imgQq7FXBsROGTIRHOyg",
+  "name": "normalize-app",
+  "source_stream": "app_raw",
+  "target_stream": "app",
+  "function_steps": { "mode": "scheduled", "signal_type": "logs", "sources": ["app_raw", "nginx_raw"], "steps": [ ... ] },
+  "cron": "every:5m",
+  "lookback_secs": 300,
+  "enabled": true,
+  "last_run_at_micros": 1790000000000000,
+  "read_until_micros": { "app_raw": 1789999940000000, "nginx_raw": 1789999640000000 },
+  "retry": {
+    "source": "nginx_raw",
+    "attempt": 2,
+    "next_at_micros": 1790000030000000,
+    "error": "read: <reason>"
+  },
+  "created_at_micros": 1789900000000000,
+  "updated_at_micros": 1789900000000000
+}
+```
+</ResponseExample>
+
+| Field | Notes |
+|---|---|
+| `read_until_micros` | The read position of each source, in microseconds. The events of the source before it have been handled. A source that has not been read yet has no entry. |
+| `retry` | The soonest planned retry of a window that failed, or `null`. `source` names the source, `attempt` is the attempt that the retry will be, `next_at_micros` is when it is due, and `error` is what the last attempt failed on. |
+
+See [Schedule and read positions](/en-US/pipelines#schedule-and-read-positions) and [Retries and dead letters](/en-US/pipelines#retries-and-dead-letters).
+
 ## Update and delete
 
-`PUT` takes the same body as [Create a pipeline](/en-US/api/intake/create-pipeline) and replaces the configuration. Changing only `enabled` needs `pipelines.pause`, and any other change needs `pipelines.edit`. `DELETE` answers `{"deleted": true}`.
+`PUT` takes the same body as [Create a pipeline](/en-US/api/intake/create-pipeline) and replaces the configuration. Changing only `enabled` needs `pipelines.pause`, and any other change needs `pipelines.edit`. Changing `enabled` from `false` to `true` resets the read positions, so every source reads back `lookback_secs` again. `DELETE` answers `{"deleted": true}`.
 
 ## Run history
 
@@ -54,7 +100,42 @@ The list returns every pipeline with the state of its latest run and a 24-hour s
 GET /api/v1/scheduled_pipelines/{id}/runs?limit=50&before_micros=<cursor>
 ```
 
-Returns the runs of a scheduled pipeline, newest first, with `id`, `state`, `started_at_micros`, `finished_at_micros`, `scanned_rows`, and `error`. A realtime pipeline records no runs.
+Returns the runs of a scheduled pipeline, newest first. A realtime pipeline records no runs.
+
+<ResponseExample>
+```json 200
+[
+  {
+    "id": "3KE7Yq0d3jvXm5cJ8r2bWQzN1aP",
+    "pipeline_id": "3KBHcb6imgQq7FXBsROGTIRHOyg",
+    "state": "succeeded",
+    "started_at_micros": 1790000000000000,
+    "finished_at_micros": 1790000000250000,
+    "scanned_rows": 1200,
+    "written_rows": 1150,
+    "dropped_rows": 48,
+    "failed_rows": 2,
+    "attempt": 1,
+    "error": null,
+    "warning": "stream `app` rejected 2 event(s): <reason>"
+  }
+]
+```
+</ResponseExample>
+
+| Field | Notes |
+|---|---|
+| `state` | `running`, `succeeded`, `failed`, or `cancelled`. |
+| `started_at_micros`, `finished_at_micros` | When the run started and ended. `finished_at_micros` is `null` while the run is running. |
+| `scanned_rows` | The events that the run read from its sources. |
+| `written_rows` | The events that every destination took. |
+| `dropped_rows` | The events that a step dropped with `abort`, or that dedupe removed. |
+| `failed_rows` | The events that a step failed on, that were routed into a source, or that a destination did not take. |
+| `attempt` | `1` for a first attempt. Higher when the run retried a window that failed. |
+| `error` | Why the run failed: a window that failed, with the planned retry, or a target stream that took none of its events while the pipeline has no dead letter stream. |
+| `warning` | What went wrong without failing the run, such as events that failed, rejected or undelivered events, or a window skipped after its retries. |
+
+`scanned_rows` equals the sum of `written_rows`, `dropped_rows`, and `failed_rows`.
 
 ## Backfill
 
@@ -79,10 +160,22 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backf
 <ResponseExample>
 ```json 202
 {
-  "job_id": "3KE6epTrWXts1oa2ePEKIHKxG19",
-  "monitor": "/api/v1/query/jobs/3KE6epTrWXts1oa2ePEKIHKxG19"
+  "jobs": [
+    {
+      "source": "app_raw",
+      "job_id": "3KE6epTrWXts1oa2ePEKIHKxG19",
+      "monitor": "/api/v1/query/jobs/3KE6epTrWXts1oa2ePEKIHKxG19"
+    },
+    {
+      "source": "nginx_raw",
+      "job_id": "3KE6eqAbXq0n2yLr7VvTq9cUo4D",
+      "monitor": "/api/v1/query/jobs/3KE6eqAbXq0n2yLr7VvTq9cUo4D"
+    }
+  ]
 }
 ```
 </ResponseExample>
 
-A realtime pipeline answers `400` (`realtime pipelines do not support backfill`). Follow the job with the `monitor` path. See [Query](/en-US/query#time-ranges-and-asynchronous-jobs).
+The backfill submits one search job per source. Each job reads its source over the window, applies the steps, and writes, delivers, and keeps dead letters the way a scheduled run does. The read positions of the pipeline do not move. Follow each job with its `monitor` path. See [Query](/en-US/query#time-ranges-and-asynchronous-jobs).
+
+A realtime pipeline answers `400` (`realtime pipelines do not support backfill`).
