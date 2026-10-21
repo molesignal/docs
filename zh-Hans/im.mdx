@@ -1,0 +1,281 @@
+---
+title: "在 IM 里使用 Mole Agent"
+sidebarTitle: "IM"
+description: "在飞书、Slack、钉钉、企业微信、Google Chat 和 Microsoft Teams 里问 Mole Agent：在群里 @ 它或私聊它。"
+"en_link": "/en-US/im"
+---
+
+Mole Agent 通过通知设置里的连接器在飞书、Slack、钉钉、企业微信、Google Chat 和 Microsoft Teams 里回答。在群里 @ 它，或者私聊它。处理的时候它会表示正在处理：飞书和 Slack 在你的消息上加一个表情，企业微信、Google Chat 和 Teams 先回复一条“正在查”，答好后原地换成答案。答案附上 MoleSignal 里这个会话的链接。
+
+这些会话就是普通的 Mole Agent 会话：在 MoleSignal 里能看到、能接着问，计入组织的每日预算，也和别的回答一样打分。参见[质量](/zh-Hans/quality)。
+
+## 怎么收消息
+
+| 平台 | 连接器 | 收消息的方式 |
+|---|---|---|
+| 飞书 | 飞书应用（`lark_app`） | 飞书的长连接 |
+| Slack | Slack 应用（`slack_app`） | Socket Mode |
+| 钉钉 | 钉钉应用（`dingtalk_app`） | Stream 模式 |
+| 企业微信 | 企业微信智能机器人（`wecom_bot`） | 智能机器人的长连接 |
+| Google Chat | Google Chat 应用（`google_chat_app`） | 从 Cloud Pub/Sub 订阅里拉取 |
+| Microsoft Teams | Microsoft Teams 机器人（`teams_app`） | Bot Framework 投到 MoleSignal 的公网回调地址 |
+
+除了 Teams，每个连接器都由一台 MoleSignal 服务器主动连出去收消息，MoleSignal 不需要能被公网访问。Teams 需要一个 https 的公网回调地址，先看完 [Teams 的安全措施](#teams-的安全措施)。每个平台要准备的地址、账号和权限见[外部条件](#外部条件)。
+
+## 开始之前
+
+- 开启需要 `agent.manage`，提问的人需要 `agent.use`。
+- 在**设置 → 通知 → 连接器**里有对应平台的连接器（见上表）：Slack 应用要填 Bot Token 和 App-Level Token，Google Chat 应用要填 Pub/Sub 订阅。参见[通知渠道](/zh-Hans/notification-channels)。
+- 要让大家自己绑定账号、让回复带上会话的链接，MoleSignal 要配置对外地址 `http.external_url`。Teams 还要求它是 https 地址，回调地址就在它下面。参见[配置](/zh-Hans/configuration)。
+
+## 在平台上设置
+
+### 飞书
+
+<Steps>
+  <Step title="用长连接接收事件">
+    在飞书开发者后台打开应用，进入**事件与回调**，选择**使用长连接接收事件**。
+  </Step>
+  <Step title="订阅消息">
+    添加事件**接收消息**（`im.message.receive_v1`）。
+  </Step>
+  <Step title="开通权限">
+    让应用能读取用户发给机器人的单聊消息、读取群里 @ 机器人的消息、以应用的身份发消息，以及给消息添加表情回复。想在话题里不 @ 机器人也能接着问，再开通读取群组中所有消息的权限。
+  </Step>
+  <Step title="发布">
+    发布应用的一个版本，把机器人加到要它回答的群里。
+  </Step>
+</Steps>
+
+如果用的是 Lark，把连接器的 API 基础地址设为 `https://open.larksuite.com/open-apis`。
+
+### Slack
+
+<Steps>
+  <Step title="生成 App-Level Token">
+    在 **Basic Information → App-Level Tokens** 生成一个带 `connections:write` 范围的令牌，填到连接器的 **App-Level Token**（以 `xapp-` 开头）。
+  </Step>
+  <Step title="开启 Socket Mode">
+    在 **Socket Mode** 里开启。
+  </Step>
+  <Step title="订阅事件">
+    在 **Event Subscriptions → Subscribe to bot events** 添加 `app_mention` 和 `message.im`。想在话题里不 @ 机器人也能接着问，再添加 `message.channels` 和 `message.groups`。
+  </Step>
+  <Step title="添加机器人权限">
+    在 **OAuth & Permissions** 添加 `app_mentions:read`、`chat:write`、`im:history` 和 `reactions:write`，话题里的回复还需要 `channels:history` 和 `groups:history`。在 **App Home** 里允许用户给应用发消息。重新安装应用，把机器人邀请到要它回答的频道。
+  </Step>
+</Steps>
+
+### 钉钉
+
+<Steps>
+  <Step title="用 Stream 模式接收机器人消息">
+    在钉钉开发者后台打开应用的机器人，把消息接收模式设为 **Stream 模式**。
+  </Step>
+  <Step title="发布">
+    发布机器人，把它加到要它回答的群里。
+  </Step>
+</Steps>
+
+连接器的 **Client ID** 和 **Client Secret** 就是应用的凭证。机器人 RobotCode 不单独填时就是 Client ID。
+
+### 企业微信
+
+企业微信用智能机器人回答：它用 API 模式的长连接收消息，回复也走这条连接。
+
+<Steps>
+  <Step title="创建智能机器人">
+    在企业微信里创建一个智能机器人（管理后台或客户端都可以），创建方式选 **API 模式**，消息接收方式选**长连接**。记下机器人的 **Bot ID** 和长连接专用的 **Secret**。
+  </Step>
+  <Step title="新建连接器">
+    在**设置 → 通知 → 连接器**新建一个**企业微信智能机器人**连接器，填 **Bot ID** 和**长连接 Secret**，长连接地址保留默认的 `wss://openws.work.weixin.qq.com`。
+  </Step>
+  <Step title="加到群里">
+    把机器人加到要它回答的群里，或者让大家私聊它。
+  </Step>
+</Steps>
+
+- 一个机器人同一时间只能有一条长连接。别处用同一个 Bot ID 连上时（例如另一套 MoleSignal 或测试环境），MoleSignal 的连接会被挤掉，状态显示**连不上**及原因。每套环境用各自的机器人。
+- 长连接和 URL 回调只能选一种。机器人改成 URL 回调后，长连接就断了。
+- 机器人的创建人是企业的超级管理员时，消息里的成员 userid 是明文，否则是加密过的。加密的 userid 不方便管理员手工绑定，请大家用 Mole Agent 发的一次性链接自己绑定。
+- 这个连接器不发通知，发通知请用企业微信应用或企业微信 Webhook 连接器。
+
+### Google Chat
+
+Google Chat 应用把消息发到一个 Cloud Pub/Sub 主题，MoleSignal 从它的订阅里拉取，不需要公网地址。
+
+<Steps>
+  <Step title="准备服务账号">
+    在 Google Cloud 项目里开启 **Google Chat API** 和 **Cloud Pub/Sub API**，在同一个项目里建一个服务账号并创建 JSON 密钥。把密钥填到连接器的**服务账号密钥**：这个服务账号是 Chat 应用发消息的身份，也用来拉取订阅。
+  </Step>
+  <Step title="建主题和订阅">
+    在 Pub/Sub 里建一个主题（例如 `mole-chat`）和它的一个 **Pull** 订阅（例如 `mole-chat-sub`）。在订阅上把 **Pub/Sub Subscriber**（`roles/pubsub.subscriber`）角色授予这个服务账号。
+  </Step>
+  <Step title="允许 Chat 往主题里发">
+    在主题上把 **Pub/Sub Publisher**（`roles/pubsub.publisher`）角色授予 `chat-api-push@system.gserviceaccount.com`。做成 Google Workspace 插件的 Chat 应用，改为授予连接设置里显示的服务账号。
+  </Step>
+  <Step title="配置 Chat 应用">
+    在 **Google Chat API → Configuration** 里填应用名称和头像，开启 **Receive 1:1 messages** 和 **Join spaces and group conversations**，在 **Connection settings** 里选 **Cloud Pub/Sub** 并填主题的完整名称 `projects/<项目>/topics/mole-chat`，在 **Visibility** 里选择可以使用这个应用的人和群组。
+  </Step>
+  <Step title="填订阅">
+    在连接器的 **Pub/Sub 订阅**里填 `projects/<项目>/subscriptions/mole-chat-sub`。
+  </Step>
+</Steps>
+
+- 订阅的确认时限保留默认的 10 秒即可：MoleSignal 拉到就确认。
+- 在空间和群聊里，只有 @ 应用的消息会发给它，在话题里接着问也要 @ 它。私聊收到每一条。
+
+### Microsoft Teams
+
+Teams 的消息由 Bot Framework 投到 MoleSignal 的公网回调地址。这是唯一需要从公网访问 MoleSignal 的平台，开启前先按 [Teams 的安全措施](#teams-的安全措施)准备好对外地址。
+
+<Steps>
+  <Step title="准备 Azure Bot">
+    在 Azure 门户创建一个 **Azure Bot**（或用已有的），类型选 **Single Tenant**。在它的 Microsoft Entra 应用注册里创建一个客户端密码。连接器填**应用 ID**、**客户端密码**和**租户 ID**。
+  </Step>
+  <Step title="添加 Teams 渠道">
+    在 Azure Bot 的 **Channels** 里添加 **Microsoft Teams**。
+  </Step>
+  <Step title="开启并复制回调地址">
+    打开 **Mole Agent → 设置 → IM 接入**，开启这个连接器，复制它的**回调地址**：`https://<对外地址>/api/v1/public/im/teams/<连接器 ID>/messages`。
+  </Step>
+  <Step title="填消息终结点">
+    在 Azure Bot 的 **Configuration** 里，把 **Messaging endpoint** 设为这个回调地址。
+  </Step>
+  <Step title="发布 Teams 应用">
+    做一个 Teams 应用包，清单的 `bots` 里填这个 Bot 的应用 ID，范围包括 `personal`、`team` 和 `groupChat`。在 Teams 管理中心或开发人员门户里上传，再装给要用它的人、团队和群聊。
+  </Step>
+</Steps>
+
+- 在频道和群聊里，只有 @ Bot 的消息会发给它，在帖子下接着问也要 @ 它。私聊收到每一条。
+- 只支持 Azure 公有云的 Bot Framework。
+
+## Teams 的安全措施
+
+Teams 的回调地址在公网上。MoleSignal 对它做了这些检查：
+
+- **每个请求都验 Bot Framework 的令牌。** 这个地址不认 MoleSignal 的登录，只认 Bot Framework 签的 JWT：签名的密钥来自 `login.botframework.com` 的 OpenID 元数据（缓存 24 小时）；`iss` 是 `https://api.botframework.com`；`aud` 是这个 Bot 的应用 ID；`exp` 和 `nbf` 允许 5 分钟误差；签名的密钥要为 Teams 渠道（`msteams`）背书；令牌里的 `serviceUrl` 要和消息里的一致。验不过返回 401 或 403，消息不处理。
+- **回复只发给 Bot Framework。** MoleSignal 只把 Bot 的令牌发给 Bot Framework 的服务地址（`smba.trafficmanager.net`、`*.botframework.com`、`*.teams.microsoft.com`）或连接器里配的服务地址，消息里的地址不是这些时拒收。
+- **只收自己的租户。** 连接器的租户填租户 ID（GUID）时，别的租户发来的消息不处理。填域名或 `botframework.com` 时不限制。
+- **地址只对开着的连接器有效。** 连接器没在 **IM 接入**里开启、停用了或删了，回调地址返回 404。地址里只有连接器的 ID，不含密钥。
+- **限制正文大小。** 超过 256 KiB 的请求直接拒绝。
+
+部署上请再做到：
+
+1. **只把回调路径开放到公网。** 用反向代理或网关只转发 `POST /api/v1/public/im/teams/`，登录页和其他 API 仍只在内网访问。例如 nginx：
+
+   ```nginx
+   server {
+     listen 443 ssl;
+     server_name molesignal.example.com;
+     # ssl_certificate 与 ssl_certificate_key …
+     client_max_body_size 256k;
+
+     location /api/v1/public/im/teams/ {
+       limit_except POST { deny all; }
+       proxy_pass http://molesignal.internal:8080;
+       proxy_set_header Host $host;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+       proxy_set_header X-Forwarded-Proto https;
+     }
+
+     location / {
+       return 404;
+     }
+   }
+   ```
+
+   如果员工也通过这个对外地址访问 MoleSignal，就在网关上把其他路径限制在公司网络或 VPN 里，只让回调路径对公网开放。
+2. **用 https。** `http.external_url` 要是 https 地址，Teams 不往 http 投；TLS 可以在代理上终止，证书要是公共 CA 签发的。
+3. **可选：按来源限制。** 可以在防火墙或网关上只允许 Azure 服务标记 `AzureBotService` 里的地址访问回调路径。这些地址会变，要跟着 Azure 公布的列表更新；令牌的验证仍然是主要的防线。
+4. **保管好客户端密码。** 它随连接器加密保存，接口不会返回。定期轮换，换了之后在连接器里更新；Bot 的应用注册只授予它需要的权限。
+5. **留意异常。** 回调请求和令牌验证失败会记在 MoleSignal 的日志与追踪里；**IM 接入**里能看到每个连接器最近一次收到消息的时间。
+
+## 外部条件
+
+每个平台在 MoleSignal 外面要准备好的东西：
+
+| 平台 | MoleSignal 出站要访问 | 入站 | 平台上要准备的 |
+|---|---|---|---|
+| 飞书 | `open.feishu.cn`（Lark 是 `open.larksuite.com`）和它给的长连接地址 | 无 | 企业自建应用、长连接接收事件、消息事件、权限、发布的版本 |
+| Slack | `slack.com` 和 Socket Mode 的 WebSocket 地址 | 无 | App-Level Token、Socket Mode、事件订阅、Bot 权限 |
+| 钉钉 | `api.dingtalk.com`、`oapi.dingtalk.com` 和 Stream 的 WebSocket 地址 | 无 | 企业内部应用的机器人、Stream 模式 |
+| 企业微信 | `openws.work.weixin.qq.com`（WebSocket，443） | 无 | API 模式、长连接的智能机器人，它的 Bot ID 和 Secret |
+| Google Chat | `oauth2.googleapis.com`、`pubsub.googleapis.com`、`chat.googleapis.com` | 无 | Chat API 与 Pub/Sub API、服务账号与 JSON 密钥、主题与拉取订阅、订阅者与发布者两个角色、Chat 应用的配置 |
+| Microsoft Teams | `login.microsoftonline.com`、`login.botframework.com`、`smba.trafficmanager.net` | Bot Framework 访问 `https://<对外地址>/api/v1/public/im/teams/…`（443） | Azure Bot、客户端密码、Teams 渠道、消息终结点、Teams 应用包 |
+
+- 防火墙或出站代理要放行上表里的出站地址。WebSocket 长连接（飞书、Slack、钉钉、企业微信）直接连到平台，不经过 HTTP 代理。
+- Teams 的入站要有：公网 DNS、公共 CA 签发的证书、只转发回调路径的反向代理，见 [Teams 的安全措施](#teams-的安全措施)。
+- 自己绑定账号、回复里的会话链接都要配置 `http.external_url`。
+
+## 开启
+
+打开 **Mole Agent → 设置 → IM 接入**，这里列出所有能在 IM 里回答的连接器：
+
+| 列 | 说明 |
+|---|---|
+| **连接器** | 连接器、它的平台，以及最近一次收到消息的时间。Teams 的连接器下面是它的回调地址，可以复制。 |
+| **状态** | **已连接**及连着的身份、**连接中**、**等待服务器连接**、**连不上**及原因、**未开启**，或连接器还缺什么，例如 Slack 的 App-Level Token、Google Chat 的 Pub/Sub 订阅。Teams 没有长连接：**已连接**表示 Bot 的凭据有效，消息由 Bot Framework 投过来。 |
+| **群里的新话题** | 群里新开的话题记在哪里：**提问人的个人会话**，或某个团队。只有提问人是这个团队的成员时才记成团队会话。 |
+| **启用** | 这个连接器是否在 IM 里回答。Teams 的连接器要 `http.external_url` 是 https 才能开启。 |
+
+在 IM 里回答的连接器要先在这里关掉，才能在通知设置里删除。
+
+## 绑定账号
+
+Mole Agent 按 IM 账号所属的 MoleSignal 用户回答，用这个用户的权限。它靠同一个连接器上启用、已验证的通知方式认出账号：
+
+| 平台 | 账号 |
+|---|---|
+| 飞书 | `open_id`、`user_id` 或 `union_id` |
+| Slack | 成员 ID |
+| 钉钉 | userId |
+| 企业微信 | 智能机器人看到的 userid |
+| Google Chat | 用户（`users/123…`）或邮箱 |
+| Microsoft Teams | Teams 用户 ID（`29:…`）或 Microsoft Entra 对象 ID |
+
+一个账号属于不止一个用户时，Mole Agent 不回答。
+
+- **自己绑定**：还没绑定的人提问时，Mole Agent 私下给他发一个一次性链接：私聊里直接发，Slack 里发一条只有他看得到的消息。他登录 MoleSignal 后打开链接，选择**绑定**，这个账号就成了他的一种通知方式，并且已经验证。链接只能用一次，15 分钟内有效。企业微信和 Google Chat 只能私下发给私聊过机器人的人，Teams 只能发给装了这个 Bot 的人；发不出去时，Mole Agent 在原处请对方先私聊，再在私聊里给链接。
+- **管理员绑定**：在**设置 → 通知 → 用户路由**里给成员绑定这个账号并验证。参见[通知渠道](/zh-Hans/notification-channels#绑定用户通知方式)。
+
+## 提问
+
+在群里 @ 机器人；私聊时直接写。私聊在 `/new` 之前一直是同一个会话。
+
+| 平台 | 群里的一个会话 |
+|---|---|
+| 飞书、Slack | 一个话题，回复发在话题里 |
+| Google Chat 空间 | 一个话题，回复发在话题里，接着问要 @ 应用 |
+| Microsoft Teams 频道 | 一个帖子，回复发在帖子下，接着问要 @ Bot |
+| 钉钉、企业微信、Google Chat 群聊、Teams 群聊 | 没有话题：一个人在一个群里的提问是他自己的一个会话 |
+
+| 命令 | 作用 |
+|---|---|
+| `/help` | 说明怎么提问，列出这些命令。 |
+| `/new` | 在这里开一个新会话。 |
+| `/scope` | 说明这个话题是谁的会话。 |
+| `/scope <团队>` | 接下来在这个团队的一个新会话里继续，团队成员都能看到、能接着问。 |
+| `/scope 我` | 接下来在你的一个新的个人会话里继续。 |
+| `/feedback 👍` 或 `/feedback 👎`，后面可以写说明 | 评价话题里最近的一个回答。 |
+
+其他命令，例如 `/rca INC-12` 或某个技能，和在 MoleSignal 里一样用。
+
+### 话题是谁的会话
+
+个人会话只有开始它的人能接着问；团队会话是这个团队的成员都能接着问。群里新开的话题，提问人在连接器设置的团队里时记成这个团队的会话，否则是他的个人会话。`/scope` 会把话题换到一个新会话，之前的消息留在原来的会话里。
+
+## 回答的时候
+
+- 在 IM 里没有人能回答 Mole Agent 的问题或确认改动。它会做合理的假设并说明，跳过需要有人确认的步骤，回复里会说明跳过了。要继续这些步骤，从链接打开 MoleSignal 里的会话。
+- 一次回答最多 15 分钟。企业微信的“正在查”是一条流式消息，10 分钟内要结束：超过 9 分钟才好的回答另发一条。
+- 回复是带各部分的回答，例如可能原因、证据和下一步，用提问人的界面语言。
+- 在群里，群里所有人都能看到回复，但它是按提问人的权限查出来的。不想让别人看到的，请私聊提问。
+- 组织今天的预算用完时，Mole Agent 会说明，不再回答。
+
+## 限制
+
+- Mole Agent 读文字消息和富文本消息里的文字，企业微信还读语音转成的文字。图片和文件会被忽略。
+- 连着连接器的服务器停了，另一台服务器大约一分钟内接手。这一分钟里的提问，只有平台重新投递时才会在连上后得到回答。Teams 不受影响：哪台服务器收到回调都能处理。
+- 企业微信的回复只能从连着机器人的那台服务器发出。别的服务器上结束的回答交给它发，通常几秒内送到。
+- 企业微信限制每个会话每分钟 30 条、每小时 1000 条消息。

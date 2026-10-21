@@ -1,0 +1,281 @@
+---
+title: "Mole Agent in IM"
+sidebarTitle: "IM"
+description: "Ask Mole Agent in Feishu, Slack, DingTalk, WeCom, Google Chat, and Microsoft Teams: mention it in a group or message it directly."
+"zh-Hans_link": "/zh-Hans/im"
+---
+
+Mole Agent answers in Feishu, Slack, DingTalk, WeCom, Google Chat, and Microsoft Teams through a connector of the notification settings. Mention it in a group or message it directly. While it works it shows so: in Feishu and Slack it reacts to your message, and in WeCom, Google Chat, and Teams it first replies "Looking into it…" and replaces that with the answer once it is done. The answer links to the chat in MoleSignal.
+
+The chats are ordinary Mole Agent chats. They appear in MoleSignal, where you can go on in them, count toward the organization's daily budget, and are scored like any other answer. See [Quality](/en-US/quality).
+
+## How messages arrive
+
+| Platform | Connector | How it receives messages |
+|---|---|---|
+| Feishu | Feishu app (`lark_app`) | Feishu's long connection |
+| Slack | Slack app (`slack_app`) | Socket Mode |
+| DingTalk | DingTalk app (`dingtalk_app`) | Stream mode |
+| WeCom | WeCom smart bot (`wecom_bot`) | The smart bot's long connection |
+| Google Chat | Google Chat app (`google_chat_app`) | Pulled from a Cloud Pub/Sub subscription |
+| Microsoft Teams | Microsoft Teams bot (`teams_app`) | Bot Framework posts them to a public callback address of MoleSignal |
+
+Except for Teams, one MoleSignal server connects out to receive each connector's messages, so MoleSignal needs no public address. Teams needs a public https callback address; read [Security for Teams](#security-for-teams) first. The addresses, accounts, and permissions each platform needs are in [External prerequisites](#external-prerequisites).
+
+## Before starting
+
+- Turning it on needs `agent.manage`. People who ask need `agent.use`.
+- A connector of the platform under **Settings → Notify → Connectors** (see the table above). A Slack app needs a bot token and an app-level token, and a Google Chat app its Pub/Sub subscription. See [Notification channels](/en-US/notification-channels).
+- For people to link their accounts themselves, and for replies to link to their chat, MoleSignal needs its external URL, `http.external_url`. Teams also needs it to be an https address: the callback address is under it. See [Configuration](/en-US/configuration).
+
+## Set up the platform
+
+### Feishu
+
+<Steps>
+  <Step title="Receive events over a long connection">
+    In the Feishu developer console, open the app, go to **Events and callbacks**, and choose to receive events through a persistent (long) connection.
+  </Step>
+  <Step title="Subscribe to messages">
+    Add the event **Message received** (`im.message.receive_v1`).
+  </Step>
+  <Step title="Grant the permissions">
+    Let the app read the messages people send it directly, read the group messages that mention it, send messages as the app, and add reactions to messages. To go on in a thread without mentioning the bot each time, also let it read all group messages.
+  </Step>
+  <Step title="Publish">
+    Publish a version of the app and add the bot to the groups where it should answer.
+  </Step>
+</Steps>
+
+For Lark, set the connector's API base URL to `https://open.larksuite.com/open-apis`.
+
+### Slack
+
+<Steps>
+  <Step title="Create an app-level token">
+    Under **Basic Information → App-Level Tokens**, generate a token with the `connections:write` scope. Enter it as the connector's **App-level token** (it starts with `xapp-`).
+  </Step>
+  <Step title="Turn on Socket Mode">
+    Under **Socket Mode**, enable it.
+  </Step>
+  <Step title="Subscribe to events">
+    Under **Event Subscriptions → Subscribe to bot events**, add `app_mention` and `message.im`. To go on in a thread without mentioning the bot each time, also add `message.channels` and `message.groups`.
+  </Step>
+  <Step title="Add the bot scopes">
+    Under **OAuth & Permissions**, add `app_mentions:read`, `chat:write`, `im:history`, and `reactions:write`, and `channels:history` and `groups:history` for replies in threads. Under **App Home**, let people send messages to the app. Reinstall the app and invite the bot to the channels where it should answer.
+  </Step>
+</Steps>
+
+### DingTalk
+
+<Steps>
+  <Step title="Receive the robot's messages over Stream">
+    In the DingTalk developer console, open the app's robot and set its message receiving mode to **Stream mode**.
+  </Step>
+  <Step title="Publish">
+    Publish the robot and add it to the groups where it should answer.
+  </Step>
+</Steps>
+
+The connector's **Client ID** and **Client secret** are the app's credentials. Its robot code is the Client ID unless the robot has one of its own.
+
+### WeCom
+
+In WeCom, Mole Agent answers as a smart bot: it receives messages over the long connection of API mode, and its replies go back over the same connection.
+
+<Steps>
+  <Step title="Create a smart bot">
+    Create a smart bot in WeCom (from the admin console or the client), choose **API mode**, and receive messages over a **long connection**. Note the bot's **Bot ID** and the **Secret** made for the long connection.
+  </Step>
+  <Step title="Create the connector">
+    Under **Settings → Notify → Connectors**, create a **WeCom smart bot** connector with the **Bot ID** and **Long connection secret**. Keep the default long connection address, `wss://openws.work.weixin.qq.com`.
+  </Step>
+  <Step title="Add it to groups">
+    Add the bot to the groups where it should answer, or let people message it directly.
+  </Step>
+</Steps>
+
+- A bot has one long connection at a time. When something else connects with the same Bot ID, such as another MoleSignal or a test environment, MoleSignal's connection is pushed out and the status says **Cannot connect** with the reason. Give each environment a bot of its own.
+- A bot receives messages either over the long connection or at a callback URL. Switching it to a callback URL ends the long connection.
+- When the bot's creator is a super administrator of the organization, messages carry members' user IDs in plain text; otherwise they are encrypted. Encrypted user IDs are hard for an administrator to bind by hand, so have people link themselves with the one-time link Mole Agent sends.
+- This connector delivers no notifications. For notifications, use a WeCom app or WeCom webhook connector.
+
+### Google Chat
+
+The Google Chat app publishes messages to a Cloud Pub/Sub topic, and MoleSignal pulls them from its subscription, so no public address is needed.
+
+<Steps>
+  <Step title="Prepare a service account">
+    In a Google Cloud project, enable the **Google Chat API** and the **Cloud Pub/Sub API**. Create a service account in the same project and a JSON key for it, and enter the key as the connector's **Service account key**: it is who the Chat app sends as, and it pulls the subscription.
+  </Step>
+  <Step title="Create a topic and a subscription">
+    In Pub/Sub, create a topic (such as `mole-chat`) and a **pull** subscription of it (such as `mole-chat-sub`). On the subscription, grant the service account the **Pub/Sub Subscriber** role (`roles/pubsub.subscriber`).
+  </Step>
+  <Step title="Let Chat publish to the topic">
+    On the topic, grant `chat-api-push@system.gserviceaccount.com` the **Pub/Sub Publisher** role (`roles/pubsub.publisher`). For a Chat app built as a Google Workspace add-on, grant it to the service account shown in its connection settings instead.
+  </Step>
+  <Step title="Configure the Chat app">
+    Under **Google Chat API → Configuration**, enter the app's name and avatar, turn on **Receive 1:1 messages** and **Join spaces and group conversations**, choose **Cloud Pub/Sub** under **Connection settings** with the topic's full name, `projects/<project>/topics/mole-chat`, and choose who can use the app under **Visibility**.
+  </Step>
+  <Step title="Enter the subscription">
+    Enter `projects/<project>/subscriptions/mole-chat-sub` as the connector's **Pub/Sub subscription**.
+  </Step>
+</Steps>
+
+- Keep the subscription's default acknowledgement deadline of 10 seconds: MoleSignal acknowledges each message as it pulls it.
+- In spaces and group conversations, only messages that mention the app reach it, so mention it again to go on in a thread. In a direct message every message reaches it.
+
+### Microsoft Teams
+
+Bot Framework posts Teams messages to a public callback address of MoleSignal. It is the only platform that needs MoleSignal to be reachable from the internet, so prepare the external address as [Security for Teams](#security-for-teams) describes before turning it on.
+
+<Steps>
+  <Step title="Prepare an Azure Bot">
+    In the Azure portal, create an **Azure Bot** (or use one you have) of the **Single Tenant** type. Create a client secret in its Microsoft Entra app registration. Enter the bot's **App ID**, the **Client secret**, and the **Tenant ID** in the connector.
+  </Step>
+  <Step title="Add the Teams channel">
+    Under the Azure Bot's **Channels**, add **Microsoft Teams**.
+  </Step>
+  <Step title="Turn it on and copy the callback address">
+    Open **Mole Agent → Settings → IM**, turn the connector on, and copy its **Callback**: `https://<external address>/api/v1/public/im/teams/<connector ID>/messages`.
+  </Step>
+  <Step title="Set the messaging endpoint">
+    Under the Azure Bot's **Configuration**, set the **Messaging endpoint** to the callback address.
+  </Step>
+  <Step title="Publish a Teams app">
+    Make a Teams app package whose manifest lists the bot's App ID under `bots`, with the scopes `personal`, `team`, and `groupChat`. Upload it in the Teams admin center or the Developer Portal, and install it for the people, teams, and group chats that use it.
+  </Step>
+</Steps>
+
+- In channels and group chats, only messages that mention the bot reach it, so mention it again to go on under a post. In a personal chat every message reaches it.
+- Only Bot Framework in the Azure public cloud is supported.
+
+## Security for Teams
+
+The Teams callback address is on the internet. MoleSignal checks every request to it:
+
+- **Every request carries a Bot Framework token.** The address does not take a MoleSignal sign-in, only a JWT that Bot Framework signed: the signing keys come from the OpenID metadata of `login.botframework.com` (cached for 24 hours); `iss` is `https://api.botframework.com`; `aud` is the bot's App ID; `exp` and `nbf` allow five minutes of clock skew; the signing key must endorse the Teams channel (`msteams`); and the token's `serviceUrl` must match the message's. A request that fails gets 401 or 403 and is not handled.
+- **Replies only go to Bot Framework.** MoleSignal sends the bot's token only to Bot Framework service addresses (`smba.trafficmanager.net`, `*.botframework.com`, `*.teams.microsoft.com`) or the service URL configured on the connector, and refuses a message whose address is anything else.
+- **Only its own tenant.** When the connector's tenant is a tenant ID (a GUID), messages from other tenants are not handled. A domain name or `botframework.com` sets no limit.
+- **The address only works for a connector that is on.** When the connector is not turned on under **IM**, is switched off, or is deleted, the callback address answers 404. The address only holds the connector's ID, never a secret.
+- **The body is limited.** Requests larger than 256 KiB are refused.
+
+In the deployment, also:
+
+1. **Open only the callback path to the internet.** Have a reverse proxy or gateway forward only `POST /api/v1/public/im/teams/`, and keep the sign-in page and every other API on the internal network. For example, with nginx:
+
+   ```nginx
+   server {
+     listen 443 ssl;
+     server_name molesignal.example.com;
+     # ssl_certificate and ssl_certificate_key …
+     client_max_body_size 256k;
+
+     location /api/v1/public/im/teams/ {
+       limit_except POST { deny all; }
+       proxy_pass http://molesignal.internal:8080;
+       proxy_set_header Host $host;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+       proxy_set_header X-Forwarded-Proto https;
+     }
+
+     location / {
+       return 404;
+     }
+   }
+   ```
+
+   If people also reach MoleSignal at this external address, limit every other path to the company network or VPN at the gateway, and open only the callback path to the internet.
+2. **Use https.** `http.external_url` must be an https address, since Teams does not post to http. TLS can end at the proxy, with a certificate from a public CA.
+3. **Optionally, limit the sources.** A firewall or gateway can admit only the addresses of the Azure service tag `AzureBotService` to the callback path. They change, so keep them up to date with the list Azure publishes; checking the token stays the main defense.
+4. **Keep the client secret safe.** It is encrypted with the connector and never returned. Rotate it regularly and update the connector when you do, and give the bot's app registration no more permissions than it needs.
+5. **Watch for anything unusual.** Callback requests and refused tokens show in MoleSignal's logs and traces, and **IM** shows when each connector last received a message.
+
+## External prerequisites
+
+What each platform needs outside MoleSignal:
+
+| Platform | Outbound from MoleSignal | Inbound | Set up on the platform |
+|---|---|---|---|
+| Feishu | `open.feishu.cn` (`open.larksuite.com` for Lark) and the long connection address it gives | None | A self-built app, events over a long connection, the message event, permissions, a published version |
+| Slack | `slack.com` and the Socket Mode WebSocket addresses | None | An app-level token, Socket Mode, event subscriptions, bot scopes |
+| DingTalk | `api.dingtalk.com`, `oapi.dingtalk.com`, and the Stream WebSocket address | None | The robot of an internal app, Stream mode |
+| WeCom | `openws.work.weixin.qq.com` (WebSocket, 443) | None | A smart bot in API mode over a long connection, with its Bot ID and secret |
+| Google Chat | `oauth2.googleapis.com`, `pubsub.googleapis.com`, `chat.googleapis.com` | None | The Chat and Pub/Sub APIs, a service account and its JSON key, a topic and a pull subscription, the Subscriber and Publisher roles, the Chat app's configuration |
+| Microsoft Teams | `login.microsoftonline.com`, `login.botframework.com`, `smba.trafficmanager.net` | Bot Framework reaches `https://<external address>/api/v1/public/im/teams/…` (443) | An Azure Bot, a client secret, the Teams channel, the messaging endpoint, a Teams app package |
+
+- Firewalls and outbound proxies must let the outbound addresses above through. The WebSocket long connections (Feishu, Slack, DingTalk, WeCom) go straight to the platform; an HTTP proxy is not used for them.
+- Inbound, Teams needs public DNS, a certificate from a public CA, and a reverse proxy that forwards only the callback path. See [Security for Teams](#security-for-teams).
+- Linking accounts and the chat links in replies need `http.external_url`.
+
+## Turn it on
+
+Open **Mole Agent → Settings → IM**. Every connector that can answer in IM is listed:
+
+| Column | What it shows |
+|---|---|
+| **Connector** | The connector, its platform, and when it last received a message. Under a Teams connector is its callback address, ready to copy. |
+| **Status** | **Connected** and who it is connected as, **Connecting**, **Waiting for a server**, **Cannot connect** with the reason, **Off**, or what the connector still needs, such as a Slack app-level token or a Google Chat Pub/Sub subscription. Teams has no long connection: **Connected** means the bot's credentials work, and Bot Framework delivers the messages. |
+| **New group threads** | Where a new thread in a group goes: **The asker's personal chat**, or a team. A team only applies when the person asking is one of its members. |
+| **On** | Whether the connector answers in IM. A Teams connector can only be turned on when `http.external_url` is https. |
+
+A connector that answers in IM cannot be deleted from the notification settings until it is turned off here.
+
+## Link people's accounts
+
+Mole Agent answers a person as the MoleSignal user their IM account belongs to, with that user's permissions. It recognizes the account by an enabled, verified notification method on the same connector:
+
+| Platform | Account |
+|---|---|
+| Feishu | `open_id`, `user_id`, or `union_id` |
+| Slack | Member ID |
+| DingTalk | User ID |
+| WeCom | The user ID the smart bot sees |
+| Google Chat | User (`users/123…`) or email address |
+| Microsoft Teams | Teams user ID (`29:…`) or Microsoft Entra object ID |
+
+An account that belongs to more than one user is not answered.
+
+- **Themselves**: when someone who is not linked yet asks, Mole Agent sends them a one-time link privately: in a direct message, or in Slack as a message only they see. They open it signed in to MoleSignal and choose **Link**, and the account becomes one of their notification methods, already verified. The link works once, within 15 minutes. In WeCom and Google Chat, a private message only reaches someone who has messaged the bot directly, and in Teams someone the bot is installed for; when it cannot be sent, Mole Agent asks in place for a direct message first and sends the link there.
+- **By an administrator**: under **Settings → Notify → User routing**, bind the account to the member and verify it. See [Notification channels](/en-US/notification-channels#bind-user-notification-methods).
+
+## Ask
+
+In a group, mention the bot; in a direct message, just write. A direct message is one chat until `/new`.
+
+| Platform | One chat in a group |
+|---|---|
+| Feishu, Slack | A thread; the reply goes into it |
+| Google Chat spaces | A thread; the reply goes into it, and going on needs a mention |
+| Microsoft Teams channels | A post; the reply goes under it, and going on needs a mention |
+| DingTalk, WeCom, Google Chat group conversations, Teams group chats | No threads: each person's questions in a group are one chat of their own |
+
+| Command | What it does |
+|---|---|
+| `/help` | Says how to ask and lists these commands. |
+| `/new` | Starts a new chat here. |
+| `/scope` | Says whose chat this thread is. |
+| `/scope <team>` | Goes on in a new chat of the team, which its members can follow and continue. |
+| `/scope me` | Goes on in a new personal chat of yours. |
+| `/feedback 👍` or `/feedback 👎`, then an optional comment | Rates the last answer in the thread. |
+
+Other commands, such as `/rca INC-12` or a skill, work as they do in MoleSignal.
+
+### Whose chat a thread is
+
+A personal chat can only be continued by the person who started it; a team chat by its team's members. A new thread in a group is a chat of the connector's team when the person asking is in that team, and their personal chat otherwise. `/scope` moves the thread to a new chat; the messages before stay in the old one.
+
+## While it answers
+
+- Nobody can answer Mole Agent's questions or confirm changes from IM. It makes reasonable assumptions and says which, and skips steps that need someone to confirm them; the reply says when it did. To go on with those, open the chat in MoleSignal from the link.
+- An answer runs for at most 15 minutes. In WeCom, "Looking into it…" is a streamed message that must end within 10 minutes, so an answer that takes longer than 9 minutes comes as a message of its own.
+- The reply is the answer with its sections, such as likely causes, evidence, and next steps, in the asker's interface language.
+- In a group, everyone in it reads the reply, though Mole Agent worked it out with the permissions of the person who asked. Ask in a direct message about anything the others should not see.
+- When the organization's daily budget is used up, Mole Agent says so instead of answering.
+
+## Limits
+
+- Mole Agent reads text messages and the text of rich-text messages, and in WeCom also the text of voice messages. Images and files are ignored.
+- When the server holding a connector stops, another server takes it over within about a minute. A question asked in that minute is answered once the connection is back only if the platform delivers it again. Teams is not affected: whichever server receives a callback handles it.
+- WeCom replies can only leave from the server that holds the bot's connection. An answer that ends on another server is handed to it and usually arrives within a few seconds.
+- WeCom allows 30 messages a minute and 1,000 an hour in each conversation.
