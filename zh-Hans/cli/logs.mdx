@@ -1,16 +1,16 @@
 ---
 title: "查看与跟随日志"
-description: "用 MoleSignal 命令行列出日志数据流，输出数据流最新的日志，用 SQL 条件筛选，并持续跟随新到达的日志。"
+description: "用 MoleSignal 命令行列出数据流，用字段查询或 SQL 条件输出并跟随数据流的日志，查看某一时刻前后的日志，执行 SQL，查看数据流的字段。"
 "en_link": "/en-US/cli/logs"
 ---
 
-## 列出日志数据流
+## 列出数据流
 
 ```bash
 molesignal streams
 ```
 
-列表显示用户能读取的每个日志数据流，以及它的字段数、保留期和描述。`--json` 每行输出一个数据流的 JSON。
+列表显示用户能读取的每个日志数据流，以及它的字段数、保留期和描述。`--type` 列出其他类型的数据流：`metrics`、`traces`、`profiles` 或 `extend`。`--names` 只输出名称，`--json` 每行输出一个数据流的 JSON。
 
 ## 输出最新的日志
 
@@ -30,20 +30,30 @@ molesignal logs app_logs
 | 选项 | 默认值 | 含义 |
 |---|---|---|
 | `-n`、`--lines <数量>` | `100` | 先输出多少条最新的日志，最多 `5000`。 |
-| `--since <时长>` | `15m` | 往前看多久：`30s`、`10m`、`2h`、`1d`。 |
+| `--since <时长>` | `15m` | 往前看多久：`30s`、`10m`、`2h`、`1d`、`1w`。 |
+| `--from <时间>`、`--to <时间>` | 无 | 用一个时间窗代替 `--since`：ISO 时间、本地时间 `2026-10-26 14:00`，或 `2h` 这样往前推的时长。 |
+| `-q`、`--query <查询>` | 无 | 字段查询，写法与 **日志** 页面相同。 |
 | `--where <条件>` | 无 | 针对数据流字段的 SQL 条件。 |
-| `--json` | 关闭 | 每条日志输出一行 JSON，包含全部字段。 |
+| `--fields <a,b,c>` | 全部 | 只输出时间和这些字段，以 `名称=值` 显示。 |
+| `--json` | 关闭 | 每条日志输出一行 JSON。 |
 | `--utc` | 关闭 | 以 UTC 而不是本地时间显示时间。 |
+| `--web` | 关闭 | 在 **日志** 页面打开同样的日志，而不是输出。 |
 
 ## 筛选日志
 
-`--where` 接受针对数据流字段的 SQL 条件，与 **日志** 中查询的 `WHERE` 子句写法相同：
+`-q` 接受字段查询，也就是 **日志** 页面的查询语言：`level = 'error'` 这样的比较、`contains`、`MATCH` 和 `MATCH_TEXT`，用 `AND` 和 `OR` 连接，用括号分组。不带字段的文本在 `message` 中搜索：
 
 ```bash
-molesignal logs app_logs --since 1h --where "level = 'error' AND service = 'payment'"
+molesignal logs app_logs --since 1h -q "level = 'error' AND (service = 'payment' OR timeout)"
 ```
 
-条件引用了不存在的字段，或不是合法的 SQL 时，命令会说明原因后结束。
+`--where` 接受针对数据流字段的 SQL 条件，与查询中 `WHERE` 子句的写法相同：
+
+```bash
+molesignal logs app_logs --where "status >= 500 AND duration_ms > 2000"
+```
+
+两者同时给出时，日志要同时满足。条件引用了不存在的字段，或不是合法的 SQL 时，命令会说明原因后结束。
 
 ## 跟随新日志
 
@@ -58,7 +68,41 @@ molesignal logs app_logs -f
 - 一次读不完的突发日志会立即接着读，不再等待。
 - 连接断开时会重试，等待时间逐次加长，最长 30 秒。断开与恢复会输出到标准错误。
 
-跟随按日志自身的时间推进。到达时带着比当前读取起点更早时间的日志不会出现。
+跟随按日志自身的时间推进。到达时带着比当前读取起点更早时间的日志不会出现。`--to` 不能与 `-f` 一起使用。
+
+## 查看某一时刻前后的日志
+
+`--around` 输出某一时刻之前和之后紧挨着的日志，中间用一行标出这个时刻。`-B` 和 `-A` 设置条数，默认各 10 条，最多 250 条。`-q` 和 `--where` 可以缩小范围：
+
+```bash
+molesignal logs app_logs --around "2026-10-26 14:03:12.345" -B 20 -A 20
+```
+
+从 `molesignal logs` 的输出中复制的时间，可以直接作为 `--around` 的时刻。
+
+## 对数据流执行 SQL
+
+`molesignal query` 执行一条只读 SQL 语句，可以使用表达式、join 和聚合，并以表格输出结果：
+
+```bash
+molesignal query "SELECT level, COUNT(*) AS logs FROM app_logs GROUP BY level ORDER BY logs DESC"
+```
+
+数据流取 `FROM` 后的第一个；`--stream` 可以指定另一个。时间窗默认是最近一小时，`--since`、`--from` 和 `--to` 可以修改。`-n` 设置最多输出的行数，默认 `1000`，最多 `5000`。`--csv` 输出带表头的 CSV，`--json` 每行输出一行 JSON，`--web` 在 **日志** 页面打开这条语句。
+
+## 查看数据流的字段
+
+```bash
+molesignal fields app_logs
+```
+
+列表显示每个字段的类型和索引。给出字段时，命令列出它在最近一小时内最常见的值及出现次数：
+
+```bash
+molesignal fields app_logs service --since 1d
+```
+
+`--match` 只保留包含某段文本的值，`-n` 设置条数，默认 `20`。`--type` 读取其他类型的数据流。
 
 ## 在管道中使用
 
@@ -72,4 +116,4 @@ molesignal logs app_logs -n 1000 --since 2h --json | jq -r .message
 
 ## 访问权限
 
-命令行用 MoleSignal 的 `list_streams` 与 `query_logs` 工具读取日志，使用登录用户或 API Token 所属者的权限。用户需要 `streams.query`，且组织的 Tool Policy 没有关闭这两个工具。
+命令行用 MoleSignal 的 `list_streams`、`query_logs`、`get_stream_schema`、`search_field_values` 和 `search_around` 工具读取，使用登录用户或 API Token 所属者的权限。用户需要 `streams.query`，且组织的 Tool Policy 没有关闭这些工具。

@@ -1,0 +1,151 @@
+---
+title: "CI and releases"
+description: "Report deployments to APM, upload RUM source maps and mobile symbols, check a release with synthetic checks and version comparison, and send the output of jobs to a stream from CI with the MoleSignal CLI."
+"zh-Hans_link": "/zh-Hans/cli/ci"
+---
+
+The commands on this page call MoleSignal's API and take an API token: set `MOLESIGNAL_URL` and
+`MOLESIGNAL_TOKEN` in the pipeline, or pass `--url` and `--token`. Create the token at
+**Identity & Access → API tokens**, with a role that holds the permission each command names.
+
+## Report a deployment
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production
+```
+
+The deployment appears on the service's timeline in APM, which compares its version with the one
+before. In CI, the commit, the repository, the pull request, the author, and the link to the run
+come from the environment of GitHub Actions, GitLab CI/CD, Jenkins, CircleCI, Buildkite,
+Bitbucket Pipelines, or Azure Pipelines. Elsewhere, the commit and the repository come from git.
+The token's role needs `apm.deploy`.
+
+Given a command after `--`, the CLI runs it first, records the deployment as succeeded or failed by
+how the command ended, and exits as the command did:
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production -- ./scripts/deploy.sh
+```
+
+| Option | Meaning |
+|---|---|
+| `--service <name>` | The service, as its spans name it in `service.name`. Required. |
+| `--version <version>` | The version deployed, as `service.version`. A deployment needs one. |
+| `--env <environment>` | The environment, as `deployment.environment.name`. |
+| `--namespace <namespace>` | The service's `service.namespace`. |
+| `--kind <kind>` | `deployment` (default), `configuration`, or `feature_flag`. |
+| `--status <status>` | `succeeded` (default), `failed`, or `rolled_back` to `--version`. |
+| `--commit`, `--repository`, `--pull-request`, `--author`, `--ci-url` | Values instead of the ones CI or git tells. |
+| `--description <text>` | Shown when the deployment is pointed at. |
+| `--time <time>` | When it happened, instead of now. |
+| `--dry-run` | Prints what would be recorded and records nothing. |
+
+The fields are those of [Report deployments from CI](/en-US/apm/deployments#report-deployments-from-ci).
+
+## Upload source maps
+
+```bash
+molesignal source-maps upload dist/assets --application checkout-web --service web-frontend --release "$VERSION"
+```
+
+Every `.map` file under the folders is uploaded under its own name, which must be the deployed
+bundle's name and `.map`. Files are gzipped on the way, four at a time; `--concurrency` changes
+that. Two maps of the same name would replace each other, so the command refuses them.
+`--application`, `--service`, and `--release` must match what the RUM SDK reports: its
+`applicationId`, `service`, and `version`. For Flutter Web, add `--platform flutter` and the
+`--debug-id` the app was built with. The token's role needs `streams.configure`.
+
+`--dry-run` lists what would be uploaded. `molesignal source-maps list` lists the uploaded maps,
+and `molesignal source-maps delete <id>` deletes one.
+
+## Upload mobile and native symbols
+
+```bash
+molesignal symbols upload build/molesignal-symbols --application checkout-app --service checkout --release 2.4.0 --debug-id "$BUILD_ID"
+```
+
+Each file is matched by what it is:
+
+| File | Uploaded as |
+|---|---|
+| `app.android-arm64.symbols` from `--split-debug-info` | Flutter symbols; the platform and the architecture come from the name. `--debug-id` is the `MOLESIGNAL_DEBUG_ID` the app was built with. |
+| `mapping.txt` | An Android R8 mapping. |
+| An ELF library such as `libapp.so` | Android native symbols; the architecture and the build ID are read from the file. |
+| An Apple `.dSYM` | One upload per architecture of the binary, each with its UUID read from the file. |
+
+`--debug-id`, `--platform`, and `--arch` replace what a file tells; for a dSYM, `--arch` keeps one
+architecture. `--dry-run` lists every file with the IDs read from it. `molesignal symbols list`
+and `molesignal symbols delete <id>` list and delete uploads. The token's role needs
+`streams.configure`. [RUM source maps and symbols](/en-US/rum/source-maps) explains how frames
+are matched.
+
+## Check a release
+
+`molesignal synthetics run <check> --wait --yes` runs a synthetic check at each of its locations
+and exits with `1` when a run fails. `molesignal services compare <service> <baseline> <candidate>
+--fail-on-regression` exits with `1` when the candidate regressed. See
+[Incidents and changes](/en-US/cli/changes#run-synthetic-checks) and
+[Metrics, traces, and services](/en-US/cli/observe#compare-two-versions).
+
+## Send lines to a stream
+
+`molesignal send` sends each line of standard input to a log stream: a line that is a JSON object
+as its fields, any other line as its `message`. Logs go in batches as they come, so it can follow
+a file:
+
+```bash
+tail -f /var/log/app.log | molesignal send app_logs --field service=billing
+```
+
+`--field name=value` adds a field to every log, `--raw` sends every line as a message, and
+`--batch` sets the most logs per request, `500` by default. A busy server is tried again. The
+command exits with `1` when MoleSignal rejected logs. The token's role needs `streams.write`, as
+an intake token's does.
+
+## Keep the output of a job
+
+`molesignal run` runs a command, shows its output as usual, and sends each line to a log stream,
+then one more log with the exit status and how long it took. It exits as the command did:
+
+```bash
+molesignal run jobs --name nightly-backup -- ./backup.sh --full
+```
+
+Each log has the fields `message`, `output` (`stdout` or `stderr`), `command`, `run_id`, and
+`host`; the last one adds `exit_code`, `duration_ms`, and `level`. `--quiet` hides the output
+here, and `--field` adds a field.
+
+## GitHub Actions
+
+Save the address and the token as repository secrets, then add steps to the deploy job.
+`if: always()` reports a failed deployment too:
+
+```yaml
+- name: Upload source maps
+  run: npx -y @molesignal/cli source-maps upload dist/assets --application checkout-web --service web-frontend --release "${{ github.sha }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+
+- name: Report the deployment
+  if: always()
+  run: npx -y @molesignal/cli deploy --service checkout --version "${{ github.sha }}" --env production --status "${{ job.status == 'success' && 'succeeded' || 'failed' }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+```
+
+## GitLab CI/CD
+
+Add `MOLESIGNAL_URL` and `MOLESIGNAL_TOKEN` as masked CI/CD variables, then run the deploy command
+through the CLI:
+
+```yaml
+deploy:
+  stage: deploy
+  environment: production
+  script:
+    - npx -y @molesignal/cli deploy --service checkout --version "$CI_COMMIT_SHORT_SHA" -- ./scripts/deploy.sh
+```
+
+The environment comes from `environment`, and the commit, merge request, and job link from GitLab.

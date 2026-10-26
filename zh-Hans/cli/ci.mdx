@@ -1,0 +1,120 @@
+---
+title: "CI 与发布"
+description: "用 MoleSignal 命令行在 CI 中向 APM 上报发布，上传 RUM 的 Source Map 与移动端符号，用拨测与版本比较检查发布，并把任务的输出发到数据流。"
+"en_link": "/en-US/cli/ci"
+---
+
+本页的命令调用 MoleSignal 的 API，需要 API Token：在流水线中设置 `MOLESIGNAL_URL` 和 `MOLESIGNAL_TOKEN`，或传入 `--url` 和 `--token`。在 **身份与访问 → API tokens** 中创建 Token，所用角色要具有各命令要求的权限。
+
+## 上报发布
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production
+```
+
+发布显示在 APM 中该服务的时间线上，APM 会把新版本与之前的版本比较。在 CI 中，提交、代码仓库、PR、发布人和 CI 运行链接取自 GitHub Actions、GitLab CI/CD、Jenkins、CircleCI、Buildkite、Bitbucket Pipelines 或 Azure Pipelines 的环境变量；在其他地方，提交和代码仓库取自 git。Token 的角色需要 `apm.deploy`。
+
+在 `--` 之后给出命令时，命令行先运行这个命令，按它的结束方式把发布记为成功或失败，并以该命令的退出码退出：
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production -- ./scripts/deploy.sh
+```
+
+| 选项 | 含义 |
+|---|---|
+| `--service <名称>` | 服务名，与 Span 的 `service.name` 一致。必填。 |
+| `--version <版本>` | 发布的版本，与 `service.version` 一致。发布必须提供。 |
+| `--env <环境>` | 环境，即 `deployment.environment.name`。 |
+| `--namespace <Namespace>` | 服务的 `service.namespace`。 |
+| `--kind <类型>` | `deployment`（默认）、`configuration` 或 `feature_flag`。 |
+| `--status <状态>` | `succeeded`（默认）、`failed`，或 `rolled_back` 表示回滚到 `--version`。 |
+| `--commit`、`--repository`、`--pull-request`、`--author`、`--ci-url` | 代替 CI 或 git 提供的值。 |
+| `--description <文本>` | 鼠标停在发布上时显示。 |
+| `--time <时间>` | 发布时间，代替当前时间。 |
+| `--dry-run` | 输出将要记录的内容，不做记录。 |
+
+字段与[从 CI 上报发布](/zh-Hans/apm/deployments#从-ci-上报发布)相同。
+
+## 上传 Source Map
+
+```bash
+molesignal source-maps upload dist/assets --application checkout-web --service web-frontend --release "$VERSION"
+```
+
+目录下的每个 `.map` 文件以自身的文件名上传，文件名必须是已部署 Bundle 的文件名加 `.map`。文件在上传时经过 gzip 压缩，默认每次同时上传四个，`--concurrency` 可以修改。同名的两个 Source Map 会互相覆盖，所以命令会拒绝。`--application`、`--service` 和 `--release` 必须与 RUM SDK 上报的 `applicationId`、`service` 和 `version` 一致。Flutter Web 需要加上 `--platform flutter`，以及构建应用时使用的 `--debug-id`。Token 的角色需要 `streams.configure`。
+
+`--dry-run` 列出将要上传的文件。`molesignal source-maps list` 列出已上传的 Source Map，`molesignal source-maps delete <ID>` 删除一个。
+
+## 上传移动端与原生符号
+
+```bash
+molesignal symbols upload build/molesignal-symbols --application checkout-app --service checkout --release 2.4.0 --debug-id "$BUILD_ID"
+```
+
+每个文件按其内容识别：
+
+| 文件 | 上传为 |
+|---|---|
+| `--split-debug-info` 生成的 `app.android-arm64.symbols` | Flutter Symbols；平台与架构取自文件名。`--debug-id` 是构建应用时使用的 `MOLESIGNAL_DEBUG_ID`。 |
+| `mapping.txt` | Android R8 Mapping。 |
+| `libapp.so` 等 ELF 动态库 | Android 原生符号；架构与 Build ID 从文件中读取。 |
+| Apple `.dSYM` | 二进制文件的每个架构各上传一次，每次带上从文件中读取的 UUID。 |
+
+`--debug-id`、`--platform` 和 `--arch` 代替从文件中读取的值；对 dSYM，`--arch` 只保留一个架构。`--dry-run` 列出每个文件及从中读取的 ID。`molesignal symbols list` 与 `molesignal symbols delete <ID>` 列出和删除已上传的文件。Token 的角色需要 `streams.configure`。帧如何匹配参见 [RUM Source Maps 与 Symbols](/zh-Hans/rum/source-maps)。
+
+## 检查发布
+
+`molesignal synthetics run <检查> --wait --yes` 在检查的每个地点运行一次，有运行失败时以 `1` 退出。`molesignal services compare <服务> <基线版本> <候选版本> --fail-on-regression` 在候选版本变差时以 `1` 退出。参见[事件与变更](/zh-Hans/cli/changes#运行拨测)与[指标、链路与服务](/zh-Hans/cli/observe#比较两个版本)。
+
+## 把日志行发到数据流
+
+`molesignal send` 把标准输入的每一行发到一个日志数据流：JSON 对象的行按其字段发送，其他行作为 `message`。日志随到随批量发送，所以可以跟随一个文件：
+
+```bash
+tail -f /var/log/app.log | molesignal send app_logs --field service=billing
+```
+
+`--field 名称=值` 给每条日志加一个字段，`--raw` 把每一行都作为消息发送，`--batch` 设置每个请求最多的日志条数，默认 `500`。服务端繁忙时会重试。有日志被 MoleSignal 拒绝时以 `1` 退出。Token 的角色需要 `streams.write`，接入 Token 具有该权限。
+
+## 保留任务的输出
+
+`molesignal run` 运行一个命令，照常显示它的输出，同时把每一行发到一个日志数据流，最后再发一条记录退出码和耗时的日志。它以该命令的退出码退出：
+
+```bash
+molesignal run jobs --name nightly-backup -- ./backup.sh --full
+```
+
+每条日志都有 `message`、`output`（`stdout` 或 `stderr`）、`command`、`run_id` 和 `host` 字段；最后一条另有 `exit_code`、`duration_ms` 和 `level`。`--quiet` 不在本地显示输出，`--field` 添加字段。
+
+## GitHub Actions
+
+把地址和 Token 保存为仓库 Secret，再在负责部署的 job 中加入以下步骤。`if: always()` 使失败的发布也会上报：
+
+```yaml
+- name: Upload source maps
+  run: npx -y @molesignal/cli source-maps upload dist/assets --application checkout-web --service web-frontend --release "${{ github.sha }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+
+- name: Report the deployment
+  if: always()
+  run: npx -y @molesignal/cli deploy --service checkout --version "${{ github.sha }}" --env production --status "${{ job.status == 'success' && 'succeeded' || 'failed' }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+```
+
+## GitLab CI/CD
+
+把 `MOLESIGNAL_URL` 和 `MOLESIGNAL_TOKEN` 添加为隐藏的 CI/CD 变量，再通过命令行运行部署命令：
+
+```yaml
+deploy:
+  stage: deploy
+  environment: production
+  script:
+    - npx -y @molesignal/cli deploy --service checkout --version "$CI_COMMIT_SHORT_SHA" -- ./scripts/deploy.sh
+```
+
+环境取自 `environment`，提交、合并请求和 job 链接取自 GitLab。
