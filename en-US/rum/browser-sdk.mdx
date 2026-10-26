@@ -1,34 +1,30 @@
 ---
 title: "Browser RUM SDK"
 sidebarTitle: "Browser SDK"
-description: "Install and configure the MoleSignal Browser RUM SDK, identify users, add custom events, and verify intake."
+description: "Install and configure the MoleSignal Browser RUM SDK, identify users, add custom events, and verify the first session."
 "zh-Hans_link": "/zh-Hans/rum/browser-sdk"
 ---
 
-The MoleSignal Browser RUM SDK collects browser sessions, page views, user interactions,
-frontend errors, Web Vitals, network resources, and trace correlation context.
+The MoleSignal Browser RUM SDK collects page views, user interactions, frontend errors, Web Vitals, network
+resources, long tasks, and trace correlation context, and sends them as [RUM events](/en-US/rum/events).
 
 ## Prerequisites
 
 - the MoleSignal deployment URL;
-- a stable application identifier, such as `checkout-web`;
-- an application-bound RUM client token, created as described below.
+- a [RUM application](/en-US/rum/applications), such as `checkout-web`;
+- the client token of the application.
 
 <Warning>
   `clientToken` is included in browser code and is visible to users. Never use an owner, administrator,
   or personal token. Use the application-bound `msrum_` client token.
 </Warning>
 
-## Create a client token
+## Get the application and its token
 
-Open **Datasource**, select **Web RUM**, and enter the application identifier. MoleSignal creates the `msrum_` client token for that application and fills it into the setup snippet. The same token is available from the API:
-
-```bash
-curl "http://localhost:5080/api/v1/auth/tokens/rum?application_id=checkout-web" \
-  -H "authorization: Bearer $MS_JWT"
-```
-
-The call returns the existing token when the application already has one. An application identifier has 1 to 128 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`. The token grants only `rum.write` for that application.
+Open **RUM → Applications**, click **Create application**, and choose the **Browser** platform. The application opens with its client
+token. **Open the setup guide** shows the endpoint, the token, and a snippet filled in with the identifier. In
+**Datasource**, **Web RUM** has the same guide. The token is also available from the
+[API](/en-US/api/auth/rum-token).
 
 ## Install and initialize
 
@@ -40,9 +36,9 @@ The call returns the existing token when the application already has one. An app
   </Step>
   <Step title="Initialize the SDK once">
     ```ts
-    import { initRum } from '@molesignal/browser-rum';
+    import { init } from '@molesignal/browser-rum';
 
-    const rum = initRum({
+    const rum = init({
       applicationId: 'checkout-web',
       clientToken: 'msrum_your_client_token',
       site: 'https://molesignal.example.com',
@@ -54,25 +50,73 @@ The call returns the existing token when the application already has one. An app
     });
     ```
 
+    `init` returns the client. `initRum` is the same function under its earlier name, and `molesignalRum` is the same API as
+    a singleton: `molesignalRum.init(...)` and `molesignalRum.setUser(...)`. Calls made to `molesignalRum` before `init` are
+    kept and replayed by `init`.
+
     Initialize the SDK before the application router mounts to capture the first page view.
     Importing and initializing the package during server-side rendering is safe; browser instrumentation
     starts only when browser APIs exist.
   </Step>
   <Step title="Verify the first session">
-    Open **RUM → Overview** and select a time range that includes the current time. Confirm that the
-    application appears, then open **Sessions** to inspect the first session.
+    Open **RUM → Explorer** and select a time range that includes the current time. Confirm that
+    the session appears, and open it to see its views, requests, and errors.
   </Step>
 </Steps>
 
-The `site` value can be a MoleSignal origin, `/api` base, or `/api/v1` base. The SDK normalizes the value and
-sends data to the RUM endpoints beneath `/api/v1/rum`.
+The `site` value can be a MoleSignal origin, or end in `/api`, `/api/v1`, or `/api/v1/rum`. The SDK sends events to
+`POST /api/v1/rum/events` and replay segments to `POST /api/v1/rum/replay`. `applicationId` is sent as `application.id`,
+and MoleSignal rejects events whose `application.id` is not the application of the token.
+
+## Load it from a script tag
+
+`dist/molesignal-rum.js` is a self-contained bundle, with rrweb and web-vitals included, that defines the global
+`MoleSignalRum`. Load it asynchronously with this snippet; callbacks passed to `onReady` wait until the script has loaded:
+
+```html
+<script>
+  (function (w, d, s, u, n) {
+    w[n] = w[n] || { q: [], onReady: function (callback) { w[n].q.push(callback); } };
+    var script = d.createElement(s);
+    script.async = 1;
+    script.src = u;
+    d.head.appendChild(script);
+  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.2.0-alpha.1/dist/molesignal-rum.js', 'MoleSignalRum');
+
+  MoleSignalRum.onReady(function () {
+    MoleSignalRum.init({
+      applicationId: 'checkout-web',
+      clientToken: 'msrum_your_client_token',
+      site: 'https://molesignal.example.com',
+      service: 'web-frontend',
+      env: 'production',
+      version: 'v1.4.0',
+    });
+  });
+</script>
+```
+
+To load it synchronously, include the file in a `<script src>` tag and call `MoleSignalRum.init(...)` afterwards.
+
+## Views and sessions
+
+A view is one page view or one route. The SDK reports a view as soon as it starts, again with a higher `view.revision` when
+something in it changes (at most every three seconds), every five minutes while it is open, and one last time when it
+ends: on a route change, when the session ends, and when the page is hidden or unloaded. Route changes are detected from the
+History API and `popstate`. Set `trackViewsManually: true` and call `startView` to name views and decide where they begin.
+
+The SDK sends no session event: MoleSignal derives sessions from the views. The session lives in the cookie
+`_msrum_s_<applicationId>`, so every tab of the application shares it. It ends after 15 minutes without activity or after four
+hours, and the next user activity starts a new one. Each session is sampled once; see [Data sampling](/en-US/rum/sampling). Set
+`trackSessionAcrossSubdomains: true` or `sessionCookieDomain: '.example.com'` to share the session across subdomains.
+`stopSession()` ends the session for all tabs. Without cookies a session lives in memory, per page.
 
 ## Identify users and add context
 
 Provide the user during initialization when possible so the first session carries the correct identity.
 
 ```ts
-const rum = initRum({
+const rum = init({
   applicationId: 'checkout-web',
   clientToken: 'msrum_your_client_token',
   site: 'https://molesignal.example.com',
@@ -80,20 +124,33 @@ const rum = initRum({
   globalContext: { region: 'eu-west-1' },
 });
 
-rum.setUser({ id: 'user-42', plan: 'enterprise' });
-rum.setGlobalContextProperty('feature_flags', ['new-checkout']);
+rum.setUser({ id: 'user-42', name: 'Ada', email: 'ada@example.com' });
+rum.setUserProperty('plan', 'enterprise');
+rum.setAccount({ id: 'acme' });
+rum.setGlobalContextProperty('checkout_step', 'payment');
 ```
 
-When no user is provided, the SDK creates a stable anonymous identifier in `localStorage`. Set
-`trackAnonymousUser: false` when privacy policy does not allow persistent anonymous identity.
+`setUser` needs at least one of `id`, `name`, and `email`; other keys are kept as properties. When no user is set, the SDK creates
+a stable anonymous identifier in `localStorage`. Set `trackAnonymousUser: false` when privacy policy does not allow
+persistent anonymous identity. Context set with the setters is added to every later event; the global context, the view context,
+and the context of the call are merged, and the last wins.
 
-## Add custom actions, errors, and views
+## Tracking consent
 
 ```ts
-rum.addAction('Checkout submitted', {
-  cart_size: 3,
-  payment_method: 'card',
-});
+const rum = init({ /* … */ trackingConsent: 'not-granted' });
+
+rum.setTrackingConsent('granted');
+```
+
+While consent is not granted, the SDK creates no cookie, anonymous identifier, or tab identifier, installs no
+instrumentation, and sends nothing. Revoking consent stops instrumentation and clears the SDK's identifiers and its
+persistent queue.
+
+## Add custom actions, errors, timings, and vitals
+
+```ts
+rum.addAction('Checkout submitted', { cart_size: 3 });
 
 try {
   await submitOrder();
@@ -101,12 +158,23 @@ try {
   rum.addError(error, { component: 'CheckoutForm' });
 }
 
-// Use this when trackViewsManually is true.
-rum.startView('Order confirmation');
+// Views: with trackViewsManually, or to name a route.
+rum.startView({ name: 'Order confirmation', context: { step: 3 } });
+rum.setViewName('Order confirmation (3DS)');
+
+// Custom timings and feature flags belong to the current view.
+rum.addTiming('cart_ready');
+rum.addFeatureFlagEvaluation('new_checkout', true);
+
+// Durations.
+const vital = rum.startDurationVital('checkout_form_ready', { description: 'form is usable' });
+rum.stopDurationVital(vital);
+
+await rum.flush();
 ```
 
-Call `rum.flush()` before a controlled navigation or shutdown to wait for queued events.
-Call `rum.stop()` to remove instrumentation and flush the client.
+Call `rum.flush()` before a controlled navigation or shutdown to wait for queued events. Call `rum.stop()` to remove
+instrumentation and flush the client.
 
 ## Automatic collection defaults
 
@@ -114,19 +182,27 @@ Call `rum.stop()` to remove instrumentation and flush the client.
 |---|---|---|
 | Page views | `trackViewsManually` | Automatic History API tracking (`false`) |
 | Fetch, XHR, and resource timing | `trackResources` | `true` |
-| Long tasks | `trackLongTasks` | `true` |
-| Web Vitals | `trackWebVitals` | `true` |
-| Clicks and form submissions | `trackUserInteractions` | `false` |
-| Rage and dead clicks | `trackFrustrations` | Same as interaction tracking |
-| Runtime errors | built in | Enabled |
+| Long animation frames and long tasks | `trackLongTasks` | `true` |
+| Web Vitals on the view | `trackWebVitals` | `true` |
+| Clicks | `trackUserInteractions` | `false` |
+| Rage, dead, and error clicks | `trackFrustrations` | Same as interaction tracking |
+| Runtime errors, unhandled rejections, failed requests | built in | Enabled |
 | `console.error` | `trackConsoleErrors` | `false` |
+| Restoring a page from the back/forward cache | `trackBfcacheViews` | `false` |
 | DOM session replay | `sessionReplaySampleRate` | `0` |
+
+Resources, errors, and long tasks that start while a click is running carry its `action.id` and are counted on it. A failed
+request is an error of source `network` with the failing request in `error.resource`. FCP, LCP, and FID describe the page load
+and are reported on the initial view. INP and CLS come from `web-vitals`, which measures them once per page load: the SDK reports
+each on the view in which the decisive interaction or layout shift happened.
 
 ## Connect browser requests to traces
 
-The fetch and XMLHttpRequest integrations read W3C `traceparent` from the outgoing request, response,
-or a `Server-Timing` entry named `traceparent`. For cross-origin APIs, expose the response headers and
-allow the origin explicitly:
+For allowed tracing URLs, the fetch and XMLHttpRequest integrations keep an existing W3C `traceparent` or inject a new one, then
+read the trace context from the request, the response, or a `Server-Timing` entry named `traceparent`. The trace ID and the span ID are
+written to `resource.trace_id` and `resource.span_id`, which lets MoleSignal connect a browser request to backend traces. By default,
+trace context is injected and read only for same-origin requests. For cross-origin APIs, expose the response headers and allow
+the origin explicitly:
 
 ```http
 Access-Control-Expose-Headers: traceparent, server-timing
@@ -138,6 +214,57 @@ allowedTracingUrls: [
   /^https:\/\/edge-\w+\.example\.com\//,
 ]
 ```
+
+## Configuration
+
+| Option | Default | Purpose |
+|---|---|---|
+| `applicationId` | required | Identifier of the application; sent as `application.id` |
+| `clientToken` | required | Application-bound `msrum_` client token |
+| `site` | required | MoleSignal origin, or an `/api`, `/api/v1`, `/api/v1/rum` base |
+| `service` | `applicationId` | `service` of the events |
+| `env`, `version` | unset | Deployment dimensions. `version` is required for source map lookup |
+| `debugId` | unset | Build debug ID, sent as `debug_id` on error frames |
+| `user`, `account`, `globalContext` | unset | Initial identity and custom attributes |
+| `trackingConsent` | `granted` | Start or defer all tracking and identifier creation |
+| `sessionSampleRate` | `100` | Percentage of sessions collected |
+| `sessionReplaySampleRate` | `0` | Percentage of collected sessions that record replay |
+| `sessionInactivityTimeout` | `900000` | Idle time after which a session ends, in milliseconds |
+| `maxSessionDuration` | `14400000` | Longest a session lasts, in milliseconds |
+| `defaultPrivacyLevel` | `mask` | `mask` or `allow`: whether action names, selectors, and element hints carry page text and IDs |
+| `trackUrlQueryString` | `false` | Keep query strings in reported URLs |
+| `excludedUrls` | `[]` | String, RegExp, or callback URL exclusions for requests |
+| `allowedTracingUrls` | same origin | Requests that receive and contribute trace context |
+| `enablePersistentQueue` | `true` | Recover unsent telemetry from IndexedDB after a reload |
+| `flushInterval`, `batchSize` | `5000`, `50` | When and how many events go in a request. Batches are capped at 100 |
+| `maxQueueSize` | `1000` | Events kept while offline |
+| `beforeSend` | unset | Inspect, modify, or drop an event |
+| `onError` | unset | Receive SDK diagnostics: failed uploads, rejected events |
+| `transport` | browser fetch | Send through your own proxy |
+
+`beforeSend(event, { kind })` receives the event object of the [event format](/en-US/rum/events). Return `false` to drop the event;
+a `view` event cannot be dropped, because its counts would stop adding up.
+
+## Delivery
+
+Events are queued, sent in batches, and persisted in IndexedDB until the server accepts them. A request is retried with exponential
+backoff after a network error, `408`, `425`, `429`, or `5xx`, and `Retry-After` is honored. Events that MoleSignal **rejects** are
+not retried: they are reported through `onError`. Any other `4xx` drops the batch. When the queue is full, resources go first, then long
+tasks, replay, vitals, actions, errors, and, last, views. When the page goes away, the most important events are sent first in one
+`keepalive` request. Tabs of the same application share the queue without sending each other's events twice.
+
+## Upgrade from 0.1
+
+Version 0.2 moves the SDK to the RUM event format, with no compatibility mode.
+
+- Events go to `POST /api/v1/rum/events` only. The endpoints for sessions, actions, and errors are gone. Custom `transport`
+  functions receive `kind: 'events' | 'replay'`.
+- The SDK sends views, not sessions. Resources, long tasks, and page views are events of their own, and rage and dead clicks are
+  `action.frustration.type` on the click.
+- `beforeSend` receives event objects of the event format, and `context.kind` is the event type.
+- The session lives in a cookie shared by tabs, and the default inactivity timeout is 15 minutes.
+- Browser, operating system, and device come from the `User-Agent` on the server.
+- Create the application first. A token is issued only for an application that exists.
 
 ## Next steps
 

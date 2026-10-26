@@ -1,0 +1,208 @@
+---
+title: "Deployments"
+sidebarTitle: "Deployments"
+description: "Report deployments, configuration changes, and feature flags from CI, read them beside the versions that traces carry, recognize rollbacks, and compare a canary with the version it replaces."
+"zh-Hans_link": "/zh-Hans/apm/deployments"
+---
+
+The **Deployments** section of a service page puts two sources side by side: the deployments that
+pipelines report, and the versions that the service's spans carry in `service.version`. A version
+that no pipeline reported still appears, from the spans alone.
+
+## The deployment timeline
+
+The timeline lists what happened to the service in the time range, the newest first:
+
+| Event | When |
+|---|---|
+| **Deployed** | A pipeline reported a deployment that succeeded. |
+| **Failed** | A pipeline reported a deployment that failed. A failed deployment does not change the running version. |
+| **Rolled back** | A pipeline reported a rollback, or reported a deployment of a version that ran before another version. The row names the version it went back from. |
+| **Went back** | The spans went back to an older version that no pipeline reported: the version seen last was first seen before a newer version that stopped more than five minutes earlier. |
+| **First seen** | The spans carried a version that no pipeline reported. |
+| **Configuration** | A pipeline or a tool reported a configuration change. Its description shows in the row. |
+| **Feature flag** | A pipeline or a tool reported a feature flag change. Its description shows in the row. |
+
+A configuration change or a feature flag does not change the running version and has no figures of
+its own. It is listed among the changes near an insight; see
+[Changes near a finding](/en-US/apm/insights#changes-near-a-finding).
+
+A reported deployment shows its commit, pull request, CI run, and author. When the repository is an
+http or https address, the commit opens on its web page, in the way GitHub, GitLab, or Bitbucket
+addresses a commit.
+
+Each version's requests, error rate, and p95 in the range show on its newest row, with the verdict
+against the version first seen before it:
+
+| Verdict | When |
+|---|---|
+| **Regressed** | The error rate rose by at least one point and to at least 1.5 times, or p95 rose by at least a fifth and at least 50 ms. The part that got worse follows the verdict. |
+| **Improved** | One of the two fell as far, and neither got worse. |
+| **No change** | Neither moved that far. |
+| **Not enough requests** | Either version served fewer requests than a version comparison needs, 1,000 by default. |
+
+Selecting a verdict opens its two versions in **Compare two versions**, which lists the endpoints that
+got slower and the errors that grew. A regressed or improved version is also flagged among the
+overview's recent deployments.
+
+## Canaries
+
+When two versions run at once, as a canary runs beside the version it replaces, a card above the
+timeline reads them side by side. Two versions run at once when both were seen within five minutes
+of the last span of the service. The card compares the newest two, from when the newer one was
+first seen:
+
+- the share of the requests that each version served;
+- requests, error rate, p50, p95, and p99 of each version;
+- the verdict of the newer version against the older one.
+
+## Report deployments from CI
+
+A pipeline reports a deployment with `POST /api/v1/apm/deployments`. The request needs an API token
+whose role holds `apm.deploy`. Owners, administrators, and editors hold it, and so does the
+**Intake token** role that new API tokens get by default.
+
+```bash
+curl -X POST "https://<host>/api/v1/apm/deployments" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"service": "checkout", "environment": "production", "version": "2.4.0", "commit": "9f2c1e7a4b3d", "repository": "https://github.com/acme/checkout", "ci_url": "https://ci.example.com/runs/7"}'
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `service` | Yes | The service, as its spans name it in `service.name`. Up to 255 characters. |
+| `version` | For a deployment | The version deployed, as its spans report it in `service.version`. Up to 192 characters. |
+| `kind` | No | `deployment` (the default), `configuration`, or `feature_flag`. |
+| `namespace` | No | The service's `service.namespace`. A deployment without one shows in every namespace. |
+| `environment` | No | The environment, as `deployment.environment.name`. A deployment without one shows in every environment. |
+| `status` | No | `succeeded` (the default), `failed`, or `rolled_back` when the deployment took the service back to `version`. |
+| `commit` | No | The commit deployed: up to 64 letters and digits. |
+| `repository` | No | Where the code lives: an https, http, ssh, or git address of up to 512 characters. A password in the address is kept as `****`, as is the user part of an https address. |
+| `pull_request` | No | An http or https link to the pull request. |
+| `author` | No | Who deployed, up to 128 characters. |
+| `ci_url` | No | An http or https link to the CI run. |
+| `description` | No | Up to 1,000 characters. It shows when the pointer rests on the event. |
+| `deployed_at` | No | When the deployment happened, in microseconds since the epoch. Defaults to the time the request arrives. |
+
+The service and the environment are named as APM names them: the organization's naming rules,
+environment mapping, and aliases apply to them, as they apply to spans. See
+[APM settings](/en-US/apm/settings).
+
+The **Datasource** page has the steps below under **GitHub Actions**, **GitLab CI/CD**, and
+**Jenkins**, with the address of the workspace filled in.
+
+### GitHub Actions
+
+Keep the token as a repository secret, then add a step to the job that deploys. `if: always()`
+reports a failed deployment too.
+
+```yaml
+- name: Report the deployment to MoleSignal
+  if: always()
+  env:
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+    DEPLOY_STATUS: ${{ job.status == 'success' && 'succeeded' || 'failed' }}
+  run: |
+    cat > deployment.json <<EOF
+    {
+      "service": "checkout",
+      "environment": "production",
+      "version": "${GITHUB_SHA::12}",
+      "status": "$DEPLOY_STATUS",
+      "commit": "$GITHUB_SHA",
+      "repository": "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY",
+      "author": "$GITHUB_ACTOR",
+      "ci_url": "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+    }
+    EOF
+    curl -fsS -X POST "https://<host>/api/v1/apm/deployments" \
+      -H "Authorization: Bearer $MOLESIGNAL_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data-binary @deployment.json
+```
+
+### GitLab CI/CD
+
+Add the token as a masked CI/CD variable named `MOLESIGNAL_TOKEN`, then report from the deploy job's
+`after_script`, which runs whether the deployment worked or not.
+
+```yaml
+deploy:
+  stage: deploy
+  environment: production
+  script:
+    - ./deploy.sh
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "success" ]; then DEPLOY_STATUS=succeeded; else DEPLOY_STATUS=failed; fi
+      cat > deployment.json <<EOF
+      {
+        "service": "checkout",
+        "environment": "$CI_ENVIRONMENT_NAME",
+        "version": "$CI_COMMIT_SHORT_SHA",
+        "status": "$DEPLOY_STATUS",
+        "commit": "$CI_COMMIT_SHA",
+        "repository": "$CI_PROJECT_URL",
+        "author": "$GITLAB_USER_LOGIN",
+        "ci_url": "$CI_PIPELINE_URL"
+      }
+      EOF
+      curl -fsS -X POST "https://<host>/api/v1/apm/deployments" \
+        -H "Authorization: Bearer $MOLESIGNAL_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data-binary @deployment.json
+```
+
+### Jenkins
+
+Add the token as a **Secret text** credential with the ID `molesignal-token`, then report in the
+pipeline's `post` block. `post { always }` reports a failed build too. A password in `GIT_URL` is
+masked when the deployment is kept.
+
+```groovy
+post {
+  always {
+    script {
+      writeFile file: 'deployment.json', text: groovy.json.JsonOutput.toJson([
+        service: 'checkout',
+        environment: 'production',
+        version: env.GIT_COMMIT.take(12),
+        status: currentBuild.currentResult == 'SUCCESS' ? 'succeeded' : 'failed',
+        commit: env.GIT_COMMIT,
+        repository: env.GIT_URL,
+        ci_url: env.BUILD_URL,
+      ])
+    }
+    withCredentials([string(credentialsId: 'molesignal-token', variable: 'MOLESIGNAL_TOKEN')]) {
+      sh '''
+        curl -fsS -X POST "https://<host>/api/v1/apm/deployments" \
+          -H "Authorization: Bearer $MOLESIGNAL_TOKEN" \
+          -H "Content-Type: application/json" \
+          --data-binary @deployment.json
+      '''
+    }
+  }
+}
+```
+
+## Report configuration changes and feature flags
+
+Report a configuration change or a feature flag with the same endpoint, with `kind` set and a
+description of what changed. It needs no version.
+
+```bash
+curl -X POST "https://<host>/api/v1/apm/deployments" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"service": "checkout", "environment": "production", "kind": "feature_flag", "description": "new_checkout on for 10% of users"}'
+```
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| A reported deployment is missing from the timeline | The time range must include `deployed_at`, and `service` must name the service as APM does. A deployment reported with an environment shows only in that environment. |
+| A deployment and the version it deployed show as two rows | The reported `version` differs from the `service.version` that the spans carry. Report the same value. |
+| `403` from the deployments endpoint | The token's role does not hold `apm.deploy`. |
+| `400` from the deployments endpoint | A field breaks a limit in the table above; the error says which. |

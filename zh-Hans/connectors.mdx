@@ -1,90 +1,147 @@
 ---
 title: "连接器"
 sidebarTitle: "连接器"
-description: "直接从 Kinesis Firehose、Cloudflare Logpush、Heroku 接收日志——并把流水线产出投递到 S3 或 Kafka。"
+description: "从 CloudWatch Logs、Amazon Data Firehose、Cloudflare Logpush、Heroku 接入日志，并把流水线产出投递到 S3、Kafka 或 HTTP 端点。"
 "en_link": "/en-US/connectors"
 ---
 
-**Connector** 是与外部平台的托管集成，支持两个方向：
+**连接器**是与外部平台的托管集成，分两个方向：
 
-- **接入源** —— 平台把数据**推进** MoleSignal（Kinesis Firehose、Cloudflare Logpush、Heroku log
-  drain）。
-- **出向 sink** —— [流水线](/zh-Hans/pipelines)把产出**投递出去**到 S3 或 Kafka。
+- **来源**从其他服务接入日志并写入数据流。CloudWatch Logs 由 MoleSignal 定时拉取；Amazon Data Firehose、Cloudflare Logpush、Heroku 把日志推送给 MoleSignal。
+- **目标**接收[定时流水线](/zh-Hans/pipelines#目标与连接器出口)的产出：Amazon S3 及 S3 兼容存储、Apache Kafka，以及任意 HTTP 端点。
 
-## 配置一个 connector
+| Kind | 连接器 | 方向 | 认证 |
+|---|---|---|---|
+| `aws_cloudwatch_logs` | AWS CloudWatch Logs | 来源，每 30 秒拉取一次 | [AWS 凭据](#aws-认证) |
+| `aws_kinesis_firehose` | Amazon Data Firehose | 来源，推送 | [推送 Token](#推送来源) |
+| `cloudflare_logpush` | Cloudflare Logpush | 来源，推送 | 推送 Token |
+| `heroku_drain` | Heroku 日志 Drain | 来源，推送 | 推送 Token |
+| `s3` | Amazon S3 | 目标 | AWS 凭据 |
+| `kafka` | Apache Kafka | 目标 | 无、SASL 或客户端证书 |
+| `http` | HTTP / Webhook | 目标 | 无、Bearer Token、Basic 认证、自定义请求头或 HMAC 签名 |
 
-在 **流水线 → 连接器** 下创建 connector，或通过 API。页面列出 **来源**（从其他服务接入日志）和 **目标**
-（流水线可以投递输出的位置）。每个 connector 有一个 `kind` 和一个
-`config_json`，后者的结构随 kind 而定。敏感字段（`push_token`、`access_key`、`secret_key` …）在 API
-响应中被掩码。
+## 创建连接器
+
+<Steps>
+  <Step title="打开连接器页面">
+    进入 **流水线 → 连接器**。页面分 **来源** 和 **目标** 两部分列出连接器。
+  </Step>
+  <Step title="选择类型">
+    点击 **新建连接器**，选择要连接到哪里。
+  </Step>
+  <Step title="填写设置">
+    填写在组织内唯一的 **名称**，填写读取或投递的位置，并选择 **认证方式**。
+  </Step>
+  <Step title="测试并创建">
+    点击 **测试连接**，在保存前试用当前设置，然后点击 **创建连接器**。推送来源没有可连接的对象，不提供测试。
+  </Step>
+</Steps>
+
+通过 API 创建时，连接器由 `name`、`kind` 和 `config_json` 组成，`config_json` 的键随 kind 而定。`config_json` 中的 `auth` 指定认证方式，每种方式有各自的键。无法生效的设置在保存时返回 `400`：缺少必填的键、成对的凭据只填了一半，或填了所选 `auth` 用不到的键。
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/connectors \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
   -d '{
-        "name": "cf-prod",
-        "kind": "cloudflare_logpush",
-        "config_json": { "push_token": "ms_cf_9f3c…", "target_stream": "cloudflare" }
+        "name": "archive",
+        "kind": "s3",
+        "config_json": {
+          "bucket": "acme-logs",
+          "region": "eu-west-1",
+          "prefix": "pipelines/checkout/",
+          "auth": "assume_role",
+          "role_arn": "arn:aws:iam::123456789012:role/molesignal-delivery"
+        }
       }'
 ```
 
-## 接入源（推送）
+## 密钥
 
-三种推送源共用一套模型：创建一个带 **`push_token`** 和 **`target_stream`** 的 connector，然后把平台
-指向对应端点。这些端点不使用 JWT——请求用 connector token 鉴权，按平台允许的方式传入：
+`config_json` 中以下键保存的是密钥：
+
+| Kind | 密钥键 |
+|---|---|
+| `s3`、`aws_cloudwatch_logs` | `access_key`、`secret_key`、`session_token` |
+| `aws_kinesis_firehose`、`cloudflare_logpush`、`heroku_drain` | `push_token` |
+| `kafka` | `sasl_password`、`tls_client_key` |
+| `http` | `url`、`bearer_token`、`basic_password`、`header_value`、`hmac_secret` |
+
+密钥不会通过 API 返回。响应中密钥显示为 `***`，`secret_keys` 列出已保存了值的密钥：
+
+```json
+{
+  "kind": "kafka",
+  "config_json": {
+    "brokers": "b-1.example.com:9096",
+    "topic": "logs",
+    "tls": true,
+    "auth": "sasl_scram_sha_512",
+    "sasl_username": "molesignal",
+    "sasl_password": "***"
+  },
+  "secret_keys": ["sasl_password"]
+}
+```
+
+- 更新时原样传回 `***` 表示保留已保存的值。因此重命名、停用连接器或修改投递位置时，不必重新填写凭据。界面上留空的已保存密钥同样保持不变。
+- 更新时没有带上的密钥会被删除。
+- 更新时改变了 `kind`，已保存的密钥一个都不保留。
+
+MoleSignal 用 `MS_CIPHER_KEY` 中的根密钥（AES-256-GCM）把密钥与其余设置分开封存，不以明文保存任何密钥。推送来源按其 Token 的 SHA-256 查找。轮换根密钥时，`molesignal rewrap-kek` 会把连接器密钥与其他密文一起重新封存，参见[生产检查清单](/zh-Hans/deployment/production-checklist)。
+
+## 来源
+
+### 推送来源
+
+三种推送来源共用一套模型：创建带 **`push_token`** 和 **`target_stream`** 的连接器，再把平台指向对应的端点。这些端点不使用 JWT，请求以推送 Token 鉴权，按平台允许的方式传入：
 
 | 方式 | 适用平台 |
 |---|---|
-| `X-Connector-Token` 头 | 可配置自定义头的平台（如 Cloudflare） |
-| `X-Amz-Firehose-Access-Key` 头 | Kinesis Firehose（自动发送） |
-| `?token=` 查询参数 | 无法设置自定义头的平台（如 Heroku） |
+| `X-Connector-Token` 请求头 | 可以配置自定义请求头的平台，如 Cloudflare |
+| `X-Amz-Firehose-Access-Key` 请求头 | Amazon Data Firehose，自动发送 |
+| `?token=` 查询参数 | 无法设置请求头的平台，如 Heroku |
 
-带 `Content-Encoding: gzip` 的 body 会被自动解压。事件走与其他接入相同的路径——schema-on-write、
-[流水线](/zh-Hans/pipelines)、[脱敏](/zh-Hans/security)一并生效。
+界面在创建连接器时生成 Token，并连同要交给平台的端点只显示一次，之后无法再读取。**生成新令牌** 会在保存连接器时取代当前 Token。通过 API 创建时，自行提供至少 16 个字符的 `push_token`。一个 Token 只对应同一 kind 的一个连接器：已被使用的 Token 返回 `409`。缺少或无法识别 Token 的请求，以及发给已停用连接器的请求，都返回 `401`。没有 Token 的连接器不接受任何推送。
+
+带 `Content-Encoding: gzip` 的请求体会被自动解压。事件走与其他接入相同的路径：schema-on-write、[流水线](/zh-Hans/pipelines)、[脱敏](/zh-Hans/security)一并生效。
 
 <Tabs>
-  <Tab title="Kinesis Firehose">
-    用 `kind: "aws_kinesis_firehose"` 创建 connector，然后给 Firehose 投递流添加一个 **HTTP
-    endpoint** 目标：
+  <Tab title="Amazon Data Firehose">
+    用 `kind: "aws_kinesis_firehose"` 创建连接器，然后为 Firehose 流选择 **HTTP endpoint** 目标：
 
-    - **URL** —— `https://molesignal.example.com/api/v1/_kinesis_firehose`
-    - **Access key** —— connector 的 `push_token`（Firehose 以 `X-Amz-Firehose-Access-Key` 发送）
+    - **HTTP endpoint URL**：`https://molesignal.example.com/api/v1/_kinesis_firehose`
+    - **Access key**：推送 Token。Firehose 以 `X-Amz-Firehose-Access-Key` 发送它。
 
-    MoleSignal 对每条 record base64 解码、按换行切分，并把每行解析为 JSON（纯文本则回退到 `message`
-    字段），并返回 Firehose 所要求的 `200` ACK。
+    MoleSignal 对每条 record 做 base64 解码，按换行切分，并把每行解析为 JSON，纯文本则放进 `message` 字段。MoleSignal 返回 Firehose 所要求的 `200` 确认。
   </Tab>
   <Tab title="Cloudflare Logpush">
-    用 `kind: "cloudflare_logpush"` 创建 connector，然后创建一个 Logpush job，目标为：
+    用 `kind: "cloudflare_logpush"` 创建连接器，然后创建一个 HTTP 目标的 Logpush 任务。Cloudflare 会把 `header_` 开头的查询参数转为请求头，因此 Token 放在 `X-Connector-Token` 中：
 
-    - **URL** —— `https://molesignal.example.com/api/v1/_cloudflare`
-    - **Header** —— `X-Connector-Token: <push_token>`
+    ```text
+    https://molesignal.example.com/api/v1/_cloudflare?header_X-Connector-Token=<push_token>
+    ```
 
-    Cloudflare 发送 gzip 压缩的 NDJSON，每行成为一条事件。端点回 `204 No Content`。
+    Cloudflare 发送 gzip 压缩的 NDJSON，每行成为一条事件。端点返回 `204 No Content`。
   </Tab>
   <Tab title="Heroku">
-    用 `kind: "heroku_drain"` 创建 connector，然后添加 drain——Heroku 设不了自定义头，故 token 放在
-    URL 里：
+    用 `kind: "heroku_drain"` 创建连接器，然后添加 Drain。Heroku 无法设置自定义请求头，因此 Token 放在 URL 中：
 
     ```bash
     heroku drains:add "https://molesignal.example.com/api/v1/_heroku?token=<push_token>"
     ```
 
-    每行日志成为一条带 `message` 和 `source: "heroku"` 的事件。端点回 `204 No Content`。
+    每行日志成为一条带 `message` 和 `source: "heroku"` 的事件。端点返回 `204 No Content`。
   </Tab>
 </Tabs>
 
 <Tip>
-  `target_stream` 在首次投递时创建，schema 随新字段出现而演化，与任意其他数据流一致。省略
-  `target_stream` 则回退到
-  按源区分的默认流名（`kinesis`、`cloudflare`、`heroku`）。
+  `target_stream` 在首次投递时创建，schema 随新字段出现而演化，与其他数据流一致。省略 `target_stream` 时回退到按来源区分的默认数据流：`kinesis`、`cloudflare` 或 `heroku`。
 </Tip>
 
-## 拉取源
+### CloudWatch Logs
 
-CloudWatch Logs 是**拉取**源：MoleSignal 按周期主动轮询 AWS API，而非被动接收推送。创建一个 connector
-后，MoleSignal 周期调用 `FilterLogEvents`（SigV4 签名，**不引 AWS SDK**），并按 connector 维度推进
-checkpoint，使每轮只读新事件。
+CloudWatch Logs 是**拉取**来源：MoleSignal 每 30 秒调用一次 `FilterLogEvents`，而不是等待推送。首次运行读取最近 5 分钟。之后每次运行从上一次成功运行结束的位置开始，因此没能读取或写入的事件会在下一次运行时重新读取。
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/connectors \
@@ -96,8 +153,7 @@ curl -X POST http://localhost:5080/api/v1/connectors \
         "config_json": {
           "region": "ap-southeast-1",
           "log_group": "/aws/lambda/checkout",
-          "access_key": "AKIA…",
-          "secret_key": "…",
+          "auth": "node_role",
           "target_stream": "cloudwatch"
         }
       }'
@@ -105,29 +161,223 @@ curl -X POST http://localhost:5080/api/v1/connectors \
 
 | 字段 | 说明 |
 |---|---|
-| `region` / `log_group` | 必填——要读取的 CloudWatch 区域与 log group。 |
-| `access_key` / `secret_key` | 具备 `logs:FilterLogEvents` 权限的 IAM 凭据。 |
-| `session_token` | 可选，用于 STS 临时凭据。 |
-| `target_stream` | 目标 stream（默认 `default`）。 |
+| `region` / `log_group` | 必填，要读取的 CloudWatch 区域与日志组。 |
+| `auth` 及其键 | 凭据，需要对该日志组有 `logs:FilterLogEvents` 权限，参见 [AWS 认证](#aws-认证)。 |
+| `target_stream` | 写入的数据流，默认 `default`。 |
 
-同一时刻只有一个节点轮询某个连接器。alert 节点之间按连接器分工，节点先认领连接器再轮询。每条事件成为
-一条带 `message`、`log_stream`、`log_group` 的日志。
+同一时刻只有一个节点轮询某个连接器。`alert` 节点之间按连接器分工，节点先认领连接器再轮询，参见 [alert 节点之间的分工](/zh-Hans/deployment/role-based#alert-节点之间的分工)。每条事件成为一条带 `message`、`log_stream`、`log_group` 的日志。已停用的连接器不会被轮询。
 
-## 出向 sink
+## 目标
 
-S3 与 Kafka connector 是 **sink**：在[流水线](/zh-Hans/pipelines#目标与连接器出口)中选中对应 connector，
-即可在流水线运行时把变换后的事件投递出去。
+目标接收定时流水线经过各步骤后的全部事件。用 **添加目标 → 连接器** 把连接器加入流程的 **目标**。投递失败时在本次运行内重试，连接器仍然没有收下的事件写入死信数据流，参见[重试与死信](/zh-Hans/pipelines#重试与死信)。
 
-| Kind | 载荷 |
+已停用的目标不会收到任何事件。每次运行都会跳过该连接器，并在运行的 `warning` 中写明。被跳过的事件不计为失败，不写入死信，重新启用连接器后也不会补发。编辑器中已停用的连接器标有 **停用**。
+
+| Kind | 投递负载 |
 |---|---|
-| `s3` | 批量 JSON Lines `PUT` 到 `s3://<bucket>/<prefix><id>.jsonl`。 |
-| `kafka` | 每条事件作为一条 JSON 记录 produce 到指定 topic。 |
+| `s3` | 每批事件一个 JSON Lines 对象，`PUT` 到 `s3://<bucket>/<prefix><id>.jsonl`。 |
+| `kafka` | 每条事件在主题上产生一条消息，消息负载为事件的 JSON。 |
+| `http` | 每批事件用一个请求发送，批次较大时拆成多个请求，格式为 NDJSON 或一个 JSON 数组。 |
+
+### Amazon S3
+
+`s3` 也可以投递到 MinIO、Cloudflare R2、阿里云 OSS 等 S3 兼容存储。在界面上打开 **S3 兼容存储** 即可填写端点。
+
+| 字段 | 说明 |
+|---|---|
+| `bucket` | 必填。 |
+| `region` | 存储桶所在区域。S3 兼容存储可能不需要。 |
+| `prefix` | 对象命名为 `<prefix><id>.jsonl`。开头的 `/` 会被去掉，末尾会补上 `/`。 |
+| `endpoint` | S3 兼容存储的 S3 API 地址，以 `http://` 或 `https://` 开头。 |
+| `virtual_hosted_style` | 为 `true` 时以主机名方式寻址存储桶，而不是把存储桶放在路径里，阿里云 OSS 等存储要求这样做。界面上为 **以主机名方式寻址存储桶**。 |
+| `auth` 及其键 | 凭据，需要对存储桶有 `s3:PutObject` 权限，参见 [AWS 认证](#aws-认证)。 |
+
+### Apache Kafka
+
+| 字段 | 说明 |
+|---|---|
+| `brokers` | 必填。主机和端口，多个用逗号分隔。 |
+| `topic` | 必填。 |
+| `tls` | 为 `true` 时用 TLS 加密连接。请连接 Broker 的 TLS 端口，常见为 9093、9094 或 9096。界面上为 **TLS 加密连接**。 |
+| `tls_ca_cert` | Broker 证书由私有 CA 签发时，填写该 CA 的 PEM 证书，仅在开启 `tls` 时可用。不填则信任系统的 CA。 |
+
+| `auth` | 界面 | 键 | 说明 |
+|---|---|---|---|
+| `none` | **无** | | 用于不要求凭据的 Broker。 |
+| `sasl_plain` | **SASL/PLAIN** | `sasl_username`、`sasl_password` | 密码原样发送。不开 TLS 时只应在内网使用。 |
+| `sasl_scram_sha_256` | **SCRAM-SHA-256** | `sasl_username`、`sasl_password` | 密码本身不经过网络传输。 |
+| `sasl_scram_sha_512` | **SCRAM-SHA-512** | `sasl_username`、`sasl_password` | Amazon MSK 使用的机制。 |
+| `mtls` | **客户端证书** | `tls_client_cert`、`tls_client_key` | 双向 TLS，需要开启 `tls`。两者都是 PEM 格式，私钥不能加密。 |
+
+TLS 与 SASL 可以组合：基于 TLS 的 SCRAM 以 `SASL_SSL` 连接。
+
+### HTTP / Webhook
+
+| 字段 | 说明 |
+|---|---|
+| `url` | 必填，以 `http://` 或 `https://` 开头的绝对地址。地址常带凭据，例如路径或查询参数中的密钥，因此按密钥保存。响应中只显示 `url_origin`，即协议、主机和端口。地址中带用户名和密码会被拒绝，请改用 `basic`。 |
+| `method` | `post`（默认）或 `put`。 |
+| `format` | `ndjson`（默认）以 `application/x-ndjson` 每行发送一个事件；`json` 以 `application/json` 发送一个 JSON 数组。 |
+
+| `auth` | 界面 | 键 | 请求 |
+|---|---|---|---|
+| `none` | **无** | | 不带凭据。 |
+| `bearer` | **Bearer 令牌** | `bearer_token` | `Authorization: Bearer <token>` |
+| `basic` | **Basic 认证** | `basic_username`、`basic_password` | HTTP Basic 认证头，请配合 `https` 使用。 |
+| `header` | **自定义请求头** | `header_name`、`header_value` | 把值放在指定的请求头中，例如 `X-API-Key` 或 `DD-API-KEY`。 |
+| `hmac` | **HMAC 签名** | `hmac_secret` | 对请求体签名，共享密钥至少 16 个字符。 |
+
+自定义请求头不能是投递本身设置的请求头：`Host`、`Content-Type`、`Content-Length`、`Content-Encoding`、`Transfer-Encoding`、`Connection`、`X-MoleSignal-Timestamp`、`X-MoleSignal-Signature`。
+
+投递遵循以下规则：
+
+- 大于 4 MiB 的批次拆成多个请求发送。单条事件超过这个大小时单独占一个请求。
+- 任何 `2xx` 状态码都算投递成功。其他状态码都算投递失败，重定向也一样：投递不跟随重定向。
+- 每个请求 30 秒超时。
+- MoleSignal 在请求前解析主机，只连接解析得到的地址。云元数据服务所在的地址一律拒绝，无论写在地址中还是由 DNS 解析得到：`169.254.0.0/16`、`fe80::/10`、`fd00:ec2::254`、`100.100.100.200`。其他私有地址可以使用。
+
+#### 校验 HMAC 签名
+
+`auth` 为 `hmac` 时，每个请求带两个请求头：
+
+| 请求头 | 内容 |
+|---|---|
+| `X-MoleSignal-Timestamp` | 请求时间，Unix 秒。 |
+| `X-MoleSignal-Signature` | `sha256=<十六进制>`，用共享密钥对 `<timestamp>.<body>` 计算的 HMAC-SHA256。 |
+
+校验请求时，用同一密钥对时间戳、一个 `.` 和原始请求体字节计算 HMAC-SHA256，再与签名做常量时间比较。拒绝超过几分钟的时间戳，使截获的请求无法在之后重放。
+
+```python
+import hashlib
+import hmac
+import time
+
+
+def verify(secret: bytes, timestamp: str, signature: str, body: bytes, tolerance: int = 300) -> bool:
+    if abs(time.time() - int(timestamp)) > tolerance:
+        return False
+    signed = timestamp.encode() + b"." + body
+    expected = "sha256=" + hmac.new(secret, signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+```
+
+## AWS 认证
+
+S3 与 CloudWatch Logs 以下列五种方式之一向 AWS 认证：
+
+| `auth` | 界面 | 键 | 凭据 |
+|---|---|---|---|
+| `access_key` | **访问密钥** | `access_key`、`secret_key` | IAM 用户的长期密钥。 |
+| `temporary_key` | **临时密钥** | `access_key`、`secret_key`、`session_token` | AWS STS 签发的短期密钥，必须与会话 Token 一起使用。请在过期前更换。 |
+| `node_role` | **节点身份** | | MoleSignal 所在节点的身份，不保存任何密钥。 |
+| `assume_role` | **扮演角色** | `role_arn`，可选 `access_key` 与 `secret_key` | 带组织外部 ID、通过 AWS STS 扮演的角色。 |
+| `web_identity` | **Web Identity** | `role_arn` | 用节点的 Web Identity Token 扮演的角色。 |
+
+不带 `auth` 时按已填的键判断：有访问密钥即 `access_key`，有 `role_arn` 即 `assume_role`，两者都没有即 `node_role`。`role_arn` 的格式为 `arn:aws:iam::<account>:role/<name>`。
+
+### 节点身份
+
+`node_role` 使用 AWS SDK 在节点上能找到的身份：EKS 的服务账号 IAM 角色（IRSA）或 EKS Pod Identity、ECS 任务角色，或 EC2 实例配置文件。节点环境中的静态密钥（如 `AWS_ACCESS_KEY_ID`）不会用于连接器。
+
+<Warning>
+  节点身份及其 Web Identity Token 属于整个部署。部署中的每个组织都可以选用 `node_role` 和 `web_identity`，因此节点身份能访问的一切，以及信任节点 Token 的每个角色，都对所有组织的连接器开放。只授予每个组织都可以拥有的访问权限。
+</Warning>
+
+### 扮演角色
+
+`assume_role` 向 AWS STS 申请该角色有效期一小时的密钥，并在过期前 5 分钟更换。扮演角色所用的基础凭据是节点身份。部署不在 AWS 上运行时，勾选 **用访问密钥扮演，不用节点身份**，并填写一个 IAM 用户的密钥。
+
+每个组织都以自己的外部 ID `molesignal-<组织 ID>` 扮演角色，该值无法修改。表单在 **外部 ID** 处显示它，`GET /api/v1/connectors/aws-external-id` 也会返回它。请在角色的信任策略中要求该外部 ID，这样其他组织即使知道角色的 ARN 也无法扮演：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "AWS": "<节点角色或 IAM 用户的 ARN>" },
+      "Action": "sts:AssumeRole",
+      "Condition": { "StringEquals": { "sts:ExternalId": "molesignal-<组织 ID>" } }
+    }
+  ]
+}
+```
+
+会话命名为 `molesignal-<连接器 ID>`，在 AWS CloudTrail 中以此名称出现。请求发往连接器 `region` 所在区域的 STS 端点：区域为空时为 `us-east-1`，中国区域使用 `amazonaws.com.cn` 域名。
+
+### Web Identity
+
+`web_identity` 用节点 `AWS_WEB_IDENTITY_TOKEN_FILE` 给出路径的 Web Identity Token 扮演角色，例如 EKS 为 IRSA 投射的服务账号 Token。连接器无法指定其他文件。角色的信任策略需要信任签发该 Token 的 OIDC 提供方。节点没有设置 `AWS_WEB_IDENTITY_TOKEN_FILE` 时，连接器拿不到凭据。
+
+Token 在连接器 `region` 所在区域的 STS 端点兑换；节点环境设置了 `AWS_ENDPOINT_URL_STS` 时改用该端点。来自 IRSA 的节点身份同样如此。
+
+## 测试连接
+
+**测试连接** 在保存前试用表单中当前的设置，留空的密钥使用已保存的值。每种类型只做足以证明投递或拉取可行的最少操作：
+
+| Kind | 测试内容 |
+|---|---|
+| `s3` | 在前缀下写入对象 `.molesignal-connection-test`，权限允许时再删除。 |
+| `kafka` | 向 Broker 读取主题元数据，以此验证连接、TLS 与认证，并确认主题存在。不写入消息。 |
+| `http` | 发送一条标记为测试的事件：`"message": "MoleSignal connection test"`、`"molesignal_connection_test": true`。 |
+| `aws_cloudwatch_logs` | 读取日志组最近一分钟内至多一条事件。不写入数据流，读取位点保持不变。 |
+
+测试在 25 秒后放弃。通过 API 测试时，`POST /api/v1/connectors/test` 接收要试用的 `kind` 与 `config_json`。带上同一 kind 的已保存连接器的 `id` 时，`***` 代表该连接器保存的密钥。无法生效的设置与保存时一样返回 `400`。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors/test \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{
+        "id": "<connector id>",
+        "kind": "kafka",
+        "config_json": {
+          "brokers": "b-1.example.com:9096",
+          "topic": "logs",
+          "tls": true,
+          "auth": "sasl_scram_sha_512",
+          "sasl_username": "molesignal",
+          "sasl_password": "***"
+        }
+      }'
+```
+
+```json
+{ "ok": true, "code": "ok", "detail": null, "elapsed_ms": 412 }
+```
+
+`elapsed_ms` 是测试用时。测试失败时，`code` 指出原因，`detail` 带上对方的原话，最多 600 个字符：
+
+| `code` | 含义 |
+|---|---|
+| `ok` | 连接成功。 |
+| `invalid` | 设置无法生效，或连接器是没有可连接对象的推送来源。 |
+| `no_credentials` | 拿不到 AWS 凭据：节点没有身份，或没有所需类型的身份。 |
+| `denied` | 对方拒绝了凭据或凭据所需的权限。 |
+| `not_found` | 存储桶、主题、日志组或地址不存在。 |
+| `tls` | TLS 握手失败：证书不受信任，或没有出示证书。 |
+| `unreachable` | 无法解析或连接主机。 |
+| `timeout` | 等待应答超时。 |
+| `failed` | 其他失败。 |
+
+## API
+
+| 端点 | 权限 | 用途 |
+|---|---|---|
+| `GET /api/v1/connectors` | `pipelines.read` | 列出组织的连接器。 |
+| `POST /api/v1/connectors` | `pipelines.edit` | 创建连接器，`enabled` 默认为 `true`。 |
+| `GET /api/v1/connectors/{id}` | `pipelines.read` | 读取连接器。 |
+| `PUT /api/v1/connectors/{id}` | `pipelines.edit` | 整体替换 `name`、`kind`、`config_json` 与 `enabled`，四者均为必填。 |
+| `DELETE /api/v1/connectors/{id}` | `pipelines.edit` | 删除连接器。 |
+| `POST /api/v1/connectors/test` | `pipelines.edit` | 在保存前测试设置。 |
+| `GET /api/v1/connectors/aws-external-id` | `pipelines.read` | 以 `external_id` 返回组织的外部 ID。 |
+
+连接器的读取结果包含 `id`、`name`、`kind`、密钥已掩码的 `config_json`、`secret_keys`、`enabled`、`last_run_at_micros`、`created_at_micros` 与 `updated_at_micros`。
 
 ## 权限
 
-`pipelines.read` 用于列出和检查 Connector。`pipelines.edit` 用于创建、更新或删除
-Connector。推送 Receiver 使用 Connector 专用 Token 身份验证，不能用普通登录 JWT 替代。
+`pipelines.read` 用于列出和查看连接器，以及读取外部 ID。`pipelines.edit` 用于创建、更新、删除和测试连接器。测试需要 `pipelines.edit`，因为它会使用已保存的密钥，并代替调用方连接其他系统。推送接收端点以推送 Token 鉴权，不能用普通登录 JWT 替代。
 
 <Card title="接入 API" icon="plug" href="/zh-Hans/api/intake/kinesis">
-  Kinesis、Cloudflare、Heroku 推送接收端点的细节。
+  Amazon Data Firehose、Cloudflare、Heroku 推送接收端点的细节。
 </Card>

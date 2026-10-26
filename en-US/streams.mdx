@@ -5,14 +5,14 @@ description: "Manage signal-specific schemas, retention, queryability, and runti
 ---
 
 A stream is the organization-scoped contract used by intake, query, pipelines, and retention.
-Open **Streams** to inspect or configure that contract.
+Open **Streams** to see what arrives, and to inspect or configure each stream.
 
 ## Stream types
 
 | Type | Typical content |
 |---|---|
 | `logs` | Structured events and application logs. |
-| `metrics` | Metric samples and labels. |
+| `metrics` | The metric samples of one source, such as one Prometheus server, told apart by `metric_name`. |
 | `traces` | OpenTelemetry spans. |
 | `profiles` | Profile metadata linked to pprof blobs. |
 | `extend` | Lookup data managed as extend tables and used during processing. |
@@ -20,23 +20,73 @@ Open **Streams** to inspect or configure that contract.
 The same stream name may exist for different stream types. Always include `stream_type` in API
 requests and automation.
 
-## Lifecycle
+## The stream list
 
-MoleSignal can create a stream on first intake, or an administrator can predeclare a stream. As data arrives, schema
-evolution adds compatible fields.
+**Streams** lists every stream of the workspace. Switch the tabs to show **All** streams or one type,
+search by name or description, and filter by runtime state. The head counts the streams that receive
+normally and those that need attention, and sums the compressed data written in the period and the
+current storage.
 
-Stream detail provides:
+| Column | Shows |
+|---|---|
+| **Status** | **Healthy**, **Delayed**, **Interrupted**, **Idle**, **Unused**, or **Stats unavailable**. See below. |
+| **Receive rate**, **Last received** | How fast data arrives, and when it last arrived. |
+| Compressed data | The compressed bytes written in the period. |
+| **Current storage**, **Retention** | The bytes stored now, and how many days data is kept. |
+| **Records**, **Collected size**, **Stored size**, **Index size** | The records kept, the bytes received before transformations, the bytes of data files, and the bytes of indexes. |
 
-- schema and indexed fields;
-- retention and compaction behavior;
-- runtime and intake status;
-- queryability;
-- links to the correct signal explorer;
-- pipeline and datasource relationships.
+| State | Meaning |
+|---|---|
+| **Healthy** | Data arrived in the last 15 minutes. |
+| **Delayed** | The last data arrived between 15 minutes and 2 hours ago. |
+| **Interrupted** | No data for more than 2 hours. |
+| **Idle** | The stream of Mole Agent traces, which is quiet between answers. |
+| **Unused** | The stream has never received data. |
 
-Set `queryable` to false when a catch-all source should continue receiving but must not appear in
-query selectors. A routing pipeline can still read the stream. Manage `extend` data through **Extend
-tables** rather than the generic telemetry query path.
+A stream marked **Not queryable** keeps receiving data but is hidden from query selectors. Each row has
+**Query** or **Explore**, **View details**, and **Copy stream ID**. **Search jobs** in the head opens
+the [search jobs](#search-jobs).
+
+## Create a stream
+
+MoleSignal creates a stream on the first write to it, so most streams appear by themselves. Create one
+in advance to set its retention, its encrypted fields, or its query access from the start. Select
+**Create stream**:
+
+| Field | Rule |
+|---|---|
+| **Stream name** | `snake_case`, up to 64 characters. |
+| **Description** | Optional. What flows through the stream. |
+| **Signal type** | **Logs**, **Metrics**, or **Traces**. |
+| **Retention (days)** | How long data is kept. |
+| **Indexed fields** | Comma-separated fields that get a full-text index. |
+| **Encrypted fields** | Comma-separated fields that are encrypted before they are stored. This cannot be changed later. See [Encrypted fields](#encrypted-fields). |
+| **Queryable** | Turn it off for a source stream that only feeds a routing pipeline. |
+
+## Stream details
+
+Select a stream to open it. **Query data** opens it in its explorer, and the menu has
+**Copy stream ID** and **Delete stream**. The tabs:
+
+| Tab | Content |
+|---|---|
+| **Overview** | The runtime state, the first data received, query access, and the trend of rows written and compressed data over 24 hours. A stream without data offers **Configure datasource** and **Send test data**. |
+| **Fields & indexes** | The fields with their type, index type, and encryption. Edit a field to change its index or its masking. See [Schema and fields](#schema-and-fields). |
+| **Retention** | The retention of the stream, and the downsampling of a metrics stream. See [Retention and deletion](#retention-and-deletion). |
+| **Usage** | What depends on the stream: the intake endpoint that writes it, pipelines, saved queries, and alert rules. Check it before a change or a deletion. |
+| **Settings** | The **Description**, **Queryable**, **Max query range (hours)**, and **Merge small files by day**. |
+
+Changes on the tabs collect into a draft. **Save and apply** applies them at once, and
+**Discard changes** drops them. Before saving, the page warns about changes that cannot be taken back:
+a shorter retention deletes expired data, and downsampling deletes the original samples.
+
+**Max query range** limits how many hours one SQL or PromQL query of the stream may cover. A query over
+a longer range is rejected, so a mistaken "last 90 days" cannot scan a large stream end to end. Empty
+or `0` means no limit.
+
+Set **Queryable** off when a catch-all source should keep receiving but must not appear in query
+selectors. A routing pipeline can still read the stream. Manage `extend` data through
+**Extend tables** rather than the generic telemetry query path.
 
 ## Schema and fields
 
@@ -52,6 +102,27 @@ The index type decides which helper structure MoleSignal builds for a field:
 | `bloom` | A Parquet Bloom filter only. |
 | `skip` | File-level minimum and maximum values that prune files for comparisons. |
 
+A field that first appears in incoming data gets its index type from its name:
+
+| Stream type | Fields | Index type |
+|---|---|---|
+| `logs` | `message` | `full_text` |
+| `logs` | `_event_id`, `level`, `session_id`, `fingerprint`, `country`, `browser`, `application`, `environment` | `exact` |
+| `traces` | `trace_id`, `span_id`, `parent_span_id`, `service.name` | `exact` |
+| `metrics` | `metric_name` | `exact` |
+
+Every other new field gets `none`. An exact `level` lets the logs histogram count errors from the index instead of reading the files. A changed index type applies to data written after the change; older files are indexed the new way when the compactor merges them.
+
+To change a field, open **Fields & indexes**, select the edit action of the field, and choose:
+
+- the **Index type**: **Not indexed**, **Full text search**, **Exact match**, **Bloom filter**, or
+  **Skip index**. Full-text search applies to text fields;
+- the **Stream-level policy** of **Result field masking**: **Inherit global rule**, **Custom stream rule**,
+  or **Explicitly unmasked for stream**. See [Field masking](/en-US/settings/data-security#field-masking).
+  Metrics streams do not take part in masking.
+
+Select **Apply to draft**, then **Save and apply**. The type of a field never changes.
+
 ### Encrypted fields
 
 Mark a field `encrypted` when creating the stream to encrypt it before it is written to Parquet. The stored column holds ciphertext, and a plain query returns the ciphertext. Read the value back with `decrypt(field)` in SQL:
@@ -64,11 +135,27 @@ The flag cannot be changed later, because existing data would become unreadable.
 
 ## Retention and deletion
 
-Retention controls when the compactor removes data. Changing retention affects future cleanup and
-does not recreate deleted files.
+Retention controls when the compactor removes data. Set it on the **Retention** tab as
+**Data retention (days)**, or leave it empty for the platform default, 30 days, set in
+[Settings → Data retention](/en-US/settings/platform#data-retention) of the `_sys` organization. Data
+older than the retention is deleted in the next cleanup, so shortening the retention deletes the data
+that is then past it, and deleted files never come back. A metric of a metrics stream that has not been
+seen within the retention also leaves the metric list.
 
-Deleting a stream is destructive and can break dashboards, saved views, alerts, reports, and
-pipelines. Review dependencies before removal.
+On the **Retention** tab of a metrics stream, **Downsample older samples** rolls the samples of every
+metric in the stream older than a number of days up into time buckets from 1 minute to 1 day: the samples of a series in one bucket
+become one point, values averaged and delta counts summed, and the original samples are deleted.
+Queries over long ranges then read far less, and older data keeps only the bucket resolution. The
+original samples cannot be recovered.
+
+For logs and traces, the stream setting **Merge small files by day** (on by default) merges the files
+of a finished day into one an hour after the day ends, when together they are no larger than the
+compactor's `[compactor].target_size`. A query over many days then opens far fewer files. Retention
+then applies by the day: a merged file is deleted once its whole day has expired. Turn the setting off
+in the stream's **Settings** tab to keep hourly files.
+
+**Delete stream** deletes the stream and its configuration, and cannot be undone. It can break
+dashboards, saved views, alerts, reports, and pipelines: check the **Usage** tab first.
 
 ## Search jobs
 

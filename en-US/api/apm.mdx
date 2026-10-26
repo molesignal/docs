@@ -1,6 +1,6 @@
 ---
 title: "APM API"
-description: "Query application performance summaries, catalogs, details, version comparisons, and projection health."
+description: "Query application performance summaries, insights, catalogs, details, version comparisons, blast radius, and projection health; report deployments; and keep service definitions, error states, service level objectives, and APM settings."
 "zh-Hans_link": "/zh-Hans/api/apm"
 ---
 
@@ -12,22 +12,49 @@ Authorization: Bearer <token>
 ```
 
 An organization workspace requires `streams.query`. A platform caller can use
-`sys.telemetry.read` in the protected `_sys` scope.
+`sys.telemetry.read` in the protected `_sys` scope. Writing service definitions, error states,
+service level objectives, and APM settings requires `apm.manage`. Reporting a deployment requires
+`apm.deploy`.
 
 ## Endpoints
 
 | Method and path | Response |
 |---|---|
-| `GET /api/v1/apm/overview` | RED summary and trend, service health, top services, transactions, dependencies, errors, and recent versions. |
+| `GET /api/v1/apm/overview` | RED summary and trend of all services, service health and its trend, rankings, deployments, environments, instrumentation gaps, top transactions, dependencies, and errors. |
+| `GET /api/v1/apm/insights` | What moved against the stretch before and the same stretch a week before, versions that did worse, where time could be won back, and the changes near each. |
 | `GET /api/v1/apm/services` | Paginated service catalog with instrumentation, versions, health, RED metrics, and trace filters. |
 | `GET /api/v1/apm/services/{service}` | Service summary, trend, transactions, dependencies, errors, and versions. |
+| `GET /api/v1/apm/services/{service}/instances` | The instances of a service in an environment, with their version, resource attributes, and what each served. |
+| `GET /api/v1/apm/services/{service}/coverage` | Whether the service's logs, metrics, profiles, and browser sessions reach MoleSignal, over the day before `to`. |
 | `GET /api/v1/apm/transactions` | Paginated transaction RED metrics and total-time ranking. |
 | `GET /api/v1/apm/transactions/{transaction}` | Transaction trend, affected errors, versions, and trace filters. |
 | `GET /api/v1/apm/dependencies` | Paginated caller/dependency RED metrics and total-time ranking. |
-| `GET /api/v1/apm/errors` | Paginated sanitized backend error groups. |
-| `GET /api/v1/apm/errors/{fingerprint}` | Error trend, affected transactions and versions, representative stack, and bounded samples. |
+| `GET /api/v1/apm/map` | The service map of an environment and namespace: services, what they call, topics, and the calls between them. |
+| `GET /api/v1/apm/map/edge` | One call of the map: its trend, what was asked along it, and the errors of a service called. |
+| `GET /api/v1/apm/blast-radius` | What a service reaches along the map: what calls it and what it calls, a hop at a time. |
+| `GET /api/v1/apm/errors` | Paginated sanitized backend error groups, with where the listed groups happened. |
+| `GET /api/v1/apm/errors/{fingerprint}` | Error trend, affected transactions and versions, where the group happened, representative stack, and bounded samples. |
 | `GET /api/v1/apm/versions/compare` | Baseline and candidate RED metrics, deltas, sufficiency status, and regressions. |
 | `GET /api/v1/apm/health` | Tenant projection status, runtime health, boundaries, and gaps. |
+| `GET /api/v1/apm/service-definitions` | Every service definition of the organization. |
+| `PUT /api/v1/apm/service-definitions/{service}?namespace=` | Create or replace a service's definition. Requires `apm.manage`. |
+| `DELETE /api/v1/apm/service-definitions/{service}?namespace=` | Delete a service's definition. Requires `apm.manage`. |
+| `POST /api/v1/apm/service-definitions/{service}/key-transactions?namespace=` | Star an endpoint as a key transaction of the service, or take the star off. Requires `apm.manage`. |
+| `PUT /api/v1/apm/errors/{fingerprint}/issue` | Set an error group's state, team, and assignee. Requires `apm.manage`. |
+| `GET /api/v1/apm/error-rules` | The organization's error grouping rules in the order they are tried. |
+| `POST /api/v1/apm/error-rules` | Create a grouping rule, tried after the others. Requires `apm.manage`. |
+| `PUT /api/v1/apm/error-rules/{id}` | Replace a grouping rule. Requires `apm.manage`. |
+| `DELETE /api/v1/apm/error-rules/{id}` | Delete a grouping rule. Requires `apm.manage`. |
+| `PUT /api/v1/apm/error-rules/order` | Set the order the rules are tried in. Requires `apm.manage`. |
+| `GET /api/v1/apm/slos` | Every service level objective with its state, what it met, the error budget left, and burn rates. |
+| `GET /api/v1/apm/slos/{id}` | One service level objective's status and each day of its window. |
+| `POST /api/v1/apm/slos` | Create a service level objective. Requires `apm.manage`. |
+| `PUT /api/v1/apm/slos/{id}` | Replace a service level objective. Requires `apm.manage`. |
+| `DELETE /api/v1/apm/slos/{id}` | Delete a service level objective. Requires `apm.manage`. |
+| `POST /api/v1/apm/deployments` | Report a deployment. Requires `apm.deploy`. |
+| `GET /api/v1/apm/deployments` | The deployments pipelines reported, the newest first. |
+| `GET /api/v1/apm/settings` | The organization's APM settings, the defaults when none were saved. |
+| `PUT /api/v1/apm/settings` | Replace the organization's APM settings. Requires `apm.manage`. |
 
 Path parameters must be URL-encoded. Use the exact `transaction` name or error `fingerprint`
 returned by a list response.
@@ -47,6 +74,7 @@ returned by a list response.
 | `direction` | enum | `asc` or `desc`. Defaults to `desc`. |
 | `limit` | integer | Page size from 1 to 200. Defaults to 50. |
 | `cursor` | string | Opaque cursor from a previous list response. |
+| `status` | enum | `/errors` only: `all` (default), `unresolved` (open, investigating, and resolved groups seen again), `investigating`, `resolved`, or `ignored`. |
 
 Filters must be non-empty and no longer than 192 bytes. The range cannot exceed the configured
 maximum, which defaults to 30 days (`[apm].max_query_range_days`).
@@ -78,7 +106,43 @@ curl --get 'http://localhost:5080/api/v1/apm/overview' \
 </RequestExample>
 
 The response contains `red`, `trend`, `service_health`, `services`, `top_transactions`,
-`top_dependencies`, `top_errors`, and `recent_versions`, plus a common `meta` object.
+`top_dependencies`, `top_errors`, and `recent_versions`, plus a common `meta` object, and:
+
+| Field | Notes |
+|---|---|
+| `service_count`, `active_service_count` | Services seen in the range, and those of them that served any request. |
+| `health_trend` | How many services were in each state, a slot at a time: the range in at most 48 slots, none shorter than a bucket. A service without requests in a slot counts as `no_traffic` there. |
+| `rankings` | `slowest` (by p95), `most_errors` (by error rate), and `busiest` (by requests), five services each. The first two list services with at least 20 requests. |
+| `deployments` | Versions first seen within the range, newest first, at most 20, each with its `red` and `verdict` as in [a service's versions](#read-a-service’s-versions). |
+| `environments`, `available_environments` | Services and requests per environment in view, and every environment the services run in whatever the `environment` filter. |
+| `instrumentation` | Services per language and SDK, and how many report no `deployment.environment`, no `service.version`, or no `service.instance.id`. |
+
+## Read insights
+
+`GET /api/v1/apm/insights` takes the common range and filter parameters and answers `meta` and:
+
+| Field | Notes |
+|---|---|
+| `now`, `previous`, `last_week` | The services in view over the range, over the stretch of the same length before, and over the same stretch a week before: `request_count`, `throughput` in requests a second, `error_rate`, `p95_micros`, and `apdex`. A stretch without requests is absent. |
+| `insights` | At most 30 findings, the most pressing first. |
+
+Each finding carries:
+
+| Field | Notes |
+|---|---|
+| `kind` | `anomaly`, `regression`, `slow_dependency`, `repeated_call`, `slow_query`, or `hot_endpoint`. |
+| `severity` | `critical`, `warning`, or `info` for a suggestion. |
+| `service` | `namespace`, `name`, and `environment`. |
+| `transaction`, `dependency` | The endpoint of a hot endpoint; the dependency of a bottleneck, a repeated call, or a slow statement. |
+| `metric` | What moved or got worse: `error_rate`, `p95`, or `throughput`. |
+| `value` | The figure now: an error rate as a ratio, a P95 in microseconds, or requests a second. A bottleneck or a hot endpoint gives its share of the time, a repeated call its calls a request, and a slow statement its P95 in microseconds. |
+| `previous`, `last_week` | The same figure over the stretch before and over the same stretch a week before; for a regression, the figure of the version before. |
+| `since` | When a move began, or when a regressed version was first seen. |
+| `version`, `previous_version` | A regression's version and the version before it. |
+| `calls`, `p95_micros` | The calls or requests a suggestion rests on, and their P95. |
+| `changes` | The changes near `since`, the nearest first: `kind`, `source` (`reported` or `observed`), `service`, `version`, `status`, `at`, `downstream` (`true` for a service that the moving one calls), `commit`, and `description`. |
+
+The thresholds are in [Insights and investigations](/en-US/apm/insights#what-insights-find).
 
 ## List and paginate services
 
@@ -166,9 +230,178 @@ Every summary carries a `red` object with the request, error, and duration figur
 |---|---|
 | `request_count`, `error_count`, `error_rate` | Requests, failed requests, and the ratio of failed to total requests, from 0 to 1. |
 | `duration_sum_micros`, `duration_average_micros` | The total and the mean duration in microseconds. The mean is `null` without requests. |
-| `p50_micros`, `p95_micros`, `p99_micros` | Latency percentiles in microseconds, estimated from histogram buckets. Each value is a bucket bound, not an exact duration. `null` without requests. |
-| `latency_partial` | `true` when some buckets use another latency bucket definition (`[apm.histogram].schema_version`). The percentiles leave those buckets out, while the counts, the sum, and the mean still include those buckets. |
-| `exemplars` | Up to 8 sample spans of the range, slowest first. `trace_available` is `false` when the trace did not survive [tail sampling](/en-US/configuration#trace-capture-and-tail-sampling) or has expired. The aggregate stays valid. |
+| `p50_micros`, `p90_micros`, `p95_micros`, `p99_micros` | Latency percentiles in microseconds, read inside the histogram bucket the rank falls in. With the default layout a value is within about 4% of the exact duration. `null` without requests. |
+| `apdex` | Requests within the threshold T plus half the requests within 4T, over all requests, from 0 to 1. T is the service's `apdex_threshold_micros`, else 500 ms; the overview's figures of all services together use 500 ms. Failed requests are never satisfied. `null` without requests. |
+| `latency_partial` | `true` when some buckets use a latency layout that cannot be told from them. Buckets of an earlier layout (`[apm.histogram].schema_version`) are converted and counted. The percentiles leave out the buckets that cannot be read, while the counts, the sum, and the mean still include them. |
+| `timeout_count`, `retry_count` | Requests that ran out of time (a timeout error type, gRPC `DEADLINE_EXCEEDED`, HTTP 408 or 504) and requests sent again (`http.request.resend_count` above 0). Absent when none. |
+| `status_codes` | Responses by status code, as `http:<code>` (100 to 599) or `grpc:<code>` (0 to 16). A bucket keeps up to 24 codes; further codes count as `http:other` or `grpc:other`. Absent when no code was counted, such as for aggregates written before codes were counted. |
+| `exemplars` | Up to 8 sample spans of the range, slowest first. A span is projected before [tail sampling](/en-US/configuration#trace-capture-and-tail-sampling) decides about its trace, so `trace_available` is usually `false`; look the trace up to know whether it was kept. The aggregate stays valid. |
+
+Service and transaction summaries carry `apdex_threshold_micros`, the T their Apdex was read with.
+A service summary also carries `health` and `health_reasons`: each figure past a line, as `metric`
+(`error_rate` or `p95`), `level`, `value`, and `threshold`. It carries `sparkline`, the request count, error count, and p95 of each bucket,
+and `current_version` with `current_version_since`, the version seen most recently and when it was
+first seen. The detail of a service or a transaction carries `latency_distribution`: the histogram
+buckets that hold requests, each as `lower_micros`, `upper_micros`, and `count`, narrowed to the
+fastest and slowest request.
+
+## Keep service definitions
+
+A definition records who owns a service and how much it matters. It is keyed by `namespace` and the
+service name, so it holds in every environment, and it can exist before the service reports.
+
+```http
+PUT /api/v1/apm/service-definitions/checkout?namespace=shop
+Content-Type: application/json
+
+{"description": "Takes orders and payments.", "team_id": "<team id>", "owner_id": "<user id>", "tier": "p0", "lifecycle": "production", "repository_url": "https://github.com/acme/checkout", "tags": {"domain": "orders", "pci": ""}, "apdex_threshold_micros": 300000, "archived": false}
+```
+
+| Field | Notes |
+|---|---|
+| `description` | Up to 2,000 characters. |
+| `team_id` | A team of the organization, or `null`. Deleting the team clears it. |
+| `owner_id` | A member of the organization, or `null`. |
+| `tier` | `p0`, the most important, through `p5`, or `null`. |
+| `lifecycle` | `production`, `staging`, `experimental`, `deprecated`, or `null`. |
+| `repository_url` | An `http`, `https`, `ssh`, `git`, or `git+ssh` URL, or `user@host:path`, without spaces, up to 2,048 characters, or `null`. A password is saved as `****`, and so is the user part of an http(s) address. Shown when the service reports no repository. |
+| `tags` | Up to 32 tags as `{ "key": "value" }`. A key is 1 to 64 lowercase letters, digits, and `_ . - /`; a value is up to 128 characters without spaces around it, empty for a key alone. |
+| `apdex_threshold_micros` | The Apdex threshold T of the service, above 0 and at most 60,000,000 (a minute), or `null` for 500 ms. |
+| `archived` | `true` keeps the service out of the catalog's default view. Left out, a saved definition keeps its state. |
+
+A save keeps the definition's `key_transactions`, which change one at a time. The response is the
+saved definition with `namespace`, `name`, `key_transactions`, `updated_by`, and `updated_at`.
+`DELETE` answers `204`, or `404` when the service has no definition.
+
+### Star key transactions
+
+```http
+POST /api/v1/apm/service-definitions/checkout/key-transactions?namespace=shop
+Content-Type: application/json
+
+{"transaction": {"name": "POST /orders", "kind": "http"}, "key": true}
+```
+
+`key: true` adds the endpoint to `key_transactions`, `false` takes it out; asking for what is already
+so changes nothing. A service without a definition gets one. A service keeps up to 50 key
+transactions, and the overflow row `__other__` cannot be one. The response is the definition after
+the change.
+
+## Read a service's coverage
+
+`GET /api/v1/apm/services/{service}/coverage` takes `namespace` and `environment`, both required, and
+optional `to`, the end of the range in view in microseconds (now by default). It looks over the day
+before `to`, and keeps each answer for five minutes.
+
+```json
+{
+  "from": 1792230096695000,
+  "to": 1792316496695000,
+  "logs": { "state": "reported", "found": ["default"] },
+  "metrics": { "state": "missing" },
+  "profiles": { "state": "reported", "found": ["cpu", "alloc_space"] },
+  "rum": { "state": "unknown" }
+}
+```
+
+| Signal | `reported` when | `found` |
+|---|---|---|
+| `logs` | A log stream with a `service.name`, `service_name`, or `service` field holds a line of the service. At most eight streams are looked at, `default` first. | The streams. |
+| `metrics` | `count(last_over_time({"service.name"="<service>"}[1h]))` at `to` is above zero. | The number of series. |
+| `profiles` | The profile stream holds a profile of the service. | The profile types. |
+| `rum` | A browser action carried one of the service's five most recent sample traces. | The session. |
+
+`missing` means the look found nothing. `unknown` means the look failed or took longer than three
+seconds. `rum` is never `missing`: a sample of traces can show that sessions reach a service, not that
+none do.
+
+## Read what a service runs as
+
+`GET /api/v1/apm/services` and `GET /api/v1/apm/services/{service}` give each service summary a
+`profile`, read from the instances that reported in the range, those of `version` alone when the
+parameter is set. Each list is ranked by how many instances share a value, at most five, as
+`{ "value": "1.8.2", "instances": 4 }`.
+
+| Field | Notes |
+|---|---|
+| `instance_count`, `host_count` | Instances and distinct `host.name` values. |
+| `versions` | The versions the instances ran. A rollout lists two. |
+| `languages`, `runtimes`, `frameworks` | `telemetry.sdk.language`; `process.runtime.name` with its version; the framework named by the instrumentation library of the entry spans. |
+| `regions`, `clusters`, `k8s_namespaces`, `workloads` | `cloud.region`, `k8s.cluster.name`, `k8s.namespace.name`, and `k8s.deployment.name` or `k8s.statefulset.name`. |
+| `repositories`, `commits` | `vcs.repository.url.full` or `git.repository_url`, kept without credentials; `vcs.ref.head.revision` or `git.commit.sha`. |
+| `entry_kinds` | `http`, `rpc`, `messaging`, `span`: the kinds of entry the service serves. |
+
+`GET /api/v1/apm/services/{service}/instances` lists the instances one by one, the most recently
+seen first, at most 500. It takes `namespace`, `environment`, and optional `version`, `from`, and
+`to`; without a service and an environment it answers `400`. Each item has `instance_id` (the
+`service.instance.id`, else `k8s.pod.name`, else `host.name`), `version`, `first_seen_at`,
+`last_seen_at`, `attributes`, a map of the attributes the instance reported last, and what it served
+in the range: `red`, as in summaries with Apdex at the service's threshold, and `sparkline`. Past the
+instance limit the rest are counted in one item whose `instance_id` is `__other__`. An instance that
+served in the range before anything was kept about it is listed with empty `attributes`.
+
+## Set an error group's state
+
+```http
+PUT /api/v1/apm/errors/<fingerprint>/issue
+Content-Type: application/json
+
+{"status": "investigating", "assignee_id": "<user id>", "team_id": "<team id>", "last_seen_at": 1792316496695000}
+```
+
+`status` is `open`, `investigating`, `resolved`, or `ignored`. `assignee_id` is a member of the
+organization or `null`, and `team_id` a team of the organization or `null`. `last_seen_at`, optional, is when the reader last saw the group, in microseconds. Setting
+`resolved` records the time as `resolved_at`.
+
+Error summaries carry the state as `issue`, or `null` while nobody has set one. `issue.regressed`
+is `true` when a resolved group occurred again after `resolved_at`; the `unresolved` filter keeps
+such groups. Setting the state of a fingerprint the projection does not know answers `404`.
+
+## Keep service level objectives
+
+A service level objective (SLO) promises a share of good requests of a service in one environment, or
+of one of its endpoints, over a rolling window. See
+[Service level objectives](/en-US/apm#service-level-objectives) for what each figure means.
+
+```http
+POST /api/v1/apm/slos
+Content-Type: application/json
+
+{"name": "Checkout availability", "namespace": "shop", "service": "checkout", "environment": "production", "transaction": null, "kind": "availability", "objective": 0.999, "window_days": 30}
+```
+
+| Field | Notes |
+|---|---|
+| `name` | Required, up to 255 bytes. |
+| `description` | Optional, up to 2,000 bytes. |
+| `namespace`, `service`, `environment` | Required. The service as APM names it. A service without `service.namespace` is in the namespace `default`. |
+| `transaction` | One endpoint, `{ "name": "POST /orders", "kind": "http" }`, or `null` for the whole service. |
+| `kind` | `availability`: a request is good when it did not fail. `latency`: a request is good when it did not fail and took at most `latency_threshold_micros`. |
+| `latency_threshold_micros` | Required and positive for `latency`. Must be `null` or absent for `availability`. |
+| `objective` | The share of good requests, above 0 and below 1, such as `0.999`. |
+| `window_days` | `7`, `28`, or `30`. |
+
+`POST` and `PUT` answer the saved SLO with `id`, `created_by`, `created_at`, `updated_by`, and
+`updated_at`. `GET /api/v1/apm/slos` answers every SLO of the organization as a status. Pass
+`namespace`, `service`, and `environment` together to keep the SLOs of one service. The window ends
+at the time of the call, so the common range parameters do not apply.
+
+| Status field | Notes |
+|---|---|
+| `slo` | The SLO as saved. |
+| `state` | `healthy`, `at_risk`, `breached`, or `no_data`. |
+| `sli` | Good requests over all requests in the window, or `null` without requests. |
+| `good_requests`, `total_requests` | The counts behind `sli`. A latency SLO estimates `good_requests` from the latency histograms, so it can be fractional. |
+| `budget_remaining` | `1 - (1 - sli) / (1 - objective)`, below zero once the objective is broken, or `null` without requests. |
+| `burn_rates` | `one_hour`, `six_hours`, and `one_day`: `(1 - sli) / (1 - objective)` over the last hour, six hours, and 24 hours, or `null` without requests. |
+
+`GET /api/v1/apm/slos/{id}` answers `status` and `history`, one entry for each UTC day of the window
+with requests, the oldest first. Each entry has `day_start` in microseconds, `sli`, `good_requests`,
+and `total_requests`.
+
+`DELETE` answers `204`. It answers `409` while alert rules watch the SLO, such as its burn-rate
+alerts: delete those rules first. Alert rules on an SLO are APM rules with the metric
+`slo_burn_rate`. See [Create a rule](/en-US/api/alerting/create-rule#apm-rules).
 
 ## Disambiguate a transaction
 
@@ -202,10 +435,145 @@ list holds at most 20 entries.
 | Field | Notes |
 |---|---|
 | `sufficient_data` | `true` only when both versions meet the configured sample threshold, which defaults to 1,000 requests per version (`[apm.version_comparison].min_requests_per_version`). |
-| `status` | `insufficient_data`, `regressed`, `improved`, or `neutral`. A higher error rate or p95 means `regressed`, and a lower one means `improved`. |
+| `status` | `insufficient_data`, `regressed`, `improved`, or `neutral`. `regressed` when the candidate's error rate rose by at least one point and to at least 1.5 times the baseline's, or its p95 by at least a fifth and 50 ms; `improved` when one of them fell as far and neither rose so; `insufficient_data` when `sufficient_data` is `false`. |
 | `delta` | `request_count_absolute` and `request_count_relative`, `error_rate_absolute` and `error_rate_relative`, and `p95_absolute_micros` and `p95_relative`. A relative value is `null` when the baseline is zero or missing. |
 
 A missing `candidate` or `baseline`, or two identical versions, answer `400`.
+
+## Read a service's versions
+
+`GET /api/v1/apm/services/{service}` answers `versions`, the versions seen in the range. Each carries
+`red`, what it served in the range, and `verdict`, how it did against the version of the same service
+first seen before it, judged as [a comparison](#compare-versions) is:
+
+| Field | Notes |
+|---|---|
+| `previous` | The version it is told against. |
+| `status` | `regressed`, `improved`, `neutral`, or `insufficient_data`. |
+| `worse` | What got worse when `status` is `regressed`: `error_rate`, `latency`, or both. |
+| `delta` | As in a comparison, the earlier version as the baseline. |
+
+The first version seen has no `verdict`. A version filter on the request does not narrow the
+figures: every version is read from the whole service.
+
+## Read where errors happened
+
+`GET /api/v1/apm/errors` answers a `breakdown` beside the page, over every group the `status` filter
+keeps (not only the page's), and `GET /api/v1/apm/errors/{fingerprint}` answers the `breakdown` of
+the group. It holds `versions`, `environments`, and `languages`, each a list of `value` and `count`,
+the occurrences, largest first. A value is empty when the spans did not report it; after the first
+seven values the rest count together as `__other__`. The language is the service's
+`telemetry.sdk.language`.
+
+## Keep error grouping rules
+
+A rule groups errors otherwise than by their type, frame, and endpoint when they are seen. Rules are
+tried in `position` order and the first that matches holds.
+
+```http
+POST /api/v1/apm/error-rules
+Content-Type: application/json
+
+{"name": "Upstream timeouts", "service_namespace": "shop", "service_name": "checkout",
+ "error_type": "*Timeout*", "message": "", "frame": "", "endpoint": "", "action": "merge", "enabled": true}
+```
+
+| Field | Notes |
+|---|---|
+| `name` | Up to 128 characters. A merged group is named by it. |
+| `service_namespace`, `service_name` | The service the rule is for. An empty `service_name` means every service; a namespace needs a name. |
+| `error_type`, `message`, `frame`, `endpoint` | Patterns for the error type, the exception message, the first application frame, and the endpoint, each up to 256 characters. A pattern matches the whole text, ignoring case, with `*` for any text. An empty pattern matches anything; at least one must be set. |
+| `action` | `merge`: the matched errors of a service become one group. `ignore`: they form no group, and their requests still count as failed. |
+| `enabled` | A rule that is off is kept but not tried. Defaults to `true`. |
+
+The response is the rule with its `id`, `position`, `updated_by`, and `updated_at`. An organization
+keeps at most 100 rules. `PUT /api/v1/apm/error-rules/order` takes `{"ids": [...]}`, puts those rules
+first in that order and the others after them, and answers the rules in their new order.
+
+A change applies at once on the node that saves it and within 30 seconds on the others, to the
+errors seen from then on; groups already made stay as they are.
+
+## Read the service map
+
+`GET /api/v1/apm/map` takes the common range, `environment`, and `namespace` parameters and answers
+`nodes`, `edges`, `namespaces` (of the services in the environment), `environments` (every one), and
+`truncated` (`true` when only the 400 busiest nodes are kept).
+
+| Field | Notes |
+|---|---|
+| `nodes[].id` | `service:<name>`, `topic:<name>`, or `<category>:<target>` for what services call. |
+| `nodes[].kind` | `service`, `external`, or `topic`. An external node carries its `category`. |
+| `nodes[].red` | `request_count`, `error_count`, `error_rate`, and `p95_micros`: what a service served, or what an external node or a topic was asked. A service also carries `health`, `namespace`, and `environments`. |
+| `edges[].kind` | `call`, `publish` (to a topic), or `consume` (from a topic). |
+| `change` | On an edge or a node, against the stretch of the same length before: `new` when it was not there, `gone` when it no longer is. Absent when nothing was there before. |
+
+Calls between services come from the service graph, with the P95 of their slowest minute; the rest
+from the APM buckets. `GET /api/v1/apm/map/edge` takes `source` and `target` node ids besides the same
+parameters and answers `kind`, `red`, `trend`, `operations` (`name`, `kind`, `red`), `every_caller`
+(`true` when the operations are the called service's endpoints from every caller), and `errors`, the
+called service's error groups.
+
+## Read a service's blast radius
+
+`GET /api/v1/apm/blast-radius` takes `service`, which it requires, and the common range and
+`environment` parameters. It reads the whole map of the environment, whatever the namespace, and
+answers `meta`, `service` (the service's own node, absent when the map has it nowhere in the range),
+`upstream` (what calls it, up to three hops), and `downstream` (what it calls or publishes to, up to two
+hops). Each side holds at most 30 nodes, the unhealthy first; calls gone against the stretch before are
+left out.
+
+| Field | Notes |
+|---|---|
+| `id`, `kind`, `name`, `namespace`, `category` | The node as [the service map](#read-the-service-map) names it. |
+| `hops` | Calls between the node and the service: `1` for a direct caller or callee. |
+| `via` | The node it is reached through, a hop nearer the service. |
+| `health` | A service's own health. For what is called, the health that its failing calls give. |
+| `red`, `call` | What it served or was asked, and the calls between it and `via`. |
+
+## Report and list deployments
+
+`POST /api/v1/apm/deployments` takes the deployment as JSON and answers `201` with it, its `id`,
+`created_by`, and `created_at` added. The fields, their limits, and CI examples are in
+[Deployments](/en-US/apm/deployments#report-deployments-from-ci). The service and the environment
+are named as the organization's naming rules, environment mapping, and aliases read them. A
+repository address is kept with its password masked. A configuration change or a feature flag sets
+`kind` to `configuration` or `feature_flag` and needs no `version`.
+
+`GET /api/v1/apm/deployments` takes `service`, `namespace`, `environment`, `from`, and `to`, the
+range in microseconds, and answers at most 200 deployments, the newest first. A deployment reported
+without a namespace or an environment is listed for every one.
+
+## Keep APM settings
+
+`GET /api/v1/apm/settings` answers the organization's settings; `PUT` replaces them as a whole and
+answers what was kept:
+
+```json
+{
+  "health": {
+    "error_rate_warning": 0.02,
+    "error_rate_critical": 0.1,
+    "p95_warning_micros": 500000,
+    "p95_critical_micros": 2000000
+  },
+  "apdex_threshold_micros": 500000,
+  "long_task_micros": 1000000,
+  "naming_rules": [{ "pattern": "^(checkout)-[a-z0-9]{5}$", "replacement": "$1" }],
+  "environment_map": [{ "from": "Production", "to": "production" }],
+  "aliases": [{ "alias_namespace": "shop", "alias": "checkout-v1", "namespace": "shop", "service": "checkout" }],
+  "metadata_rules": { "team_from_tier": "p1", "owner_from_tier": "p0", "repository_from_tier": null }
+}
+```
+
+A field left out takes its default. Names are trimmed, and a blank alias namespace is `default`. The
+limits and what each setting does are in [APM settings](/en-US/apm/settings). A save applies at once
+on the node that saves it and within 30 seconds on the others.
+
+The platform's cardinality limits are read and replaced with `GET` and `PUT
+/api/v1/settings/apm_limits`, which require `sys.settings.manage`. The body carries
+`services_per_org_hour`, `transactions_per_service_hour`, `dependencies_per_service_hour`,
+`operations_per_dependency_hour`, `error_groups_per_service_hour`, `versions_per_service_hour`, and
+`instances_per_service_hour`, each from 1 to 100000.
 
 ## Check projection health
 
@@ -284,9 +652,10 @@ Every endpoint returns a common `meta` object:
 
 | Status | Cause |
 |---|---|
-| `400` | A parameter is invalid: an unsupported `sort` (`unsupported APM sort field`), a `limit` outside 1 through 200, an empty or oversized filter (`invalid APM service filter`), a range longer than the maximum (`APM query range exceeds configured maximum`), an end before the start (`APM range end precedes start`), or an unknown `direction` or `resolution`. |
-| `403` | The token lacks `streams.query`. |
-| `404` | The error fingerprint, transaction, or service does not exist in the range. |
+| `400` | A parameter is invalid: an unsupported `sort` (`unsupported APM sort field`), a `limit` outside 1 through 200, an empty or oversized filter (`invalid APM service filter`), a range longer than the maximum (`APM query range exceeds configured maximum`), an end before the start (`APM range end precedes start`), an unknown `direction` or `resolution`, an SLO that fails the checks above (`SLO objective must be between 0 and 1, exclusive`), or an SLO list filter without all of `namespace`, `service`, and `environment`. |
+| `403` | The token lacks `streams.query`, or `apm.manage` for a write. |
+| `404` | The error fingerprint, transaction, service, or SLO does not exist in the range. |
+| `409` | Alert rules still watch the SLO being deleted. |
 
 <CardGroup cols={2}>
   <Card title="APM guide" icon="gauge-high" href="/en-US/apm">

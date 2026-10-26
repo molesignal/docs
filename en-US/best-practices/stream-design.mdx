@@ -1,0 +1,99 @@
+---
+title: "Design streams and fields that stay useful"
+sidebarTitle: "Stream and field design"
+description: "Decide how to split data into streams, name fields consistently, index what is filtered, and protect sensitive values before the first large source arrives."
+"zh-Hans_link": "/zh-Hans/best-practices/stream-design"
+---
+
+Streams and fields are hard to change once data, dashboards, and alert rules depend on them. A field
+type is fixed once written, an encrypted flag cannot be added later, and a renamed field breaks every
+saved query. Spend an hour on the design before connecting the first busy source.
+
+## Split streams by what differs
+
+Create a separate stream only when the data needs a different contract: another retention, another
+access rule, another schema, or a separate query range limit. Otherwise keep data together and tell it
+apart with fields.
+
+| Situation | Recommended | Trade-off |
+|---|---|---|
+| Debug logs kept 3 days, audit logs kept a year | Two `logs` streams with their own retention. | Queries that need both use two streams. |
+| Many services with the same log shape | One stream, with `service.name` on every event. | Retention and access cannot differ per service. |
+| A raw firehose that a pipeline sorts into streams | A source stream with **Queryable** off, and a routing pipeline. | The raw events are kept until their retention ends, so keep it short. |
+| Each Prometheus server | One `metrics` stream per source. | A query across sources names several streams. |
+| One stream per pod, version, or customer | Avoid. Use fields instead. | Many small streams multiply files and break dashboards on each change. |
+
+MoleSignal creates a stream on its first write, so a typo in a sender creates a new stream silently.
+Check the [stream list](/en-US/streams#the-stream-list) after connecting each source, and create the
+important streams in advance with their retention and encrypted fields.
+
+## Agree on field names before sending
+
+Use the OpenTelemetry names wherever they exist, and the same name for the same thing in every
+signal. Cross-signal jumps and APM depend on them.
+
+| Field | Content | Why |
+|---|---|---|
+| `service.name` | The service, the same in logs, traces, and metrics. | Joins every signal to one service. |
+| `deployment.environment.name` | `production`, `staging`, and so on. | Filters every page by environment. |
+| `service.version` | The released version. | Drives deployment comparison in APM. |
+| `trace_id`, `span_id` | Set in every log line written inside a request. | Turns a log line into a jump to its trace. |
+| `level` | One spelling, such as lowercase `error`, `warn`, `info`. | The log histogram counts levels from its index. |
+| `host.name`, `k8s.pod.name` | Where the event happened. | Narrows a problem to one machine. |
+
+Keep the type of a field the same across all senders: a field that arrives as a number from one
+service and as text from another is rejected with `type mismatch on field`. Normalize such fields in a
+pipeline with **Convert type** before they are stored. Never reuse an existing field name for a new
+meaning; add a new field instead.
+
+## Index what is filtered
+
+The [index type](/en-US/streams#schema-and-fields) decides how fast a filter is. New fields get none,
+except a few well-known names. Review the fields that dashboards and alerts filter on:
+
+- **Exact match** for identifiers that are compared as a whole: `trace_id`, `user_id`, `order_id`,
+  `service.name`.
+- **Full text search** for prose such as `message`, searched by words.
+- **Skip index** for numbers and times that are compared with `<` and `>`, such as `duration_ms`.
+- Nothing for fields that are only displayed.
+
+An index change applies to new data; older files get it when the compactor merges them. Change it on
+**Streams → Fields & indexes**, then **Save and apply**.
+
+## Keep cardinality out of labels
+
+A metric label with an unbounded value, such as a user ID, a request ID, or a full URL, creates a new
+series for every value. The [cardinality limits](/en-US/settings/platform#metric-cardinality) then refuse
+new series for the whole organization. Put such values in logs or span attributes, where they cost
+nothing per value, and keep metric labels to bounded sets such as service, route template, method, and
+status class.
+
+Reference data that would otherwise be copied into every event, such as the team of a service or the
+plan of a customer, belongs in an [extend table](/en-US/extend-tables): a pipeline looks it up while
+processing.
+
+## Protect sensitive values from the start
+
+| Need | Tool | When it applies |
+|---|---|---|
+| Never store a value, such as a card number | A [regex pattern](/en-US/settings/data-security#regex-patterns) with **Redact on intake**, or a pipeline step that removes the field. | At intake, for good. |
+| Store a value, but only for a few readers | An encrypted field, declared when the stream is created, read with `decrypt()`. | From the creation of the stream. |
+| Hide a value from most query results | [Field masking](/en-US/settings/data-security#field-masking). | At query time, on the result. |
+
+Prefer removing a value in the sender or the collector. A value that never leaves the source cannot
+leak from MoleSignal.
+
+## Acceptance criteria
+
+- Every stream has an owner, a reason to exist, and a retention set on purpose.
+- A known request can be followed from its log line to its trace with one click.
+- Fields filtered by dashboards and rules have a suitable index.
+- No metric label carries an unbounded value, and **Cardinality** on Metrics shows stable series counts.
+- Test events with sensitive markers arrive redacted, masked, or encrypted as planned.
+
+## Related guides
+
+- [Streams](/en-US/streams)
+- [Pipelines](/en-US/pipelines)
+- [Data security settings](/en-US/settings/data-security)
+- [Roll out telemetry for a new service](/en-US/best-practices/service-onboarding)

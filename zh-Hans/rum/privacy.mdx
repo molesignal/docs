@@ -10,7 +10,7 @@ description: "阻止敏感浏览器数据进入 RUM 事件和 DOM 会话回放�
 ## 隐私安全默认值
 
 ```ts
-initRum({
+init({
   applicationId: 'checkout-web',
   clientToken: 'msrum_your_client_token',
   site: 'https://molesignal.example.com',
@@ -22,14 +22,13 @@ initRum({
 使用这些默认值时：
 
 - URL 查询参数和 Fragment 会被移除；
-- 上下文中名为 `password`、`secret`、`token`、`authorization`、`cookie`、`api_key` 以及信用卡字段的键会被递归脱敏；
-- 遮罩模式不会上报交互标签和原始错误堆栈；
+- 用户、账户和上下文数据中名为 `password`、`secret`、`token`、`authorization`、`cookie`、`api_key` 以及信用卡字段的键会被递归脱敏；
+- 操作名称是 `Click <结构化选择器>`，选择器不带 ID、测试 ID 或 class。只有设置 `defaultPrivacyLevel: 'allow'` 时，才会用元素文本为操作命名；
 - 会话回放中的 DOM 文本会被遮罩；
 - 所有 Input 和 `contenteditable` 值始终会被遮罩，即使页面可见文本已被允许。
 
 <Warning>
-  按字段名脱敏只是安全兜底，不是数据分类系统。不要向用户或自定义上下文对象添加凭据、支付数据、
-  健康数据或不必要的个人信息。
+  按字段名脱敏只是安全兜底，不是数据分类系统。不要向用户或自定义上下文对象添加凭据、支付数据、健康数据或不必要的个人信息。
 </Warning>
 
 ## 屏蔽或遮罩 DOM 内容
@@ -62,8 +61,7 @@ sessionReplay: {
 
 ## 谨慎允许页面可见文本
 
-只有标记完所有敏感区域后，才可设置 `defaultPrivacyLevel: 'allow'`。Input 值仍会被遮罩，配置的
-`maskTextSelector` 和 `contenteditable` 元素也会继续被遮罩。
+只有标记完所有敏感区域后，才可设置 `defaultPrivacyLevel: 'allow'`。Input 值仍会被遮罩，配置的 `maskTextSelector` 和 `contenteditable` 元素也会继续被遮罩。
 
 ```ts
 defaultPrivacyLevel: 'allow',
@@ -75,8 +73,7 @@ sessionReplay: {
 
 ## 控制 URL 与网络采集
 
-除非应用能保证查询参数中不含标识符或秘密，否则请保持 `trackUrlQueryString: false`。
-在采集前排除敏感路由或网络接口：
+除非应用能保证查询参数中不含标识符或秘密，否则请保持 `trackUrlQueryString: false`。在采集前排除敏感路由或网络接口：
 
 ```ts
 excludedUrls: [
@@ -86,8 +83,30 @@ excludedUrls: [
 ],
 ```
 
-`allowedTracingUrls` 只控制哪些 Origin 可以提供链路上下文，不会启用请求或响应 Body 采集；
-SDK 只记录耗时和清洗后的 URL 元数据。
+`allowedTracingUrls` 只控制哪些 Origin 可以提供链路上下文，不会启用请求或响应 Body 采集；SDK 只记录耗时和清洗后的 URL 元数据。
+
+## 在接入时去掉敏感文本
+
+SDK 是第一道防线，服务端是第二道。应用会在任何内容写入前，把它选定的几类敏感文本从每个事件里去掉，不论事件由哪个 SDK 或客户端发来。在 **RUM → 应用** 里打开应用，开关 **敏感数据** 里的各类。新建的应用全部开启。
+
+| 类别 | 去掉的内容 | 替换成 |
+|---|---|---|
+| **令牌、密钥和密码** | Bearer 和 Basic 令牌、JWT，云和代码服务的密钥（AWS 访问密钥，GitHub、GitLab、Slack、Stripe、OpenAI、Google 和 npm 令牌），私钥，`password=`、`secret:`、`api_key=`、`authorization:` 等词后面的值，以及 `Authorization`、`Cookie`、`Set-Cookie`、`Proxy-Authorization`、`X-API-Key`、`X-Auth-Token`、`X-CSRF-Token` 请求头的值。 | `[secret]` |
+| **邮箱地址** | 形如 `jane@example.com` 的地址。 | `[email]` |
+| **电话号码** | 以 `+` 开头、含 8 到 15 位数字的国际号码，11 位的中国手机号，以及 `(415) 555-2671` 这样的北美号码。 | `[phone]` |
+| **银行卡号** | 13 到 19 位、各组之间可有空格或短横线、开头符合各卡组织号段且通过校验位的数字。 | `[card]` |
+| **证件号码** | 通过校验位的中国居民身份证号，以及美国社会安全号。 | `[id]` |
+| **敏感的 URL 参数** | 查询串和片段里参数的值，参数名是 `code`、`key`、`sig`、`sid`、`otp`、`ticket`、`email`、`phone` 等，或含有 `token`、`secret`、`password`、`auth`、`signature`、`api_key`、`credential`、`jwt`、`session`。还有主机前的用户名和密码。参数名保留。 | `[redacted]` |
+
+去掉文本的位置：事件所在和来自的地址（`view.url`、`view.referrer`、`resource.url` 和错误的地址），错误的消息、堆栈和它的成因，视图和被点击对象的名称，请求的 GraphQL 操作名、负载和变量，请求与响应的头，以及 `context` 对象。夹在文本里的地址按地址处理，堆栈在地址之后给出的位置（`:10:5`）保留。`user` 和 `account` 是应用有意发送的关于人的信息，保持原样。
+
+去掉文本发生在事件被拆成行之前，所以由它派生的内容也由保留下来的部分派生：含邮箱的地址的 `view.url_path` 和 `view.url_path_group`，以及错误所属的 [issue](/zh-Hans/rum/errors)。只在邮箱或数字上不同的错误会成为同一个 issue。
+
+<Warning>
+  各类别是形状加校验，不是对数据的分类。看起来像电话号码的数字，比如以 `13` 开头的 11 位订单号，会被当成电话去掉；写在自由文本里的姓名和住址则识别不出来。某一类去掉了排查所需的内容时，关掉它，并在 SDK 一侧让敏感值不进入事件。
+</Warning>
+
+改动只对之后到达的事件生效，之前已经存储的内容不变。会话回放分段不做这样的处理：它们的文本由 SDK 按上面的隐私级别遮盖。
 
 ## 上线前检查
 

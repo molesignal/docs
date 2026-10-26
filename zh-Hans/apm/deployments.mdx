@@ -1,0 +1,186 @@
+---
+title: "部署"
+sidebarTitle: "部署"
+description: "从 CI 上报发布、配置变更和功能开关，与链路里观测到的版本对照，识别回滚，并把金丝雀版本与它要替换的版本并排对比。"
+"en_link": "/en-US/apm/deployments"
+---
+
+服务页的**部署**标签把两种来源放在一起：流水线上报的发布事件，以及服务的 Span 在 `service.version` 里带的版本。没有流水线上报的版本，也会根据 Span 显示出来。
+
+## 发布时间线
+
+时间线按从新到旧列出时间范围内服务发生的变化：
+
+| 事件 | 条件 |
+|---|---|
+| **发布** | 流水线上报了一次成功的发布。 |
+| **发布失败** | 流水线上报了一次失败的发布。失败的发布不改变正在运行的版本。 |
+| **回滚** | 流水线上报了回滚，或者上报的发布是在另一个版本之前运行过的版本。这一行会写明从哪个版本回滚。 |
+| **退回** | Span 退回到没有流水线上报的旧版本：最后看到的版本首次出现在一个更新的版本之前，而那个更新的版本已停止超过五分钟。 |
+| **首次出现** | Span 带来了一个没有流水线上报的版本。 |
+| **配置变更** | 流水线或工具上报了一次配置变更。这一行显示它的描述。 |
+| **功能开关** | 流水线或工具上报了一次功能开关变更。这一行显示它的描述。 |
+
+配置变更和功能开关不改变正在运行的版本，也没有自己的指标。它们会出现在洞察附近的变更里，见[发现附近的变更](/zh-Hans/apm/insights#发现附近的变更)。
+
+上报的发布会显示 commit、PR、CI 运行和作者。仓库是 http 或 https 地址时，点击 commit 会按 GitHub、GitLab 或 Bitbucket 的提交地址格式打开这次提交的网页。
+
+每个版本在时间范围内的请求数、错误率和 p95 显示在它最新的一行，并附上与它之前首次出现的版本的对比结论：
+
+| 结论 | 条件 |
+|---|---|
+| **变差** | 错误率至少上升 1 个百分点且达到原来的 1.5 倍，或 p95 至少变慢五分之一且至少 50 毫秒。结论后会写明哪一项变差。 |
+| **变好** | 其中一项下降了同样的幅度，并且没有一项变差。 |
+| **无明显变化** | 两项变化都没有达到上述幅度。 |
+| **请求不足** | 任一版本的请求数少于版本对比所需的数量，默认 1,000。 |
+
+点击结论会在**对比两个版本**中打开这两个版本，并列出变慢的端点和增多的错误。变差或变好的版本也会在概览的最近部署里标出。
+
+## 金丝雀
+
+两个版本同时运行时（例如金丝雀版本与它要替换的版本并存），时间线上方会有一张卡片把它们并排对比。两个版本都在服务最后一个 Span 之前五分钟内出现过，就算同时运行。卡片对比最新的两个版本，从较新版本首次出现时算起：
+
+- 每个版本承接的请求占比；
+- 每个版本的请求数、错误率、p50、p95 和 p99；
+- 较新版本相对较旧版本的结论。
+
+## 从 CI 上报发布
+
+流水线通过 `POST /api/v1/apm/deployments` 上报发布。请求需要角色具有 `apm.deploy` 权限的 API Token。所有者、管理员和编辑者都具有该权限，新建 API Token 时默认使用的**接入 Token** 角色也具有。
+
+```bash
+curl -X POST "https://<host>/api/v1/apm/deployments" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"service": "checkout", "environment": "production", "version": "2.4.0", "commit": "9f2c1e7a4b3d", "repository": "https://github.com/acme/checkout", "ci_url": "https://ci.example.com/runs/7"}'
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `service` | 是 | 服务名，与 Span 的 `service.name` 一致。最多 255 个字符。 |
+| `version` | 发布时必填 | 发布的版本，与 Span 的 `service.version` 一致。最多 192 个字符。 |
+| `kind` | 否 | `deployment`（默认）、`configuration` 或 `feature_flag`。 |
+| `namespace` | 否 | 服务的 `service.namespace`。不填时在所有 Namespace 中显示。 |
+| `environment` | 否 | 环境，即 `deployment.environment.name`。不填时在所有环境中显示。 |
+| `status` | 否 | `succeeded`（默认）、`failed`，或 `rolled_back`，表示这次发布把服务回滚到 `version`。 |
+| `commit` | 否 | 发布的提交：最多 64 个字母和数字。 |
+| `repository` | 否 | 代码仓库：https、http、ssh 或 git 地址，最多 512 个字符。地址中的密码保存为 `****`，https 地址中的用户名部分也是如此。 |
+| `pull_request` | 否 | PR 的 http 或 https 链接。 |
+| `author` | 否 | 发布人，最多 128 个字符。 |
+| `ci_url` | 否 | CI 运行的 http 或 https 链接。 |
+| `description` | 否 | 最多 1,000 个字符，鼠标停在事件上时显示。 |
+| `deployed_at` | 否 | 发布时间，自 Unix 纪元起的微秒数。默认为请求到达的时间。 |
+
+服务名和环境按 APM 的方式命名：组织的命名规则、环境映射和别名对它们生效，与对 Span 的处理相同。参见 [APM 设置](/zh-Hans/apm/settings)。
+
+**数据源**页面的 **GitHub Actions**、**GitLab CI/CD** 和 **Jenkins** 下有以下步骤，并已填好工作区的地址。
+
+### GitHub Actions
+
+把 Token 保存为仓库 Secret，然后在负责部署的 job 里加一个步骤。`if: always()` 使失败的发布也会上报。
+
+```yaml
+- name: Report the deployment to MoleSignal
+  if: always()
+  env:
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+    DEPLOY_STATUS: ${{ job.status == 'success' && 'succeeded' || 'failed' }}
+  run: |
+    cat > deployment.json <<EOF
+    {
+      "service": "checkout",
+      "environment": "production",
+      "version": "${GITHUB_SHA::12}",
+      "status": "$DEPLOY_STATUS",
+      "commit": "$GITHUB_SHA",
+      "repository": "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY",
+      "author": "$GITHUB_ACTOR",
+      "ci_url": "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+    }
+    EOF
+    curl -fsS -X POST "https://<host>/api/v1/apm/deployments" \
+      -H "Authorization: Bearer $MOLESIGNAL_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data-binary @deployment.json
+```
+
+### GitLab CI/CD
+
+把 Token 添加为名为 `MOLESIGNAL_TOKEN` 的隐藏 CI/CD 变量，然后在部署 job 的 `after_script` 中上报。`after_script` 不论部署成败都会执行。
+
+```yaml
+deploy:
+  stage: deploy
+  environment: production
+  script:
+    - ./deploy.sh
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "success" ]; then DEPLOY_STATUS=succeeded; else DEPLOY_STATUS=failed; fi
+      cat > deployment.json <<EOF
+      {
+        "service": "checkout",
+        "environment": "$CI_ENVIRONMENT_NAME",
+        "version": "$CI_COMMIT_SHORT_SHA",
+        "status": "$DEPLOY_STATUS",
+        "commit": "$CI_COMMIT_SHA",
+        "repository": "$CI_PROJECT_URL",
+        "author": "$GITLAB_USER_LOGIN",
+        "ci_url": "$CI_PIPELINE_URL"
+      }
+      EOF
+      curl -fsS -X POST "https://<host>/api/v1/apm/deployments" \
+        -H "Authorization: Bearer $MOLESIGNAL_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data-binary @deployment.json
+```
+
+### Jenkins
+
+把 Token 添加为 ID 为 `molesignal-token` 的 **Secret text** 凭据，然后在流水线的 `post` 块中上报。`post { always }` 在构建失败时也会上报。`GIT_URL` 中带的密码在保存时会被遮盖。
+
+```groovy
+post {
+  always {
+    script {
+      writeFile file: 'deployment.json', text: groovy.json.JsonOutput.toJson([
+        service: 'checkout',
+        environment: 'production',
+        version: env.GIT_COMMIT.take(12),
+        status: currentBuild.currentResult == 'SUCCESS' ? 'succeeded' : 'failed',
+        commit: env.GIT_COMMIT,
+        repository: env.GIT_URL,
+        ci_url: env.BUILD_URL,
+      ])
+    }
+    withCredentials([string(credentialsId: 'molesignal-token', variable: 'MOLESIGNAL_TOKEN')]) {
+      sh '''
+        curl -fsS -X POST "https://<host>/api/v1/apm/deployments" \
+          -H "Authorization: Bearer $MOLESIGNAL_TOKEN" \
+          -H "Content-Type: application/json" \
+          --data-binary @deployment.json
+      '''
+    }
+  }
+}
+```
+
+## 上报配置变更与功能开关
+
+配置变更和功能开关使用同一个接口上报，设置 `kind`，并在描述里写明改了什么，不需要版本。
+
+```bash
+curl -X POST "https://<host>/api/v1/apm/deployments" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"service": "checkout", "environment": "production", "kind": "feature_flag", "description": "new_checkout on for 10% of users"}'
+```
+
+## 故障排查
+
+| 现象 | 检查 |
+|---|---|
+| 上报的发布没有出现在时间线上 | 时间范围要包含 `deployed_at`，`service` 要与 APM 中的服务名一致。带环境上报的发布只在该环境中显示。 |
+| 一次发布和它发布的版本显示成了两行 | 上报的 `version` 与 Span 的 `service.version` 不同。上报相同的值。 |
+| 发布接口返回 `403` | Token 的角色没有 `apm.deploy` 权限。 |
+| 发布接口返回 `400` | 某个字段超出了上表的限制，错误信息会指出是哪个字段。 |

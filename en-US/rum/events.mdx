@@ -1,0 +1,318 @@
+---
+title: "RUM event format"
+sidebarTitle: "Event format"
+description: "The JSON events RUM SDKs and other clients send to MoleSignal: the intake endpoint, its answer, the rules, and the fields of each event type."
+"zh-Hans_link": "/zh-Hans/rum/events"
+---
+
+Every RUM SDK sends the same JSON events to one endpoint. A client without an SDK, such as a native
+app that has no SDK yet, sends the same events with an HTTP request.
+
+An event has a `type`, a `date`, the `session` and the `view` it belongs to, and an object named
+after its type that carries the details. The JSON Schema of an event ships with the source as
+`contracts/rum/events/v1.schema.json`, together with valid and invalid example events.
+
+## Send events
+
+```http
+POST /api/v1/rum/events
+Authorization: Bearer msrum_<prefix>_<secret>
+Content-Type: application/json
+```
+
+| Part | Rule |
+|---|---|
+| Credential | The [client token](/en-US/rum/applications#client-token) of the application, which holds `rum.write` for that application only. Any other credential with `rum.write` must name the application in `application.id` of every event. |
+| Body | A JSON array of events. One event object and NDJSON (`Content-Type: application/x-ndjson`, one event per line) work too. |
+| Compression | `Content-Encoding: gzip` is optional. No other encoding is accepted. |
+| Size | At most 5000 events and 5 MiB once decompressed. A larger request answers `413`. |
+
+<RequestExample>
+```bash cURL
+curl -X POST "http://localhost:5080/api/v1/rum/events" \
+  -H "authorization: Bearer $RUM_CLIENT_TOKEN" \
+  -H "content-type: application/json" \
+  -d '[{
+    "type": "error",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34", "url": "https://shop.example.com/checkout" },
+    "error": {
+      "id": "e7b1c9a2-3d4f-4b65-8a90-1c2d3e4f5a61",
+      "message": "Payment provider timeout",
+      "source": "custom",
+      "handling": "handled"
+    }
+  }]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "accepted": 1,
+  "rejected": []
+}
+```
+</ResponseExample>
+
+## The answer
+
+The answer reports every event on its own, so one bad event does not discard the rest of the request.
+
+| Field | Meaning |
+|---|---|
+| `accepted` | The number of events that were written. |
+| `rejected` | One entry for each event that was not written: its position in the request (`index`, from `0`) and the `reason`. |
+| `sampled` | The number of events that were left out on purpose, because the application [keeps a share of its sessions](/en-US/rum/sampling#keep-a-share-of-sessions-at-the-server) and these belong to sessions it does not keep. The errors of those sessions are not among them when the application keeps every error. Only present when there are some. They are not rejected, and are not counted in `accepted`. |
+
+A request whose events are all bad still answers `200`, with `accepted` set to `0`. A request that
+cannot be read at all fails as a whole: `400` for a body that is not JSON, an unsupported
+`Content-Encoding`, or a gzip stream that cannot be decoded; `401` or `403` for a token that is missing,
+revoked, or without `rum.write`; `413` for a request over the limits above.
+
+An event is rejected for one of these reasons:
+
+| Reason | Cause |
+|---|---|
+| A message naming the field | The event does not match the schema: a required field is missing, a value has the wrong type or is not in the list of allowed values, or a number is negative. |
+| `date is more than a day in the future` | The clock of the device runs far ahead. |
+| `application.id is not the application of the client token` | The event names an application other than the one the token is bound to. |
+| ``application `<id>` does not exist`` | The application was deleted, or never created. |
+| `application.id is required` | The credential is not a client token and the event names no application. |
+| `line is not JSON` | A line of an NDJSON body cannot be parsed. |
+
+An SDK reports rejected events through its error callback and does not send them again.
+
+## Rules
+
+- `date` is the time the event began, in epoch milliseconds. The `date` of a `view` is the start of the
+  view and never changes between its revisions.
+- Every duration, and every time relative to the start of a view, such as `performance.lcp.timestamp`
+  or `resource.dns.start`, is an **integer number of nanoseconds**. Round before sending.
+- A view is sent again with a higher `view.revision` and its counts so far, whenever something in it changes.
+  MoleSignal keeps the highest revision. Counts are cumulative, never deltas.
+- A client sends no session event. MoleSignal derives the session from its views: its start and end,
+  duration, counts, landing and exit page, and whether a replay was recorded.
+- `session.start`, in epoch milliseconds, is optional and expected. A node that does not know a session yet
+  uses it to tell a session that began moments ago from one it lost track of.
+- `application.id` is optional. The application is the one the client token is bound to, and a different
+  value is rejected.
+- `geo` and `network` are written by MoleSignal and ignored when sent. So is `retention`: `retention.rate` is the share of such
+  rows that was kept, in percent, and `retention.filter` is what kept the row (the id of a [filter](/en-US/rum/sampling#filters),
+  `default`, or `errors` for an error of a session that was not kept). Totals are worked out with them.
+- A field the schema does not know is accepted and kept. A field the schema knows with the wrong type or
+  value rejects the event.
+- `error.frames` carries the structured stack that source maps, mapping files, and native symbol files are
+  applied to. `error.stack` is the same stack as text for display and search.
+
+## Attributes of every event
+
+| Attribute | Type | Notes |
+|---|---|---|
+| `type` | string | Required: `view`, `action`, `error`, `resource`, `long_task`, or `vital`. |
+| `date` | integer | Required. Epoch milliseconds. |
+| `source` | string | Required: `browser`, `android`, `ios`, `flutter`, `react-native`, `kotlin-multiplatform`, `unity`, `roku`, `electron`, or `other`. |
+| `session` | object | Required. `id` is required. `type` is `user` (default), `synthetics`, or `ci_test`. `start` is epoch milliseconds. `has_replay` is a boolean. |
+| `view` | object | Required. `id` is required. `url`, `name`, `referrer`, and `in_foreground` are optional. |
+| `application.id` | string | Optional. See the rules above. |
+| `service`, `env`, `version` | string | The dimensions of a release. `version` is the key that source maps and symbols are looked up by. |
+| `build_version`, `build_id` | string | The build number, and the build identifier that debug artifacts were uploaded under. |
+| `action.id` | string | The action that started this event, when there is one. |
+| `usr` | object | `id`, `name`, `email`, and `anonymous_id`. Other keys are kept as `usr.extra`. |
+| `account` | object | `id` and `name`. |
+| `tab.id` | string | The browser tab. |
+| `connectivity` | object | `status`, `interfaces`, `effective_type`, and `cellular` (`technology`, `carrier_name`). |
+| `display.viewport` | object | `width` and `height`. |
+| `browser`, `os`, `device` | object | Browser name and version, operating system, and device type (`mobile`, `desktop`, `tablet`, `tv`, `gaming_console`, `bot`, or `other`), model, brand, architecture, locale, time zone, battery, and memory. |
+| `sdk` | object | `name`, `version`, `session_sample_rate`, and `replay_sample_rate`. |
+| `context` | object | Free-form attributes of the application. |
+| `feature_flags` | object | Free-form feature flag evaluations. |
+
+Identifiers match `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`, up to 128 characters. Text attributes of
+`usr`, `account`, and the device are limited to 256 characters.
+
+## View
+
+A `view` event carries a `view` object with these fields next to the `url`, `name`, and `id` above.
+
+| Field | Notes |
+|---|---|
+| `revision` | Required. Starts at `1` and grows by one each time the view is sent again. |
+| `time_spent` | Required. Nanoseconds the view was open. |
+| `url` | Required. |
+| `is_active` | `false` in the last revision of a view that ended. |
+| `loading_type` | `initial_load`, `route_change`, `bf_cache`, `activity_display`, `activity_redisplay`, `fragment_display`, `fragment_redisplay`, `view_controller_display`, `view_controller_redisplay`, or `session_renewal`. |
+| `loading_time`, `first_byte`, `dom_interactive`, `dom_content_loaded`, `dom_complete`, `load_event`, `network_settled_time`, `interaction_to_next_view_time` | Navigation timings in nanoseconds. |
+| `performance.fcp`, `performance.lcp`, `performance.fid`, `performance.inp`, `performance.cls`, `performance.fbc` | Web Vitals. LCP has `timestamp`, `target_selector`, `resource_url`, and `sub_parts` (`load_delay`, `load_time`, `render_delay`). INP has `duration`, `timestamp`, `target_selector`, and `sub_parts` (`input_delay`, `processing_duration`, `presentation_delay`). CLS has `score`. |
+| `custom_timings` | An object of named timings. |
+| `action`, `error`, `resource`, `long_task`, `frustration`, `crash`, `frozen_frame` | Objects of the form `{ "count": n }` with the cumulative counts. |
+| `memory_average`, `memory_max`, `cpu_ticks_count`, `cpu_ticks_per_second`, `refresh_rate_average`, `refresh_rate_min`, `slow_frames_rate`, `freeze_rate` | Mobile measurements. |
+| `flutter_build_time`, `flutter_raster_time` | `{ min, max, average, metric_max }` in nanoseconds. |
+
+## Action
+
+| Field | Notes |
+|---|---|
+| `id` | Required. |
+| `type` | Required: `custom`, `click`, `tap`, `scroll`, `swipe`, `application_start`, or `back`. |
+| `loading_time` | Nanoseconds. |
+| `target` | `name`, `selector`, `width`, and `height` of the element. |
+| `position` | `x` and `y` of the pointer. |
+| `name_source` | How the name was found: `custom_attribute`, `mask_placeholder`, `standard_attribute`, `text_content`, `mask_disallowed`, or `blank`. |
+| `frustration.type` | A list of `rage_click`, `dead_click`, `error_click`, `rage_tap`, or `error_tap`. |
+| `error`, `crash`, `long_task`, `resource` | Objects of the form `{ "count": n }`. |
+
+## Error
+
+| Field | Notes |
+|---|---|
+| `id`, `message`, `source` | Required. `source` is `network`, `source`, `console`, `logger`, `agent`, `webview`, `custom`, or `report`. |
+| `type` | The error class, such as `TypeError`. |
+| `stack` | The stack as text. |
+| `frames` | Up to 1000 frames: `file`, `function`, `class`, `module`, `line`, `column`, `debug_id`, `build_id`, `relative_address`, `instruction_addr`, `image_addr`, and `artifact_kind` (`javascript_sourcemap`, `flutter_symbols`, `android_native_symbols`, or `apple_dsym`). |
+| `fingerprint` | Optional, up to 128 characters. Errors of one application that name the same fingerprint are one [issue](/en-US/rum/errors), whatever their messages and stacks. Left out, MoleSignal groups them by type, message, and the first frames of the application's own code, and writes the id of the issue to `error.issue_id`. A value sent as `issue_id` is replaced. |
+| `handling` | `handled` or `unhandled`. |
+| `is_crash`, `category`, `source_type` | `category` is `ANR`, `App Hang`, `Exception`, `Watchdog Termination`, `Memory Warning`, or `Network`. |
+| `resource` | The failed request of a `network` error: `method`, `status_code`, and `url`. |
+| `causes`, `threads`, `binary_images` | Chained causes, thread stacks, and loaded images. |
+
+## Resource
+
+| Field | Notes |
+|---|---|
+| `type`, `url` | Required. `type` is `document`, `xhr`, `beacon`, `fetch`, `css`, `js`, `image`, `font`, `media`, `other`, or `native`. |
+| `method`, `status_code` | `status_code` is `0` when the request got no response. |
+| `duration` | Nanoseconds. |
+| `size`, `encoded_body_size`, `decoded_body_size`, `transfer_size` | Bytes. |
+| `redirect`, `dns`, `connect`, `ssl`, `first_byte`, `download`, `worker` | Phases, each `{ start, duration }` in nanoseconds. |
+| `trace_id`, `span_id` | The W3C trace context of the request. MoleSignal joins the session to the backend trace by `trace_id`. |
+| `graphql` | `operation_type`, `operation_name`, `payload`, and `variables`. |
+| `request.headers`, `response.headers` | Objects of headers. |
+
+## Long task
+
+| Field | Notes |
+|---|---|
+| `duration` | Required. Nanoseconds. |
+| `entry_type` | `long-task` or `long-animation-frame`. |
+| `start_time`, `blocking_duration`, `render_start`, `style_and_layout_start`, `first_ui_event_timestamp` | Nanoseconds relative to the start of the view. |
+| `is_frozen_frame` | `true` for a frozen frame of a mobile app. |
+| `scripts` | The scripts of a long animation frame, each with `duration`, `source_url`, `source_function_name`, `invoker`, and `invoker_type`. |
+
+## Vital
+
+| Field | Notes |
+|---|---|
+| `id`, `type` | Required. `type` is `duration`, `app_launch`, or `operation_step`. |
+| `name`, `duration` | Required for `duration`. |
+| `app_launch_metric`, `startup_type` | Required for `app_launch` together with `duration`: `ttid` or `ttfd`, and `cold_start` or `warm_start`. |
+| `step_type`, `operation_key`, `failure_reason` | For `operation_step`: `start`, `update`, `retry`, or `end`. |
+
+## What MoleSignal adds
+
+- **Place:** the country, subdivision, city, continent, and coordinates of the client IP address, looked up in
+  the DB-IP City Lite database. The address itself is kept only when the application keeps it.
+- **Browser, system, and device:** for browser events that carry none, parsed from the `User-Agent` header.
+  A crawler becomes `device.type: bot`. Values an SDK sends win.
+- **URL parts:** `view.url_host`, `view.url_path`, and `view.url_path_group`, and the same for `resource.url`.
+- **Long task scripts:** `long_task.top_script.source_url`, `long_task.top_script.function`, and `long_task.top_script.invoker_type`, from the entry of `long_task.scripts` that ran the longest. A browser that reports no scripts leaves them empty, and what a client sends in these columns is dropped.
+- **Sessions:** the `rum_sessions` row of each session, derived from its views.
+
+Before an event is stored, the application's choices are applied: the sessions it does not keep are left out, and the
+[sensitive text](/en-US/rum/privacy#take-sensitive-text-out-at-intake) it chose to take out is replaced.
+
+The IP address and the place follow the [settings of the application](/en-US/rum/applications#collection).
+
+## Where the events are stored
+
+Each type has its own ordinary Logs stream, created with the first application. The streams have a fixed
+schema, so a value of the wrong type never changes a column.
+
+| Stream | Rows |
+|---|---|
+| `rum_sessions` | One row for each session, derived. |
+| `rum_views` | One row for each view. |
+| `rum_actions` | One row for each action. |
+| `rum_errors` | One row for each error. |
+| `rum_resources` | One row for each request. It holds the most rows, so set a shorter retention for it in its stream settings. |
+| `rum_long_tasks` | One row for each long task. |
+| `rum_vitals` | One row for each vital. |
+
+Columns are the flattened names of the event, such as `view.performance.lcp.timestamp` and `resource.status_code`.
+Browse them in the [RUM explorer](/en-US/rum/explorer), or query the streams with SQL on **Logs**.
+
+## Example
+
+A request with a view that is sent again, a failed request, and the error it caused:
+
+```json
+[
+  {
+    "type": "view",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user", "start": 1789999990000 },
+    "view": {
+      "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34",
+      "url": "https://shop.example.com/checkout",
+      "name": "/checkout",
+      "revision": 3,
+      "time_spent": 8200000000,
+      "loading_time": 1200000000,
+      "performance": { "lcp": { "timestamp": 900000000, "target_selector": "img.hero" } },
+      "error": { "count": 1 },
+      "resource": { "count": 22 }
+    },
+    "usr": { "id": "u-42" },
+    "context": { "plan": "pro" }
+  },
+  {
+    "type": "resource",
+    "date": 1790000001500,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "resource": {
+      "type": "fetch",
+      "method": "POST",
+      "url": "https://api.example.com/orders",
+      "status_code": 500,
+      "duration": 482000000,
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "span_id": "00f067aa0ba902b7"
+    }
+  },
+  {
+    "type": "error",
+    "date": 1790000001600,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "error": {
+      "id": "0a9b8c7d-6e5f-4a3b-8c1d-2e3f4a5b6c70",
+      "message": "Failed to fetch https://api.example.com/orders: 500",
+      "source": "network",
+      "type": "ServerError",
+      "handling": "handled",
+      "resource": { "method": "POST", "status_code": 500, "url": "https://api.example.com/orders" }
+    }
+  }
+]
+```
+
+<CardGroup cols={2}>
+  <Card title="RUM applications" icon="grid" href="/en-US/rum/applications">
+    Create the application a client token is bound to.
+  </Card>
+  <Card title="RUM explorer" icon="magnifying-glass" href="/en-US/rum/explorer">
+    Search the events by type and field.
+  </Card>
+</CardGroup>

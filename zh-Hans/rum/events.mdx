@@ -1,0 +1,296 @@
+---
+title: "RUM 事件格式"
+sidebarTitle: "事件格式"
+description: "RUM SDK 与其他客户端发送给 MoleSignal 的 JSON 事件：接入端点、应答、规则，以及各类事件的字段。"
+"en_link": "/en-US/rum/events"
+---
+
+所有 RUM SDK 都向同一个端点发送同样的 JSON 事件。没有 SDK 的客户端（例如还没有 SDK 的原生应用）也可以用 HTTP 请求发送同样的事件。
+
+事件有 `type`、`date`，以及它所属的 `session` 和 `view`，另有一个以类型命名的对象承载详情。事件的 JSON Schema 随源码发布，位于 `contracts/rum/events/v1.schema.json`，并附有合法与非法的示例事件。
+
+## 发送事件
+
+```http
+POST /api/v1/rum/events
+Authorization: Bearer msrum_<prefix>_<secret>
+Content-Type: application/json
+```
+
+| 部分 | 规则 |
+|---|---|
+| 凭证 | 应用的 [Client Token](/zh-Hans/rum/applications#client-token)，它只对该应用拥有 `rum.write`。其他拥有 `rum.write` 的凭证必须在每个事件的 `application.id` 中写明应用。 |
+| 请求体 | 事件的 JSON 数组；单个事件对象和 NDJSON（`Content-Type: application/x-ndjson`，每行一个事件）同样可用。 |
+| 压缩 | 可选 `Content-Encoding: gzip`，不接受其他编码。 |
+| 大小 | 最多 5000 个事件，解压后最多 5 MiB。超出时返回 `413`。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST "http://localhost:5080/api/v1/rum/events" \
+  -H "authorization: Bearer $RUM_CLIENT_TOKEN" \
+  -H "content-type: application/json" \
+  -d '[{
+    "type": "error",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34", "url": "https://shop.example.com/checkout" },
+    "error": {
+      "id": "e7b1c9a2-3d4f-4b65-8a90-1c2d3e4f5a61",
+      "message": "Payment provider timeout",
+      "source": "custom",
+      "handling": "handled"
+    }
+  }]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "accepted": 1,
+  "rejected": []
+}
+```
+</ResponseExample>
+
+## 应答
+
+应答逐个报告每个事件，因此一个坏事件不会让请求里的其余事件一起被丢弃。
+
+| 字段 | 含义 |
+|---|---|
+| `accepted` | 已写入的事件数。 |
+| `rejected` | 每个未写入的事件对应一项：它在请求中的位置（`index`，从 `0` 起）和原因 `reason`。 |
+| `sampled` | 有意舍弃的事件数：应用[只保留一部分会话](/zh-Hans/rum/sampling#在服务端保留一部分会话)，这些事件属于它不保留的会话。应用保留所有错误时，那些会话的错误不在其中。只有存在时才出现。它们不算被拒绝，也不计入 `accepted`。 |
+
+请求里的事件全部不合格时仍返回 `200`，`accepted` 为 `0`。完全无法读取的请求会整体失败：请求体不是 JSON、`Content-Encoding` 不受支持或 gzip 数据无法解码时返回 `400`；Token 缺失、已吊销或没有 `rum.write` 时返回 `401` 或 `403`；超出上述限制时返回 `413`。
+
+事件会因以下原因被拒绝：
+
+| 原因 | 缘由 |
+|---|---|
+| 指出字段的消息 | 事件不符合 Schema：缺少必填字段、值的类型错误或不在允许的取值内，或数字为负。 |
+| `date is more than a day in the future` | 设备时钟远远超前。 |
+| `application.id is not the application of the client token` | 事件指明的应用不是 Token 绑定的应用。 |
+| ``application `<id>` does not exist`` | 应用已删除，或从未创建。 |
+| `application.id is required` | 凭证不是 Client Token，事件也没有指明应用。 |
+| `line is not JSON` | NDJSON 请求体中的某一行无法解析。 |
+
+SDK 通过错误回调报告被拒绝的事件，不会重新发送。
+
+## 规则
+
+- `date` 是事件开始的时间，单位为 epoch 毫秒。`view` 的 `date` 是视图的开始时间，在它的各个修订之间不会改变。
+- 所有时长，以及相对视图开始的时间（例如 `performance.lcp.timestamp`、`resource.dns.start`），都是**整数纳秒**。发送前请先取整。
+- 视图中只要有变化，就用更高的 `view.revision` 和当前的计数再次发送。MoleSignal 保留最高的修订。计数是累计值，不是增量。
+- 客户端不发送会话事件。MoleSignal 从视图派生会话：开始与结束时间、时长、各类计数、落地页与退出页，以及是否录制了回放。
+- `session.start` 为 epoch 毫秒，可选但建议提供。尚不认识某个会话的节点用它区分刚开始的会话和丢失了状态的老会话。
+- `application.id` 可选。应用就是 Client Token 绑定的那个，写成别的值会被拒绝。
+- `geo` 和 `network` 由 MoleSignal 写入，发送了也会被忽略。`retention` 也一样：`retention.rate` 是这类行保留下来的比例（百分数），`retention.filter` 是什么保留了这一行（[过滤器](/zh-Hans/rum/sampling#过滤器)的 id、`default`，或者没被保留的会话的错误的 `errors`）。总数就是用它们算出来的。
+- Schema 不认识的字段会被接受并保留；Schema 认识的字段如果类型或取值错误，事件会被拒绝。
+- `error.frames` 承载结构化堆栈，Source Map、mapping 文件和原生符号文件应用于它。`error.stack` 是同一堆栈的文本形式，用于展示和搜索。
+
+## 每个事件都有的属性
+
+| 属性 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | 必填：`view`、`action`、`error`、`resource`、`long_task` 或 `vital`。 |
+| `date` | integer | 必填。epoch 毫秒。 |
+| `source` | string | 必填：`browser`、`android`、`ios`、`flutter`、`react-native`、`kotlin-multiplatform`、`unity`、`roku`、`electron` 或 `other`。 |
+| `session` | object | 必填。`id` 必填。`type` 为 `user`（默认）、`synthetics` 或 `ci_test`。`start` 为 epoch 毫秒。`has_replay` 为布尔值。 |
+| `view` | object | 必填。`id` 必填。`url`、`name`、`referrer` 和 `in_foreground` 可选。 |
+| `application.id` | string | 可选，见上面的规则。 |
+| `service`、`env`、`version` | string | 发布的维度。`version` 是查找 Source Map 与 Symbols 的键。 |
+| `build_version`、`build_id` | string | 构建号，以及调试产物上传时使用的构建标识。 |
+| `action.id` | string | 触发该事件的动作（如果有）。 |
+| `usr` | object | `id`、`name`、`email` 和 `anonymous_id`，其他键保存为 `usr.extra`。 |
+| `account` | object | `id` 和 `name`。 |
+| `tab.id` | string | 浏览器标签页。 |
+| `connectivity` | object | `status`、`interfaces`、`effective_type` 和 `cellular`（`technology`、`carrier_name`）。 |
+| `display.viewport` | object | `width` 和 `height`。 |
+| `browser`、`os`、`device` | object | 浏览器名称与版本、操作系统，以及设备类型（`mobile`、`desktop`、`tablet`、`tv`、`gaming_console`、`bot` 或 `other`）、型号、品牌、架构、区域设置、时区、电量和内存。 |
+| `sdk` | object | `name`、`version`、`session_sample_rate` 和 `replay_sample_rate`。 |
+| `context` | object | 应用自定义的属性。 |
+| `feature_flags` | object | 自定义的 Feature Flag 取值。 |
+
+标识符由 `A-Z`、`a-z`、`0-9`、`.`、`_`、`:` 和 `-` 组成，最长 128 个字符。`usr`、`account` 和设备的文本属性最长 256 个字符。
+
+## 视图
+
+`view` 事件的 `view` 对象除了上面的 `id`、`url` 和 `name`，还有这些字段。
+
+| 字段 | 说明 |
+|---|---|
+| `revision` | 必填。从 `1` 开始，每次再次发送加 1。 |
+| `time_spent` | 必填。视图打开的纳秒数。 |
+| `url` | 必填。 |
+| `is_active` | 视图已结束时，最后一个修订为 `false`。 |
+| `loading_type` | `initial_load`、`route_change`、`bf_cache`、`activity_display`、`activity_redisplay`、`fragment_display`、`fragment_redisplay`、`view_controller_display`、`view_controller_redisplay` 或 `session_renewal`。 |
+| `loading_time`、`first_byte`、`dom_interactive`、`dom_content_loaded`、`dom_complete`、`load_event`、`network_settled_time`、`interaction_to_next_view_time` | 导航耗时，单位为纳秒。 |
+| `performance.fcp`、`performance.lcp`、`performance.fid`、`performance.inp`、`performance.cls`、`performance.fbc` | Web Vitals。LCP 有 `timestamp`、`target_selector`、`resource_url` 和 `sub_parts`（`load_delay`、`load_time`、`render_delay`）；INP 有 `duration`、`timestamp`、`target_selector` 和 `sub_parts`（`input_delay`、`processing_duration`、`presentation_delay`）；CLS 有 `score`。 |
+| `custom_timings` | 命名耗时的对象。 |
+| `action`、`error`、`resource`、`long_task`、`frustration`、`crash`、`frozen_frame` | 形如 `{ "count": n }` 的累计计数对象。 |
+| `memory_average`、`memory_max`、`cpu_ticks_count`、`cpu_ticks_per_second`、`refresh_rate_average`、`refresh_rate_min`、`slow_frames_rate`、`freeze_rate` | 移动端度量。 |
+| `flutter_build_time`、`flutter_raster_time` | `{ min, max, average, metric_max }`，单位为纳秒。 |
+
+## 动作
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 必填。 |
+| `type` | 必填：`custom`、`click`、`tap`、`scroll`、`swipe`、`application_start` 或 `back`。 |
+| `loading_time` | 纳秒。 |
+| `target` | 元素的 `name`、`selector`、`width` 和 `height`。 |
+| `position` | 指针的 `x` 和 `y`。 |
+| `name_source` | 名称的来源：`custom_attribute`、`mask_placeholder`、`standard_attribute`、`text_content`、`mask_disallowed` 或 `blank`。 |
+| `frustration.type` | `rage_click`、`dead_click`、`error_click`、`rage_tap` 或 `error_tap` 的列表。 |
+| `error`、`crash`、`long_task`、`resource` | 形如 `{ "count": n }` 的对象。 |
+
+## 错误
+
+| 字段 | 说明 |
+|---|---|
+| `id`、`message`、`source` | 必填。`source` 为 `network`、`source`、`console`、`logger`、`agent`、`webview`、`custom` 或 `report`。 |
+| `type` | 错误类，例如 `TypeError`。 |
+| `stack` | 文本形式的堆栈。 |
+| `frames` | 最多 1000 帧：`file`、`function`、`class`、`module`、`line`、`column`、`debug_id`、`build_id`、`relative_address`、`instruction_addr`、`image_addr` 和 `artifact_kind`（`javascript_sourcemap`、`flutter_symbols`、`android_native_symbols` 或 `apple_dsym`）。 |
+| `fingerprint` | 可选，最长 128 个字符。同一应用里 fingerprint 相同的错误是同一个 [issue](/zh-Hans/rum/errors)，不管消息和堆栈是否相同。不填时，MoleSignal 按类型、消息和应用自己代码的前几个帧归并，并把 issue 的 id 写入 `error.issue_id`。作为 `issue_id` 发送的值会被替换。 |
+| `handling` | `handled` 或 `unhandled`。 |
+| `is_crash`、`category`、`source_type` | `category` 为 `ANR`、`App Hang`、`Exception`、`Watchdog Termination`、`Memory Warning` 或 `Network`。 |
+| `resource` | `network` 错误中失败的请求：`method`、`status_code` 和 `url`。 |
+| `causes`、`threads`、`binary_images` | 链式原因、线程堆栈和已加载的镜像。 |
+
+## 资源
+
+| 字段 | 说明 |
+|---|---|
+| `type`、`url` | 必填。`type` 为 `document`、`xhr`、`beacon`、`fetch`、`css`、`js`、`image`、`font`、`media`、`other` 或 `native`。 |
+| `method`、`status_code` | 请求没有收到响应时，`status_code` 为 `0`。 |
+| `duration` | 纳秒。 |
+| `size`、`encoded_body_size`、`decoded_body_size`、`transfer_size` | 字节数。 |
+| `redirect`、`dns`、`connect`、`ssl`、`first_byte`、`download`、`worker` | 各阶段，均为 `{ start, duration }`，单位为纳秒。 |
+| `trace_id`、`span_id` | 请求的 W3C trace 上下文。MoleSignal 按 `trace_id` 把会话和后端链路关联起来。 |
+| `graphql` | `operation_type`、`operation_name`、`payload` 和 `variables`。 |
+| `request.headers`、`response.headers` | 请求头与响应头的对象。 |
+
+## 长任务
+
+| 字段 | 说明 |
+|---|---|
+| `duration` | 必填。纳秒。 |
+| `entry_type` | `long-task` 或 `long-animation-frame`。 |
+| `start_time`、`blocking_duration`、`render_start`、`style_and_layout_start`、`first_ui_event_timestamp` | 相对视图开始的纳秒数。 |
+| `is_frozen_frame` | 移动应用的冻结帧为 `true`。 |
+| `scripts` | 长动画帧中的脚本，每项有 `duration`、`source_url`、`source_function_name`、`invoker` 和 `invoker_type`。 |
+
+## 指标
+
+| 字段 | 说明 |
+|---|---|
+| `id`、`type` | 必填。`type` 为 `duration`、`app_launch` 或 `operation_step`。 |
+| `name`、`duration` | `duration` 类型必填。 |
+| `app_launch_metric`、`startup_type` | `app_launch` 类型与 `duration` 一同必填：`ttid` 或 `ttfd`，以及 `cold_start` 或 `warm_start`。 |
+| `step_type`、`operation_key`、`failure_reason` | 用于 `operation_step`：`start`、`update`、`retry` 或 `end`。 |
+
+## MoleSignal 补充的内容
+
+- **位置：**根据客户端 IP 地址在 DB-IP City Lite 数据库中查到的国家、行政区、城市、洲和坐标。只有应用选择保存 IP 地址时才保存地址本身。
+- **浏览器、系统和设备：**浏览器事件没有携带这些内容时，由 `User-Agent` 请求头解析得到。爬虫会成为 `device.type: bot`。SDK 发送的值优先。
+- **URL 各部分：**`view.url_host`、`view.url_path` 和 `view.url_path_group`，`resource.url` 同理。
+- **长任务的脚本：**`long_task.top_script.source_url`、`long_task.top_script.function` 和 `long_task.top_script.invoker_type`，取自 `long_task.scripts` 里运行最久的那一项。浏览器没有报告脚本时，它们为空；客户端在这些列里发送的内容会被丢弃。
+- **会话：**由视图派生出的每个会话的 `rum_sessions` 行。
+
+事件存储之前，会先应用该应用的选择：它不保留的会话被舍弃，它选择去掉的[敏感文本](/zh-Hans/rum/privacy#在接入时去掉敏感文本)被替换。
+
+IP 地址与位置遵循[应用的设置](/zh-Hans/rum/applications#采集)。
+
+## 事件的存储位置
+
+每种类型都有自己的普通 Logs 数据流，在创建第一个应用时创建。数据流的 Schema 是固定的，因此类型错误的值不会改变列。
+
+| 数据流 | 行 |
+|---|---|
+| `rum_sessions` | 每个会话一行，由服务端派生。 |
+| `rum_views` | 每个视图一行。 |
+| `rum_actions` | 每个动作一行。 |
+| `rum_errors` | 每个错误一行。 |
+| `rum_resources` | 每个请求一行。它的行数最多，请在其数据流设置中为它设置更短的保留期。 |
+| `rum_long_tasks` | 每个长任务一行。 |
+| `rum_vitals` | 每个指标一行。 |
+
+列名是事件展平后的名称，例如 `view.performance.lcp.timestamp` 和 `resource.status_code`。可在 [RUM 探索](/zh-Hans/rum/explorer)中浏览，也可在 **日志** 中用 SQL 查询这些数据流。
+
+## 示例
+
+一个请求，其中有再次发送的视图、一个失败的请求，以及它引发的错误：
+
+```json
+[
+  {
+    "type": "view",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user", "start": 1789999990000 },
+    "view": {
+      "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34",
+      "url": "https://shop.example.com/checkout",
+      "name": "/checkout",
+      "revision": 3,
+      "time_spent": 8200000000,
+      "loading_time": 1200000000,
+      "performance": { "lcp": { "timestamp": 900000000, "target_selector": "img.hero" } },
+      "error": { "count": 1 },
+      "resource": { "count": 22 }
+    },
+    "usr": { "id": "u-42" },
+    "context": { "plan": "pro" }
+  },
+  {
+    "type": "resource",
+    "date": 1790000001500,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "resource": {
+      "type": "fetch",
+      "method": "POST",
+      "url": "https://api.example.com/orders",
+      "status_code": 500,
+      "duration": 482000000,
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "span_id": "00f067aa0ba902b7"
+    }
+  },
+  {
+    "type": "error",
+    "date": 1790000001600,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "error": {
+      "id": "0a9b8c7d-6e5f-4a3b-8c1d-2e3f4a5b6c70",
+      "message": "Failed to fetch https://api.example.com/orders: 500",
+      "source": "network",
+      "type": "ServerError",
+      "handling": "handled",
+      "resource": { "method": "POST", "status_code": 500, "url": "https://api.example.com/orders" }
+    }
+  }
+]
+```
+
+<CardGroup cols={2}>
+  <Card title="RUM 应用" icon="grid" href="/zh-Hans/rum/applications">
+    创建 Client Token 所绑定的应用。
+  </Card>
+  <Card title="RUM 探索" icon="magnifying-glass" href="/zh-Hans/rum/explorer">
+    按类型和字段搜索事件。
+  </Card>
+</CardGroup>

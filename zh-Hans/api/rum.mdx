@@ -1,0 +1,493 @@
+---
+title: "RUM API"
+description: "发送 RUM 事件与回放分段，管理 RUM 应用，搜索各类事件的行，并读取会话的时间线、回放和关联链路。"
+"en_link": "/en-US/api/rum"
+---
+
+RUM API 接收浏览器和移动端客户端的事件，并把它们读出来。所有端点都使用 `/api/v1/rum` 前缀，并需要 Bearer Token。
+
+```http
+Authorization: Bearer <token>
+```
+
+写入事件和回放分段需要 `rum.write`；与应用绑定的 [Client Token](/zh-Hans/api/auth/rum-token) 正好只对一个应用拥有这个权限。读取需要 `streams.query`。平台调用方可以在受保护的 `_sys` 范围内使用 `sys.telemetry.read`。创建、修改和删除应用需要 `api_tokens.manage`，设置 issue 的状态、团队或处理人需要 `rum.manage`。
+
+**类型** 说明一个端点处理哪种行：`sessions`、`views`、`actions`、`errors`、`resources`、`long_tasks` 或 `vitals`。每个类型对应同名[数据流](/zh-Hans/rum/events#事件的存储位置)，去掉 `rum_` 前缀。
+
+## 端点
+
+| 方法与路径 | 用途 |
+|---|---|
+| `POST /api/v1/rum/events` | 发送事件，见 [RUM 事件格式](/zh-Hans/rum/events)。需要 `rum.write`。 |
+| `POST /api/v1/rum/replay` | 发送回放分段。需要 `rum.write`。 |
+| `GET /api/v1/rum/replay/{session_id}` | 会话的回放分段。 |
+| `GET /api/v1/rum/applications` | 组织的应用。 |
+| `POST /api/v1/rum/applications` | 创建应用。需要 `api_tokens.manage`。 |
+| `GET /api/v1/rum/applications/{id}` | 一个应用。 |
+| `PATCH /api/v1/rum/applications/{id}` | 修改应用的名称、平台或设置。需要 `api_tokens.manage`。 |
+| `DELETE /api/v1/rum/applications/{id}` | 删除应用并吊销它的 Client Token。需要 `api_tokens.manage`。 |
+| `GET /api/v1/rum/schema/{type}` | 某个类型的列，以及它们的数据类型和单位。 |
+| `GET` 或 `POST /api/v1/rum/search` | 某个类型的一页行。 |
+| `GET` 或 `POST /api/v1/rum/facets` | 某个字段最常见的取值。 |
+| `GET` 或 `POST /api/v1/rum/histogram` | 匹配的行随时间的数量，按柱统计。 |
+| `GET` 或 `POST /api/v1/rum/aggregate` | 对匹配的行做计数、求和、平均和百分位，按分组或按时间柱拆开。 |
+| `GET /api/v1/rum/playlists` | 组织的播放列表，或某个应用的播放列表。 |
+| `POST /api/v1/rum/playlists` | 新建播放列表，可带上开始时就放进去的会话。需要 `rum.manage`。 |
+| `GET /api/v1/rum/playlists/{id}` | 一个播放列表及其会话。 |
+| `PATCH /api/v1/rum/playlists/{id}` | 修改名称或说明。需要 `rum.manage`。 |
+| `DELETE /api/v1/rum/playlists/{id}` | 删除播放列表。需要 `rum.manage`。 |
+| `POST /api/v1/rum/playlists/{id}/sessions` | 把会话放进播放列表。需要 `rum.manage`。 |
+| `DELETE /api/v1/rum/playlists/{id}/sessions/{session_id}` | 把一个会话移出播放列表。需要 `rum.manage`。 |
+| `GET /api/v1/rum/sessions/{id}/playlists` | 一个会话所在的播放列表。 |
+| `GET` 或 `POST /api/v1/rum/analytics/funnel` | 按顺序走完一串步骤的会话。 |
+| `GET` 或 `POST /api/v1/rum/analytics/paths` | 会话在某个页面之后，或之前打开的页面。 |
+| `GET` 或 `POST /api/v1/rum/analytics/retention` | 某个周期内首次出现的用户，有多少在之后的周期里再次出现。 |
+| `POST /api/v1/rum/alerts/preview` | [RUM 指标的告警规则](/zh-Hans/rum/alerts)在最近一段时间里会看到什么。 |
+| `GET /api/v1/rum/issues` | 应用的错误归并成的 issue，以及它们在某个时间范围内的数字。 |
+| `GET /api/v1/rum/issues/{id}` | 一个 issue，及其最近的会话和堆栈。 |
+| `PATCH /api/v1/rum/issues/{id}` | 设置 issue 的状态、团队或处理人。需要 `rum.manage`。 |
+| `GET /api/v1/rum/{type}/{id}` | 某个类型的一行及其全部列。 |
+| `GET /api/v1/rum/sessions/{id}/timeline` | 会话做过的一切，按顺序排列。 |
+| `GET /api/v1/rum/sessions/{id}/related-traces` | 会话的后端链路。 |
+| `GET /api/v1/rum/traces/{trace_id}/session` | 请求携带了某条后端链路 ID 的会话。 |
+
+[`GET /api/v1/auth/tokens/rum`](/zh-Hans/api/auth/rum-token) 返回应用的 Client Token。
+
+## 发送回放分段
+
+```http
+POST /api/v1/rum/replay
+```
+
+```json
+{
+  "application": "checkout-web",
+  "session_id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f",
+  "seq": 1,
+  "events": [{ "type": 2, "timestamp": 1790000000000, "data": { "node": {} } }]
+}
+```
+
+`session_id`、`seq` 和 `events` 必填。也可以带上 `env`、`service` 和 `version`，即 SDK 初始化时设置的值：应用的[保留过滤器](/zh-Hans/rum/sampling#过滤器)据此知道会话是什么样的，没被保留的会话的分段就不会存。不接受其他字段。`events` 是 rrweb 事件。Client Token 只写入它自己的应用：可以省略 `application`，写成别的值会返回 `403`；其他凭证必须指明应用。应用不存在时返回 `404`。应答描述已保存的分段：`id`、`seq`、`event_count` 和 `has_full_snapshot`。
+
+`GET /api/v1/rum/replay/{session_id}` 返回 `session_id`、`segment_count` 和 `events`，即会话所有分段的事件，按顺序排列。
+
+## 管理应用
+
+应用有 `id`、`name`、`platform` 和 `settings`：
+
+```json
+{
+  "id": "checkout-web",
+  "name": "Checkout web",
+  "platform": "browser",
+  "settings": {
+    "collect_ip": true,
+    "collect_geo": true,
+    "default_privacy": "mask",
+    "issues_per_hour": 100,
+    "scrub": ["secrets", "emails", "phones", "cards", "national_ids", "url_params"],
+    "session_sample_rate": 100,
+    "retention_filters": [],
+    "keep_errors": true
+  },
+  "created_by": "<user-id>",
+  "created_at_micros": 1790000000000000,
+  "updated_at_micros": 1790000000000000
+}
+```
+
+| 字段 | 规则 |
+|---|---|
+| `id` | 仅创建时可设置。1 到 64 个字符，可使用 `A-Z`、`a-z`、`0-9`、`.`、`_`、`:` 与 `-`。省略时由名称生成。不能修改。 |
+| `name` | 创建时必填。1 到 128 个字符。 |
+| `platform` | `browser`（默认）、`android`、`ios`、`flutter`、`react-native` 或 `other`。 |
+| `settings` | `collect_ip` 和 `collect_geo` 为布尔值，默认 `true`。`default_privacy` 为 `mask`（默认）或 `allow`。`issues_per_hour` 是应用每小时新开的 [issue](/zh-Hans/rum/errors#每小时新开的-issue) 数，范围 1 到 10000，默认 100。`scrub` 是事件存储前去掉的敏感文本的类别列表，取自 `secrets`、`emails`、`phones`、`cards`、`national_ids` 和 `url_params`，默认全部，空列表表示一类都不去掉（见 [RUM 隐私](/zh-Hans/rum/privacy#在接入时去掉敏感文本)）。`session_sample_rate` 是没有任何保留过滤器描述的会话的保留百分比，0 到 100 的整数，默认 100（见 [RUM 数据采样](/zh-Hans/rum/sampling#在服务端保留一部分会话)），超过 100 返回 `400`。`retention_filters` 是[过滤器](/zh-Hans/rum/sampling#过滤器)列表，最多 10 个，每个是 `{ "name", "rate", "conditions" }`，另有 `id`：省略时由服务端按名称生成，改名时保持不变；`PATCH` 会替换整个列表。`rate` 是 0 到 100 的整数。条件是 `{ "field", "op", "values" }`：`field` 取自 `env`、`service`、`version`、`source`、`session.type`、`geo.country_iso_code`、`browser.name`、`os.name` 和 `device.type`，`op` 是 `is` 或 `is_not`，`values` 有 1 到 20 个；一个过滤器最多 5 个条件。名称不能重复（不分大小写），`default` 和 `errors` 两个 id 已被占用。`keep_errors` 决定是否保留没被保留的会话的错误，默认 `true`。列表不合规返回 `400`。省略的项在创建时取默认值，在 `PATCH` 时保持原值。 |
+
+`POST` 返回新建的应用；标识符或名称已存在时返回 `409`。`PATCH` 接受 `name`、`platform` 和 `settings` 中的任意几项。`DELETE` 返回 `{ "deleted": true }`。应用已经发送的事件会保留在数据流中，直到保留期结束。
+
+## 搜索行
+
+```http
+GET /api/v1/rum/search?type=errors&from=1790000000000000&to=1790003600000000&filters=[{"field":"env","op":"=","value":"production"}]&limit=100
+```
+
+`POST` 在 JSON 请求体中使用同样的名称，适合地址放不下的查询。在地址中，`filters`、`free_text` 和 `columns` 是 JSON 编码的列表。
+
+| 参数 | 类型 | 行为 |
+|---|---|---|
+| `type` | string | 必填。行的类型。 |
+| `from`、`to` | integer | 范围，单位为 Unix epoch 起的微秒。`to` 默认为当前时间，`from` 默认为 `to` 之前 24 小时。`to` 必须大于 `from`。 |
+| `filters` | list | 每一行都要满足的条件，见下文。 |
+| `free_text` | 字符串列表 | 最多 8 个词。每个词都必须在该类型的某个文本列中找到，不区分大小写。 |
+| `columns` | 字符串列表 | 要返回的列。省略时为该类型的默认列。标识一行的列总会包含在内。 |
+| `limit` | integer | 页大小，1 到 5,000，默认 100。 |
+| `cursor` | string | 上一次应答的 `next_cursor` 或 `previous_cursor`。其他参数不要重复，或者要原样重复。 |
+
+**筛选条件** 有 `field`、`op` 和 `value`。最多 32 个条件，`value` 最长 512 个字符。
+
+| `op` | 含义 |
+|---|---|
+| `=`、`!=` | 等于和不等于。`value` 为空时，询问字段是否没有值，或有值。 |
+| `in`、`not_in` | 字段是列表中的某个值，或不是其中任何一个。`value` 是含 1 到 100 个值的 JSON 列表，例如 `["Chrome","Safari"]`。 |
+| `contains` | 字段包含这段文本，不区分大小写。适用于文本列和 JSON 文档。 |
+| `>`、`>=`、`<`、`<=` | 数字或时间的比较。 |
+| `exists`、`missing` | 字段有值，或没有值。 |
+
+指向该类型没有的字段，或字段无法回答的操作符，会让请求返回 `400`。
+
+应答包含一页行，最新的在前：
+
+```json
+{
+  "items": [
+    { "timestamp_micros": 1790000001600000, "error.message": "Payment provider timeout", "error.id": "0a9b8c7d-6e5f-4a3b-8c1d-2e3f4a5b6c70" }
+  ],
+  "has_more": true,
+  "next_cursor": "<cursor>",
+  "previous_cursor": null
+}
+```
+
+一行包含 `timestamp_micros` 和所请求的列。JSON 列保存文档。视图和会话只出现一次，是它们的最新版本。
+
+## 统计与描述行
+
+`facets` 接受 `search` 的参数（不分页），并增加必填的 `field` 和 `limit`（1 到 100，默认 10）。它返回字段在匹配的行中最常见的取值：
+
+```json
+{ "field": "browser.name", "values": [{ "value": "Chrome", "count": 812 }, { "value": "Safari", "count": 247 }] }
+```
+
+统计耗时过长或系统繁忙时，返回空列表，并把 `unavailable` 设为 `time_budget` 或 `busy`。保存 JSON 文档的字段返回 `400`。
+
+`histogram` 接受同样的选择条件，以及要统计的柱：`bucket_micros`（至少 1000）和 `origin_micros`（第一根柱的起点，省略时为 `from`，不能晚于 `from`）。一个范围最多 512 根柱。每个桶是 `{ start_micros, total, errors }`。`errors` 统计出问题的行：有错误的会话和视图、有受挫信号的操作，以及状态为 `400` 及以上或 `0` 的请求。没有这类行的类型，`split` 为 `false`。
+
+`GET /api/v1/rum/schema/{type}` 列出其他端点接受和返回的列：
+
+```json
+{
+  "type": "views",
+  "stream": "rum_views",
+  "id_field": "view.id",
+  "versioned": true,
+  "default_columns": ["view.id", "view.url_path", "view.loading_time"],
+  "fields": [
+    { "name": "view.loading_time", "data_type": "int64", "unit": "ns", "facetable": true, "indexed": false }
+  ]
+}
+```
+
+`data_type` 为 `bool`、`int64`、`float64`、`utf8` 或 `json`。`unit` 为 `ns`、`ms`、`bytes`、`count`、`score`、`percent`、`per_second`、`px` 或 `none`：时长以 SDK 发送的纳秒保存，由客户端格式化。`facetable` 的字段可以按取值统计，`indexed` 的字段筛选时不必读取每一行，`id_field` 是区分各行的列。
+
+## 度量行
+
+`aggregate` 接受 `search` 的选择条件，对每个匹配的行做度量。它给出图表、表格和地图背后的数字：有多少个会话，某个 Web Vitals 的第 75 百分位，按页面或按小时拆开。
+
+```http
+GET /api/v1/rum/aggregate?type=views&group_by=["view.url_path_group"]&measures=[{"fn":"count","name":"views"},{"fn":"p75","field":"view.performance.lcp.timestamp","name":"lcp"}]&limit=5
+```
+
+| 参数 | 类型 | 行为 |
+|---|---|---|
+| `type`、`from`、`to`、`filters`、`free_text` | | 与 `search` 相同。 |
+| `measures` | 列表 | 必填。最多 16 个度量，见下。 |
+| `group_by` | 字符串列表 | 最多 2 个字段，每种取值组合一行。保存 JSON 文档的字段不能用来分组。 |
+| `bucket_micros`、`origin_micros` | 整数 | 与 `histogram` 相同。给出它们后，每个分组每根柱一行。 |
+| `order_by` | 字符串 | 度量名、分组字段，或 `time`（有柱而没有分组时）。省略时，分组按第一个度量排名，柱按时间排。 |
+| `order` | `asc` 或 `desc` | 省略时，度量降序，分组和时间升序。 |
+| `limit` | 整数 | 分组数，1 到 250，默认 10。有柱时最多 20，每个分组都会在所有柱上展开。 |
+| `estimate` | 布尔 | 默认 `true`：数量、总和和平均值是所有会话的，每一行按它被保留的比例（`retention.rate`）放大，百分位数按同样的比例加权。`false` 数存下来的行，和探索器一样。 |
+
+一个**度量**有 `fn` 和 `field`，还可以有 `name`、`where` 和 `fallback`。
+
+| `fn` | 含义 |
+|---|---|
+| `count` | 行数。给出 `field` 时，是该字段有值的行数。`estimate` 开着时按行的比例放大。 |
+| `stored` | 存下来的行数，不论它们是以多大的比例保留的。 |
+| `count_distinct` | `field` 有多少种不同的取值。`fallback` 指定 `field` 没有值时改用的字段，这样没有 ID 的用户可以用匿名 ID 区分。人和其他值按看到的数；`estimate` 开着时，会话（`session.id`）会放大。 |
+| `sum`、`avg`、`min`、`max` | 对数值求和、求平均、取最小、取最大。 |
+| `p50`、`p75`、`p90`、`p95`、`p99` | 数值的百分位，是估计值。 |
+
+`where` 是筛选条件列表，写法与 `search` 相同，度量只取满足它们的行：`{"fn":"count","where":[{"field":"session.error.count","op":"=","value":"0"}]}` 统计没有错误的会话。度量的名字是 `name`，没有时是 `fn(field)`，没有字段时是 `fn`；两个度量不能同名。类型没有的字段，或对不是数值的字段求数值，返回 `400`。
+
+```json
+{
+  "group_by": ["view.url_path_group"],
+  "measures": [
+    { "name": "views", "fn": "count", "unit": "count" },
+    { "name": "lcp", "fn": "p75", "field": "view.performance.lcp.timestamp", "unit": "ns" }
+  ],
+  "rows": [
+    { "group": ["/checkout"], "values": [8031, 3400000000.0] },
+    { "group": [null], "values": [212, null] }
+  ]
+}
+```
+
+一行有它所属的 `group`（顺序同 `group_by`）和各度量的 `values`（顺序同 `measures`）。按时间拆开时，还有 `start_micros`，即它的柱的起点。行没有值的分组是 `null`，没有数值的百分位也是 `null`。`unit` 是 `count`，或 `schema` 给出的字段单位。视图和会话只计一次，取最新版本。没有行匹配时，带分组或分段的答案没有行，两者都没有的答案有一行：计数为 `0`，其他度量为 `null`。读取者无权看到的值，返回它被遮盖后的文本。统计耗时过长或系统繁忙时，返回空的 `rows`，并把 `unavailable` 设为 `time_budget` 或 `busy`。
+
+## 漏斗、路径与留存
+
+`/api/v1/rum/analytics` 下的三个端点回答 [RUM 分析](/zh-Hans/rum/analytics) 的问题。它们都取 `search` 里适用于会话、视图和操作的筛选：`from` 和 `to`（微秒），以及 `filters`，即每一行都要满足的条件，通常是应用（`application.id`）和环境（`env`）。`GET` 时，列表以 JSON 写在参数里，所以一个问题就是一条链接；`POST` 在 JSON 请求体里使用同样的名字。需要 `streams.query`，或受保护的 `_sys` 范围内的 `sys.telemetry.read`。统计耗时过长或系统繁忙时，不返回数字，并把 `unavailable` 设为 `time_budget` 或 `busy`。应答带有它所属的 `from` 和 `to`。
+
+### 漏斗
+
+```http
+GET /api/v1/rum/analytics/funnel?filters=[{"field":"application.id","op":"=","value":"shop-web"}]&steps=[{"type":"views","filters":[{"field":"view.url_path_group","op":"=","value":"/cart"}]},{"type":"actions","name":"Paid","filters":[{"field":"action.target.name","op":"=","value":"Pay now"}]}]&window_secs=1800&breakdown=browser.name
+```
+
+| 参数 | 类型 | 行为 |
+|---|---|---|
+| `from`、`to` | integer | 微秒。省略时是最近 7 天。 |
+| `filters` | list | 除各步自己的筛选外，每一步都要满足的条件。 |
+| `steps` | list | 必填，2 到 8 步。一步有 `type`（`views` 或 `actions`）、对该类型的行生效的 `filters`（同 `search`），以及可选的 `name`；省略 `name` 时取它第一个筛选的值。 |
+| `window_secs` | integer | 从第一步到之后某一步最长多少秒。省略时不限时间。 |
+| `breakdown` | string | 第一步的行的一个文本字段，按它的每个值各给一个漏斗。保留会话最多的 10 个值。 |
+
+会话按它第一个符合条件的行计入第一步；之后每一步，按同一会话里晚于上一步那一行、第一个符合该步骤的行计入。
+
+```json
+{
+  "groups": [
+    {
+      "value": null,
+      "steps": [
+        { "name": "/cart", "sessions": 4, "conversion": 1.0, "from_previous": null, "median_ms": null },
+        { "name": "Paid", "sessions": 2, "conversion": 0.5, "from_previous": 0.5, "median_ms": 210000.0 }
+      ]
+    }
+  ],
+  "from": 1779400000000000,
+  "to": 1780000000000000
+}
+```
+
+一个分组是 `breakdown` 取某个值的会话的漏斗，按它们在第一步的会话数排序；`value` 为 `null` 表示全部会话合在一起，或行里没有这个值的会话。`conversion` 是占第一步会话的比例，`from_previous` 是占上一步会话的比例，`median_ms` 是离上一步所用时间的中位数；没有意义的地方都是 `null`。字段不是文本，或该类型没有这个字段，请求返回 `400`。
+
+### 路径
+
+| 参数 | 类型 | 行为 |
+|---|---|---|
+| `from`、`to`、`filters` | | 同 `funnel`。读的行是视图。 |
+| `anchor` | string | 路径从哪个页面开始；往前看时，是到哪个页面为止。省略时，是每个会话的第一个页面；往前看时是最后一个。 |
+| `backward` | boolean | 跟踪锚点之前的页面。默认 `false`。 |
+| `depth` | integer | 锚点之后（或之前）1 到 6 页，默认 3。 |
+| `by` | string | 区分页面的字段：`view.url_path_group`（默认）、`view.url_path` 或 `view.name`。 |
+
+```json
+{
+  "columns": 3,
+  "sessions": 9,
+  "backward": false,
+  "nodes": [
+    { "column": 0, "page": "/products", "sessions": 2, "ends": 0 },
+    { "column": 1, "page": "/cart", "sessions": 2, "ends": 0 },
+    { "column": 2, "page": "/checkout", "sessions": 1, "ends": 1 }
+  ],
+  "links": [
+    { "column": 0, "source": "/products", "target": "/cart", "sessions": 2 },
+    { "column": 1, "source": "/cart", "target": "/checkout", "sessions": 1 }
+  ],
+  "from": 1779400000000000,
+  "to": 1780000000000000
+}
+```
+
+页面分在 `columns` 列里，列数比 `depth` 多一，路径所围绕的页面是第 0 列（往前看时是最后一列）。一个节点是某一列的一个页面，带有在那里的 `sessions`，以及没有再往下走的 `ends`（往前看时，是从这里开始的）。一条链接从 `column` 列的一个页面走到下一列（时间上更晚的一列，往前看时同样）的一个页面，带有走这条路的会话数。页面按打开的顺序取，紧接着再次打开的页面只算一次。每一列列出会话最多的 8 个页面，其余是 `__other__`。`sessions` 是有路径所围绕那个页面的会话数。
+
+### 留存
+
+| 参数 | 类型 | 行为 |
+|---|---|---|
+| `from`、`to`、`filters` | | 同 `funnel`。读的行是会话。省略 `from` 和 `to` 时，历史足够长，能有队列可看：从现在往前 `periods` 的两倍个周期，且至少 14 天（`week` 时至少 8 周）。 |
+| `period` | `day` 或 `week` | UTC 的一天，或从周一开始的 UTC 的一周。默认 `day`。 |
+| `periods` | integer | 第一个周期之后 1 到 30 个周期。默认 7。 |
+
+```json
+{
+  "period": "day",
+  "periods": 3,
+  "cohorts": [
+    { "start_micros": 1779408000000000, "users": 1, "returned": [1, 0, null] },
+    { "start_micros": 1779494400000000, "users": 6, "returned": [0, null, null] }
+  ],
+  "from": 1779408000000000,
+  "to": 1779753600000000
+}
+```
+
+一个队列是在所问时间范围内、于从 `start_micros` 开始的那个周期里首次出现的用户。一个人是会话的 `usr.id`，没有时是它的 `usr.anonymous_id`。`returned` 给出之后每个周期里有多少队列成员出现过；到 `to` 还没有结束的周期是 `null`。
+
+## 播放列表
+
+[播放列表](/zh-Hans/rum/playlists)是某个应用的一串会话的命名列表，每个会话带一个值得从那里开始看的时刻。
+
+```json
+{
+  "id": "2xT9bQ1kLw5nVf8cZ0aR7mHpJd3",
+  "application": "checkout-web",
+  "name": "Checkout failures",
+  "description": "Sessions that ended at the checkout with an error.",
+  "created_by": "<user-id>",
+  "created_at_micros": 1790000000000000,
+  "updated_at_micros": 1790000100000000,
+  "session_count": 2,
+  "sessions": [
+    { "session_id": "3f6c9a52-1b7e-4d08-a5c3-90e2d41f7b68", "at_micros": 1790000005000000, "added_by": "<user-id>", "added_at_micros": 1790000000000000 },
+    { "session_id": "9d41e7b0-62fa-4c3d-8e15-b7a09c52d3f4", "at_micros": null, "added_by": "<user-id>", "added_at_micros": 1790000100000000 }
+  ]
+}
+```
+
+`GET /api/v1/rum/playlists` 返回不带 `sessions` 的播放列表，最近修改的在前，可用 `application` 缩小到一个应用。读取需要 `streams.query`，平台调用方可以使用 `sys.telemetry.read`。其余请求会修改播放列表，需要 `rum.manage`；除了返回 `{ "deleted": true }` 的 `DELETE`，它们都返回带会话的播放列表。
+
+| 请求 | 请求体 | 规则 |
+|---|---|---|
+| `POST /rum/playlists` | `application`、`name`，以及可选的 `description` 和 `sessions` | 应用必须存在（`404`）。名称 1 到 128 个字符，且同一应用里没有别的播放列表同名，不分大小写（`409`）。说明不超过 1000 个字符。 |
+| `PATCH /rum/playlists/{id}` | `name` 和 `description`，各自可选 | 省略的部分保持原值。应用不能改。 |
+| `POST /rum/playlists/{id}/sessions` | `sessions` | 再次放进去的会话取新给的 `at_micros`，位置不变。一个播放列表最多 500 个会话（`400`）。 |
+
+请求里的一个会话写作 `{ "session_id": "...", "at_micros": 1790000005000000 }`：id 为 1 到 128 个字符；给出 `at_micros` 时，它是会话打开的时刻，一个晚于纪元的微秒数；省略时会话从头打开。播放列表保存的是 id，不是会话：它不检查会话是否存在，行已被保留期删除的会话仍留在列表里。`GET /api/v1/rum/sessions/{id}/playlists` 返回装着某个会话的播放列表（不带它们的会话）。
+
+## 读取一行、一个会话
+
+`GET /api/v1/rum/{type}/{id}` 返回一行及其全部列，找不到时返回 `404`。`from` 和 `to` 可以缩小查找范围，省略时查找最近 30 天。`{id}` 是该类型 `id_field` 的值。
+
+`GET /api/v1/rum/sessions/{id}/timeline` 的应答：
+
+| 字段 | 内容 |
+|---|---|
+| `session` | 会话行；还没有派生出会话行时为 `null`。 |
+| `items` | 属于该会话的其他类型的行，最早的在前。每项有 `type`：`view`、`action`、`error`、`resource`、`long_task` 或 `vital`。 |
+| `truncated` | 行数超过时间线容量的类型。 |
+
+`GET /api/v1/rum/sessions/{id}/related-traces` 列出会话的后端链路：先是会话的请求所携带 ID 的链路（`relation: direct`），没有这样的链路时，是会话运行期间在跑的链路（`relation: time-correlated`）。每条链路有 `trace_id`、`service`、`span_count`、`duration_ms` 和 `started_at_micros`，应答还有 `primary_service`。`GET /api/v1/rum/traces/{trace_id}/session` 方向相反，返回会话，或 `null`。
+
+## Issue
+
+相似的错误归并成 [issue](/zh-Hans/rum/errors)，每条错误行在 `error.issue_id` 里带着所属 issue 的 id。issue 的数字从所查时间范围内它的错误里数出来，状态和历史另外保存。时间都是自 Unix 纪元起的微秒数。
+
+```http
+GET /api/v1/rum/issues?application=checkout-web&status=unresolved&sort=sessions&limit=50
+```
+
+| 参数 | 类型 | 行为 |
+|---|---|---|
+| `application` | string | 必填。 |
+| `env`、`source` | string | 只算这个环境的错误，或由这个来源（`browser`、`flutter` 等）发送的错误。 |
+| `filters` | list | 对所数错误的更多条件，与 `search` 相同。 |
+| `from`、`to` | integer | 与 `search` 相同。 |
+| `status` | string | `unresolved`（默认：待处理、调查中和回归）、`all`，或 `open`、`investigating`、`regressed`、`resolved`、`ignored` 之一。 |
+| `assignee`、`team` | string | 用户 ID 或团队 ID；`none` 表示没有人处理的 issue。 |
+| `search` | string | 在 issue 的类型、消息或位置里查找的词，忽略大小写。 |
+| `fresh` | boolean | 只要在范围内首次出现或在范围内回归的 issue。 |
+| `sort` | string | `sessions`（默认）、`users`、`occurrences`、`last_seen`、`first_seen` 或 `status`。 |
+| `order` | `asc` 或 `desc` | 省略时除 `status` 外为降序。 |
+| `limit` | integer | 1 到 100，默认 50。 |
+
+```json
+{
+  "issues": [
+    {
+      "id": "3f9c2a71e0b4c8d1",
+      "application_id": "checkout-web",
+      "status": "regressed",
+      "assignee_id": "<user-id>",
+      "team_id": null,
+      "overflow": false,
+      "source": "source",
+      "error_type": "ChunkLoadError",
+      "message": "Loading chunk 482 failed.",
+      "location": "src/router/lazy.ts:34 · loadChunk",
+      "first_seen_at": 1789300000000000,
+      "last_seen_at": 1790000000000000,
+      "first_version": "2.2.0",
+      "last_version": "2.4.1",
+      "resolved_at": 1789600000000000,
+      "resolved_version": "2.3.0",
+      "resolved_by": "<user-id>",
+      "regressed_at": 1789900000000000,
+      "regressed_version": "2.4.1",
+      "regressed_environment": "production",
+      "updated_by": null,
+      "updated_at": 1789900000000000,
+      "sessions": 612,
+      "users": 498,
+      "occurrences": 1530,
+      "trend": [3, 5, 4, 9, 40, 120]
+    }
+  ],
+  "total": 8
+}
+```
+
+`regressed_environment` 是让 issue 回归的那条错误所在的环境，那条错误没有写环境时为 `null`。issue 属于整个应用，与它的错误在哪个环境无关。服务端还记下每个环境第一次看到它的时间，[告警规则](/zh-Hans/rum/alerts#收窄规则)就是据此数出一个环境的新问题。
+
+列表读取会话（或用户、出现次数，按 `sort`）最多的 250 个 issue，再用 `status`、`assignee`、`team`、`search` 和 `fresh` 缩小。`total` 是筛选之后剩下的 issue 数，在 `limit` 截断列表之前。`trend` 是时间范围等分成最多 12 段后每段的出现次数，从早到晚。`overflow` 标出一个 issue：它计入应用超出[每小时可新开 issue 数](/zh-Hans/rum/errors#每小时新开的-issue)之后的错误。计数耗时过长或系统繁忙时，返回空的 issue 列表，并把 `unavailable` 设为 `time_budget` 或 `busy`。
+
+`GET /api/v1/rum/issues/{id}` 返回列表里那样的 issue（没有 `trend`），其 `sessions`、`users` 和 `occurrences` 按 `from` 和 `to` 数，另有两个字段：
+
+| 字段 | 内容 |
+|---|---|
+| `samples` | 最近三个遇到该 issue 的会话，从新到旧：`timestamp_micros`、`session_id`、`user_id`、`anonymous_id`、`page`、`browser`、`system`、`version`、`has_replay` 和 `retained`：没被保留的会话的错误是 `false`，它没有会话可以打开。 |
+| `stack` | 最近一条带帧的错误的堆栈；没有一条带帧时，是最近一条错误，`frames` 为空；范围内没有这个 issue 的错误时为 `null`：`message`、`text`、`frames`、`symbolication`、`handling`、`is_crash` 和 `category`。帧有 `raw`（SDK 发送的）、`restored`（调试产物还原出的，没有则为 `null`）和 `in_app`。尝试过还原时，`symbolication` 为 `completed`、`partial` 或 `missing`。 |
+
+issue 不存在时返回 `404`。
+
+`PATCH /api/v1/rum/issues/{id}` 接受 `status`、`assignee_id` 和 `team_id` 中的任意几项，并返回修改后的 issue。
+
+```json
+{ "status": "resolved", "assignee_id": "<user-id>", "team_id": null }
+```
+
+`status` 为 `open`、`investigating`、`resolved` 或 `ignored`。`regressed` 由规则在已解决的 issue 于更新的版本再现时设置，设置它返回 `400`。`assignee_id` 必须是组织成员，`team_id` 必须是组织的团队；`null` 或空文本表示撤下处理人或团队。省略的字段保持原值。标为已解决会记下 `resolved_at`、`resolved_by`，并把应用当时最新的版本记为 `resolved_version`；任何新状态都会结束此前已解决或回归的记录。没有写明任何要改的字段的请求返回 `400`；把已有的值再设一遍返回 `200`，什么也不改变。每次修改以 `rum.issue.update` 写入审计日志。
+
+## 预览告警规则
+
+```http
+POST /api/v1/rum/alerts/preview
+```
+
+按评估规则的同一段代码，逐个窗口读出[RUM 指标的告警规则](/zh-Hans/rum/alerts)在最近一段时间里会看到什么。需要 `streams.query`。
+
+```json
+{
+  "query": { "application_id": "checkout-web", "environment": "production", "page": "/checkout", "metric": "lcp_p75" },
+  "period_secs": 3600
+}
+```
+
+| 字段 | 类型 | 行为 |
+|---|---|---|
+| `query` | object | 必填。指标：`application_id` 和 `metric`，以及给出的 `environment`、`page`、`version` 和 `min_samples`。不能收窄到页面或版本的指标带 `page` 或 `version` 会被拒绝，计数带 `min_samples` 也会被拒绝。 |
+| `period_secs` | integer | 必填。规则评估所用的窗口，取 60 到 21,600。每个点是一个窗口。 |
+| `from`、`to` | integer | 自 Unix 纪元起的微秒数范围，按整窗口读取。`to` 默认是现在。`from` 默认是 `to` 之前 6 小时，但不少于 12 个、不多于 72 个窗口，也不超过一天。一个范围最多 360 个窗口。 |
+
+```json
+{
+  "metric": "lcp_p75",
+  "unit": "milliseconds",
+  "min_samples": 50,
+  "period_secs": 3600,
+  "from": 1789956800000000,
+  "to": 1790000000000000,
+  "points": [
+    { "at": 1789956800000000, "value": null, "samples": null },
+    { "at": 1789960400000000, "value": 2480, "samples": 612 }
+  ],
+  "current": { "at": 1789996400000000, "value": 2310, "samples": 540 }
+}
+```
+
+`unit` 为 `count`、`percent`、`milliseconds` 或 `score`。点的 `at` 是窗口的起点，`value` 是指标，`samples` 是指标所用的行数；窗口里的行数少于 `min_samples` 时，两者都为 `null`。`current` 是最后一个点，即截止到 `to` 的窗口。计数耗时过长或系统繁忙时，返回空的 `points`，并把 `unavailable` 设为 `time_budget` 或 `busy`。应用不存在时返回 `404`，规则与指标不相符时返回 `400`。
+
+## 错误
+
+| 状态 | 原因 |
+|---|---|
+| `400` | 参数、筛选条件、列或游标与请求不符。 |
+| `401`、`403` | Token 缺失或无效，或没有端点要求的权限。 |
+| `404` | 行、会话或应用不存在。 |
+| `409` | 已有标识符或名称相同的应用。 |
+| `413` | 请求超出 [`events`](/zh-Hans/rum/events#发送事件) 的限制。 |

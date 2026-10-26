@@ -1,0 +1,568 @@
+---
+title: "RUM API"
+description: "Send RUM events and replay segments, manage RUM applications, search the rows of every event type, and read sessions with their timeline, replay, and related traces."
+"zh-Hans_link": "/zh-Hans/api/rum"
+---
+
+The RUM API takes the events of browser and mobile clients and reads them back. All endpoints use the
+`/api/v1/rum` prefix and require a bearer token.
+
+```http
+Authorization: Bearer <token>
+```
+
+Writing events and replay segments requires `rum.write`; an application-bound [client token](/en-US/api/auth/rum-token) holds
+exactly this permission for one application. Reading requires `streams.query`. A platform caller can use `sys.telemetry.read`
+in the protected `_sys` scope. Creating, changing, and deleting an application requires `api_tokens.manage`, and setting the state, the team,
+or the person of an issue requires `rum.manage`.
+
+A **type** names the kind of row an endpoint works on: `sessions`, `views`, `actions`, `errors`, `resources`, `long_tasks`,
+or `vitals`. Each type is the [stream](/en-US/rum/events#where-the-events-are-stored) of the same name with the `rum_` prefix
+removed.
+
+## Endpoints
+
+| Method and path | Purpose |
+|---|---|
+| `POST /api/v1/rum/events` | Send events. See [RUM event format](/en-US/rum/events). Requires `rum.write`. |
+| `POST /api/v1/rum/replay` | Send a replay segment. Requires `rum.write`. |
+| `GET /api/v1/rum/replay/{session_id}` | The replay segments of a session. |
+| `GET /api/v1/rum/applications` | The applications of the organization. |
+| `POST /api/v1/rum/applications` | Create an application. Requires `api_tokens.manage`. |
+| `GET /api/v1/rum/applications/{id}` | One application. |
+| `PATCH /api/v1/rum/applications/{id}` | Change the name, platform, or settings of an application. Requires `api_tokens.manage`. |
+| `DELETE /api/v1/rum/applications/{id}` | Delete an application and revoke its client token. Requires `api_tokens.manage`. |
+| `GET /api/v1/rum/schema/{type}` | The columns of a type, with their data types and units. |
+| `GET` or `POST /api/v1/rum/search` | A page of the rows of a type. |
+| `GET` or `POST /api/v1/rum/facets` | The most common values of a field. |
+| `GET` or `POST /api/v1/rum/histogram` | The number of matching rows over time, bar by bar. |
+| `GET` or `POST /api/v1/rum/aggregate` | Counts, sums, averages, and percentiles over the matching rows, per group or per bar of time. |
+| `GET /api/v1/rum/playlists` | The playlists of the organization, or of one application. |
+| `POST /api/v1/rum/playlists` | Make a playlist, with the sessions it starts with. Requires `rum.manage`. |
+| `GET /api/v1/rum/playlists/{id}` | One playlist with its sessions. |
+| `PATCH /api/v1/rum/playlists/{id}` | Change the name or the description. Requires `rum.manage`. |
+| `DELETE /api/v1/rum/playlists/{id}` | Delete a playlist. Requires `rum.manage`. |
+| `POST /api/v1/rum/playlists/{id}/sessions` | Put sessions in a playlist. Requires `rum.manage`. |
+| `DELETE /api/v1/rum/playlists/{id}/sessions/{session_id}` | Take a session out of a playlist. Requires `rum.manage`. |
+| `GET /api/v1/rum/sessions/{id}/playlists` | The playlists a session is in. |
+| `GET` or `POST /api/v1/rum/analytics/funnel` | The sessions that got through a series of steps in order. |
+| `GET` or `POST /api/v1/rum/analytics/paths` | The pages sessions opened after a page, or before it. |
+| `GET` or `POST /api/v1/rum/analytics/retention` | How many of the people first seen in a period were seen again in the periods after. |
+| `POST /api/v1/rum/alerts/preview` | What an [alert rule on a RUM figure](/en-US/rum/alerts) would have seen over the last stretch of time. |
+| `GET /api/v1/rum/issues` | The issues the errors of an application are grouped into, with their numbers in a range. |
+| `GET /api/v1/rum/issues/{id}` | One issue, with its latest sessions and its stack. |
+| `PATCH /api/v1/rum/issues/{id}` | Set the state, the team, or the person of an issue. Requires `rum.manage`. |
+| `GET /api/v1/rum/{type}/{id}` | One row of a type with all its columns. |
+| `GET /api/v1/rum/sessions/{id}/timeline` | Everything a session did, in order. |
+| `GET /api/v1/rum/sessions/{id}/related-traces` | The backend traces of a session. |
+| `GET /api/v1/rum/traces/{trace_id}/session` | The session whose request carried a backend trace ID. |
+
+[`GET /api/v1/auth/tokens/rum`](/en-US/api/auth/rum-token) returns the client token of an application.
+
+## Send a replay segment
+
+```http
+POST /api/v1/rum/replay
+```
+
+```json
+{
+  "application": "checkout-web",
+  "session_id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f",
+  "seq": 1,
+  "events": [{ "type": 2, "timestamp": 1790000000000, "data": { "node": {} } }]
+}
+```
+
+`session_id`, `seq`, and `events` are required. `env`, `service`, and `version` may be sent too, as the SDK was set up with them:
+they tell the [retention filters](/en-US/rum/sampling#filters) of the application what the session is like, so that a segment of a
+session that is not kept is not stored. No other field is accepted. `events` are rrweb events. A client token writes
+to its own application: `application` can be left out, and a different value answers `403`. Any other credential
+names the application. An application that does not exist answers `404`. The answer describes the stored segment:
+its `id`, `seq`, `event_count`, and `has_full_snapshot`.
+
+`GET /api/v1/rum/replay/{session_id}` returns `session_id`, `segment_count`, and `events`, the events of all the
+segments of the session in order.
+
+## Manage applications
+
+An application has an `id`, a `name`, a `platform`, and `settings`:
+
+```json
+{
+  "id": "checkout-web",
+  "name": "Checkout web",
+  "platform": "browser",
+  "settings": {
+    "collect_ip": true,
+    "collect_geo": true,
+    "default_privacy": "mask",
+    "issues_per_hour": 100,
+    "scrub": ["secrets", "emails", "phones", "cards", "national_ids", "url_params"],
+    "session_sample_rate": 100,
+    "retention_filters": [],
+    "keep_errors": true
+  },
+  "created_by": "<user-id>",
+  "created_at_micros": 1790000000000000,
+  "updated_at_micros": 1790000000000000
+}
+```
+
+| Field | Rule |
+|---|---|
+| `id` | On creation only. 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`. Made from the name when left out. It cannot change. |
+| `name` | Required on creation. 1 to 128 characters. |
+| `platform` | `browser` (default), `android`, `ios`, `flutter`, `react-native`, or `other`. |
+| `settings` | `collect_ip` and `collect_geo` are booleans and default to `true`. `default_privacy` is `mask` (default) or `allow`. `issues_per_hour` is how many new [issues](/en-US/rum/errors#new-issues-an-hour) the application opens in an hour, from 1 to 10000, and defaults to 100. `scrub` is the list of kinds of sensitive text taken out of an event before it is stored, from `secrets`, `emails`, `phones`, `cards`, `national_ids`, and `url_params`; it defaults to all of them, and an empty list takes out none (see [RUM privacy](/en-US/rum/privacy#take-sensitive-text-out-at-intake)). `session_sample_rate` is the percentage of the sessions that no retention filter describes that is kept, a whole number from 0 to 100, and defaults to 100 (see [RUM data sampling](/en-US/rum/sampling#keep-a-share-of-sessions-at-the-server)); a value above 100 answers `400`. `retention_filters` is the list of [filters](/en-US/rum/sampling#filters), up to 10, each `{ "name", "rate", "conditions" }` with an `id` that the server makes from the name when it is left out and keeps when the filter is renamed; a `PATCH` replaces the whole list. `rate` is a whole number from 0 to 100. A condition is `{ "field", "op", "values" }` with a `field` of `env`, `service`, `version`, `source`, `session.type`, `geo.country_iso_code`, `browser.name`, `os.name`, or `device.type`, an `op` of `is` or `is_not`, and 1 to 20 `values`; a filter has at most 5 conditions. A name is used once, whatever its case, and the ids `default` and `errors` are taken. `keep_errors` keeps the errors of sessions that are not kept, and defaults to `true`. A list that is not right answers `400`. Each one left out takes its default on creation and keeps its value on a `PATCH`. |
+
+`POST` answers the new application. An identifier or a name that exists answers `409`. `PATCH` takes any of `name`, `platform`, and
+`settings`. `DELETE` answers `{ "deleted": true }`. The events the application already sent stay in the streams until
+their retention ends them.
+
+## Search rows
+
+```http
+GET /api/v1/rum/search?type=errors&from=1790000000000000&to=1790003600000000&filters=[{"field":"env","op":"=","value":"production"}]&limit=100
+```
+
+`POST` takes the same names in a JSON body and suits queries too long for an address. In an address, `filters`, `free_text`, and
+`columns` are JSON-encoded lists.
+
+| Parameter | Type | Behavior |
+|---|---|---|
+| `type` | string | Required. The type of the rows. |
+| `from`, `to` | integer | The range in microseconds since the Unix epoch. `to` defaults to now and `from` to 24 hours before `to`. `to` must be greater than `from`. |
+| `filters` | list | Conditions that every row meets. See below. |
+| `free_text` | list of strings | Up to 8 words. Every word must be found in one of the text columns of the type, ignoring case. |
+| `columns` | list of strings | The columns to answer with. Without it, the default columns of the type. The column that names the row is always included. |
+| `limit` | integer | The page size from 1 to 5,000. Defaults to 100. |
+| `cursor` | string | The `next_cursor` or `previous_cursor` of an earlier answer. Repeat nothing else, or repeat it exactly. |
+
+A **filter** has a `field`, an `op`, and a `value`. At most 32 filters, and a value of at most 512 characters.
+
+| `op` | Meaning |
+|---|---|
+| `=`, `!=` | Equal and not equal. An empty `value` asks whether the field has no value, or has one. |
+| `in`, `not_in` | The field is one of a list of values, or none of them. `value` is a JSON list of 1 to 100 values, such as `["Chrome","Safari"]`. |
+| `contains` | The field contains the text, ignoring case. Text columns and JSON documents. |
+| `>`, `>=`, `<`, `<=` | Comparison of a number or a time. |
+| `exists`, `missing` | The field has a value, or has none. |
+
+A field that the type does not have, or an operator the field cannot answer, fails the request with `400`.
+
+The answer holds the rows of one page, newest first:
+
+```json
+{
+  "items": [
+    { "timestamp_micros": 1790000001600000, "error.message": "Payment provider timeout", "error.id": "0a9b8c7d-6e5f-4a3b-8c1d-2e3f4a5b6c70" }
+  ],
+  "has_more": true,
+  "next_cursor": "<cursor>",
+  "previous_cursor": null
+}
+```
+
+A row has `timestamp_micros` and the columns asked for. A JSON column holds the document. Views and sessions
+appear once, in their latest version.
+
+## Count and describe rows
+
+`facets` takes the parameters of `search` without paging and adds `field` (required) and `limit` (from 1 to 100, default 10).
+It answers the most common values of the field across the matching rows:
+
+```json
+{ "field": "browser.name", "values": [{ "value": "Chrome", "count": 812 }, { "value": "Safari", "count": 247 }] }
+```
+
+A count that takes too long or finds the system busy answers an empty list with `unavailable` set to `time_budget` or `busy`.
+A field that holds a JSON document answers `400`.
+
+`histogram` takes the same selection and the bars to count into: `bucket_micros` (at least 1000) and `origin_micros`, the start of
+the first bar, which is `from` when left out and cannot be after it. A range holds at most 512 bars. Each bucket is `{ start_micros, total, errors }`. `errors` counts the rows
+that went wrong: sessions and views with errors, actions with frustration, and requests with a status of `400` or more, or
+`0`. `split` is `false` for the types that have no such rows.
+
+`GET /api/v1/rum/schema/{type}` lists the columns the other endpoints take and answer with:
+
+```json
+{
+  "type": "views",
+  "stream": "rum_views",
+  "id_field": "view.id",
+  "versioned": true,
+  "default_columns": ["view.id", "view.url_path", "view.loading_time"],
+  "fields": [
+    { "name": "view.loading_time", "data_type": "int64", "unit": "ns", "facetable": true, "indexed": false }
+  ]
+}
+```
+
+`data_type` is `bool`, `int64`, `float64`, `utf8`, or `json`. `unit` is `ns`, `ms`, `bytes`, `count`, `score`, `percent`,
+`per_second`, `px`, or `none`: durations are stored in the nanoseconds the SDK sent, and a client formats them. A
+`facetable` field can be counted by value, an `indexed` field filters without reading every row, and `id_field` names the
+column that tells one row from another.
+
+## Measure rows
+
+`aggregate` takes the selection of `search` and measures across every matching row. It answers the numbers behind charts,
+tables, and maps: how many sessions, the 75th percentile of a vital, per page or per hour.
+
+```http
+GET /api/v1/rum/aggregate?type=views&group_by=["view.url_path_group"]&measures=[{"fn":"count","name":"views"},{"fn":"p75","field":"view.performance.lcp.timestamp","name":"lcp"}]&limit=5
+```
+
+| Parameter | Type | Behavior |
+|---|---|---|
+| `type`, `from`, `to`, `filters`, `free_text` | | As in `search`. |
+| `measures` | list | Required. Up to 16 measures. See below. |
+| `group_by` | list of strings | Up to 2 fields, and a row for every combination of their values. A field that holds a JSON document cannot be grouped by. |
+| `bucket_micros`, `origin_micros` | integer | As in `histogram`. With them, there is a row per group per bar. |
+| `order_by` | string | The name of a measure, a group field, or `time` (bars without groups). Without it, groups are ranked by the first measure and bars come in time order. |
+| `order` | `asc` or `desc` | Descending for a measure, and ascending for a group or time, when left out. |
+| `limit` | integer | The number of groups, from 1 to 250. Defaults to 10. With bars it is at most 20, and each group is followed through all the bars. |
+| `estimate` | boolean | Defaults to `true`: counts, sums, and averages are those of every session, each row counting for as many as the share it was kept with says (`retention.rate`), and percentiles are weighed by the same shares. `false` counts the rows that are stored, as the explorer does. |
+
+A **measure** has an `fn` and a `field`, and may have a `name`, a `where`, and a `fallback`.
+
+| `fn` | Meaning |
+|---|---|
+| `count` | The rows. With a `field`, the rows that have a value in it. Scaled by their shares when `estimate` is on. |
+| `stored` | The rows that are stored, whatever share they were kept with. |
+| `count_distinct` | How many different values `field` has. `fallback` names the field to take where `field` has no value, so users without an ID can be told apart by their anonymous ID. People and other values are counted as they were seen; sessions (`session.id`) are scaled when `estimate` is on. |
+| `sum`, `avg`, `min`, `max` | Of a number. |
+| `p50`, `p75`, `p90`, `p95`, `p99` | The percentile of a number, estimated. |
+
+`where` is a list of filters, as in `search`, and the measure takes only the rows that meet them:
+`{"fn":"count","where":[{"field":"session.error.count","op":"=","value":"0"}]}` counts the sessions without errors. A measure
+is called by its `name`, else `fn(field)`, else `fn` when it has no field, and two measures cannot have the same name. A field
+that the type does not have, or a number asked of a field that is not one, fails the request with `400`.
+
+```json
+{
+  "group_by": ["view.url_path_group"],
+  "measures": [
+    { "name": "views", "fn": "count", "unit": "count" },
+    { "name": "lcp", "fn": "p75", "field": "view.performance.lcp.timestamp", "unit": "ns" }
+  ],
+  "rows": [
+    { "group": ["/checkout"], "values": [8031, 3400000000.0] },
+    { "group": [null], "values": [212, null] }
+  ]
+}
+```
+
+A row has the `group` it is of, in the order of `group_by`, and the `values` of the measures, in their order. Over time it
+also has `start_micros`, where its bar begins. A group whose rows have no value is `null`, and so is a percentile of no
+values. `unit` is `count`, or the unit of the field as `schema` gives it. Views and sessions are counted once, in their
+latest version. Where no row matches, an answer with groups or bars has no rows, and one with neither has one row: counts are `0` and the other measures `null`. A value the reader may not see comes back as the text it is masked to. A count that takes too long or finds
+the system busy answers no rows, with `unavailable` set to `time_budget` or `busy`.
+
+## Funnels, paths, and retention
+
+The three endpoints under `/api/v1/rum/analytics` answer the questions of [RUM analytics](/en-US/rum/analytics). Each takes the
+selection of `search` that applies to sessions, views, and actions: `from` and `to` in microseconds, and `filters`, what every
+row has to meet, usually the application (`application.id`) and the environment (`env`). With `GET`, the lists are JSON in their
+parameters, so a question is a link; `POST` takes the same names in a JSON body. They need `streams.query`, or `sys.telemetry.read`
+in the protected `_sys` scope. A count that takes too long or finds the system busy answers no figures, with `unavailable` set
+to `time_budget` or `busy`. The answers carry the `from` and `to` they are of.
+
+### Funnel
+
+```http
+GET /api/v1/rum/analytics/funnel?filters=[{"field":"application.id","op":"=","value":"shop-web"}]&steps=[{"type":"views","filters":[{"field":"view.url_path_group","op":"=","value":"/cart"}]},{"type":"actions","name":"Paid","filters":[{"field":"action.target.name","op":"=","value":"Pay now"}]}]&window_secs=1800&breakdown=browser.name
+```
+
+| Parameter | Type | Behavior |
+|---|---|---|
+| `from`, `to` | integer | Microseconds. Without them, the last 7 days. |
+| `filters` | list | What every step has to meet besides its own filters. |
+| `steps` | list | Required. From 2 to 8. A step has a `type`, `views` or `actions`, a list of `filters` as in `search` applied to the rows of that type, and an optional `name`, which is the value of its first filter when left out. |
+| `window_secs` | integer | The longest from the first step to a later one, in seconds. Without it, as long as it takes. |
+| `breakdown` | string | A text field of the rows of the first step, to give a funnel for each of its values. The 10 values with the most sessions are kept. |
+
+A session counts for the first step by its first row that meets it, and for each step after by its first row that meets it later
+than the row of the step before, in the same session.
+
+```json
+{
+  "groups": [
+    {
+      "value": null,
+      "steps": [
+        { "name": "/cart", "sessions": 4, "conversion": 1.0, "from_previous": null, "median_ms": null },
+        { "name": "Paid", "sessions": 2, "conversion": 0.5, "from_previous": 0.5, "median_ms": 210000.0 }
+      ]
+    }
+  ],
+  "from": 1779400000000000,
+  "to": 1780000000000000
+}
+```
+
+A group is the funnel of the sessions that have one value of the `breakdown`, in the order of their sessions at the first step,
+and `value` is `null` for all of them together, or for the sessions whose row has no value. `conversion` is the share of the
+sessions of the first step, `from_previous` the share of the sessions of the step before, and `median_ms` the middle of the times
+since the step before; each is `null` where it has no meaning. A field of a type that is not text, or that the type does not have,
+fails the request with `400`.
+
+### Paths
+
+| Parameter | Type | Behavior |
+|---|---|---|
+| `from`, `to`, `filters` | | As in `funnel`. The rows are the views. |
+| `anchor` | string | The page the paths start from, or end at when going back. Without it, the first page of each session, or the last going back. |
+| `backward` | boolean | Follow the pages before the anchor. Defaults to `false`. |
+| `depth` | integer | From 1 to 6 pages after (or before) the anchor. Defaults to 3. |
+| `by` | string | The field a page is told by: `view.url_path_group` (the default), `view.url_path`, or `view.name`. |
+
+```json
+{
+  "columns": 3,
+  "sessions": 9,
+  "backward": false,
+  "nodes": [
+    { "column": 0, "page": "/products", "sessions": 2, "ends": 0 },
+    { "column": 1, "page": "/cart", "sessions": 2, "ends": 0 },
+    { "column": 2, "page": "/checkout", "sessions": 1, "ends": 1 }
+  ],
+  "links": [
+    { "column": 0, "source": "/products", "target": "/cart", "sessions": 2 },
+    { "column": 1, "source": "/cart", "target": "/checkout", "sessions": 1 }
+  ],
+  "from": 1779400000000000,
+  "to": 1780000000000000
+}
+```
+
+The pages are in `columns`, one more than `depth`, the page the paths are of being column 0 (the last column going back).
+A node is a page of a column with the `sessions` that were there and the `ends` that went no further (that began there,
+going back). A link goes from a page of `column` to a page of the next column (the one after in time, also going back) with the
+sessions that went that way. Pages are taken in the order they were opened, one page opened again at once counting once. A
+column names the 8 pages with the most sessions, and the rest are `__other__`. `sessions` is the number of sessions that have
+the page the paths are of.
+
+### Retention
+
+| Parameter | Type | Behavior |
+|---|---|---|
+| `from`, `to`, `filters` | | As in `funnel`. The rows are the sessions. Without `from` and `to`, the history is long enough to have cohorts: twice `periods` periods back from now, and at least 14 days (8 weeks for `week`). |
+| `period` | `day` or `week` | A day of UTC, or a week of UTC that begins on Monday. Defaults to `day`. |
+| `periods` | integer | From 1 to 30 periods after the first. Defaults to 7. |
+
+```json
+{
+  "period": "day",
+  "periods": 3,
+  "cohorts": [
+    { "start_micros": 1779408000000000, "users": 1, "returned": [1, 0, null] },
+    { "start_micros": 1779494400000000, "users": 6, "returned": [0, null, null] }
+  ],
+  "from": 1779408000000000,
+  "to": 1779753600000000
+}
+```
+
+A cohort is the people first seen in the period that begins at `start_micros`, in the time range asked for. A person is
+the `usr.id` of a session, or where it has none its `usr.anonymous_id`. `returned` has, for each period after, how many of the
+cohort were seen then; it is `null` for a period that has not ended by `to`.
+
+## Playlists
+
+A [playlist](/en-US/rum/playlists) is a named list of the sessions of one application, each with the moment worth opening it at.
+
+```json
+{
+  "id": "2xT9bQ1kLw5nVf8cZ0aR7mHpJd3",
+  "application": "checkout-web",
+  "name": "Checkout failures",
+  "description": "Sessions that ended at the checkout with an error.",
+  "created_by": "<user-id>",
+  "created_at_micros": 1790000000000000,
+  "updated_at_micros": 1790000100000000,
+  "session_count": 2,
+  "sessions": [
+    { "session_id": "3f6c9a52-1b7e-4d08-a5c3-90e2d41f7b68", "at_micros": 1790000005000000, "added_by": "<user-id>", "added_at_micros": 1790000000000000 },
+    { "session_id": "9d41e7b0-62fa-4c3d-8e15-b7a09c52d3f4", "at_micros": null, "added_by": "<user-id>", "added_at_micros": 1790000100000000 }
+  ]
+}
+```
+
+`GET /api/v1/rum/playlists` answers the playlists without `sessions`, the one changed last first, and takes `application` to
+narrow to one. Reading requires `streams.query`, and a platform caller can use `sys.telemetry.read`. The others change a playlist
+and require `rum.manage`; every one of them answers the playlist with its sessions, except `DELETE`, which answers `{ "deleted": true }`.
+
+| Request | Body | Rule |
+|---|---|---|
+| `POST /rum/playlists` | `application`, `name`, and optionally `description` and `sessions` | The application must exist (`404`). The name is 1 to 128 characters and no other playlist of the application has it, whatever the case (`409`). The description is up to 1,000 characters. |
+| `PATCH /rum/playlists/{id}` | `name` and `description`, each optional | A part left out keeps its value. The application cannot change. |
+| `POST /rum/playlists/{id}/sessions` | `sessions` | A session put in again takes the `at_micros` it is given and keeps its place. A playlist holds at most 500 sessions (`400`). |
+
+A session in a request is `{ "session_id": "...", "at_micros": 1790000005000000 }`: the id is 1 to 128 characters, and `at_micros`, when
+given, is a moment after the epoch in microseconds that the session opens at; without it, the session opens at its beginning. The
+playlist holds ids, not sessions: it does not check that a session exists, and a session whose rows have been deleted by retention stays
+in the list. `GET /api/v1/rum/sessions/{id}/playlists` answers the playlists, without their sessions, that hold a session.
+
+## Read one row, one session
+
+`GET /api/v1/rum/{type}/{id}` answers one row with all its columns, or `404`. `from` and `to` narrow where to look; without
+them the lookup covers the last 30 days. `{id}` is the value of the `id_field` of the type.
+
+`GET /api/v1/rum/sessions/{id}/timeline` answers:
+
+| Field | Content |
+|---|---|
+| `session` | The session row, or `null` while no row of it was derived yet. |
+| `items` | The rows of every other type that belong to the session, oldest first. Each has a `type`: `view`, `action`, `error`, `resource`, `long_task`, or `vital`. |
+| `truncated` | The types that had more rows than a timeline carries. |
+
+`GET /api/v1/rum/sessions/{id}/related-traces` lists the backend traces of a session. It names the traces whose ID a request
+of the session carried (`relation: direct`), and when there are none, the traces that ran while the session did
+(`relation: time-correlated`). Each trace has its `trace_id`, `service`, `span_count`, `duration_ms`, and
+`started_at_micros`, and the answer has the `primary_service`. `GET /api/v1/rum/traces/{trace_id}/session` goes the other way
+and answers the session, or `null`.
+
+## Issues
+
+Errors that are alike are grouped into [issues](/en-US/rum/errors), and every error row carries the id of its issue in `error.issue_id`.
+The numbers of an issue are counted from its errors in the range asked for. Its state and its history are kept apart.
+Times are microseconds since the Unix epoch.
+
+```http
+GET /api/v1/rum/issues?application=checkout-web&status=unresolved&sort=sessions&limit=50
+```
+
+| Parameter | Type | Behavior |
+|---|---|---|
+| `application` | string | Required. |
+| `env`, `source` | string | Only the errors of this environment, or sent by this source (`browser`, `flutter`, and so on). |
+| `filters` | list | More conditions on the errors counted, as in `search`. |
+| `from`, `to` | integer | As in `search`. |
+| `status` | string | `unresolved` (default: open, investigating, and regressed), `all`, or one of `open`, `investigating`, `regressed`, `resolved`, `ignored`. |
+| `assignee`, `team` | string | A user ID or a team ID, or `none` for issues that nobody has. |
+| `search` | string | Words found, ignoring case, in the type, the message, or the place of the issue. |
+| `fresh` | boolean | Only the issues first seen in the range, or regressed in it. |
+| `sort` | string | `sessions` (default), `users`, `occurrences`, `last_seen`, `first_seen`, or `status`. |
+| `order` | `asc` or `desc` | Descending, but for `status`, when left out. |
+| `limit` | integer | From 1 to 100. Defaults to 50. |
+
+```json
+{
+  "issues": [
+    {
+      "id": "3f9c2a71e0b4c8d1",
+      "application_id": "checkout-web",
+      "status": "regressed",
+      "assignee_id": "<user-id>",
+      "team_id": null,
+      "overflow": false,
+      "source": "source",
+      "error_type": "ChunkLoadError",
+      "message": "Loading chunk 482 failed.",
+      "location": "src/router/lazy.ts:34 · loadChunk",
+      "first_seen_at": 1789300000000000,
+      "last_seen_at": 1790000000000000,
+      "first_version": "2.2.0",
+      "last_version": "2.4.1",
+      "resolved_at": 1789600000000000,
+      "resolved_version": "2.3.0",
+      "resolved_by": "<user-id>",
+      "regressed_at": 1789900000000000,
+      "regressed_version": "2.4.1",
+      "regressed_environment": "production",
+      "updated_by": null,
+      "updated_at": 1789900000000000,
+      "sessions": 612,
+      "users": 498,
+      "occurrences": 1530,
+      "trend": [3, 5, 4, 9, 40, 120]
+    }
+  ],
+  "total": 8
+}
+```
+
+`regressed_environment` is the environment of the error that brought the issue back, and `null` when that error names none. An issue
+belongs to the whole application, whatever environment its errors are in. The server also keeps the first time each environment saw
+it, which is what [alert rules](/en-US/rum/alerts#narrow-a-rule) count to tell the new issues of an environment.
+
+The list reads the 250 issues with the most sessions (or users, or occurrences, by `sort`) and narrows them by `status`, `assignee`,
+`team`, `search`, and `fresh`. `total` is how many issues the filters leave, before `limit` cuts the list. `trend` holds the occurrences
+in each of up to 12 equal parts of the range, oldest first. `overflow` marks the issue that counts the errors of an application past
+the [issues it may open in an hour](/en-US/rum/errors#new-issues-an-hour). A count that takes too long or finds the system busy
+answers no issues, with `unavailable` set to `time_budget` or `busy`.
+
+`GET /api/v1/rum/issues/{id}` answers the issue as the list has it, without `trend`, with `sessions`, `users`, and `occurrences`
+counted over `from` and `to`, and two more fields:
+
+| Field | Content |
+|---|---|
+| `samples` | The last three sessions that met the issue, newest first: `timestamp_micros`, `session_id`, `user_id`, `anonymous_id`, `page`, `browser`, `system`, `version`, `has_replay`, and `retained`: `false` for an error of a session that was not kept, which has no session to open. |
+| `stack` | The stack of the latest error that has frames; when none has frames, the latest error with an empty `frames`; `null` when the range holds no error of the issue: `message`, `text`, `frames`, `symbolication`, `handling`, `is_crash`, and `category`. A frame has `raw`, what the SDK sent, `restored`, what a debug artifact resolved it to or `null`, and `in_app`. `symbolication` is `completed`, `partial`, or `missing` when resolving was tried. |
+
+An issue that does not exist answers `404`.
+
+`PATCH /api/v1/rum/issues/{id}` takes any of `status`, `assignee_id`, and `team_id`, and answers the issue after the change.
+
+```json
+{ "status": "resolved", "assignee_id": "<user-id>", "team_id": null }
+```
+
+`status` is `open`, `investigating`, `resolved`, or `ignored`. `regressed` is set by the rules when a resolved issue is seen again in
+a newer version, and answers `400`. `assignee_id` has to be a member of the organization and `team_id` a team of it; `null` or an
+empty text takes the person or the team off. A field left out stays. Resolving records `resolved_at`, `resolved_by`, and the newest version of
+the application as `resolved_version`, and any new state ends the record of an earlier resolving or regression. A request that names no field to change answers `400`; one that sets what is already set answers `200` and changes nothing. Each change is written to the audit log as `rum.issue.update`.
+
+## Preview an alert rule
+
+```http
+POST /api/v1/rum/alerts/preview
+```
+
+Reads what an [alert rule on a RUM figure](/en-US/rum/alerts) would have seen over the last stretch of time, one window at a time, by
+the code that evaluates the rule. It requires `streams.query`.
+
+```json
+{
+  "query": { "application_id": "checkout-web", "environment": "production", "page": "/checkout", "metric": "lcp_p75" },
+  "period_secs": 3600
+}
+```
+
+| Field | Type | Behavior |
+|---|---|---|
+| `query` | object | Required. The figure: `application_id` and `metric`, and `environment`, `page`, `version`, and `min_samples` when given. A `page` or a `version` is refused for a figure that cannot be narrowed to it, and a `min_samples` for a count. |
+| `period_secs` | integer | Required. The window the rule is evaluated over, from 60 to 21,600. Each point is one window. |
+| `from`, `to` | integer | The range in microseconds since the Unix epoch, read in whole windows. `to` defaults to now. `from` defaults to six hours before `to`, held between 12 and 72 windows and within a day. A range holds at most 360 windows. |
+
+```json
+{
+  "metric": "lcp_p75",
+  "unit": "milliseconds",
+  "min_samples": 50,
+  "period_secs": 3600,
+  "from": 1789956800000000,
+  "to": 1790000000000000,
+  "points": [
+    { "at": 1789956800000000, "value": null, "samples": null },
+    { "at": 1789960400000000, "value": 2480, "samples": 612 }
+  ],
+  "current": { "at": 1789996400000000, "value": 2310, "samples": 540 }
+}
+```
+
+`unit` is `count`, `percent`, `milliseconds`, or `score`. A point has the start of its window in `at`, the figure in `value`, and the
+rows the figure is made of in `samples`; a window that holds fewer rows than `min_samples` has neither. `current` is the last point,
+the window that ends at `to`. A count that takes too long or finds the system busy answers no points, with `unavailable` set to
+`time_budget` or `busy`. An application that does not exist answers `404`, and a rule that does not fit its figure answers `400`.
+
+## Errors
+
+| Status | Cause |
+|---|---|
+| `400` | A parameter, a filter, a column, or a cursor that does not fit the request. |
+| `401`, `403` | The token is missing or invalid, or does not hold the permission the endpoint requires. |
+| `404` | The row, session, or application does not exist. |
+| `409` | An application with that identifier or name exists. |
+| `413` | A request over the limits of [`events`](/en-US/rum/events#send-events). |

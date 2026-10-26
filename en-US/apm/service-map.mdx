@@ -1,0 +1,141 @@
+---
+title: "Service map"
+sidebarTitle: "Service map"
+description: "A live topology of service-to-service calls derived automatically from trace spans."
+"zh-Hans_link": "/zh-Hans/apm/service-map"
+---
+
+The **service map** shows service-to-service calls and call health through request rate, error rate,
+and latency (the **RED** metrics). MoleSignal builds the map automatically from existing traces, so
+normal tracing requires no extra instrumentation.
+
+<Info>
+  Service map and [APM](/en-US/apm) use the same trace input but different projections. Service map
+  pairs cross-service parent and child spans to build topology. APM builds bounded service,
+  transaction, dependency, error, and version aggregates.
+</Info>
+
+## How the map is built
+
+As trace spans arrive, MoleSignal pairs each span with the parent span. Spans from **different
+services** form a call edge — *parent service → child service* — and the edge takes
+the child (callee) span's duration and error status. Same-service parent/child spans are internal and
+aren't drawn as edges. An edge is in the caller's environment (`deployment.environment.name`, or
+`deployment.environment`), else in the callee's.
+
+Edges are accumulated into **one-minute buckets** per service pair and flushed to storage in the
+background, so the map reflects recent traffic within roughly half a minute.
+
+### In-memory vs storage mode
+
+By default (`intake` mode) pairing happens **in-memory** on the node that accepts the spans — low
+latency. In a multi-node deployment, spans for one call that land on different nodes can't be paired
+in memory, so the map may undercount those edges. The map never invents an edge.
+
+To get a complete map across nodes, switch **Settings → General → Service map data source** to
+**storage** mode. A single node then periodically rebuilds the graph from **stored traces** — seeing
+every span regardless of the intake node — at the cost of a 1–2 minute delay. The setting is
+stored in the database and takes effect at runtime; no restart needed.
+
+## Required trace data
+
+The map needs traces with:
+
+- a **`service.name`** resource attribute on every span (OTLP exporters set this attribute), and
+- **parent/child span relationships** that cross service boundaries — i.e. a client span in one
+  service whose child server span runs in another.
+
+Standard OpenTelemetry instrumentation produces both. Point the tracer at any
+[trace intake endpoint](/en-US/intake), and MoleSignal populates the map automatically.
+
+## Topology
+
+The topology endpoint aggregates a time window into nodes (services) and edges (calls):
+
+```http
+GET /api/v1/web/topology?from=2026-06-14T00:00:00Z&to=2026-06-14T01:00:00Z
+Authorization: Bearer <jwt>
+```
+
+```json
+{
+  "nodes": [
+    { "id": "checkout", "name": "checkout", "rps": 42.0, "error_rate": 0.01, "p95_ms": 120.0, "span_count": 151200 }
+  ],
+  "edges": [
+    { "source": "checkout", "target": "payments", "rps": 41.0, "err_rate": 0.02, "p95_ms": 95.0 }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `rps` | Requests per second over the window. |
+| `error_rate` / `err_rate` | Fraction of requests with an `ERROR` status (0–1). |
+| `p95_ms` | The highest one-minute 95th-percentile latency in the window, in milliseconds. |
+| `span_count` | Total spans seen for the node in the window. |
+
+## Raw service graph
+
+For the underlying minute-by-minute edge snapshots — useful for charting a single dependency over
+time — query the service graph directly:
+
+```http
+GET /api/v1/traces/service_graph?from=1717200000000000&to=1717286400000000&service=checkout
+Authorization: Bearer <jwt>
+```
+
+`from` and `to` are microseconds since the Unix epoch. The optional `service` filter returns edges
+where the selected service appears on either side of the call. Each row carries `environment`,
+`request_count`, `error_count`, and `p50_us` / `p95_us` / `p99_us` for one service pair in one minute.
+
+## In the UI
+
+- **APM → Service map** draws the services of an environment and the calls between them, with what
+  they call and the topics they publish to and consume from. See [the APM service map](#the-apm-service-map).
+- **Dependencies** on a service's APM page draws the service among what calls it and what it calls,
+  as the APM map does, and lists the calls into it; a call opens in the same drawer.
+- The **Service graph** tab of the Traces page draws the map of the traces a query matches.
+
+Every service map draws alike: a node is a ring in the colour of how it fares around what it is, its
+name, and its requests a second, error rate, and P95; a call is an arrow as thick as its traffic, red
+from 5% failed calls and orange from 1%.
+
+From any service or edge, pivot straight into the underlying traces and logs through
+[cross-signal correlation](/en-US/correlation).
+
+## The APM service map
+
+**APM → Service map** joins the service graph with the APM projections, for the environment and the
+namespace chosen in its scope row:
+
+| Node | Drawn from |
+|---|---|
+| Service | The service graph, with the RED figures and health of its APM summary. |
+| Database, cache, outside HTTP or RPC | The calls out of APM dependencies, by target. |
+| Service that reports nothing | A call naming it in `peer.service` when it sends no spans of its own. |
+| Topic | Publishing calls to a messaging destination, and messaging endpoints that consume from it. |
+
+A call is as thick as its traffic and in the colour of how it fails. Against the stretch of the same
+length before, a call made only now reads **New** and one no longer made reads **Gone**, dashed, with
+its node. Choosing a node lights what calls it and what it calls, and the **slowest path** down from
+it: at each node the call with the highest P95. The card over the map lists the node's calls; a call
+opens in a drawer with its requests, errors, and latency over time and what was asked along it:
+
+- to a service, the endpoints of the service called, as every caller asked them, and its error groups;
+- to a database, a cache, or an outside endpoint, the operations of the call;
+- through a topic, how long its messages waited: from the end of publishing to the start of
+  consuming, read from the latest consumptions in the trace store (at most 200), each matched to the
+  span its links name, else its parent.
+
+A map with more than 60 nodes starts with each namespace folded into one node; choose it to unfold
+the namespace. **Fold namespaces** folds or unfolds every one. At most 400 nodes are drawn, the busiest.
+
+<CardGroup cols={2}>
+  <Card title="Topology & service-graph API" icon="diagram-project" href="/en-US/api/web/topology">
+    Query the topology and raw service-graph endpoints over HTTP.
+  </Card>
+  <Card title="Application performance monitoring" icon="gauge-high" href="/en-US/apm">
+    Keep the service catalog and analyze service endpoints, dependencies, errors, and deployments.
+  </Card>
+</CardGroup>

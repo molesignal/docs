@@ -1,97 +1,147 @@
 ---
 title: "Connectors"
 sidebarTitle: "Connectors"
-description: "Receive logs straight from Kinesis Firehose, Cloudflare Logpush, and Heroku — and fan pipeline output out to S3 or Kafka."
+description: "Bring logs in from CloudWatch Logs, Amazon Data Firehose, Cloudflare Logpush, and Heroku, and deliver pipeline output to S3, Kafka, or an HTTP endpoint."
 "zh-Hans_link": "/zh-Hans/connectors"
 ---
 
-A **connector** is a managed integration with an external platform. Connectors work in two
-directions:
+A **connector** is a managed integration with an external platform. Connectors work in two directions:
 
-- **Intake sources** — a platform pushes data **into** MoleSignal (Kinesis Firehose, Cloudflare
-  Logpush, Heroku log drains).
-- **Egress sinks** — a [pipeline](/en-US/pipelines) fans pipeline output **out** to S3 or Kafka.
+- **Sources** bring logs in from another service and write them to a stream. MoleSignal pulls CloudWatch Logs on a schedule. Amazon Data Firehose, Cloudflare Logpush, and Heroku push their logs to MoleSignal.
+- **Destinations** receive the output of a [scheduled pipeline](/en-US/pipelines#sinks-and-connector-egress): Amazon S3 and S3-compatible storage, Apache Kafka, and any HTTP endpoint.
 
-## Configure a connector
+| Kind | Connector | Direction | Authentication |
+|---|---|---|---|
+| `aws_cloudwatch_logs` | AWS CloudWatch Logs | Source, pulled every 30 seconds | [AWS credentials](#aws-authentication) |
+| `aws_kinesis_firehose` | Amazon Data Firehose | Source, pushed | [Push token](#push-sources) |
+| `cloudflare_logpush` | Cloudflare Logpush | Source, pushed | Push token |
+| `heroku_drain` | Heroku log drain | Source, pushed | Push token |
+| `s3` | Amazon S3 | Destination | AWS credentials |
+| `kafka` | Apache Kafka | Destination | None, SASL, or a client certificate |
+| `http` | HTTP / Webhook | Destination | None, a bearer token, Basic auth, a custom header, or an HMAC signature |
 
-Create connectors under **Pipelines → Connectors**, or over the API. The page lists **Sources**,
-which bring logs in from another service, and **Destinations**, which a pipeline can deliver its
-output to. Each connector has a `kind` and a
-`config_json` whose shape depends on the kind. Sensitive fields (`push_token`, `access_key`,
-`secret_key`, …) are masked in API responses.
+## Create a connector
+
+<Steps>
+  <Step title="Open the connectors">
+    Go to **Pipelines → Connectors**. The page lists **Sources** and **Destinations**.
+  </Step>
+  <Step title="Choose the kind">
+    Click **New connector** and choose what to connect to.
+  </Step>
+  <Step title="Fill in the settings">
+    Enter a **Name** that is unique within the organization, fill in where the connector reads from or delivers to, and choose the **Authentication**.
+  </Step>
+  <Step title="Test and create">
+    Click **Test connection** to try the settings before saving them, then click **Create connector**. A push source has nothing to connect to and offers no test.
+  </Step>
+</Steps>
+
+Over the API, a connector is a `name`, a `kind`, and a `config_json` whose keys depend on the kind. `auth` in `config_json` names the way of authenticating, and each way takes its own keys. Settings that cannot work answer `400` when they are saved: a missing required key, half of a credential pair, or a key that the chosen `auth` does not use.
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/connectors \
   -H "authorization: Bearer $MS_JWT" \
   -H 'content-type: application/json' \
   -d '{
-        "name": "cf-prod",
-        "kind": "cloudflare_logpush",
-        "config_json": { "push_token": "ms_cf_9f3c…", "target_stream": "cloudflare" }
+        "name": "archive",
+        "kind": "s3",
+        "config_json": {
+          "bucket": "acme-logs",
+          "region": "eu-west-1",
+          "prefix": "pipelines/checkout/",
+          "auth": "assume_role",
+          "role_arn": "arn:aws:iam::123456789012:role/molesignal-delivery"
+        }
       }'
 ```
 
-## Intake sources (push)
+## Secrets
 
-The three push sources share one model: create a connector with a **`push_token`** and a
-**`target_stream`**, then point the platform at the matching endpoint. These endpoints do not use the
-JWT — the request authenticates with the connector token, supplied whichever way the platform allows:
+These keys of `config_json` hold secrets:
+
+| Kind | Secret keys |
+|---|---|
+| `s3`, `aws_cloudwatch_logs` | `access_key`, `secret_key`, `session_token` |
+| `aws_kinesis_firehose`, `cloudflare_logpush`, `heroku_drain` | `push_token` |
+| `kafka` | `sasl_password`, `tls_client_key` |
+| `http` | `url`, `bearer_token`, `basic_password`, `header_value`, `hmac_secret` |
+
+A secret never leaves through the API. A response shows `***` in its place and names the secrets that hold a value in `secret_keys`:
+
+```json
+{
+  "kind": "kafka",
+  "config_json": {
+    "brokers": "b-1.example.com:9096",
+    "topic": "logs",
+    "tls": true,
+    "auth": "sasl_scram_sha_512",
+    "sasl_username": "molesignal",
+    "sasl_password": "***"
+  },
+  "secret_keys": ["sasl_password"]
+}
+```
+
+- An update that sends `***` back keeps the stored value, so a connector can be renamed, turned off, or pointed elsewhere without entering its credentials again. In the UI, a saved secret left empty keeps its value.
+- A secret left out of an update is removed.
+- An update that changes the `kind` keeps none of the stored secrets.
+
+MoleSignal seals the secrets with the root key from `MS_CIPHER_KEY` (AES-256-GCM) apart from the other settings, and stores no secret in plain text. A push source is found by the SHA-256 of its token. `molesignal rewrap-kek` re-seals the connector secrets together with the other secrets when the root key rotates. See [Production checklist](/en-US/deployment/production-checklist).
+
+## Sources
+
+### Push sources
+
+The three push sources share one model: create a connector with a **`push_token`** and a **`target_stream`**, then point the platform at the matching endpoint. These endpoints do not use the JWT. The request authenticates with the push token, supplied whichever way the platform allows:
 
 | Method | Used by |
 |---|---|
-| `X-Connector-Token` header | Platforms with configurable headers (e.g. Cloudflare) |
-| `X-Amz-Firehose-Access-Key` header | Kinesis Firehose (sent automatically) |
-| `?token=` query parameter | Platforms that can't set headers (e.g. Heroku) |
+| `X-Connector-Token` header | Platforms with configurable headers, such as Cloudflare |
+| `X-Amz-Firehose-Access-Key` header | Amazon Data Firehose, which sends it automatically |
+| `?token=` query parameter | Platforms that cannot set headers, such as Heroku |
 
-Bodies sent with `Content-Encoding: gzip` are decompressed automatically. Events flow through the
-same intake path as everything else — schema-on-write, [pipelines](/en-US/pipelines), and
-[masking](/en-US/security) all apply.
+The UI generates the token when it creates the connector and shows it once, with the endpoint to give the platform. The token cannot be read back. **Generate a new token** replaces it when the connector is saved. Over the API, supply a `push_token` of at least 16 characters. One token opens one connector of a kind: a token already in use answers `409`. A request with a missing or unknown token, or for a connector that is turned off, answers `401`. A connector without a token accepts nothing.
+
+Bodies sent with `Content-Encoding: gzip` are decompressed automatically. Events flow through the same intake path as everything else: schema-on-write, [pipelines](/en-US/pipelines), and [masking](/en-US/security) all apply.
 
 <Tabs>
-  <Tab title="Kinesis Firehose">
-    Create the connector with `kind: "aws_kinesis_firehose"`, then add an **HTTP endpoint**
-    destination to the Firehose delivery stream:
+  <Tab title="Amazon Data Firehose">
+    Create the connector with `kind: "aws_kinesis_firehose"`, then choose the **HTTP endpoint** destination for the Firehose stream:
 
-    - **URL** — `https://molesignal.example.com/api/v1/_kinesis_firehose`
-    - **Access key** — the connector `push_token` (Firehose sends the value as `X-Amz-Firehose-Access-Key`)
+    - **HTTP endpoint URL**: `https://molesignal.example.com/api/v1/_kinesis_firehose`
+    - **Access key**: the push token. Firehose sends it as `X-Amz-Firehose-Access-Key`.
 
-    MoleSignal base64-decodes each record, splits the record on newlines, and parses each line as JSON
-    (falling back to a `message` field for plain text). MoleSignal returns the `200` ACK expected by Firehose.
+    MoleSignal base64-decodes each record, splits the record on newlines, and parses each line as JSON, falling back to a `message` field for plain text. MoleSignal returns the `200` acknowledgment that Firehose expects.
   </Tab>
   <Tab title="Cloudflare Logpush">
-    Create the connector with `kind: "cloudflare_logpush"`, then create a Logpush job whose
-    destination is:
+    Create the connector with `kind: "cloudflare_logpush"`, then create a Logpush job with an HTTP destination. Cloudflare turns a `header_` query parameter into a request header, so the token travels in `X-Connector-Token`:
 
-    - **URL** — `https://molesignal.example.com/api/v1/_cloudflare`
-    - **Header** — `X-Connector-Token: <push_token>`
+    ```text
+    https://molesignal.example.com/api/v1/_cloudflare?header_X-Connector-Token=<push_token>
+    ```
 
-    Cloudflare ships gzip-compressed NDJSON; each line becomes one event. The endpoint replies
-    `204 No Content`.
+    Cloudflare ships gzip-compressed NDJSON, and each line becomes one event. The endpoint replies `204 No Content`.
   </Tab>
   <Tab title="Heroku">
-    Create the connector with `kind: "heroku_drain"`, then add the drain — Heroku can't set custom
-    headers, so the token rides in the URL:
+    Create the connector with `kind: "heroku_drain"`, then add the drain. Heroku cannot set custom headers, so the token travels in the URL:
 
     ```bash
     heroku drains:add "https://molesignal.example.com/api/v1/_heroku?token=<push_token>"
     ```
 
-    Each log line becomes an event with `message` and `source: "heroku"`. The endpoint replies
-    `204 No Content`.
+    Each log line becomes an event with `message` and `source: "heroku"`. The endpoint replies `204 No Content`.
   </Tab>
 </Tabs>
 
 <Tip>
-  The `target_stream` is created on first delivery, and the schema evolves as new fields appear — same
-  as any other stream. Omit `target_stream` to fall back to a per-source default (`kinesis`, `cloudflare`,
-  `heroku`).
+  The `target_stream` is created on first delivery, and the schema evolves as new fields appear, the same as any other stream. Omit `target_stream` to fall back to a per-source default: `kinesis`, `cloudflare`, or `heroku`.
 </Tip>
 
-## Pull sources
+### CloudWatch Logs
 
-CloudWatch Logs is a **pull** source: MoleSignal polls the AWS API on a schedule instead of receiving
-a push. Create a connector and MoleSignal periodically calls `FilterLogEvents` (signed with SigV4 — no
-AWS SDK needed), advancing a per-connector checkpoint so each run reads only new events.
+CloudWatch Logs is a **pull** source: MoleSignal calls `FilterLogEvents` every 30 seconds instead of receiving a push. The first run reads the last 5 minutes. Each later run starts where the last successful run ended, so events that could not be read or written are read again on the next run.
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/connectors \
@@ -103,8 +153,7 @@ curl -X POST http://localhost:5080/api/v1/connectors \
         "config_json": {
           "region": "ap-southeast-1",
           "log_group": "/aws/lambda/checkout",
-          "access_key": "AKIA…",
-          "secret_key": "…",
+          "auth": "node_role",
           "target_stream": "cloudwatch"
         }
       }'
@@ -112,30 +161,223 @@ curl -X POST http://localhost:5080/api/v1/connectors \
 
 | Field | Notes |
 |---|---|
-| `region` / `log_group` | Required — the CloudWatch region and log group to read. |
-| `access_key` / `secret_key` | IAM credentials with `logs:FilterLogEvents`. |
-| `session_token` | Optional, for temporary STS credentials. |
-| `target_stream` | Destination stream (default `default`). |
+| `region` / `log_group` | Required. The CloudWatch region and log group to read. |
+| `auth` and its keys | The credentials, which need `logs:FilterLogEvents` on the log group. See [AWS authentication](#aws-authentication). |
+| `target_stream` | Destination stream. Default `default`. |
 
-One node polls a connector at a time. The alert nodes divide the connectors between them, and a node
-claims a connector before it polls. Each event becomes a log with `message`, `log_stream`, and `log_group`.
+One node polls a connector at a time. The `alert` nodes divide the connectors between them, and a node claims a connector before it polls. See [Work division between alert nodes](/en-US/deployment/role-based#work-division-between-alert-nodes). Each event becomes a log with `message`, `log_stream`, and `log_group`. A connector that is turned off is not polled.
 
-## Egress sinks
+## Destinations
 
-S3 and Kafka connectors are **sinks**: select these connectors in a [pipeline](/en-US/pipelines#sinks-and-connector-egress)
-to fan transformed events out as the pipeline runs.
+A destination receives every event that comes through the steps of a scheduled pipeline. Add the connector to the **Destinations** of the flow with **Add destination → Connector**. A delivery that fails is retried within the run, and events that the connector still does not take go to the dead letter stream. See [Retries and dead letters](/en-US/pipelines#retries-and-dead-letters).
+
+A destination that is turned off receives nothing. Each run skips the connector and names it in the `warning` of the run. The skipped events do not count as failed, do not become dead letters, and are not sent when the connector is turned on again. In the editor, a connector that is off reads **Off**.
 
 | Kind | Payload |
 |---|---|
-| `s3` | Batched JSON Lines `PUT` to `s3://<bucket>/<prefix><id>.jsonl`. |
-| `kafka` | One JSON record produced per event to the configured topic. |
+| `s3` | One JSON Lines object per batch, `PUT` to `s3://<bucket>/<prefix><id>.jsonl`. |
+| `kafka` | One message per event on the topic, with the event as its JSON payload. |
+| `http` | The batch in one request, or in several when it is large, as NDJSON or as one JSON array. |
+
+### Amazon S3
+
+The `s3` kind also delivers to S3-compatible storage such as MinIO, Cloudflare R2, and Alibaba Cloud OSS. In the UI, turn on **S3-compatible storage** to set the endpoint.
+
+| Field | Notes |
+|---|---|
+| `bucket` | Required. |
+| `region` | The bucket's region. An S3-compatible store may not need one. |
+| `prefix` | Objects are named `<prefix><id>.jsonl`. A leading `/` is dropped, and a trailing `/` is added. |
+| `endpoint` | The S3 API address of an S3-compatible store, starting with `http://` or `https://`. |
+| `virtual_hosted_style` | `true` addresses the bucket as a host name rather than in the path, which stores such as Alibaba Cloud OSS require. UI: **Address the bucket as a host name**. |
+| `auth` and its keys | The credentials, which need `s3:PutObject` on the bucket. See [AWS authentication](#aws-authentication). |
+
+### Apache Kafka
+
+| Field | Notes |
+|---|---|
+| `brokers` | Required. Host and port, several separated by commas. |
+| `topic` | Required. |
+| `tls` | `true` encrypts the connection with TLS. Connect to the brokers' TLS port, often 9093, 9094, or 9096. UI: **Encrypt the connection with TLS**. |
+| `tls_ca_cert` | The PEM certificate of a private CA that issued the brokers' certificates. Only with `tls`. Without it, the system's CAs are trusted. |
+
+| `auth` | UI | Keys | Notes |
+|---|---|---|---|
+| `none` | **None** | | For a broker that asks for no credentials. |
+| `sasl_plain` | **SASL/PLAIN** | `sasl_username`, `sasl_password` | Sends the password as it is. Without TLS, use it on a private network only. |
+| `sasl_scram_sha_256` | **SCRAM-SHA-256** | `sasl_username`, `sasl_password` | The password itself never crosses the network. |
+| `sasl_scram_sha_512` | **SCRAM-SHA-512** | `sasl_username`, `sasl_password` | The mechanism that Amazon MSK uses. |
+| `mtls` | **Client certificate** | `tls_client_cert`, `tls_client_key` | Mutual TLS. Needs `tls`. Both are PEM, and the private key cannot be encrypted. |
+
+TLS and SASL combine: SCRAM over TLS connects as `SASL_SSL`.
+
+### HTTP / Webhook
+
+| Field | Notes |
+|---|---|
+| `url` | Required. An absolute `http://` or `https://` URL. A URL often carries a credential, such as a key in the path or the query, so it is kept as a secret. Responses show only `url_origin`, the scheme, host, and port. A user name and password in the URL are refused: use `basic`. |
+| `method` | `post` (default) or `put`. |
+| `format` | `ndjson` (default) sends one event per line as `application/x-ndjson`. `json` sends one JSON array as `application/json`. |
+
+| `auth` | UI | Keys | Request |
+|---|---|---|---|
+| `none` | **None** | | No credential. |
+| `bearer` | **Bearer token** | `bearer_token` | `Authorization: Bearer <token>` |
+| `basic` | **Basic auth** | `basic_username`, `basic_password` | HTTP Basic authorization. Use it over `https`. |
+| `header` | **Custom header** | `header_name`, `header_value` | The value in the named header, such as `X-API-Key` or `DD-API-KEY`. |
+| `hmac` | **HMAC signature** | `hmac_secret` | A signature of the body. The secret needs at least 16 characters. |
+
+A custom header cannot be one that the delivery sets itself: `Host`, `Content-Type`, `Content-Length`, `Content-Encoding`, `Transfer-Encoding`, `Connection`, `X-MoleSignal-Timestamp`, or `X-MoleSignal-Signature`.
+
+A delivery follows these rules:
+
+- A batch larger than 4 MiB is split into several requests. An event larger than that goes in a request of its own.
+- Any `2xx` status counts as delivered. Any other status fails the delivery, and so does a redirect: redirects are not followed.
+- A request times out after 30 seconds.
+- MoleSignal resolves the host before the request and connects only to the addresses it resolved. An address where cloud metadata services answer is refused, whether it appears in the URL or comes from DNS: `169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, and `100.100.100.200`. Other private addresses are allowed.
+
+#### Verify an HMAC signature
+
+With `hmac`, every request carries two headers:
+
+| Header | Content |
+|---|---|
+| `X-MoleSignal-Timestamp` | The time of the request in Unix seconds. |
+| `X-MoleSignal-Signature` | `sha256=<hex>`, the HMAC-SHA256 of `<timestamp>.<body>` under the shared secret. |
+
+To verify a request, compute the HMAC-SHA256 of the timestamp, a `.`, and the raw body bytes with the same secret, and compare the result with the signature in constant time. Refuse a timestamp older than a few minutes, so that a captured request cannot be sent again later.
+
+```python
+import hashlib
+import hmac
+import time
+
+
+def verify(secret: bytes, timestamp: str, signature: str, body: bytes, tolerance: int = 300) -> bool:
+    if abs(time.time() - int(timestamp)) > tolerance:
+        return False
+    signed = timestamp.encode() + b"." + body
+    expected = "sha256=" + hmac.new(secret, signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+```
+
+## AWS authentication
+
+S3 and CloudWatch Logs authenticate to AWS in one of five ways:
+
+| `auth` | UI | Keys | Credentials |
+|---|---|---|---|
+| `access_key` | **Access key** | `access_key`, `secret_key` | The long-lived key of an IAM user. |
+| `temporary_key` | **Temporary key** | `access_key`, `secret_key`, `session_token` | A short-lived key from AWS STS, valid only with its session token. Replace it before it expires. |
+| `node_role` | **Node identity** | | The identity of the node that MoleSignal runs on. No key is stored. |
+| `assume_role` | **Assume a role** | `role_arn`, optionally `access_key` and `secret_key` | A role assumed through AWS STS with the organization's external ID. |
+| `web_identity` | **Web identity** | `role_arn` | A role assumed with the web identity token of the node. |
+
+Without `auth`, the stored keys decide: an access key reads as `access_key`, a `role_arn` as `assume_role`, and neither as `node_role`. A `role_arn` has the form `arn:aws:iam::<account>:role/<name>`.
+
+### Node identity
+
+`node_role` uses the identity that the AWS SDKs find on the node: EKS IAM roles for service accounts (IRSA) or EKS Pod Identity, an ECS task role, or an EC2 instance profile. A static key in the node's environment, such as `AWS_ACCESS_KEY_ID`, is never used for connectors.
+
+<Warning>
+  The node's identity and its web identity token belong to the deployment. Every organization in the deployment can choose `node_role` and `web_identity`, so whatever the node's identity can reach, and every role that trusts the node's token, is open to the connectors of every organization. Grant them only access that every organization may have.
+</Warning>
+
+### Assume a role
+
+`assume_role` asks AWS STS for a one-hour key of the role and renews the key 5 minutes before it expires. The base credentials that assume the role are the node's identity. For a deployment that does not run on AWS, select **Assume it with an access key, not the node's identity** and enter the key of an IAM user.
+
+Every organization assumes roles with its own external ID, `molesignal-<organization ID>`, which cannot be changed. The form shows it under **External ID**, and `GET /api/v1/connectors/aws-external-id` returns it. Require the external ID in the trust policy of the role, so that no other organization can assume the role even when it learns the ARN:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "AWS": "<ARN of the node role or IAM user>" },
+      "Action": "sts:AssumeRole",
+      "Condition": { "StringEquals": { "sts:ExternalId": "molesignal-<organization ID>" } }
+    }
+  ]
+}
+```
+
+The session is named `molesignal-<connector ID>`, which is how it appears in AWS CloudTrail. The request goes to the regional STS endpoint of the connector's `region`: `us-east-1` when the region is empty, and the `amazonaws.com.cn` domain for the China regions.
+
+### Web identity
+
+`web_identity` assumes the role with the web identity token whose path the node's `AWS_WEB_IDENTITY_TOKEN_FILE` gives, such as the service account token that EKS projects for IRSA. A connector cannot name another file. The trust policy of the role must trust the OIDC provider that issues the token. On a node without `AWS_WEB_IDENTITY_TOKEN_FILE`, the connector has no credentials.
+
+The token is exchanged at the regional STS endpoint of the connector's `region`, or at `AWS_ENDPOINT_URL_STS` when the node's environment sets it. The same applies to a node identity that comes from IRSA.
+
+## Test a connection
+
+**Test connection** tries the settings as they stand in the form, before they are saved. A secret left empty is the saved one. Each kind does the least that proves a delivery or a pull can work:
+
+| Kind | Test |
+|---|---|
+| `s3` | Writes the object `.molesignal-connection-test` under the prefix, and removes it when the policy allows. |
+| `kafka` | Reads the topic's metadata from the brokers, which proves the connection, TLS, and authentication, and that the topic exists. Writes no message. |
+| `http` | Sends one event marked as a test: `"message": "MoleSignal connection test"` and `"molesignal_connection_test": true`. |
+| `aws_cloudwatch_logs` | Reads at most one event of the last minute of the log group. Writes nothing to the stream and leaves the read position where it was. |
+
+A test gives up after 25 seconds. Over the API, `POST /api/v1/connectors/test` takes the `kind` and the `config_json` to try. With the `id` of a saved connector of the same kind, `***` stands for the secret that the connector holds. Settings that cannot work answer `400`, as on save.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors/test \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  -d '{
+        "id": "<connector id>",
+        "kind": "kafka",
+        "config_json": {
+          "brokers": "b-1.example.com:9096",
+          "topic": "logs",
+          "tls": true,
+          "auth": "sasl_scram_sha_512",
+          "sasl_username": "molesignal",
+          "sasl_password": "***"
+        }
+      }'
+```
+
+```json
+{ "ok": true, "code": "ok", "detail": null, "elapsed_ms": 412 }
+```
+
+`elapsed_ms` is how long the test took. A failed test names the cause in `code`, and `detail` carries the words of the other side, up to 600 characters:
+
+| `code` | Meaning |
+|---|---|
+| `ok` | Connected. |
+| `invalid` | The settings cannot work, or the connector is a push source, which has nothing to connect to. |
+| `no_credentials` | No AWS credentials could be had: the node has no identity, or none of the kind asked for. |
+| `denied` | The other side refused the credentials or what they are allowed to do. |
+| `not_found` | The bucket, topic, log group, or address does not exist. |
+| `tls` | The TLS handshake failed: a certificate not trusted, or not presented. |
+| `unreachable` | The host could not be resolved or connected to. |
+| `timeout` | No answer in time. |
+| `failed` | Any other failure. |
+
+## API
+
+| Endpoint | Permission | Purpose |
+|---|---|---|
+| `GET /api/v1/connectors` | `pipelines.read` | List the connectors of the organization. |
+| `POST /api/v1/connectors` | `pipelines.edit` | Create a connector. `enabled` defaults to `true`. |
+| `GET /api/v1/connectors/{id}` | `pipelines.read` | Read a connector. |
+| `PUT /api/v1/connectors/{id}` | `pipelines.edit` | Replace `name`, `kind`, `config_json`, and `enabled`, all required. |
+| `DELETE /api/v1/connectors/{id}` | `pipelines.edit` | Delete a connector. |
+| `POST /api/v1/connectors/test` | `pipelines.edit` | Test settings before saving them. |
+| `GET /api/v1/connectors/aws-external-id` | `pipelines.read` | Return the organization's external ID as `external_id`. |
+
+A connector reads as `id`, `name`, `kind`, `config_json` with masked secrets, `secret_keys`, `enabled`, `last_run_at_micros`, `created_at_micros`, and `updated_at_micros`.
 
 ## Permissions
 
-`pipelines.read` lists and inspects connectors. `pipelines.edit` creates, updates, or deletes connectors.
-Push receivers authenticate with the connector token and do not accept a normal login JWT as a
-replacement.
+`pipelines.read` lists and inspects connectors and reads the external ID. `pipelines.edit` creates, updates, deletes, and tests connectors. A test needs `pipelines.edit` because it uses the stored secrets and connects to another system for the caller. Push receivers authenticate with the push token and do not accept a normal login JWT as a replacement.
 
 <Card title="Intake API" icon="plug" href="/en-US/api/intake/kinesis">
-  Endpoint details for the Kinesis, Cloudflare, and Heroku push receivers.
+  Endpoint details for the Amazon Data Firehose, Cloudflare, and Heroku push receivers.
 </Card>

@@ -1,6 +1,6 @@
 ---
 title: "链路列表与详情"
-description: "列出链路摘要，按时间统计链路数量，并读取单条链路的所有 Span。"
+description: "列出链路摘要与 Span，按时间统计链路数量，读取单条链路的所有 Span，并查找链接到它的 Span。"
 "en_link": "/en-US/api/web/trace"
 ---
 
@@ -23,22 +23,47 @@ GET /api/v1/web/traces
 | `from`、`to` | integer | 以微秒表示的窗口。默认是最近 24 小时，截至当前。`to` 必须大于 `from`。 |
 | `q` | string | 不区分大小写的文本，必须出现在某个 Span 的 `trace_id`、`span_id`、服务、操作或状态中。最长 256 个字符。 |
 | `filters` | string | 过滤条件的 JSON 数组，见下文。 |
+| `where` | string | JSON 条件树：用 AND 和 OR 连接的过滤条件和文本，见下文。 |
 | `sort` | string | `latest`（默认）、`earliest`、`duration_desc`、`duration_asc`、`span_count_desc` 或 `errors_desc`。 |
 | `limit` | integer | 页大小。默认 `20`。取值限制在 1 到 5000 之间。 |
 | `cursor` | string | 之前某一页返回的 `next_cursor` 或 `previous_cursor`。 |
+| `fields` | string | 随每条链路一起返回的根 Span 字段，用逗号分隔，按数据流中的字段名指定。最多 12 个。未知字段、JSON 字段或 `molesignal.trace.*` 字段返回 `400`。 |
 
-过滤条件是包含 `field`、`op` 和 `value` 的对象，一个请求最多带 32 个过滤条件。所有过滤条件必须同时匹配。
+过滤条件是包含 `field`、`op` 和 `value` 的对象，一个请求最多带 32 个过滤条件。所有过滤条件必须同时匹配。运算符 `in` 用 `values`（值的列表）代替 `value`。
 
 | 字段 | 类型 | 运算符 |
 |---|---|---|
-| `trace_id` | 文本 | `=`、`!=`、`contains` |
-| `duration_ns`、`span_count`、`error_count` | 整数 | `=`、`!=`、`>`、`>=`、`<`、`<=` |
-| `service`（或 `service_name`）、`operation`（或 `operation_name`）、`status` | 文本 | `=`、`!=`、`contains` |
-| 链路数据流的任何其他标量字段 | 取决于字段类型 | 文本：`=`、`!=`、`contains`。数字与时间戳：`=`、`!=`、`>`、`>=`、`<`、`<=`。布尔值：`=`、`!=`。 |
+| `trace_id` | 文本 | `=`、`!=`、`contains`、`in` |
+| `duration_ns`、`span_count`、`error_count` | 整数 | `=`、`!=`、`>`、`>=`、`<`、`<=`、`in` |
+| 链路数据流的任何其他标量字段 | 取决于字段类型 | 文本：`=`、`!=`、`contains`、`in`。数字与时间戳：`=`、`!=`、`>`、`>=`、`<`、`<=`、`in`。布尔值：`=`、`!=`、`in`。 |
 
-运算符 `eq`、`ne` 和 `like` 分别是 `=`、`!=` 和 `contains` 的别名。JSON 字段不能用作过滤条件。
+过滤条件按数据流中的字段名指定字段，例如 `service.name`、`name`，不接受其他名称。运算符 `eq`、`ne` 和 `like` 分别是 `=`、`!=` 和 `contains` 的别名。JSON 字段不能用作过滤条件。
 
-`cursor` 会把页面绑定到签发它的查询。带着 `cursor` 重复请求，同时更换 `limit`、`sort`、`q` 或 `filters`，会返回 `400`。
+`trace_id`、`duration_ns`、`span_count` 和 `error_count` 在 trace 上比较。其他字段都属于 span：trace 中有一个 span 满足过滤条件，该 trace 即匹配；`!=` 在 trace 的所有 span 都不含该值时匹配。缺少该字段的 span 视为不含该值。
+
+`in` 匹配 `values` 中的任意一个值：1 到 64 个值，每个最长 512 字节，且符合字段类型。重复列出的值只算一次。作用于 span 字段时，trace 中有一个 span 含有其中某个值，该 trace 即匹配。
+
+`where` 表达过滤条件列表无法表达的内容：多个可选分支。它是以下四种形式之一的 JSON 对象：
+
+| 形式 | 匹配 |
+|---|---|
+| 与 `filters` 中相同的过滤条件 | 该过滤条件。 |
+| `{"text": "..."}` | 该文本，匹配方式与 `q` 相同。 |
+| `{"and": [...]}` | 列表中的所有条件。 |
+| `{"or": [...]}` | 列表中的任意一个条件。 |
+
+`filters`、`q` 和 `where` 需同时满足。条件树中的过滤条件含义不变：作用于 span 字段时，trace 中有一个 span 满足即匹配；`!=` 在 trace 的所有 span 都不含该值时匹配。trace 匹配 `A` 或匹配 `B`，即匹配 `{"or": [A, B]}`。`filters` 与 `where` 中的过滤条件合计最多 32 个。一棵条件树最多查找 8 段文本，分组最多嵌套 8 层，每个分组至少有一个条件。
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_JWT" \
+  --data-urlencode 'filters=[{"field":"status_code","op":"=","value":"ERROR"}]' \
+  --data-urlencode 'where={"or":[{"field":"service.name","op":"=","value":"checkout"},{"field":"span_count","op":">","value":"50"}]}'
+```
+
+该请求列出失败的链路中，含有 `checkout` 的 span 或 span 数超过 50 的链路。
+
+`cursor` 会把页面绑定到签发它的查询。带着 `cursor` 重复请求，同时更换 `limit`、`sort`、`q`、`filters` 或 `where`，会返回 `400`。
 
 <RequestExample>
 ```bash cURL
@@ -46,7 +71,8 @@ curl -G "http://localhost:5080/api/v1/web/traces" \
   -H "authorization: Bearer $MS_JWT" \
   --data-urlencode 'sort=duration_desc' \
   --data-urlencode 'limit=2' \
-  --data-urlencode 'filters=[{"field":"service","op":"=","value":"checkout"}]'
+  --data-urlencode 'fields=http.route' \
+  --data-urlencode 'filters=[{"field":"service.name","op":"in","values":["checkout","payments"]}]'
 ```
 </RequestExample>
 
@@ -61,7 +87,10 @@ curl -G "http://localhost:5080/api/v1/web/traces" \
       "start_ns": 1790000000000000000,
       "duration_ms": 180.0,
       "span_count": 3,
-      "error_count": 1
+      "error_count": 1,
+      "status": "ERROR",
+      "http_status_code": 502,
+      "fields": { "http.route": "/checkout" }
     }
   ],
   "next_cursor": null,
@@ -73,20 +102,26 @@ curl -G "http://localhost:5080/api/v1/web/traces" \
 
 每个条目通过根 Span 描述一条链路：根 Span 的 `service` 与 `operation`、以纳秒表示的开始时间、以毫秒表示的时长、Span 数量和错误 Span 数量。设置了 `next_cursor` 时，`has_more` 为 `true`。
 
+| 字段 | 说明 |
+|---|---|
+| `status` | 根 Span 的状态：`OK`、`ERROR` 或 `UNSET`。 |
+| `http_status_code` | 根 Span 的 `http.response.status_code`，或其 `http.status_code`，取值在 100 到 599 之间时返回。其他情况，以及摘要开始保存该字段之前存入的链路，不返回此字段。 |
+| `fields` | `fields` 中请求、且根 Span 有值的字段。没有时不返回。读取失败时，页面照常返回，只是不含这些字段。 |
+
 ## 按时间统计链路数量
 
 ```http
 GET /api/v1/web/traces/histogram
 ```
 
-按链路的开始时间，把列表查询匹配的每一条链路统计到时间桶中。该调用使用与列表相同的窗口、`q` 和 `filters`，匹配的链路也相同。时间桶由调用方指定。
+按链路的开始时间，把列表查询匹配的每一条链路统计到时间桶中。该调用使用与列表相同的窗口、`q`、`filters` 和 `where`，匹配的链路也相同。时间桶由调用方指定。
 
 **查询参数**
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
 | `from`、`to` | integer | 以微秒表示的窗口，两者都必填。`to` 必须大于 `from`。 |
-| `q`、`filters` | string | 与列表相同。 |
+| `q`、`filters`、`where` | string | 与列表相同。 |
 | `bucket_micros` | integer | 一个时间桶的长度，单位为微秒。不小于 `1000`。 |
 | `origin_micros` | integer | 第一个时间桶的起点，单位为微秒。不晚于 `from`。 |
 
@@ -100,7 +135,7 @@ curl -G "http://localhost:5080/api/v1/web/traces/histogram" \
   --data-urlencode 'to=1790003700000000' \
   --data-urlencode 'bucket_micros=900000000' \
   --data-urlencode 'origin_micros=1790000100000000' \
-  --data-urlencode 'filters=[{"field":"service","op":"=","value":"checkout"}]'
+  --data-urlencode 'filters=[{"field":"service.name","op":"=","value":"checkout"}]'
 ```
 </RequestExample>
 
@@ -110,15 +145,15 @@ curl -G "http://localhost:5080/api/v1/web/traces/histogram" \
   "bucket_micros": 900000000,
   "origin_micros": 1790000100000000,
   "buckets": [
-    { "start_micros": 1790000100000000, "total": 42, "errors": 3 },
-    { "start_micros": 1790001900000000, "total": 17, "errors": 0 }
+    { "start_micros": 1790000100000000, "total": 42, "errors": 3, "p50_ns": 41000000, "p95_ns": 180000000, "p99_ns": 320000000 },
+    { "start_micros": 1790001900000000, "total": 17, "errors": 0, "p50_ns": 38000000, "p95_ns": 95000000, "p99_ns": 120000000 }
   ],
   "split": true
 }
 ```
 </ResponseExample>
 
-`buckets` 只列出包含链路的时间桶，按时间从早到晚排列。`total` 是在该时间桶内开始的链路数量。`errors` 是其中至少有一个错误 Span 的链路数量。
+`buckets` 只列出包含链路的时间桶，按时间从早到晚排列。`total` 是在该时间桶内开始的链路数量。`errors` 是其中至少有一个错误 Span 的链路数量。`p50_ns`、`p95_ns` 和 `p99_ns` 是这些链路耗时的中位数、第 95 和第 99 百分位，以纳秒表示。它们是估算值，没有统计到耗时时不返回。
 
 统计读取链路摘要；过滤条件作用于 Span 字段时，还会读取 Span。列表对每条链路只返回一条摘要。写入重试导致同一条摘要存了两份时，统计会计两次。
 
@@ -130,13 +165,63 @@ curl -G "http://localhost:5080/api/v1/web/traces/histogram" \
 | `busy` | 该角色正在运行的查询已达到 [`[search.admission]`](/zh-Hans/configuration) 允许的数量。 |
 | `scan_limit` | 窗口内的行数超过了 `[querier].max_scan_rows` 允许单次查询读取的数量。 |
 
+## 列出 Span
+
+```http
+GET /api/v1/web/traces/spans
+```
+
+查询匹配的每个 Span 返回一行，使用游标分页。调用接受链路列表的窗口、`q`、`filters` 和 `where`，并按单个 Span 解读：作用于 Span 字段的过滤条件针对 Span 本身，`!=` 保留缺少该字段的 Span。`duration_ns` 是 Span 自身的耗时，`span_count` 与 `error_count` 是 Span 所属链路的数量。Span 匹配 `A` 或匹配 `B`，即匹配 `{"or": [A, B]}`。
+
+**查询参数**
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `from`、`to` | integer | 以微秒表示的窗口。默认是最近 24 小时，截至当前。`to` 必须大于 `from`。 |
+| `q`、`filters`、`where` | string | 与链路列表相同。 |
+| `sort` | string | `latest`（默认）、`earliest`、`duration_desc` 或 `duration_asc`。 |
+| `limit` | integer | 页大小。默认 `100`。取值限制在 1 到 5000 之间。 |
+| `cursor` | string | 之前某一页返回的 `next_cursor` 或 `previous_cursor`。游标携带其页面的查询；更换 `limit` 会返回 `400`。 |
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    {
+      "trace_id": "0af7651916cd43dd8448eb211c80319c",
+      "span_id": "53995c3f42cd8ad8",
+      "parent_span_id": "b7ad6b7169203331",
+      "service": "payments",
+      "operation": "POST /pay",
+      "start_ns": 1790000000020000000,
+      "duration_ns": 140000000,
+      "status": "ERROR",
+      "kind": 2,
+      "http_status_code": 502
+    }
+  ],
+  "next_cursor": null,
+  "previous_cursor": null,
+  "has_more": false
+}
+```
+</ResponseExample>
+
+`status` 为 `OK`、`ERROR` 或 `UNSET`。`kind` 按 OTLP 的编号表示 Span 类型：`1` internal、`2` server、`3` client、`4` producer、`5` consumer。Span 没有 `parent_span_id`、`kind` 或 `http_status_code` 时不返回对应字段。调用作为受跟踪的查询运行，与其他查询一样经过准入控制。
+
 ## 读取单条链路
 
 ```http
 GET /api/v1/web/trace/{trace_id}
 ```
 
-返回最近 24 小时内一条链路的所有 Span，按开始时间排序。`trace_id` 由 1 到 128 个字符组成，字符取自 `A-Z`、`a-z`、`0-9`、`-` 和 `_`。
+返回一条链路的所有 Span，按开始时间排序。`trace_id` 由 1 到 128 个字符组成，字符取自 `A-Z`、`a-z`、`0-9`、`-` 和 `_`。
+
+**查询参数**
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `from`、`to` | integer | 以微秒表示的窗口，即该链路的 Span 开始的时间范围。两者同时提供或都不提供。最长 31 天。不提供时在最近 24 小时内查找。 |
 
 响应最多包含 100,000 个 Span，大小不超过 32 MiB。上限截断了 Span 列表时，`truncated` 为 `true`。
 
@@ -189,10 +274,43 @@ GET /api/v1/web/trace/{trace_id}
 | `partial`、`partial_reasons` | 是否缺少 Span，以及原因。 |
 | `late_span_count`、`duplicate_span_count`、`conflict_span_count` | 迟到、重复或冲突的 Span 数量。 |
 
+## 查找链接到某条链路的 Span
+
+```http
+GET /api/v1/web/trace/{trace_id}/linked
+```
+
+Span 会保存指向其来源 Span 的链接，链路详情随 Span 一起返回这些链接。本调用查找反方向的链接：其他链路中链接到本链路某个 Span 的 Span。调用接受与链路详情相同的 `from` 和 `to`，并在该窗口内查找。
+
+<ResponseExample>
+```json 200
+{
+  "spans": [
+    {
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "span_id": "00f067aa0ba902b7",
+      "service": "billing-worker",
+      "operation": "process invoice",
+      "start_ns": 1790000005000000000,
+      "duration_ns": 30000000,
+      "status": "OK",
+      "linked_span_id": "53995c3f42cd8ad8",
+      "attributes": { "messaging.operation": "process" }
+    }
+  ],
+  "more": false
+}
+```
+</ResponseExample>
+
+`spans` 最多列出 200 个链接过来的 Span，按时间从新到旧排列；还有更多 Span 链接到该链路时，`more` 为 `true`。`linked_span_id` 是链接指向的本链路 Span，`attributes` 是该链接自身的属性。
+
+查找会把窗口内每个 Span 的链接作为文本读取，并受链路统计的时间预算限制。无法完成时，调用仍返回 `200`，`spans` 为空，`unavailable` 给出原因：`time_budget`、`busy` 或 `scan_limit`，含义与链路统计相同。
+
 **错误**
 
 | 状态码 | 原因 |
 |---|---|
-| `400` | 参数无效：`to` 不大于 `from`、过滤条件使用了未知的字段或运算符（`unsupported trace filter field: nope`）、游标与查询不匹配，或 `trace_id` 的字符或长度无效。统计时还包括：缺少窗口或时间桶参数、`bucket_micros` 小于 `1000`、`origin_micros` 晚于 `from`，或请求覆盖的时间桶超过 512 个。 |
+| `400` | 参数无效：`to` 不大于 `from`、过滤条件使用了未知的字段或运算符（`unsupported trace filter field: nope`）、`in` 过滤条件没有值或超过 64 个值、`where` 不是条件树或超出其限制、游标与查询不匹配、`fields` 中的字段未知或是文档，或 `trace_id` 的字符或长度无效。统计时还包括：缺少窗口或时间桶参数、`bucket_micros` 小于 `1000`、`origin_micros` 晚于 `from`，或请求覆盖的时间桶超过 512 个。链路详情及其反向链接还包括：只提供了 `from` 与 `to` 中的一个，或窗口超过 31 天。 |
 | `403` | Token 缺少 `streams.query`。 |
-| `404` | 最近 24 小时内找不到该链路，或链路已被采样丢弃。 |
+| `404` | 窗口内找不到该链路，或链路已被采样丢弃。 |

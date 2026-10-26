@@ -1,116 +1,84 @@
 ---
 title: "Alerting and incident response"
-description: "Rules, incidents, anomaly detection, templates, schedules, escalations, silences, subscriptions, and insights."
+description: "How rules, incidents, escalation, on-call, silences, and notifications fit together, and where each is managed in Alerts."
 "zh-Hans_link": "/zh-Hans/alerting"
 ---
 
-Open **Alerts** to move from detection to acknowledgement, escalation, and resolution.
+Open **Alerts** to move from detection to acknowledgement, escalation, and resolution. A
+[rule](/en-US/alerting/rules) watches a query or a figure and opens an [incident](/en-US/alerting/incidents)
+when its condition holds. The [escalation policy](/en-US/alerting/on-call#escalation-policies) of the
+incident pages the people and the [on-call schedules](/en-US/alerting/on-call#on-call-schedules) it names,
+and moves on when nobody acknowledges. [Notification channels](/en-US/notification-channels) deliver each
+page. [Silences](/en-US/alerting/silences) pause notifications during maintenance, and
+[semantic groups](/en-US/alerting/silences#semantic-groups) collapse related incidents.
 
-## Alert center
+## The alert center
 
-| Section | Purpose |
-|---|---|
-| **Incidents** | Triage active incidents, inspect context, acknowledge, resolve, silence, or start RCA. |
-| **Rules** | Create scheduled, real-time, or anomaly rules and severity thresholds. |
-| **History** | Review past incident and rule activity. |
-| **Insights** | Inspect volume, resolution time, fast-resolution ratio, and activity by hour. |
-| **Escalations** | Define ordered targets and acknowledgement timeouts. |
-| **On-call schedules** | Build timezone-aware rotations and temporary overrides. |
-| **Silence policies** | Suppress matching notifications for a controlled time window. |
-| **Groups** | Normalize labels into reusable incident-grouping semantics. |
+| Section | Purpose | Guide |
+|---|---|---|
+| **Incidents** | What fires now: acknowledge, silence, resolve, and investigate. | [Incidents](/en-US/alerting/incidents) |
+| **Rules** | Threshold, anomaly, and real-time rules. | [Alert rules](/en-US/alerting/rules) |
+| **Status pages** | Tell customers about incidents and maintenance. | [Status pages](/en-US/status-pages) |
+| **History** | Past incidents, searchable by service and state. | [History](/en-US/alerting/incidents#history) |
+| **Insights** | Incident volume, recovery time, noisy rules, and affected services. | [Insights](/en-US/alerting/incidents#insights) |
+| **Groups** | Semantic groups that collapse related incidents. | [Semantic groups](/en-US/alerting/silences#semantic-groups) |
+| **Escalations** | Who is paged, in which order, and when to move on. | [Escalation policies](/en-US/alerting/on-call#escalation-policies) |
+| **On-call schedules** | Rotations and temporary coverage. | [On-call schedules](/en-US/alerting/on-call#on-call-schedules) |
+| **Silence policies** | Pause notifications for matching incidents. | [Silence policies](/en-US/alerting/silences#silence-policies) |
 
-## Rule types
+## Set up alerting
 
-<CardGroup cols={3}>
-  <Card title="Scheduled" icon="clock">
-    Runs a SQL or PromQL query on an interval and evaluates the configured trigger and severity
-    thresholds.
-  </Card>
-  <Card title="Real-time" icon="bolt">
-    Counts matching records as they arrive on the intake path. The rule opens an incident as soon as the
-    count in the last `period_secs` seconds meets the trigger, and resolves it when the count drops.
-  </Card>
-  <Card title="Anomaly" icon="wave-square">
-    Compares current values with a historical MAD or EWMA baseline, optionally with weekly
-    seasonality.
-  </Card>
-</CardGroup>
+A workspace usually gets ready for its first page in this order:
 
-### Real-time rules
+<Steps>
+  <Step title="Connect a channel">
+    Configure a connector such as email, an IM app, or phone and SMS under
+    [Settings → Notify → Connectors](/en-US/notification-channels), and have members bind their
+    personal methods in [Account settings → Notify](/en-US/account#notify).
+  </Step>
+  <Step title="Build the on-call schedule">
+    Create an [on-call schedule](/en-US/alerting/on-call#create-a-schedule) with the rotation of the team.
+  </Step>
+  <Step title="Create the default escalation policy">
+    Create a policy named `default` that pages the schedule first and a lead next. Rules saved in the
+    rule workbench use it. See [The default policy](/en-US/alerting/on-call#the-default-policy).
+  </Step>
+  <Step title="Create and test rules">
+    Start from a preset in the [rule workbench](/en-US/alerting/rules#create-a-threshold-rule), test it on
+    real data, and save it.
+  </Step>
+  <Step title="Rehearse">
+    Trigger a rule on purpose with [Trigger a rule](/en-US/api/alerting/trigger-rule), and check that the
+    page arrives, the escalation moves on, and acknowledgement stops it.
+  </Step>
+</Steps>
 
-A real-time rule runs on the intake path instead of on a timer. Every record that an intake node accepts is checked against the real-time rules of its stream, and the matches go into a sliding window of `period_secs` seconds. The rule fires as soon as the number of matches in the window meets the trigger, and an incident resolves when the count no longer meets it.
-
-| Part | Behavior |
-|---|---|
-| Statement | `SELECT count(*) FROM <stream> [WHERE <condition>]`, in SQL. The table is the `stream` of the rule. A condition compares fields with literals (`=`, `!=`, `<`, `<=`, `>`, `>=`), and uses `IN`, `BETWEEN`, `LIKE`, `ILIKE`, and `IS [NOT] NULL`, joined by `AND`, `OR`, `NOT`, and parentheses. A missing or null field never matches a comparison. |
-| Window | `period_secs` from 1 to 3600. |
-| Trigger | `operator` is `gt` or `gte`, and `for_periods` is `0` or `1`. Tiers in `thresholds` set the severity by count. |
-| Incident | The incident follows the usual lifecycle: one active incident per rule, the `silence_secs` cool-down, escalation, and notification. |
-
-[Create a rule](/en-US/api/alerting/create-rule) rejects a real-time rule outside these limits with `400`. Counting happens in memory on each intake node and starts at zero after a restart. In a role-split cluster, every intake node counts the records it receives, so size the threshold for one node.
-
-Use the rule workbench to select the stream, query, evaluation range, thresholds, labels,
-annotations, template, and escalation policy. Test the query before enabling the rule.
-
-Anomaly rules accept a 1–30 day lookback, a positive deviation multiplier, and either `mad` or
-`ewma`. EWMA also uses an alpha value in the range `(0, 1]`.
-
-## Incident lifecycle
-
-An incident starts active. A responder can acknowledge the incident, silence matching delivery,
-and resolve the incident after recovery. Incident detail preserves rule context, trace ids, labels, delivery state, and
-related RCA when available.
-
-Semantic grouping combines incidents with the same normalized fingerprint. Acknowledging or
-resolving a group cascades to all member incidents.
-
-Mole Agent RCA requires Agent permissions and a configured model provider. Mole Agent stores the
-evidence-backed result with the incident instead of replacing the incident lifecycle. Under an RCA, choose **Helpful** or **Not helpful**. Once the organization's Mole Agent token budget for today is used up, automatic generation pauses and on-demand generation follows the organization's budget setting. See [Mole Agent](/en-US/agent#usage-and-budget).
-
-## Escalation and on-call
-
-The `alert` role evaluates rules and drives escalation. With several `alert` nodes, each rule belongs to one node, and that node also escalates the incidents of the rule. See [Role-based deployment](/en-US/distributed-deployment#work-division-between-alert-nodes). Escalation works in these steps:
-
-1. resolve the active step's users, teams, schedules, and channels;
-2. dispatch each target and record an independent delivery result;
-3. wait for acknowledgement until `ack_timeout_secs`;
-4. advance to the next step until acknowledged, resolved, or exhausted.
-
-Schedules use an explicit timezone, rotations, and date-bounded overrides. Use the on-call preview
-before assigning a schedule to production escalation.
-
-## Notification delivery
-
-Configure SMTP, Slack, Lark, and webhook credentials under **Settings → Notify →
-Connectors**. Connector configuration is encrypted at rest, and sensitive values are never returned
-in plaintext.
-
-Use **User routing** to bind personal provider identities, **Templates** to build reusable messages,
-**Policies** to match events and resolve recipients, and **Fallback routes** for team or organization
-delivery. See [Notification channels and delivery](/en-US/notification-channels) for the complete
-workflow.
-
-## Silences
-
-A silence matches labels during a fixed window and pauses delivery without changing the rule.
-Silencing one active incident can create a matching silence rule.
+See [Make production alerts actionable](/en-US/best-practices/actionable-alerts) and
+[Set up on-call and notifications](/en-US/best-practices/on-call-setup) for advice on what to alert on
+and how to route it.
 
 ## Permissions
 
 | Permission | Capability |
 |---|---|
-| `alerts.read` | Read rules, incidents, notification resources, insights, groups, and silences. |
-| `alerts.manage` | Create and change rules, connectors, templates, policies, fallback routes, escalations, and groups. |
-| `alerts.acknowledge` | Acknowledge and resolve incidents or incident groups. |
+| `alerts.read` | Read rules, incidents, history, insights, groups, silences, and notification resources. |
+| `alerts.manage` | Create and change rules, escalation policies, groups, connectors, templates, policies, and fallback routes. |
+| `alerts.acknowledge` | Acknowledge and resolve incidents and groups of incidents. |
 | `alerts.silence` | Create, change, and remove silences. |
-| `schedules.read` | Read schedules and on-call results. |
-| `schedules.manage` | Create schedules, rotations, and overrides. |
+| `schedules.read` | Read schedules and who is on call. |
+| `schedules.manage` | Create and change schedules, rotations, and overrides. |
 
 <CardGroup cols={2}>
-  <Card title="Notification channels" icon="bell" href="/en-US/notification-channels">
-    Configure connectors, users, templates, policies, fallbacks, and delivery operations.
+  <Card title="Alert rules" icon="sliders" href="/en-US/alerting/rules">
+    Create, test, and tune rules.
   </Card>
-  <Card title="Webhook connectors" icon="webhook" href="/en-US/alert-webhook-channels">
-    Configure payloads, target overrides, signing, and webhook security.
+  <Card title="Incidents" icon="triangle-exclamation" href="/en-US/alerting/incidents">
+    Acknowledge, investigate, and resolve.
+  </Card>
+  <Card title="On-call and escalation" icon="phone" href="/en-US/alerting/on-call">
+    Schedules, overrides, and escalation policies.
+  </Card>
+  <Card title="Notification channels" icon="bell" href="/en-US/notification-channels">
+    Connectors, personal methods, templates, policies, and fallbacks.
   </Card>
 </CardGroup>

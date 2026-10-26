@@ -1,0 +1,396 @@
+---
+title: "状态页 Webhook 订阅"
+description: "让 HTTPS 端点订阅公开状态页：确认流程、请求格式、Payload 字段、重试与退订。"
+"en_link": "/en-US/status-pages/webhooks"
+---
+
+Webhook 订阅会把公开状态页每一次已发布的变更，以 JSON `POST` 请求发送到一个 HTTPS 端点。可用它把服务状态同步到聊天群、工单系统或内部状态看板。
+
+组件、事件、维护与订阅者管理视图的说明见[状态页](/zh-Hans/status-pages)。
+
+## 订阅如何生效
+
+<Steps>
+  <Step title="登记端点">
+    在公开页面或通过 API 提交端点 URL。订阅先处于待确认状态。
+  </Step>
+  <Step title="接收确认请求">
+    MoleSignal 向端点发送一次 `status_page_subscription_confirmation` 请求。端点必须返回 2xx 状态码，否则登记失败。
+  </Step>
+  <Step title="用 Token 确认">
+    打开请求中的 `confirm_url`，或把 `token` 发送到确认接口。订阅随即生效。
+  </Step>
+  <Step title="接收更新">
+    确认之后发布的每一次变更都会作为一个请求投递。确认之前发布的变更不会补发。
+  </Step>
+</Steps>
+
+## 端点要求
+
+| 要求 | 规则 |
+|---|---|
+| 页面可见性 | 仅支持公开状态页。私有状态页只接受已验证的邮件订阅。 |
+| 协议 | 仅支持 `https`。 |
+| 凭证 | URL 中不能包含用户名或密码。 |
+| 主机 | 拒绝 `localhost`、`*.localhost` 与 `*.local`。主机必须解析到公网 IP 地址，拒绝私有、回环、链路本地、运营商级 NAT 与文档保留地址段。 |
+| 长度 | 3 到 2048 个字符，不能包含控制字符。 |
+| 响应 | 10 秒内返回任意 2xx 状态码。不跟随重定向，因此 3xx 响应视为失败。 |
+
+每次投递前，MoleSignal 都会重新解析主机，并再次套用同样的地址规则。
+
+## 订阅
+
+在公开页面选择**订阅**，把**接收方式**设为 **Webhook**，填入端点 URL，然后选择**发送确认**。
+
+通过 API 订阅时，请求发往提供该状态页的源站：
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<slug>/subscriptions" \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "webhook", "target": "https://hooks.example.com/status"}'
+```
+
+只想接收部分组件的更新时，加上 `component_ids`，填写各组件的 `id`（见公开页面接口 `GET /api/v1/public/status-pages/<slug>` 列出的组件）。不传或传空数组表示整个页面。分组不能被选择，请填写组内的组件。
+
+该调用无需认证。登记成功返回 `202 Accepted`：
+
+```json
+{
+  "accepted": true,
+  "confirmation_required": true
+}
+```
+
+| 情况 | 结果 |
+|---|---|
+| 新端点 | 发送确认请求。 |
+| 已生效的端点 | 返回 `202`，并发送一次 `status_page_subscription_manage` 请求。已选的组件与 Token 保持不变。 |
+| 10 分钟内已收到过确认请求的端点 | 返回 `202`，不会再次发送确认请求。 |
+| 超过 10 分钟后，待确认或已退订的端点 | 携带新 Token 重新发送确认请求。之前的 Token 随即失效。 |
+| 确认请求没有得到 2xx 响应 | 调用失败，返回 `503` 与错误码 `unavailable`。修复端点后重新登记。 |
+| URL 不满足端点要求 | 调用失败，返回 `400` 与错误码 `invalid_argument`。 |
+| 页面已有 10,000 个待确认或已生效的订阅者 | 调用失败，返回 `429` 与错误码 `resource_exhausted`。 |
+
+<Note>
+  订阅链接基于 `http.external_url` 生成；页面的自定义域名处于有效状态时，则基于该域名生成。`http.external_url` 为空时，登记会以 `503` 失败。
+</Note>
+
+## 请求格式
+
+发往端点的每个请求形态相同。
+
+| 属性 | 值 |
+|---|---|
+| 方法 | `POST` |
+| `Content-Type` | `application/json` |
+| `User-Agent` | `MoleSignal-Status-Page/1.0` |
+| 请求体 | 一个 JSON 对象，`type` 字段标明 Payload 类型。 |
+| 超时 | 10 秒 |
+| 成功判定 | 任意 2xx 状态码。响应体会被忽略。 |
+
+请求不携带签名 Header。如需识别请求是否真实，可在登记的 URL 的路径或查询串中加入一段难以猜测的值，并拒绝缺少该值的请求。管理视图只显示 Webhook 目标的协议与主机，例如 `https://hooks.example.com/***`。
+
+按 `type` 分发处理。忽略未知字段与未知的 `type` 取值，这样 Payload 增加字段时端点仍可正常工作。
+
+## 确认请求
+
+每次登记，MoleSignal 发送一次如下 Payload：
+
+```json
+{
+  "type": "status_page_subscription_confirmation",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "confirm_url": "https://status.example.com/status/acme-cloud#subscription_action=confirm&subscription_token=<token>",
+  "manage_url": "https://status.example.com/status/acme-cloud#subscription_action=manage&subscription_token=<token>",
+  "unsubscribe_url": "https://status.example.com/status/acme-cloud#subscription_action=unsubscribe&subscription_token=<token>",
+  "components": ["公共 API"],
+  "token": "<token>"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | 固定为 `status_page_subscription_confirmation`。 |
+| `page_name` | string | 状态页名称。 |
+| `page_slug` | string | 状态页 Slug。用于下文的 API 路径。 |
+| `confirm_url` | string | 在浏览器中打开即可确认订阅的页面地址。 |
+| `manage_url` | string | 打开**管理订阅**的页面地址，可在其中修改组件。 |
+| `unsubscribe_url` | string | 在浏览器中打开即可结束订阅的页面地址。 |
+| `components` | array of strings | 订阅接收的组件名称。订阅整个页面时为空数组。 |
+| `token` | string | 订阅 Token。用于确认订阅，之后也用于退订。 |
+
+打开 `confirm_url`，或发送 Token 来确认订阅：
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/confirm" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+确认成功返回 `200 OK`：
+
+```json
+{
+  "accepted": true,
+  "confirmation_required": false
+}
+```
+
+Token 不存在、已被之后的登记替换，或已用于退订时，返回 `400` 与错误码 `invalid_argument`。
+
+<Warning>
+  请保存好 Token。更新 Payload 不会再次携带它，而它是端点所有者结束订阅的唯一凭证。
+</Warning>
+
+## 管理订阅请求
+
+为已经生效的端点再次登记时，MoleSignal 发送的是管理订阅的链接，而不是新的确认请求，10 分钟内最多一次：
+
+```json
+{
+  "type": "status_page_subscription_manage",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "manage_url": "https://status.example.com/status/acme-cloud#subscription_action=manage&subscription_token=<token>",
+  "unsubscribe_url": "https://status.example.com/status/acme-cloud#subscription_action=unsubscribe&subscription_token=<token>",
+  "components": [],
+  "token": "<token>"
+}
+```
+
+字段与确认请求相同，只是没有 `confirm_url`。
+
+## 更新 Payload
+
+所有时间戳均为整数，表示自 Unix 纪元起的微秒数（UTC）。组件名称、事件标题与消息保持页面团队写入时的原文，不做翻译。
+
+选择了组件的订阅，只接收涉及其中某个组件的更新。关闭**通知订阅者**发布的更新不发送任何请求。每个更新 Payload 还带有订阅自身的链接：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `manage_url` | string | 打开**管理订阅**的页面地址。 |
+| `unsubscribe_url` | string | 结束订阅的页面地址。 |
+
+### 事件与维护更新
+
+事件或维护每发布一条更新，MoleSignal 就发送一次 `incident_update`。计划维护使用同一种 Payload，`incident_kind` 为 `maintenance`。草稿不发送任何请求。
+
+| 对象 | 何时发送请求 | `status` |
+|---|---|---|
+| 事件 | 事件发布时。 | 发布时选择的状态，通常为 `investigating`。 |
+| 事件 | 之后的每条更新。 | `investigating`、`identified`、`in_progress` 或 `monitoring`。 |
+| 事件 | 事件解决时。 | `resolved` |
+| 维护 | 维护发布时。 | 通常为 `scheduled`。 |
+| 维护 | 修改已计划的维护时：标题、计划时间、组件或消息。 | `scheduled` |
+| 维护 | 工作开始时：到达计划开始时间后自动开始，或由团队标记为已开始。 | `in_progress` |
+| 维护 | 团队完成或取消工作时。 | `completed` 或 `cancelled` |
+
+事件更新：
+
+```json
+{
+  "type": "incident_update",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "incident_id": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "incident_kind": "incident",
+  "title": "公共 API 错误率升高",
+  "impact": "major",
+  "status": "identified",
+  "message": "边缘代理的一次配置变更导致部分请求被拒绝，正在回滚该变更。",
+  "occurred_at": 1779529680000000,
+  "next_update_at": 1779531480000000,
+  "started_at": 1779529260000000,
+  "ended_at": null,
+  "component_names": ["公共 API", "Web 控制台"]
+}
+```
+
+维护公告：
+
+```json
+{
+  "type": "incident_update",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "incident_id": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "incident_kind": "maintenance",
+  "title": "欧洲区域数据库升级",
+  "impact": "maintenance",
+  "status": "scheduled",
+  "message": "欧洲区域的主数据库将于 5 月 25 日 10:00 至 10:30（UTC）升级。切换期间写入可能延迟数秒。",
+  "occurred_at": 1779443280000000,
+  "next_update_at": null,
+  "started_at": 1779703200000000,
+  "ended_at": null,
+  "component_names": ["欧洲区域"]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | 固定为 `incident_update`。 |
+| `page_name` | string | 状态页名称。 |
+| `page_slug` | string | 状态页 Slug。 |
+| `incident_id` | string | 事件或维护的标识。同一事件的所有更新保持不变。 |
+| `incident_kind` | string | `incident` 表示非计划事件，`maintenance` 表示计划维护。 |
+| `title` | string | 该条更新发布时事件或维护的标题。 |
+| `impact` | string | 事件为 `minor`、`major` 或 `critical`。计划维护为 `maintenance`。 |
+| `status` | string | 该条更新设置的状态。见下表。 |
+| `message` | string | 更新正文。 |
+| `occurred_at` | integer | 该条更新的发布时间。 |
+| `next_update_at` | integer 或 null | 该条更新承诺的下次更新时间。没有承诺时为 `null`。 |
+| `started_at` | integer | 维护的计划开始时间；事件的开始时间。 |
+| `ended_at` | integer 或 null | 事件解决的时间，或维护完成、取消的时间。在此之前为 `null`。 |
+| `component_names` | array of strings | 页面上显示的受影响组件的名称，按页面顺序排列。已隐藏与已归档的组件不会列出。没有可列出的组件时为空数组。 |
+
+| `incident_kind` | `status` 取值 | 结束状态 |
+|---|---|---|
+| `incident` | `investigating`、`identified`、`in_progress`、`monitoring`、`resolved` | `resolved` |
+| `maintenance` | `scheduled`、`in_progress`、`completed`、`cancelled` | `completed` 或 `cancelled` |
+
+对维护而言，每条更新中的 `started_at` 都是计划开始时间。团队改期时该值随之变化。工作开始后它仍是计划时间：实际开始时间是 `in_progress` 那条更新的 `occurred_at`。维护没有计划结束时间，因此在工作完成或取消之前，`ended_at` 为 `null`。
+
+<Note>
+  开启到点自动开始时（默认开启），MoleSignal 在计划开始时间发布 `in_progress` 更新，并作为 `incident_update` 发出。关闭时，到达计划开始时间不会发送请求：下一次请求随团队发布的下一条更新发出。
+</Note>
+
+### 维护提醒
+
+已计划的维护开始之前，MoleSignal 发送 `maintenance_reminder`。提前量在每个维护上设置，默认 60 分钟。提醒不是一条更新：它不会出现在维护的时间线上。
+
+```json
+{
+  "type": "maintenance_reminder",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "incident_id": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "title": "欧洲区域数据库升级",
+  "occurred_at": 1779699600000000,
+  "started_at": 1779703200000000,
+  "component_names": ["欧洲区域"]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | 固定为 `maintenance_reminder`。 |
+| `page_name` | string | 状态页名称。 |
+| `page_slug` | string | 状态页 Slug。 |
+| `incident_id` | string | 维护的标识，与该维护的 `incident_update` Payload 中的一致。 |
+| `title` | string | 发送提醒时维护的标题。 |
+| `occurred_at` | integer | 提醒的发送时间。 |
+| `started_at` | integer | 维护的计划开始时间。 |
+| `component_names` | array of strings | 页面上显示的受影响组件的名称，按页面顺序排列。已隐藏与已归档的组件不会列出。 |
+
+每个计划开始时间只发送一次提醒，因此改期后的维护会在新的开始时间之前再次提醒。维护在提醒时间之后才发布或改期、提前量为 `0`，或已离开 `scheduled` 状态时，不发送提醒。
+
+### 组件状态变更
+
+页面上显示的组件状态被修改时，MoleSignal 发送 `component_status_changed`。组件创建时的初始状态不发送请求。已隐藏与已归档的组件不发送请求。
+
+```json
+{
+  "type": "component_status_changed",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "component_id": "2xZqD1hWk9TfM5vBn7QsR3yLgUe",
+  "component_name": "公共 API",
+  "status": "degraded_performance",
+  "occurred_at": 1779529440000000
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | 固定为 `component_status_changed`。 |
+| `page_name` | string | 状态页名称。 |
+| `page_slug` | string | 状态页 Slug。 |
+| `component_id` | string | 组件标识。组件改名后保持不变。 |
+| `component_name` | string | 状态变更时的组件名称。 |
+| `status` | string | 新状态：`operational`、`degraded_performance`、`partial_outage`、`major_outage` 或 `maintenance`。 |
+| `occurred_at` | integer | 新状态开始生效的时间。 |
+
+事件不会为其影响的组件发送 `component_status_changed`。`incident_update` Payload 通过 `component_names` 列出这些组件。
+
+<Note>
+  变更发布时处于隐藏状态的组件，不会出现在发给订阅者的内容中。它的状态变更不发送请求，`incident_update` 的 `component_names` 也不会列出它。只影响已隐藏组件的事件或维护仍会发送，`component_names` 为空数组。隐藏或重新显示组件这一操作本身不发送请求。
+</Note>
+
+### 事故复盘
+
+已解决事件的复盘发布时，或复盘修订发布时，只要打开了**通知订阅者**，MoleSignal 就发送 `postmortem_published`。
+
+```json
+{
+  "type": "postmortem_published",
+  "page_name": "Acme Cloud",
+  "page_slug": "acme-cloud",
+  "incident_id": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "title": "公共 API 错误率升高",
+  "impact": "major",
+  "revision": false,
+  "occurred_at": 1779616080000000,
+  "started_at": 1779529260000000,
+  "ended_at": 1779533520000000,
+  "component_names": ["公共 API"],
+  "postmortem": "## 发生了什么\n\n边缘代理的一次配置变更拒绝了部分请求。",
+  "incident_url": "https://status.example.com/status/acme-cloud/incidents/2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "manage_url": "https://status.example.com/status/acme-cloud#subscription_action=manage&subscription_token=<token>",
+  "unsubscribe_url": "https://status.example.com/status/acme-cloud#subscription_action=unsubscribe&subscription_token=<token>"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | 固定为 `postmortem_published`。 |
+| `incident_id` | string | 事件的标识，与该事件的 `incident_update` Payload 中的一致。 |
+| `title` | string | 事件标题。 |
+| `impact` | string | `minor`、`major` 或 `critical`。 |
+| `revision` | boolean | 用修订后的内容替换已发布的内容时为 `true`。 |
+| `occurred_at` | integer | 复盘的发布时间。 |
+| `postmortem` | string | 原样的 Markdown 复盘。 |
+| `incident_url` | string | 公开页面上该事件的地址。 |
+
+`page_name`、`page_slug`、`started_at`、`ended_at` 与 `component_names` 的含义同 `incident_update`。
+
+## 投递与重试
+
+| 行为 | 说明 |
+|---|---|
+| 时延 | 变更发生后，投递通常在 30 秒内开始。 |
+| 尝试次数 | 每条更新最多 5 次。 |
+| 重试间隔 | 每次失败后依次等待 1 分钟、5 分钟、30 分钟、2 小时。 |
+| 失败判定 | 10 秒内没有返回 2xx 状态码，包括返回重定向。 |
+| 放弃 | 第 5 次失败后，该投递标记为失败，不再发送。 |
+| 投递保证 | 至少一次。同一投递可能到达多次，也可能乱序到达。 |
+
+重试的投递会重复同样的请求体。Payload 不携带投递标识，因此请用 `type`、`incident_id` 或 `component_id` 加上 `occurred_at` 去重。同一事件的多条更新按 `occurred_at` 排序。
+
+订阅结束、页面归档或页面改为私有之后，不再为该端点排队新的更新。
+
+页面管理者可在**状态页 → 订阅者 → 投递记录**中查看每一次投递的尝试次数、状态与最后错误。已送达与已失败的记录会在页面的投递保留期之后清除：30、60、90、180 或 365 天。
+
+## 退订
+
+打开确认请求中的 `unsubscribe_url`，或发送 Token：
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/unsubscribe" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+调用返回 `200 OK` 与 `"accepted": true`。仍在等待该端点的投递会被取消。
+
+拥有 `status_pages.manage` 权限的用户也可以在**状态页 → 订阅者**中撤销订阅者，或为待确认的订阅者选择**重新发送确认**。重新发送会签发新的 Token。
+
+<CardGroup cols={2}>
+  <Card title="状态页" icon="signal" href="/zh-Hans/status-pages">
+    创建页面、发布事件与维护，并管理订阅者。
+  </Card>
+  <Card title="Webhook 通知连接器" icon="webhook" href="/zh-Hans/notification-channels/webhooks">
+    把告警通知发送到 Slack、飞书或通用 Webhook。
+  </Card>
+</CardGroup>

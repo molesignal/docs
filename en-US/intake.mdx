@@ -13,11 +13,14 @@ Open **Datasource** to onboard a source:
 
 1. Search the catalog or filter it by category: **Recommended**, **Infrastructure**, **Cloud**, **Databases**, **Messaging**, **Apps & languages**, **Security**, and **Custom**. The signal tabs (**Logs**, **Metrics**, **Traces**, **Profiles**) narrow the list further.
 2. Select a source such as Kubernetes, a Linux host, AWS, an OpenTelemetry SDK, or Web RUM.
-3. Follow the four setup steps:
-   - **Prepare connection details** shows the endpoint and the token to use.
-   - **Deploy collector** shows commands and configuration with the real endpoint and token already filled in.
-   - **Verify data receipt** shows whether data has arrived. **Verify connection** checks once, and the status also refreshes every 30 seconds.
-   - **Complete setup** finishes the guide.
+3. Follow the three steps of the guide:
+   - **Endpoint and token** shows where to send data and the token to authenticate with. **Show token** reveals the token, with its role, workspace, and expiry. For a RUM source, choose the **RUM application** first: its client token appears once it is chosen.
+   - **Set up the source** shows commands and configuration with the real endpoint and token already filled in.
+   - **Verify data is arriving** checks the receiver, then looks for data received in the last hour. **Verify connection** checks at once, and the figures refresh every 30 seconds.
+4. Read the result of the verification:
+   - **Data detected**: data arrived in the last hour, and the signals of the source are healthy. **View received data** opens the data, and **Create pipeline** starts a pipeline for it.
+   - **Receiver is healthy, but data needs attention**: the receiver answers, but no data arrived, or not every signal is healthy. Check the deployment, or wait for the next batch.
+   - **Verification failed**: the receiver could not be checked. **Possible causes** lists a collector that is not running, a token that is invalid or expired, and a network or proxy that blocks the endpoint.
 
 The endpoint comes from `http.external_url` when it is set, and from the address of the browser otherwise. Set `http.external_url` behind a reverse proxy so generated snippets point at the public address. See [Configuration](/en-US/configuration).
 
@@ -27,7 +30,7 @@ Senders authenticate with a bearer token: `Authorization: Bearer <token>`.
 
 | Token | Permission | Created by | Use |
 |---|---|---|---|
-| Default intake token (`ms_…`) | `streams.write` only | Datasource page, or `GET /api/v1/auth/tokens/default` | Collectors, agents, and SDK exporters that send logs, metrics, and traces. Does not expire. |
+| Default intake token (`ms_…`) | `streams.write` and `apm.deploy` only | Datasource page, or `GET /api/v1/auth/tokens/default` | Collectors, agents, and SDK exporters that send logs, metrics, and traces, and pipelines that [report deployments](/en-US/apm/deployments#report-deployments-from-ci). Does not expire. |
 | RUM client token (`msrum_…`) | `rum.write` only, bound to one application | Datasource page for Web RUM and mobile RUM sources, or `GET /api/v1/auth/tokens/rum?application_id=<id>` | Browser and mobile code. The token is visible to end users. |
 | Personal or service account token (`ms_…`) | The permissions of the chosen role | **Identity & Access → API tokens** | Automation, scripts, and MCP clients. |
 | Login token (JWT) | The permissions of the signed-in user | `POST /api/v1/auth/signin` | Interactive use. Expires after 24 hours by default (`[auth].token_ttl_secs`). |
@@ -43,7 +46,7 @@ The **Datasource** page creates a RUM client token when an application id is ent
 | Native HTTP JSON | `POST /api/v1/intake/{logs,metrics,traces}/{stream}` | `curl`, application code, Vector `http` sink, Fluent Bit `http` output | The `{stream}` path segment |
 | OTLP over HTTP | `POST /api/v1/logs`, `/api/v1/metrics`, `/api/v1/traces` | OpenTelemetry SDKs and Collector | `stream-name` header, otherwise `default` |
 | OTLP over gRPC | `:4317` | OpenTelemetry SDKs and Collector | `stream-name` metadata, otherwise `default` |
-| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus, VictoriaMetrics, any remote_write v1 sender | One metrics stream per metric name |
+| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus, VictoriaMetrics, any remote_write v1 sender | `stream-name` header, otherwise `default` |
 | Elasticsearch `_bulk` | `POST /api/v1/_bulk` | Filebeat, Logstash, Vector `elasticsearch` sink | `_index` of each action, otherwise `stream-name` header, otherwise `default` |
 | Loki push (JSON) | `POST /api/v1/loki/api/v1/push` | Senders that can POST the Loki JSON shape | `stream-name` header, otherwise `default` |
 | Kinesis Firehose, Cloudflare Logpush, Heroku | `/api/v1/_kinesis_firehose`, `/api/v1/_cloudflare`, `/api/v1/_heroku` | AWS, Cloudflare, Heroku | Configured on the connector. See [Connectors](/en-US/connectors). |
@@ -55,7 +58,7 @@ All endpoints except the push connectors require a bearer token with the `stream
 - **Request size.** A request body larger than 2 MiB is rejected with `413`. Keep batches below that size.
 - **Compression.** OTLP over HTTP does not accept compressed request bodies and answers `400`. Disable compression in the sender; the OpenTelemetry Collector `otlphttp` exporter compresses with gzip by default and needs `compression: none`. Elasticsearch `_bulk`, Loki push, and the push connectors accept `Content-Encoding: gzip`.
 - **Loki encoding.** Only the JSON request shape is decoded. Promtail and Grafana Alloy send snappy-compressed protobuf by default and cannot send to this endpoint.
-- **Rate limit.** The `router` role limits requests per organization and answers `429` with a `Retry-After` header. A `standalone` node does not apply this limit. See [Role-based deployment](/en-US/distributed-deployment#rate-limiting).
+- **Rate limit.** The `router` role limits requests per organization and answers `429` with a `Retry-After` header. A `standalone` node does not apply this limit. See [Role-based deployment](/en-US/deployment/role-based#rate-limiting).
 - **Reserved stream.** The stream name `_molesignal` is reserved for the service's own telemetry and rejects public intake.
 
 ## Streams and schema
@@ -146,7 +149,7 @@ remote_write:
       credentials: "${MS_TOKEN}"
 ```
 
-Each series becomes a row in the metrics stream named after its `__name__`. Other labels become fields. Native histograms and metric metadata are skipped, and exemplars are stored beside the samples.
+A metrics stream holds the metrics of one source, so give each Prometheus server its own stream with the `stream-name` header (`headers:` in the `remote_write` entry); without it, samples go to `default`. Each sample becomes a row whose `metric_name` is its `__name__`. Other labels become fields, and a label named like a metric field, such as `metric_name`, is kept as `exported_<name>`. Native histograms and metric metadata are skipped, and exemplars are stored beside the samples.
 
 ## Elasticsearch bulk
 
@@ -174,7 +177,7 @@ Labels become fields, the log line becomes the `message` field, and the nanoseco
 ## Related pages
 
 <CardGroup cols={2}>
-  <Card title="Integration guides" icon="plug" href="/en-US/integrations">
+  <Card title="Integration guides" icon="plug" href="/en-US/intake/integrations">
     Complete configurations for the OpenTelemetry Collector, Vector, Fluent Bit, Filebeat, Prometheus, and Kubernetes.
   </Card>
   <Card title="Pipelines" icon="code-branch" href="/en-US/pipelines">

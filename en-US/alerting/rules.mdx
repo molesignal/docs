@@ -1,0 +1,163 @@
+---
+title: "Alert rules"
+description: "Create threshold and anomaly rules in the rule workbench, test them on real data, split them by host or service, and decide how incidents recover."
+"zh-Hans_link": "/zh-Hans/alerting/rules"
+---
+
+A rule says what must not happen. MoleSignal evaluates it on an interval, and opens an
+[incident](/en-US/alerting/incidents) when the condition holds. Open **Alerts → Rules**. Reading rules
+requires `alerts.read`, and creating or changing them requires `alerts.manage`.
+
+## Rule types
+
+| Type | Evaluates | Created in |
+|---|---|---|
+| **Threshold rule** | A SQL or PromQL query, an [APM figure](/en-US/apm#alert-on-apm-figures), or a [RUM figure](/en-US/rum/alerts), against fixed thresholds, on an interval. | The rule workbench. |
+| **Anomaly detection** | A query, an APM figure, or a RUM figure against a baseline learned from its history. | The anomaly editor. |
+| **Real-time rule** | Records counted as they arrive on the intake path. | The API only. See [Real-time rules](#real-time-rules). |
+
+## The rule list
+
+**Rules** lists every rule with its data source, its trigger condition, its state, and its last
+evaluation. Search by rule, service, or source, and switch between **All**, **Enabled**, and
+**Disabled**.
+
+| State | Meaning |
+|---|---|
+| **Not evaluated** | The rule has not run yet. |
+| **Healthy** | The last evaluation did not meet the condition. |
+| **Waiting duration** | The condition holds, but not yet for the required duration. |
+| **Firing** | The rule has an open incident. |
+| **Disabled** | The rule is saved as a draft and does not run. |
+
+Select a rule, or **Edit** in its row, to open it.
+
+## Create a threshold rule
+
+Select **New rule → Threshold rule** to open the rule workbench.
+
+<Steps>
+  <Step title="Choose the rule type">
+    Choose **Metric alert**, **Log alert**, **Trace alert**, **APM alert**, or **RUM alert**. Under
+    **Quick start**, a preset fills in a typical query, such as **High error rate**, **High P95
+    latency**, **Error log spike**, or **No data**. APM and RUM alerts pick a service or an application
+    and a figure instead of a query; see [Alert on APM figures](/en-US/apm#alert-on-apm-figures) and
+    [RUM alerts](/en-US/rum/alerts).
+  </Step>
+  <Step title="Fill in the basic information">
+    The **Rule name** titles the incidents, for example `api_high_error_rate`. **Service** ties the rule
+    to a service for ownership and cross-signal context. **Description** says what the rule protects.
+  </Step>
+  <Step title="Write the query">
+    Set the **Target stream**, the **Evaluation interval** (every 1, 5, or 10 minutes), the
+    **Query language** (**PromQL** for metrics, **SQL** otherwise), and the **Query**. The query must
+    return a number: the evaluator reads the first column of the first row. Optionally fill in
+    [**Split by**](#split-a-rule-by-columns).
+  </Step>
+  <Step title="Set the trigger conditions">
+    Each row is a severity: **When result** is compared with the **Threshold** by an operator, **And
+    for** a number of minutes. **Add severity** adds another row. The highest severity that matches
+    wins, and a higher severity cannot be easier to reach than a lower one. The minutes become a number
+    of evaluations. Set [**Recovery** and **When there is no data**](#recovery-and-missing-data) below.
+  </Step>
+  <Step title="Add response guidance">
+    Under **Notify and response**, enter a **Response guide / Runbook URL**. Responders open it from the
+    incident list. Who is told is decided by the [escalation policy](/en-US/alerting/on-call#escalation-policies)
+    and the [Notify policies](/en-US/notification-channels#create-templates-and-policies), not by the rule.
+  </Step>
+  <Step title="Test the rule">
+    Select **Test rule**. The query runs on the real data of the last 6 hours, and **Query preview**
+    draws the result with the threshold line, the current value, the estimated number of triggers, the
+    rows scanned, and the latency. A split rule shows how many groups it found.
+  </Step>
+  <Step title="Save">
+    **Pre-create checks** must all be ready: a name, a successful test of the current query, valid
+    thresholds, and a valid runbook URL. Then select **Save and enable**, or **Save draft** to keep the
+    rule without running it.
+  </Step>
+</Steps>
+
+A rule created in the workbench uses the escalation policy named `default`. An organization without
+one opens incidents that escalate to nobody: create it first. See
+[The default policy](/en-US/alerting/on-call#the-default-policy).
+
+## Split a rule by columns
+
+A scheduled rule on a SQL or PromQL query can be split by columns of its result, such as the host or the service. Set **Split by** in the rule workbench, or `query.group_by` when you [create a rule](/en-US/api/alerting/create-rule#rules-split-by-columns). Each group of values then behaves as a rule of its own.
+
+| Part | Behavior |
+|---|---|
+| Group | The rows with the same values in the named columns. Names match the columns of the result without regard to case. |
+| Value | The first row of the group gives the value: its first numeric column other than the named columns and a time column. |
+| Trigger | Every group is compared with the trigger or the tiers on its own, and counts its own `for_periods`. |
+| Incident | Every group opens its own incident, with its values as labels and in the title, for example `Errors per host · web-1`. The incident resolves when the group meets the recovery condition. A group missing from the result has no value, and the rule's choice for missing data decides. |
+| Limits | Up to 8 columns and 100 groups a round. Past 100 groups the rest are not evaluated, and in that round a group missing from the result keeps its incident. |
+
+Return one row for each group, the worst first:
+
+```sql
+SELECT host, count(*) AS errors
+FROM app_logs
+WHERE level = 'error'
+GROUP BY host
+ORDER BY errors DESC
+```
+
+In PromQL the labels of a series are its columns, so `sum by (instance) (rate(http_requests_total{status=~"5.."}[5m]))` splits by `instance`. When the result has rows but no column of that name, the round fails and nothing changes. Testing a query in the rule workbench checks the columns. APM, RUM, real-time, and anomaly rules are not split.
+
+## Recovery and missing data
+
+Every rule says when an open incident recovers and what an evaluation without a value counts as. Set them under **Recovery** and **When there is no data** in the rule workbench, or as `trigger.recovery` and `trigger.no_data` when you [create a rule](/en-US/api/alerting/create-rule#recovery-and-missing-data).
+
+- **Recovery threshold:** an open incident waits for the value to cross back over this line, for example a rule that fires above 90 recovers below 80. A value that hovers around the threshold no longer fires and recovers over and over.
+- **Recovery duration:** the value has to stay on the healthy side for this long before the incident recovers.
+- **When there is no data:** the query returned no value, or a group of a split rule is missing from the result.
+
+| Choice | What happens |
+|---|---|
+| Recovered | The evaluation counts as not matching, and an open incident recovers. The default. |
+| Keep the state | Nothing changes, and the rule shows **No data**. The default for anomaly rules. |
+| Open a no-data incident | Keeps the state, and after the duration without data opens an incident marked **No data**, notified as `NO DATA · <title>`. It resolves when data returns. Resolve it by hand when the host or service is gone for good: it is not reopened before data returns. |
+| Zero | The missing value is compared as 0, which suits counts. |
+
+Real-time rules take neither setting: they resolve as soon as their count drops.
+
+## Anomaly rules
+
+An anomaly rule fires when a value leaves the band that its own history predicts, so it needs no fixed
+threshold. Select **New rule → Anomaly detection rule**.
+
+| Section | Field | Rule |
+|---|---|---|
+| Identity | **Rule name**, **Severity**, **Service** | The service is optional and gives cross-signal context. |
+| Detection query | **Data source** | **Query**, an **APM figure** of a service or an endpoint, or a **RUM figure** of an application. See [Alert on anomalies of APM figures](/en-US/apm/insights#alert-on-anomalies-of-apm-figures) and [RUM anomaly rules](/en-US/rum/alerts#anomaly-rules). |
+| | **Stream**, **Stream type**, **Query language**, **Query** | A query that returns one number, such as an average, a P95, or a count. |
+| | **Evaluation window** | 1, 5, or 15 minutes, or 1 hour. |
+| Detector | **Algorithm** | **MAD**, a robust median, or **EWMA**, which follows recent drift. |
+| | **Lookback (days)** | 1 to 30 days of history at the same time of day. 7 by default. |
+| | **Sensitivity (k·σ)** | The rule fires when the distance from the baseline exceeds k times the spread. Higher is less sensitive. 3 by default. |
+| | **Smoothing (α)** | EWMA only, in `(0, 1]`. Higher follows recent samples more. |
+| | **Trigger after (intervals)** | Consecutive anomalous evaluations before an incident opens. |
+| | **Weekly seasonality** | Compares only with the same weekday, which avoids alarms between weekdays and weekends. Needs a lookback of at least 7 days; 28 or more works best. |
+
+## Real-time rules
+
+A real-time rule runs on the intake path instead of on a timer. Every record that an intake node accepts is checked against the real-time rules of its stream, and the matches go into a sliding window of `period_secs` seconds. The rule fires as soon as the number of matches in the window meets the trigger, and an incident resolves when the count no longer meets it.
+
+| Part | Behavior |
+|---|---|
+| Statement | `SELECT count(*) FROM <stream> [WHERE <condition>]`, in SQL. The table is the `stream` of the rule. A condition compares fields with literals (`=`, `!=`, `<`, `<=`, `>`, `>=`), and uses `IN`, `BETWEEN`, `LIKE`, `ILIKE`, and `IS [NOT] NULL`, joined by `AND`, `OR`, `NOT`, and parentheses. A missing or null field never matches a comparison. |
+| Window | `period_secs` from 1 to 3600. |
+| Trigger | `operator` is `gt` or `gte`, and `for_periods` is `0` or `1`. Tiers in `thresholds` set the severity by count. |
+| Incident | The incident follows the usual lifecycle: one active incident per rule, the `silence_secs` cool-down, escalation, and notification. |
+
+[Create a rule](/en-US/api/alerting/create-rule) rejects a real-time rule outside these limits with `400`. Counting happens in memory on each intake node and starts at zero after a restart. In a role-split cluster, every intake node counts the records it receives, so size the threshold for one node.
+
+## Change, pause, or delete a rule
+
+Open a rule to change it, then **Test rule** again and save. **Save draft** keeps the rule disabled, and
+**Save and enable** turns it back on. To delete a rule, call
+[Delete a rule](/en-US/api/alerting/delete-rule). To mute the notifications of a rule for a while
+without changing it, use a [silence](/en-US/alerting/silences).
+
+The [alert rule API](/en-US/api/alerting/create-rule) creates, tests, and triggers rules from scripts.

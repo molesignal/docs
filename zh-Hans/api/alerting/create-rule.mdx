@@ -14,11 +14,11 @@ POST /api/v1/alerts/rules
 
 `alert` 角色每隔 `[alert].eval_interval_secs`（默认 30 秒）评估一次所有已启用的 `scheduled` 与 `anomaly` 规则。`real_time` 规则在接入路径上匹配，记录到达时就会开启事件。
 
-1. 评估器在 `now - period_secs` 到 `now` 的窗口内运行 `query.statement`。`sql` 语句由 SQL 引擎执行，`promql` 语句由 PromQL 引擎在 `now` 时刻作为即时查询执行。
-2. 评估器把第一行第一列读作数字。结果中没有数字时，规则不会命中。`promql` 结果的第一列是样本值 `value`，因此由第一条序列决定结果。请先把表达式聚合成一条序列，例如使用 `sum(...)`。
+1. 评估器在 `now - period_secs` 到 `now` 的窗口内运行 `query.statement`。`sql` 语句由 SQL 引擎执行，`promql` 语句由 PromQL 引擎在 `now` 时刻作为即时查询执行。APM 规则则从该窗口的 APM 聚合中读取指标，RUM 规则则从该窗口的 RUM 数据中读取，见 [APM 规则](#apm-规则)和 [RUM 规则](#rum-规则)。
+2. 评估器把第一行第一列读作数字。结果中没有数字时算作没有数据，怎么处理由 `trigger.no_data` 决定，见[恢复条件与没有数据](#恢复条件与没有数据)。`promql` 结果的第一列是样本值 `value`，因此由第一条序列决定结果。请先把表达式聚合成一条序列，例如使用 `sum(...)`，或用 `query.group_by` 按标签拆分规则，见[按列拆分的规则](#按列拆分的规则)。
 3. 数字与 `trigger` 比较。`thresholds` 数组非空时，数字改为与每一档阈值比较。
-4. 条件连续命中 `for_periods` 次评估后，开启一个事件。一条规则同一时间最多有一个活动事件。`silence_secs` 大于 0 时，从该规则上一个事件创建起，经过这么多秒之前不会再开启新事件，即使上一个事件已经解决。
-5. 条件不再命中时，评估器会解决处于 `open` 状态的事件。已确认的事件保持已确认，直到用户将其解决。
+4. 条件连续命中 `for_periods` 次评估后，开启一个事件。一条规则同一时间最多有一个活动事件；按列拆分的规则每组最多一个。`silence_secs` 大于 0 时，从该规则上一个事件创建起，经过这么多秒之前不会再开启新事件，即使上一个事件已经解决。
+5. 满足恢复条件时，评估器会解决处于 `open` 状态的事件。默认的恢复条件是条件第一次不再命中的那次评估。已确认的事件保持已确认，直到用户将其解决。
 6. 每次评估完成后，评估器把时间写入 `last_eval_at`，把结果写入 `last_state`。查询失败或超时时，这两个字段保持不变。
 
 对 `scheduled` 与 `anomaly` 规则，调用不会检查数据流或语句是否有效。启用规则前，先运行[测试规则](/zh-Hans/api/alerting/test-rule)。`real_time` 规则在保存时按下面的限制检查。
@@ -30,7 +30,7 @@ POST /api/v1/alerts/rules
 | `name` | string | 是 | 不能为空。名称会成为事件摘要。 |
 | `description` | string | 否 | 默认为空。 |
 | `enabled` | boolean | 否 | 默认 `true`。评估器跳过已停用的规则，测试与手动触发调用仍然可用。 |
-| `kind` | string | 否 | `scheduled`（默认）、`real_time` 或 `anomaly`。`real_time` 规则在接入路径上匹配，参见[实时规则](/zh-Hans/alerting#实时规则)。 |
+| `kind` | string | 否 | `scheduled`（默认）、`real_time` 或 `anomaly`。`real_time` 规则在接入路径上匹配，参见[实时规则](/zh-Hans/alerting/rules#实时规则)。 |
 | `query` | object | 是 | 语句及其窗口，见下文。 |
 | `trigger` | object | 是 | 触发条件，见下文。 |
 | `thresholds` | array | 否 | `scheduled` 与 `real_time` 规则的严重程度分档。数组非空时，分档取代 `trigger` 的条件。`anomaly` 规则忽略分档。 |
@@ -45,9 +45,12 @@ POST /api/v1/alerts/rules
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `language` | string | 是 | `sql` 或 `promql`。语言决定由哪个引擎评估语句。`promql` 语句的时间窗口来自范围选择器，例如 `[5m]`，`period_secs` 只决定查询窗口。 |
-| `statement` | string | 是 | 不能为空。第一行第一列是被评估的值。`real_time` 规则使用 `SELECT count(*) FROM <stream> [WHERE <condition>]`。 |
+| `statement` | string | 是 | 不能为空（APM 和 RUM 规则除外）。第一行第一列是被评估的值。`real_time` 规则使用 `SELECT count(*) FROM <stream> [WHERE <condition>]`。 |
 | `period_secs` | integer | 是 | 窗口长度，单位为秒。`real_time` 规则取 1 到 3600，并统计该窗口内匹配的记录数。 |
-| `stream` | object | 是 | `{ "name": "app", "stream_type": "logs" }`，即语句的主数据流。 |
+| `stream` | object | 是（APM 和 RUM 规则除外） | `{ "name": "app", "stream_type": "logs" }`，即语句的主数据流。 |
+| `apm` | object | APM 规则必填 | 规则代替语句监控的 APM 指标，见 [APM 规则](#apm-规则)。 |
+| `rum` | object | RUM 规则必填 | 规则代替语句监控的 RUM 指标，见 [RUM 规则](#rum-规则)。 |
+| `group_by` | array | 否 | 按结果里的这些列拆分 `scheduled` 规则，例如 `["host"]`。最多 8 个名字，每个 1 到 128 个字符，不能重复。见[按列拆分的规则](#按列拆分的规则)。 |
 
 第一行中名为 `service`、`host` 和 `trace_id` 的列会丰富事件：新增 `service` 与 `host` 标签，并填充 `affected_services`、`host_ids` 与 `trace_ids`。
 
@@ -59,6 +62,8 @@ POST /api/v1/alerts/rules
 | `threshold` | number | 是 | 用于比较的值。 |
 | `for_periods` | integer | 是 | 开启事件前必须连续命中的评估次数。`0` 与 `1` 效果相同。`real_time` 规则取 `0` 或 `1`。 |
 | `silence_secs` | integer | 是 | 冷却时间，单位为秒。事件开启后，这条规则在这段时间内不会开启新事件，即使事件更早被解决。`0` 表示不设冷却。[手动触发](/zh-Hans/api/alerting/trigger-rule)不受它限制。 |
+| `recovery` | object | 否 | 开着的事件什么时候恢复，见[恢复条件与没有数据](#恢复条件与没有数据)。 |
+| `no_data` | object | 否 | 一次评估没有值时算作什么，见[恢复条件与没有数据](#恢复条件与没有数据)。 |
 
 `anomaly` 规则忽略 `operator` 与 `threshold`，仍使用 `for_periods`。带有 `thresholds` 的规则会忽略 `trigger` 的 `operator`、`threshold` 与 `for_periods`，但该对象仍是必填项。
 
@@ -77,6 +82,82 @@ POST /api/v1/alerts/rules
 | `k` | number | 是 | 偏离倍数，必须为正数。 |
 | `alpha` | number | 否 | `ewma` 的平滑系数，大于 0 且不超过 1，默认 `0.3`。 |
 | `weekly_seasonality` | boolean | 否 | 默认 `false`。只对比同一星期几，要求 `lookback_days` 不小于 7。 |
+
+## 恢复条件与没有数据
+
+`trigger.recovery` 让事件等数值明确回落后才恢复。否则数值在阈值附近来回时，会反复触发、反复恢复。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `recovery.threshold` | number | 开着的事件要等值越过这条线、回到健康的一侧才恢复，例如高于 `90` 触发的规则设 `80`。它要在每一档阈值健康的一侧：高于阈值触发时不能比阈值高，低于阈值触发时不能比阈值低，而且各档要朝同一个方向。`anomaly` 规则不能设。不设时，值不再满足阈值就恢复。 |
+| `recovery.for_periods` | integer | 连续多少次评估在健康的一侧才恢复。`0` 与 `1` 都是一次。最多 1440。 |
+
+`trigger.no_data` 决定一次评估没有值时算作什么：查询没有返回行或数字，或者[按列拆分的规则](#按列拆分的规则)里某一组不在结果里。
+
+| `no_data.action` | 没有值的一次评估怎么算 |
+|---|---|
+| `resolve` | 算作不命中：开着的事件按恢复条件恢复。`scheduled` 规则的默认值。 |
+| `keep` | 什么都不变：不累计命中，也不累计恢复，`last_state` 为 `no_data`。`anomaly` 规则的默认值。 |
+| `alert` | 与 `keep` 相同，另外连续 `no_data.for_periods` 次评估没有值时开一个无数据事件。有值的第一次评估会把它解决。 |
+| `zero` | 把缺的值当作 `0` 比较。适合计数：没有序列、没有行就是什么都没发生。 |
+
+无数据事件有自己的指纹，可以和阈值开的事件同时开着。它带标签 `alert.condition` = `no_data`，摘要与规则或这一组的事件相同，通知标题写作 `NO DATA · <摘要>`。严重程度取规则的 `severity`，没有时取 `severity` 标签，再没有是 `warning`。`silence_secs` 对它同样生效。值仍然缺着时有人解决了它，数据回来之前不会再开；按列拆分的规则里这一组也不再跟着。`real_time` 规则不能设 `recovery` 和 `no_data`。
+
+## 按列拆分的规则
+
+带 `query.group_by` 的 `scheduled` 规则对结果里的每一组分别评估。一组是这些列取值相同的行，列名与结果的列名匹配时不区分大小写。APM、RUM、`real_time` 或 `anomaly` 规则带 `group_by` 时返回 `400`。
+
+1. `sql` 语句以 101 行为上限运行，`promql` 语句返回全部序列。每组返回一行，最严重的排在前面。
+2. 组内第一行给出值：除这些列以及 `_timestamp`、`ts`、`time`、`timestamp` 以外的第一个数值列。
+3. 值与 `trigger` 或 `thresholds` 比较，每组各自累计 `for_periods`。
+4. 触发的组开自己的事件。事件以这一组的取值为标签，摘要是规则名加上这些取值，例如 `Errors per host · web-1`。`silence_secs` 对每组分别生效。
+5. 满足恢复条件的组，其 `open` 事件被解决。之前出现过、这次不在结果里的组，这次评估没有值，怎么处理由 `trigger.no_data` 决定。
+6. 有组在触发时 `last_state` 为 `firing`，有组没有值且保持原状态时为 `no_data`，有组命中时为 `pending`，否则为 `healthy`。
+
+每轮最多读取 100 组。结果组数更多时，其余的组不评估，结果里没有的组这一轮也保留它的事件。结果有行却缺少 `group_by` 里某个名字的列时，这一轮评估失败，什么都不改变。[测试规则](/zh-Hans/api/alerting/test-rule)会列出每一组。
+
+## APM 规则
+
+带 `query.apm` 的规则监控某个 APM 服务或其端点的指标，读取的是 APM 页面使用的同一份聚合。APM 规则必须是 `scheduled`。调用会把 `query.stream` 存为 `null`；`query.statement` 为空时，会填入 `apm:p95 checkout POST /orders` 这样的描述。`query.language` 按原样保存，不起作用。
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `service` | string | 是 | 服务名，最多 255 字节。 |
+| `namespace` | string | 否 | 服务的命名空间。缺省时包含该服务名的所有命名空间。 |
+| `environment` | string | 否 | 缺省时包含服务的所有环境。 |
+| `transaction` | object | 否 | 某个端点：`{ "name": "POST /orders", "kind": "http" }`。`kind` 取 `http`、`rpc`、`messaging`、`span` 或 `other`。缺省时为整个服务。 |
+| `metric` | string | 是 | 指标，见下表。 |
+| `slo_id` | string | `slo_burn_rate` 必填 | 要读取燃烧率的 SLO。其他指标不接受 `slo_id`。 |
+| `short_window_secs` | integer | 否 | 仅用于 `slo_burn_rate`，且必须短于 `period_secs`。此时取整个周期与其最后 `short_window_secs` 两段燃烧率中较低的一个，因此两段都要超过阈值。 |
+
+| `metric` | 取值 |
+|---|---|
+| `error_rate` | 失败请求占全部请求的百分比，0 到 100。 |
+| `p50`、`p90`、`p95`、`p99`、`average` | 延迟，单位为毫秒。 |
+| `throughput` | 窗口内的每秒请求数。 |
+| `request_count`、`error_count` | 窗口内的请求数或失败请求数。 |
+| `new_error_groups` | 窗口内首次出现的服务（或 `transaction` 端点）错误组数。 |
+| `apdex` | 阈值为 500 毫秒的 Apdex，0 到 1。 |
+| `slo_burn_rate` | SLO 消耗错误预算的速度，是目标允许速度的多少倍。为 `1` 时，预算恰好用满 SLO 窗口。 |
+
+24 小时以内的窗口读取分钟级聚合，更长的窗口读取小时级聚合。窗口内没有请求时，`request_count`、`error_count`、`new_error_groups` 和 `throughput` 读数为 `0`，其他指标没有读数，因此不会命中阈值。结果的列为 `value`、`service` 和 `trace_id`，因此事件会带上 `service` 标签、`affected_services` 中的服务，以及一个样本 trace ID。
+
+## RUM 规则
+
+带 `query.rum` 的规则监控某个 RUM 应用的指标，读取方式与 RUM 页面相同。RUM 规则是 `scheduled` 或 `anomaly`，一条规则监控 APM 指标或 RUM 指标，不能两者兼有。调用会把 `query.stream` 存为 `null`；`query.statement` 为空时，会填入 `rum:lcp_p75 checkout-web /checkout` 这样的描述。`query.language` 按原样保存，不起作用。应用必须存在，否则调用返回 `400`。
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `application_id` | string | 是 | [RUM 应用](/zh-Hans/rum/applications)。 |
+| `environment` | string | 否 | 缺省时包含应用的所有环境。 |
+| `page` | string | 否 | 某个页面，App 里是某个屏幕。缺省时为所有页面。会话类和 issue 类指标不接受。 |
+| `version` | string | 否 | 应用的某个版本。缺省时为所有版本。issue 类指标不接受。 |
+| `metric` | string | 是 | 指标，见下文。 |
+| `min_samples` | integer | 否 | 窗口里指标所用的行数至少有多少，指标才有值。缺省时取指标自己的默认值。计数不接受。 |
+
+`metric` 取 `session_count`、`view_count`、`error_count`、`error_rate`、`crash_free_sessions`、`frustration_rate`、`failed_request_rate`、`lcp_p75`、`inp_p75`、`cls_p75`、`ttfb_p75`、`new_issues` 和 `regressed_issues` 之一。每项指标的含义、单位和所需行数见 [RUM 告警](/zh-Hans/rum/alerts#指标)。`anomaly` 规则可以用除 `new_issues` 和 `regressed_issues` 之外的全部指标。`period_secs` 取 60 秒到 6 小时。
+
+窗口内没有行时，计数读数为 `0`，其他指标没有读数，因此不会命中阈值。结果只有一行，列为 `value` 和 `application`。事件开启时，规则还会找出最多三个样本会话，与事件一起保存，见 [RUM 告警](/zh-Hans/rum/alerts#事件)。
 
 <RequestExample>
 ```bash cURL
@@ -99,6 +180,57 @@ curl -X POST http://localhost:5080/api/v1/alerts/rules \
   "severity": "critical",
   "escalation_policy_id": "<policy-id>",
   "labels": { "team": "checkout" }
+}
+EOF
+```
+```bash APM 规则
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "Checkout p95",
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "",
+    "period_secs": 300,
+    "apm": {
+      "namespace": "shop",
+      "service": "checkout",
+      "environment": "production",
+      "transaction": { "name": "POST /orders", "kind": "http" },
+      "metric": "p95"
+    }
+  },
+  "trigger": { "operator": "gt", "threshold": 800, "for_periods": 2, "silence_secs": 0 },
+  "severity": "error",
+  "labels": { "service.name": "checkout", "deployment.environment": "production" }
+}
+EOF
+```
+```bash RUM 规则
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_JWT" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "Checkout is slow",
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "",
+    "period_secs": 3600,
+    "rum": {
+      "application_id": "checkout-web",
+      "environment": "production",
+      "page": "/checkout",
+      "metric": "lcp_p75"
+    }
+  },
+  "trigger": { "operator": "gt", "threshold": 2500, "for_periods": 1, "silence_secs": 0 },
+  "severity": "warning",
+  "labels": { "rum.application": "checkout-web", "deployment.environment": "production", "rum.page": "/checkout" }
 }
 EOF
 ```
@@ -138,7 +270,7 @@ EOF
 
 | 状态码 | 原因 |
 |---|---|
-| `400` | `name` 或 `query.statement` 为空，缺少 `query.stream`，`escalation_policy_id` 不属于该组织的任何策略，`anomaly` 规则的 `anomaly_params` 缺失或无效，或者 `real_time` 规则超出上述限制。响应为 JSON，错误码为 `invalid_argument`，消息例如 `anomaly detector not yet supported: prophet`。 |
+| `400` | `name` 或 `query.statement` 为空，缺少 `query.stream`，APM 规则不是 `scheduled` 或其 `query.apm` 无效（`APM alert service is invalid`、`an SLO burn-rate alert names its SLO`），RUM 规则是 `real_time`、指明的应用不存在，或其 `query.rum` 无效（指标不能收窄到的 `page` 或 `version`、计数上的 `min_samples`、超出 60 到 21,600 秒的窗口），`escalation_policy_id` 不属于该组织的任何策略，`anomaly` 规则的 `anomaly_params` 缺失或无效，或者 `real_time` 规则超出上述限制。响应为 JSON，错误码为 `invalid_argument`，消息例如 `anomaly detector not yet supported: prophet`。 |
 | `403` | Token 缺少 `alerts.manage`。 |
 | `422` | 必填字段缺失或取值类型错误，例如未知的 `operator`。响应为纯文本。 |
 

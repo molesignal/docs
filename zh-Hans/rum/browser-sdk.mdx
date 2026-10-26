@@ -1,50 +1,39 @@
 ---
 title: "Browser RUM SDK"
 sidebarTitle: "Browser SDK"
-description: "安装和配置 MoleSignal Browser RUM SDK，识别用户、添加自定义事件并验证数据接入。"
+description: "安装并配置 MoleSignal Browser RUM SDK，识别用户、添加自定义事件，并验证第一个会话。"
 "en_link": "/en-US/rum/browser-sdk"
 ---
 
-MoleSignal Browser RUM SDK 会采集浏览器会话、页面访问、用户交互、前端错误、Web Vitals、
-网络资源以及用于关联链路的上下文。
+MoleSignal Browser RUM SDK 采集页面视图、用户交互、前端错误、Web Vitals、网络资源、长任务和链路关联上下文，并以 [RUM 事件](/zh-Hans/rum/events)的形式发送。
 
-## 准备工作
-
-接入前提：
+## 前提条件
 
 - MoleSignal 部署地址；
-- 稳定的应用标识，例如 `checkout-web`；
-- 与应用绑定的 RUM Client Token，创建方式见下文。
+- 一个 [RUM 应用](/zh-Hans/rum/applications)，例如 `checkout-web`；
+- 该应用的 Client Token。
 
 <Warning>
-  `clientToken` 会包含在浏览器代码中，所有用户都能看到。不要使用所有者、管理员或个人 Token。
-  请使用与应用绑定的 `msrum_` Client Token。
+  `clientToken` 会包含在浏览器代码中，用户可以看到。请勿使用所有者、管理员或个人 Token，只使用与应用绑定的 `msrum_` Client Token。
 </Warning>
 
-## 创建 Client Token
+## 获取应用及其 Token
 
-打开 **数据源**，选择 **Web RUM**，输入应用标识。MoleSignal 会为该应用创建 `msrum_` Client Token，并填入配置片段中。也可以通过 API 获取同一个 Token：
+打开 **用户体验 → 应用**，点击 **创建应用**，选择 **浏览器** 平台。应用会打开并显示它的 Client Token。**打开接入向导** 会给出端点、Token，以及填好标识符的示例。**数据源** 中的 **Web RUM** 是同一个向导。也可以通过 [API](/zh-Hans/api/auth/rum-token) 获取 Token。
 
-```bash
-curl "http://localhost:5080/api/v1/auth/tokens/rum?application_id=checkout-web" \
-  -H "authorization: Bearer $MS_JWT"
-```
-
-应用已有 Token 时，该调用会返回现有的 Token。应用标识由 1 到 128 个字符组成，可使用 `A-Z`、`a-z`、`0-9`、`.`、`_`、`:` 与 `-`。该 Token 只授予针对该应用的 `rum.write` 权限。
-
-## 安装与初始化
+## 安装并初始化
 
 <Steps>
-  <Step title="安装依赖">
+  <Step title="安装包">
     ```bash
     npm install @molesignal/browser-rum
     ```
   </Step>
   <Step title="只初始化一次 SDK">
     ```ts
-    import { initRum } from '@molesignal/browser-rum';
+    import { init } from '@molesignal/browser-rum';
 
-    const rum = initRum({
+    const rum = init({
       applicationId: 'checkout-web',
       clientToken: 'msrum_your_client_token',
       site: 'https://molesignal.example.com',
@@ -56,23 +45,58 @@ curl "http://localhost:5080/api/v1/auth/tokens/rum?application_id=checkout-web" 
     });
     ```
 
-    如果需要采集首次页面访问，请在应用路由器挂载前初始化 SDK。服务端渲染期间可以安全地导入并初始化；
-    只有浏览器 API 可用时，浏览器监测才会启动。
+    `init` 返回客户端。`initRum` 是同一个函数的早期名称，`molesignalRum` 是同一套 API 的单例形式：`molesignalRum.init(...)`、`molesignalRum.setUser(...)`。在 `init` 之前对 `molesignalRum` 的调用会被保留，并在 `init` 时重放。
+
+    请在应用路由挂载之前初始化 SDK，以捕获第一个页面视图。在服务端渲染期间导入并初始化该包是安全的：只有存在浏览器 API 时才会启动浏览器端的采集。
   </Step>
   <Step title="验证第一个会话">
-    打开 **用户体验 → 概览**，选择包含当前时间的时间范围，确认应用已经出现，然后进入 **会话** 检查第一个会话。
+    打开 **用户体验 → 探索**，选择包含当前时间的时间范围，确认会话已出现，并打开它查看视图、请求和错误。
   </Step>
 </Steps>
 
-`site` 可以是 MoleSignal Origin、`/api` 基础地址或 `/api/v1` 基础地址。SDK 会自动规范化地址，
-并将数据发送到 `/api/v1/rum` 下的 RUM 接口。
+`site` 可以是 MoleSignal 的源地址，也可以以 `/api`、`/api/v1` 或 `/api/v1/rum` 结尾。SDK 把事件发送到 `POST /api/v1/rum/events`，把回放分段发送到 `POST /api/v1/rum/replay`。`applicationId` 会作为 `application.id` 发送，事件的 `application.id` 不是 Token 所绑定的应用时，MoleSignal 会拒绝该事件。
+
+## 通过 script 标签加载
+
+`dist/molesignal-rum.js` 是自包含的包，内含 rrweb 和 web-vitals，定义全局变量 `MoleSignalRum`。用下面的代码异步加载，传给 `onReady` 的回调会等到脚本加载完成后执行：
+
+```html
+<script>
+  (function (w, d, s, u, n) {
+    w[n] = w[n] || { q: [], onReady: function (callback) { w[n].q.push(callback); } };
+    var script = d.createElement(s);
+    script.async = 1;
+    script.src = u;
+    d.head.appendChild(script);
+  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.2.0-alpha.1/dist/molesignal-rum.js', 'MoleSignalRum');
+
+  MoleSignalRum.onReady(function () {
+    MoleSignalRum.init({
+      applicationId: 'checkout-web',
+      clientToken: 'msrum_your_client_token',
+      site: 'https://molesignal.example.com',
+      service: 'web-frontend',
+      env: 'production',
+      version: 'v1.4.0',
+    });
+  });
+</script>
+```
+
+若要同步加载，请用 `<script src>` 标签引入该文件，随后调用 `MoleSignalRum.init(...)`。
+
+## 视图与会话
+
+视图是一次页面浏览或一个路由。SDK 在视图开始时立即上报；视图中有变化时再次上报，`view.revision` 递增（最多每三秒一次）；视图打开期间每五分钟上报一次；视图结束时最后上报一次——路由切换、会话结束、页面被隐藏或卸载时都会结束视图。路由切换通过 History API 和 `popstate` 检测。设置 `trackViewsManually: true` 并调用 `startView`，可以自行命名视图并决定视图从哪里开始。
+
+SDK 不发送会话事件：MoleSignal 从视图派生会话。会话保存在 Cookie `_msrum_s_<applicationId>` 中，因此应用的所有标签页共享它。会话在 15 分钟无活动或满四小时后结束，下一次用户活动会开始新的会话。每个会话只采样一次，见[数据采样](/zh-Hans/rum/sampling)。设置 `trackSessionAcrossSubdomains: true` 或 `sessionCookieDomain: '.example.com'` 可以在子域名之间共享会话。`stopSession()` 会结束所有标签页的会话。没有 Cookie 时，会话只存在于内存中，每个页面各自一份。
 
 ## 识别用户并添加上下文
 
-尽量在初始化时提供用户信息，让第一个会话就带有正确身份。
+尽可能在初始化时提供用户，这样第一个会话就带有正确的身份。
 
 ```ts
-const rum = initRum({
+const rum = init({
   applicationId: 'checkout-web',
   clientToken: 'msrum_your_client_token',
   site: 'https://molesignal.example.com',
@@ -80,20 +104,28 @@ const rum = initRum({
   globalContext: { region: 'eu-west-1' },
 });
 
-rum.setUser({ id: 'user-42', plan: 'enterprise' });
-rum.setGlobalContextProperty('feature_flags', ['new-checkout']);
+rum.setUser({ id: 'user-42', name: 'Ada', email: 'ada@example.com' });
+rum.setUserProperty('plan', 'enterprise');
+rum.setAccount({ id: 'acme' });
+rum.setGlobalContextProperty('checkout_step', 'payment');
 ```
 
-如果未提供用户，SDK 会在 `localStorage` 中创建稳定的匿名标识。如果隐私政策不允许持久化匿名身份，
-请设置 `trackAnonymousUser: false`。
+`setUser` 至少需要 `id`、`name` 和 `email` 之一，其他键会作为属性保留。没有设置用户时，SDK 会在 `localStorage` 中创建稳定的匿名标识。隐私政策不允许持久的匿名身份时，请设置 `trackAnonymousUser: false`。用 setter 设置的上下文会加到之后的每个事件上；全局上下文、视图上下文和调用时传入的上下文会合并，后者优先。
 
-## 添加自定义操作、错误和页面访问
+## 跟踪同意
 
 ```ts
-rum.addAction('Checkout submitted', {
-  cart_size: 3,
-  payment_method: 'card',
-});
+const rum = init({ /* … */ trackingConsent: 'not-granted' });
+
+rum.setTrackingConsent('granted');
+```
+
+在未获得同意期间，SDK 不创建 Cookie、匿名标识或标签页标识，不安装任何采集，也不发送任何数据。撤销同意会停止采集，并清除 SDK 的标识及其持久队列。
+
+## 添加自定义操作、错误、耗时和指标
+
+```ts
+rum.addAction('Checkout submitted', { cart_size: 3 });
 
 try {
   await submitOrder();
@@ -101,31 +133,43 @@ try {
   rum.addError(error, { component: 'CheckoutForm' });
 }
 
-// trackViewsManually 为 true 时使用。
-rum.startView('Order confirmation');
+// 视图：配合 trackViewsManually 使用，或用来为路由命名。
+rum.startView({ name: 'Order confirmation', context: { step: 3 } });
+rum.setViewName('Order confirmation (3DS)');
+
+// 自定义耗时和 Feature Flag 属于当前视图。
+rum.addTiming('cart_ready');
+rum.addFeatureFlagEvaluation('new_checkout', true);
+
+// 时长。
+const vital = rum.startDurationVital('checkout_form_ready', { description: 'form is usable' });
+rum.stopDurationVital(vital);
+
+await rum.flush();
 ```
 
-在受控跳转或关闭前，如果需要等待队列中的事件发送完成，请调用 `rum.flush()`。
-调用 `rum.stop()` 会移除监测并刷新客户端队列。
+在受控的导航或关闭之前调用 `rum.flush()`，等待队列中的事件发送完成。调用 `rum.stop()` 会移除采集并刷新客户端。
 
-## 自动采集默认值
+## 自动采集的默认值
 
-| 数据 | 配置项 | 默认值 |
+| 数据 | 选项 | 默认值 |
 |---|---|---|
-| 页面访问 | `trackViewsManually` | 自动跟踪 History API（`false`） |
+| 页面视图 | `trackViewsManually` | 通过 History API 自动跟踪（`false`） |
 | Fetch、XHR 和资源耗时 | `trackResources` | `true` |
-| Long Task | `trackLongTasks` | `true` |
-| Web Vitals | `trackWebVitals` | `true` |
-| 点击和表单提交 | `trackUserInteractions` | `false` |
-| 愤怒点击和无效点击 | `trackFrustrations` | 与交互跟踪保持一致 |
-| 运行时错误 | 内置 | 已启用 |
+| 长动画帧与长任务 | `trackLongTasks` | `true` |
+| 视图上的 Web Vitals | `trackWebVitals` | `true` |
+| 点击 | `trackUserInteractions` | `false` |
+| Rage、Dead 和 Error 点击 | `trackFrustrations` | 与交互跟踪一致 |
+| 运行时错误、未处理的 rejection、失败的请求 | 内置 | 启用 |
 | `console.error` | `trackConsoleErrors` | `false` |
+| 从后退/前进缓存恢复页面 | `trackBfcacheViews` | `false` |
 | DOM 会话回放 | `sessionReplaySampleRate` | `0` |
 
-## 将浏览器请求关联到链路
+点击进行期间开始的资源、错误和长任务会带上它的 `action.id`，并计入这次点击。失败的请求是来源为 `network` 的错误，失败的请求写在 `error.resource` 中。FCP、LCP 和 FID 描述页面加载，在初始视图上报。INP 和 CLS 来自 `web-vitals`，它们每次页面加载只度量一次：SDK 把每个指标记在决定性的交互或布局偏移发生的那个视图上。
 
-Fetch 和 XMLHttpRequest 集成会从传出请求、响应或名为 `traceparent` 的 `Server-Timing` 条目中读取
-W3C `traceparent`。对于跨域 API，请显式放行来源并暴露响应头：
+## 把浏览器请求关联到链路
+
+对允许跟踪的 URL，fetch 和 XMLHttpRequest 集成会保留已有的 W3C `traceparent` 或注入新的，然后从请求、响应或名为 `traceparent` 的 `Server-Timing` 条目中读取 trace 上下文。trace ID 和 span ID 写入 `resource.trace_id` 和 `resource.span_id`，MoleSignal 据此把浏览器请求与后端链路关联起来。默认只对同源请求注入和读取 trace 上下文。对于跨域 API，请暴露响应头并显式允许该源：
 
 ```http
 Access-Control-Expose-Headers: traceparent, server-timing
@@ -138,6 +182,50 @@ allowedTracingUrls: [
 ]
 ```
 
+## 配置
+
+| 选项 | 默认值 | 用途 |
+|---|---|---|
+| `applicationId` | 必填 | 应用的标识符，作为 `application.id` 发送 |
+| `clientToken` | 必填 | 与应用绑定的 `msrum_` Client Token |
+| `site` | 必填 | MoleSignal 源地址，或 `/api`、`/api/v1`、`/api/v1/rum` 地址 |
+| `service` | `applicationId` | 事件的 `service` |
+| `env`、`version` | 未设置 | 部署维度。查找 Source Map 需要 `version` |
+| `debugId` | 未设置 | 构建的 debug ID，作为 `debug_id` 写在错误帧上 |
+| `user`、`account`、`globalContext` | 未设置 | 初始的身份和自定义属性 |
+| `trackingConsent` | `granted` | 开始或推迟全部采集和标识的创建 |
+| `sessionSampleRate` | `100` | 采集的会话百分比 |
+| `sessionReplaySampleRate` | `0` | 已采集会话中录制回放的百分比 |
+| `sessionInactivityTimeout` | `900000` | 会话因空闲而结束的时间，单位为毫秒 |
+| `maxSessionDuration` | `14400000` | 会话持续的最长时间，单位为毫秒 |
+| `defaultPrivacyLevel` | `mask` | `mask` 或 `allow`：操作名称、选择器和元素提示是否带有页面文本和 ID |
+| `trackUrlQueryString` | `false` | 在上报的 URL 中保留查询字符串 |
+| `excludedUrls` | `[]` | 以字符串、RegExp 或回调形式排除请求的 URL |
+| `allowedTracingUrls` | 同源 | 接收并贡献 trace 上下文的请求 |
+| `enablePersistentQueue` | `true` | 重新加载后从 IndexedDB 恢复未发送的遥测 |
+| `flushInterval`、`batchSize` | `5000`、`50` | 请求发送的时机和每个请求的事件数。批次上限为 100 |
+| `maxQueueSize` | `1000` | 离线时保留的事件数 |
+| `beforeSend` | 未设置 | 检查、修改或丢弃事件 |
+| `onError` | 未设置 | 接收 SDK 的诊断信息：上传失败、被拒绝的事件 |
+| `transport` | 浏览器 fetch | 通过自己的代理发送 |
+
+`beforeSend(event, { kind })` 接收[事件格式](/zh-Hans/rum/events)中的事件对象。返回 `false` 会丢弃该事件；`view` 事件不能丢弃，否则它的计数就对不上了。
+
+## 发送
+
+事件会入队、分批发送，并保存在 IndexedDB 中，直到服务端接受。网络错误、`408`、`425`、`429` 或 `5xx` 之后，请求会以指数退避重试，并遵守 `Retry-After`。被 MoleSignal **拒绝**的事件不会重试，而是通过 `onError` 报告。其他 `4xx` 会丢弃整个批次。队列已满时，先丢资源，然后是长任务、回放、指标、操作、错误，最后才是视图。页面离开时，最重要的事件会先通过一个 `keepalive` 请求发送。同一应用的多个标签页共用队列，不会重复发送彼此的事件。
+
+## 从 0.1 升级
+
+0.2 版把 SDK 迁移到 RUM 事件格式，没有兼容模式。
+
+- 事件只发送到 `POST /api/v1/rum/events`，会话、操作和错误的端点已经没有了。自定义 `transport` 收到的是 `kind: 'events' | 'replay'`。
+- SDK 发送视图，不再发送会话。资源、长任务和页面视图是各自独立的事件，Rage 和 Dead 点击是点击上的 `action.frustration.type`。
+- `beforeSend` 收到的是事件格式的事件对象，`context.kind` 是事件类型。
+- 会话保存在标签页共享的 Cookie 中，默认空闲超时为 15 分钟。
+- 浏览器、操作系统和设备由服务端从 `User-Agent` 解析。
+- 请先创建应用。只有存在的应用才会签发 Token。
+
 ## 后续步骤
 
 <CardGroup cols={2}>
@@ -145,12 +233,12 @@ allowedTracingUrls: [
     分别控制会话和回放数据量。
   </Card>
   <Card title="隐私" icon="shield" href="/zh-Hans/rum/privacy">
-    在用户设备上拦截敏感数据。
+    让敏感值留在用户设备上。
   </Card>
   <Card title="会话回放" icon="video" href="/zh-Hans/rum/session-replay">
-    安全地记录和回放 DOM 变化。
+    安全地记录并回放 DOM 变化。
   </Card>
   <Card title="Source Maps 与 Symbols" icon="file-code" href="/zh-Hans/rum/source-maps">
-    还原压缩后的 Browser 堆栈，并查看统一调试产物流程。
+    还原压缩后的浏览器堆栈，并了解统一的调试产物流程。
   </Card>
 </CardGroup>

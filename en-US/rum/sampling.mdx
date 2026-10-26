@@ -1,17 +1,17 @@
 ---
 title: "RUM data sampling"
 sidebarTitle: "Data sampling"
-description: "Control Browser RUM session and replay volume with independent sampling rates and bounded client queues."
+description: "Control RUM session and replay volume with sampling rates in the SDK, retention filters at the server, and bounded client queues."
 "zh-Hans_link": "/zh-Hans/rum/sampling"
 ---
 
 The Browser RUM SDK makes a sampling decision during session creation. The decision remains stable
-for that browser-tab session.
+for that session, in every tab of the application.
 
 ## Configure sampling rates
 
 ```ts
-const rum = initRum({
+const rum = init({
   applicationId: 'checkout-web',
   clientToken: 'msrum_your_client_token',
   site: 'https://molesignal.example.com',
@@ -33,6 +33,85 @@ sessions report RUM data and approximately 5% of all sessions record replay (`25
   cannot promote a session excluded by `sessionSampleRate`.
 </Note>
 
+## Keep a share of sessions at the server
+
+An application can keep a share of the sessions it receives, on top of what the SDK samples, whatever client sent them. Open the
+application in **RUM → Applications** and find **Sessions kept**. **Share of sessions kept (%)** is from `0` to `100`; the default is
+`100`, which keeps every session.
+
+A session is kept or dropped as a whole. The server decides by a hash of the session id, so every event and every replay
+segment of a session meets the same fate on any node, and a session that is kept has all that it did. The sessions that are
+dropped leave nothing behind: no event, no row of `rum_sessions`, and no replay, but for their errors (see
+[Keep every error](#keep-every-error)).
+
+The share is of the sessions the SDK reported. With `sessionSampleRate: 50` in the SDK and **Share of sessions kept** at `20`, about
+10% of all sessions are stored. A value of `0` stores nothing, which suits an application that is paused without
+changing its SDKs. The answer of the [intake](/en-US/rum/events#the-answer) says how many events were left out as `sampled`, and an
+SDK that reads it sees that the data is not lost. A replay segment of a session that is not kept answers `200` with `sampled: true`.
+
+A change applies to the events that arrive after it. Sessions already stored stay, and a session that began before the change
+is kept or dropped by the new share from then on.
+
+### Filters
+
+A filter gives a share of its own to the sessions it describes: every session of production, say, and a tenth of the rest. Add
+filters under **Sessions kept**. A filter has a name, a share from `0` to `100`, and up to 5 conditions, all of which a session has
+to meet. A filter without a condition describes every session.
+
+A condition looks at one fact of a session and compares it with a list of values: the session **is** one of them, or **is not** any
+of them (a session with no value for the fact is not any of them). Values are not case-sensitive, and `*` stands for any text,
+so `2.*` is every version of 2. A condition lists up to 20 values, and an application has up to 10 filters.
+
+| Fact | Field |
+|---|---|
+| Environment | `env` |
+| Service | `service` |
+| Version | `version` |
+| Platform of the SDK | `source` |
+| Kind of session | `session.type` |
+| Country | `geo.country_iso_code` |
+| Browser | `browser.name` |
+| System | `os.name` |
+| Kind of device | `device.type` |
+
+The filters are asked in the order they are listed, and **the first one that describes a session decides its share**, so a more
+particular filter goes above a wider one. The sessions no filter describes are kept by the share under the filters, **Share of the
+other sessions kept (%)**. Without filters, that is the one share of the application.
+
+<Note>
+  A session has to meet the same fate in every event, so a condition can only look at facts that stay the same while a session lasts.
+  What a person does during a session, and who they are when the SDK only learns it later (a user id set after sign-in), cannot
+  decide whether the session is kept. Errors are kept by a switch of their own, below.
+</Note>
+
+A replay segment is judged by what it says of its session: the browser and the place it came from, and the `env`, `service` and
+`version` that the browser and Flutter SDKs send in the body of the request (an SDK leaves out the `env` or `version` it was not
+given). When the segment leaves a fact open, it is kept if any filter that might describe the session would keep it.
+
+### Keep every error
+
+The errors of the sessions that are not kept are stored all the same, unless **Keep every error** is turned off. That keeps a rare error
+from being lost with its session: it is an issue, and counted with the others. Such an error is a row of `rum_errors` alone. Its
+session has no row, no views and no replay, so the page of the issue says *Session not kept* where it would link to the session.
+
+### Totals are estimates
+
+Every row says the share of such rows that was kept in `retention.rate` (`25` for a session kept by a filter of 25%), and what kept it
+in `retention.filter`: the id of the filter, `default` for the share of the other sessions, or `errors` for an error of a session
+that was not kept. While **Keep every error** is on, every error is kept, so an error says `100` whichever session it is of.
+
+A page that shows totals counts each row for as many as its share says: a session kept with a share of 25 counts for four. The page says
+**Estimated** and the share of sessions that was kept, so a total is what there would be had every session been kept.
+
+- Counts, sums and averages are scaled, and a percentile is weighed by the same shares.
+- The people that were seen, and the smallest and the largest values, are not scaled: they are what was seen.
+- A funnel and the paths count sessions by their shares. The cohorts of retention are people, so they are counted as they were seen.
+- The explorer lists the rows that were kept, and its counts and charts count those rows as they are. Pass `estimate=false`
+  to the [aggregate API](/en-US/api/rum#measure-rows) for the same numbers.
+- An alert rule that waits for **minimum samples** waits for rows that are stored, not for what they stand for.
+
+Sampling adds noise: a total made of a few sessions says little, however far it is scaled.
+
 ## Choose initial values
 
 | Traffic profile | Session rate | Replay rate within sampled sessions |
@@ -46,9 +125,10 @@ and the number of sessions needed for each browser and release before rollout.
 
 ## Session boundaries
 
-The SDK stores the decision in `sessionStorage`. A new session starts after either boundary:
+The SDK stores the decision in the session cookie `_msrum_s_<applicationId>`, which the tabs of the application share.
+A new session starts after either boundary:
 
-- `sessionInactivityTimeout`: 30 minutes by default;
+- `sessionInactivityTimeout`: 15 minutes by default;
 - `maxSessionDuration`: 4 hours by default.
 
 Both values accept milliseconds. The allowed range is one minute through 24 hours.
@@ -58,9 +138,8 @@ sessionInactivityTimeout: 15 * 60_000,
 maxSessionDuration: 2 * 60 * 60_000,
 ```
 
-Changing a sampling option does not change the decision already stored for the current session. Use
-a new tab or clear the `molesignal_rum_session_<applicationId>` session-storage entry when testing a
-new configuration.
+Changing a sampling option does not change the decision already stored for the current session. Call
+`stopSession()` or clear the `_msrum_s_<applicationId>` cookie when testing a new configuration.
 
 ## Bound client-side volume
 

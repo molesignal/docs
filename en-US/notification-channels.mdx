@@ -1,7 +1,7 @@
 ---
 title: "Notification channels and delivery"
 sidebarTitle: "Notification channels"
-description: "Configure SMTP, Slack, Lark, DingTalk, WeCom, Microsoft Teams, Google Chat, and webhook connectors, then route notifications through users, policies, templates, and fallbacks."
+description: "Configure SMTP, Slack, Lark, DingTalk, WeCom, Microsoft Teams, Google Chat, voice and SMS (Alibaba Cloud, Twilio, AWS), and webhook connectors, then route notifications through users, policies, templates, and fallbacks."
 "zh-Hans_link": "/zh-Hans/notification-channels"
 ---
 
@@ -36,6 +36,12 @@ routes.
 | Microsoft Teams webhook (`teams_webhook`) | Channel webhook URL, timeout | Configured webhook or per-target webhook URL |
 | Google Chat app (`google_chat_app`) | Service account key (JSON), optional Pub/Sub subscription, API base URL, timeout | User (`users/…`) or space (`spaces/…`) |
 | Google Chat webhook (`google_chat_webhook`) | Space webhook URL, timeout | Configured webhook or per-target webhook URL |
+| Alibaba Cloud voice (`aliyun_voice`) | AccessKey, text-to-speech template code, optional caller ID, title and text variables, variable length limit, times read, API base URL, timeout | Number in mainland China |
+| Alibaba Cloud SMS (`aliyun_sms`) | AccessKey, signature, template code, title and text variables, variable length limit, API base URL, timeout | Mainland or international number |
+| Twilio voice (`twilio_voice`) | Account SID, auth token, calling number, language, optional voice, times read, API base URL, timeout | E.164 number |
+| Twilio SMS (`twilio_sms`) | Account SID, auth token, sender, API base URL, timeout | E.164 number |
+| AWS voice (`aws_voice`) | Region, authentication, origination identity, optional Polly voice, times read, optional API URL, timeout | E.164 number |
+| AWS SMS (`aws_sms`) | Region, authentication, optional origination identity, optional API URL, timeout | E.164 number |
 | Webhook (`webhook`) | Default URL, HTTP method, headers, timeout | User, address, group, or per-target webhook URL |
 
 All connector timeouts must be between 1 and 60 seconds. URLs must be absolute `http` or `https`
@@ -142,7 +148,7 @@ the **Signing secret**. MoleSignal generates the timestamp and HMAC-SHA256 signa
 request.
 
 A `fixed_group` target uses the configured URL. A `webhook` target can override the configured URL with another
-absolute URL. See [Webhook connectors](/en-US/alert-webhook-channels) for the request and signature
+absolute URL. See [Webhook connectors](/en-US/notification-channels/webhooks) for the request and signature
 format.
 
 ### DingTalk app
@@ -234,6 +240,92 @@ app only sends notifications.
 Copy a space's incoming webhook URL into **Webhook URL**. A `fixed_group` target uses it; a
 `webhook` target replaces it.
 
+### Phone numbers for voice and SMS
+
+Voice and SMS connectors send to one number: the phone number a member binds (`direct_user`), or a
+fixed number in a fallback route (`fixed_address`). Write it with `+` and the country code, like
+`+14155550100`; spaces and hyphens are removed. Alibaba Cloud connectors also take an 11-digit
+mainland mobile number.
+
+A call reads the notification's title, then its text, up to 400 characters; a text puts the title on
+one line and the text on the next, up to 320 characters. Alibaba Cloud only sends approved
+templates, which the title and text fill, as described below.
+
+Providers limit how often one number is called or texted. A call or text refused for that, for a
+wrong number, or for an unapproved template fails the delivery, and the policy goes on to the
+person's next method and the fallback routes. Whether a call was answered or heard is not reported
+back: a successful delivery means the provider accepted the call or the text.
+
+One connector calls one number at most once a minute. Notifications that arrive within the minute
+wait on that line, shown as **Queued to merge** in the delivery log; when the minute is over they
+are read in one call, each notification's title in turn, and those acknowledged meanwhile are left
+out. Alibaba Cloud allows one call a minute to a number anyway, so a burst of alerts is no longer
+refused.
+
+### Alibaba Cloud voice
+
+Voice notifications from Alibaba Cloud Voice Service, to numbers in mainland China only. Complete
+the enterprise qualification in the Voice Service console, apply for a **text-to-speech** voice
+notification template such as `Hello, ${content}. Please handle it now.`, and create an AccessKey
+for a RAM user that can only call Voice Service. Then fill in:
+
+- **AccessKey ID** and **AccessKey secret**;
+- **Template code** — starting with `TTS_`;
+- **Caller ID** — empty for the shared mode; the number you bought in the dedicated mode, which then
+  shows on every call so on-call people can save it as a contact. The template must be of the same
+  mode;
+- **Title variable** and **Text variable** — variable names in the template, such as `content`. The
+  title and text are cut to the **Variable length limit** (35 by default) and filled in; leave both
+  empty for a template without variables;
+- **Times read** — 1 to 3.
+
+Alibaba Cloud calls one number at most once a minute, 5 times an hour and 20 times a day, and
+refuses the calls beyond that. Keep links and IP addresses out of the variables.
+
+### Alibaba Cloud SMS
+
+Apply for an **SMS signature** and a **notification** template such as `${content}. Please handle
+it now.` in the SMS console, then fill in the AccessKey, **Signature**, **Template code** (starting
+with `SMS_`), and the **Title variable** and **Text variable**.
+
+A variable in a notification template holds 35 characters by default; once Alibaba Cloud lifts the
+limit for an enterprise account, raise the **Variable length limit**. Variables cannot carry links or
+IP addresses. Numbers can be mainland mobile numbers or international numbers.
+
+### Twilio voice
+
+Find the **Account SID** and **Auth token** on the Twilio console, then fill in:
+
+- **Calling number** — a voice-capable number on the account, like `+14155550100`;
+- **Language** — the language the notification is read in, such as `en-US` or `cmn-CN`;
+- **Voice** — optional, such as `Polly.Joanna` or `Polly.Zhiyu`; Twilio's default voice when empty;
+- **Times read** — 1 to 3.
+
+### Twilio SMS
+
+Fill in the **Account SID**, **Auth token**, and **Sender**. The sender is a number on the account
+(E.164), a Messaging Service (`MG…`), or an alphanumeric sender ID of up to 11 letters and digits
+where the destination country allows one. Texts to US numbers need A2P 10DLC registration first.
+
+### AWS voice and SMS
+
+AWS voice (`aws_voice`) calls with `SendVoiceMessage` from AWS End User Messaging and Amazon Polly
+reads the notification; AWS SMS (`aws_sms`) sends a transactional text with `SendTextMessage`. Fill
+in:
+
+- **Region** — such as `us-east-1`;
+- **Authentication** — the same ways as the AWS data connectors: access key, temporary key, node
+  identity, assumed role, or web identity. To assume a role, its trust policy requires the external
+  ID the page shows;
+- **Origination identity** — a phone number, phone number ID, pool ID, or the ARN of one. Voice needs
+  one, and the number must be voice-capable; SMS can leave it empty for AWS to pick a number for the
+  destination, or name a sender ID;
+- **Polly voice** — voice only, optional: `MATTHEW` when empty, `ZHIYU` for Mandarin;
+- **API URL** — optional; the region's endpoint when empty.
+
+The identity needs `sms-voice:SendVoiceMessage` or `sms-voice:SendTextMessage`. An AWS account still
+in the sandbox only reaches verified numbers.
+
 ### Generic webhook
 
 Enter a default URL and select `POST`, `PUT`, or `PATCH`. Add request headers as a JSON object:
@@ -278,7 +370,7 @@ header value as the provider message ID.
 
 Administrators can open **Settings → Notify → User routing**, select a member, and click
 **Bind notify method**. Each identity selects one connector and one external identity, such as an
-email address, Slack user ID, or Lark user ID.
+email address, a Slack or Lark user ID, or the phone number a voice or SMS connector calls.
 
 After binding an identity:
 
@@ -287,6 +379,21 @@ After binding an identity:
 3. enable the identity in the **Alert events**, **On-call events**, or **Reports** preference;
 4. order multiple identities from primary to fallback;
 5. optionally configure quiet hours and allow critical alerts to bypass the restriction.
+
+### Move on when nobody acknowledges
+
+In the order for alert events, every step after the first can wait a number of minutes:
+
+| Setting | Effect |
+|---|---|
+| First step | Sent as soon as the alert fires or escalates to the person. |
+| Wait N minutes | Used to send again if nobody has acknowledged the alert N minutes after the person was first notified. |
+| Same minutes as the step before | Used only when the step before fails to send. |
+
+For example, Lark at once, SMS after 3 minutes, a call after 5 minutes: once the alert is
+acknowledged or resolved, no later step is sent, including those of the people its escalations
+reached. A step that fails to send still moves on to the next at once. A step waits at most a day,
+and only for alert events; the orders for on-call events and reports only fall back on failure.
 
 Members can manage personal identities and preferences under **Account settings → Notify**.
 Reading another member's settings requires `org.members.read`. Changing or attesting another
@@ -337,7 +444,7 @@ chain.
 Retries create a new attempt. Existing delivery history remains unchanged.
 
 A delivery with the stage **Direct** comes from a feature that names its connector and target
-itself, such as a [scheduled log inspection](/en-US/log-inspections). A direct delivery passes
+itself, such as a [scheduled log inspection](/en-US/logs/inspections). A direct delivery passes
 through no policy and cannot be retried.
 
 ## Connector lifecycle and status
@@ -363,12 +470,13 @@ references before deleting the connector.
 | Webhook returns an error | Verify the URL, method, header JSON, timeout, and a 2xx endpoint response. |
 | No user delivery occurs | Verify the identity and connector are enabled, the category preference contains the identity, and quiet hours do not suppress delivery. |
 | Fallback never runs | Verify the policy enables that fallback level and the category has an enabled route. |
+| A call or text is not sent | Verify the number starts with + and the country code, the template and signature are approved, the template variable names match, and the provider's rate limits and account sandbox. |
 
 <CardGroup cols={2}>
   <Card title="Alerting" icon="bell" href="/en-US/alerting">
     Create rules and follow the incident lifecycle.
   </Card>
-  <Card title="Webhook connectors" icon="webhook" href="/en-US/alert-webhook-channels">
+  <Card title="Webhook connectors" icon="webhook" href="/en-US/notification-channels/webhooks">
     Review webhook payloads, overrides, signing, and security.
   </Card>
 </CardGroup>
