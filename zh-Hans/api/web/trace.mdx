@@ -6,7 +6,7 @@ description: "列出链路摘要与 Span，按时间统计链路数量，读取�
 
 所有调用都读取组织的一个链路数据流：包含 `trace_id`、`span_id`、`service.name`、`name`、`start_time_unix_nano`、`end_time_unix_nano` 和 `status_code` 全部字段的数据流。名为 `default` 的数据流优先于其他符合条件的数据流，仍然相同时按数据流名称决定。组织没有这样的数据流时，结果为空。只有通过[尾部采样](/zh-Hans/configuration#链路捕获与尾部采样)保留下来的链路才能读取。
 
-所有调用都需要 `streams.query`，系统范围可使用 `sys.telemetry.read`。
+所有调用都需要 `traces.read`，系统范围可使用 `sys.telemetry.read`。
 
 ## 列出链路摘要
 
@@ -24,6 +24,7 @@ GET /api/v1/web/traces
 | `q` | string | 不区分大小写的文本，必须出现在某个 Span 的 `trace_id`、`span_id`、服务、操作或状态中。最长 256 个字符。 |
 | `filters` | string | 过滤条件的 JSON 数组，见下文。 |
 | `where` | string | JSON 条件树：用 AND 和 OR 连接的过滤条件和文本，见下文。 |
+| `expression` | string | **链路**页写法的字段查询。它代替 `q`、`filters` 和 `where`，二者只能选其一，见下文。 |
 | `sort` | string | `latest`（默认）、`earliest`、`duration_desc`、`duration_asc`、`span_count_desc` 或 `errors_desc`。 |
 | `limit` | integer | 页大小。默认 `20`。取值限制在 1 到 5000 之间。 |
 | `cursor` | string | 之前某一页返回的 `next_cursor` 或 `previous_cursor`。 |
@@ -56,19 +57,29 @@ GET /api/v1/web/traces
 
 ```bash
 curl -G "http://localhost:5080/api/v1/web/traces" \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   --data-urlencode 'filters=[{"field":"status_code","op":"=","value":"ERROR"}]' \
   --data-urlencode 'where={"or":[{"field":"service.name","op":"=","value":"checkout"},{"field":"span_count","op":">","value":"50"}]}'
 ```
 
 该请求列出失败的链路中，含有 `checkout` 的 span 或 span 数超过 50 的链路。
 
+`expression` 改为接收**链路**页的文本：用 `=`、`!=`、`>`、`>=`、`<`、`<=`、`contains` 和 `field in ('a', 'b')` 的比较、要查找的词、引号中的短语、不区分大小写的 `AND` 和 `OR`（`AND` 优先），以及括号。服务端把它读成页面会发送的 `q`、`filters` 和 `where`，再按上文校验。文本最长 8 KiB，括号最多嵌套 32 层。读不懂的部分（例如未闭合的括号，或比较的值为空）返回 `400`，并指出该部分。
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode "expression=status_code = 'ERROR' AND (service.name = 'checkout' OR span_count > 50)"
+```
+
+该请求列出的链路与上一个请求相同。
+
 `cursor` 会把页面绑定到签发它的查询。带着 `cursor` 重复请求，同时更换 `limit`、`sort`、`q`、`filters` 或 `where`，会返回 `400`。
 
 <RequestExample>
 ```bash cURL
 curl -G "http://localhost:5080/api/v1/web/traces" \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   --data-urlencode 'sort=duration_desc' \
   --data-urlencode 'limit=2' \
   --data-urlencode 'fields=http.route' \
@@ -121,7 +132,7 @@ GET /api/v1/web/traces/histogram
 | 参数 | 类型 | 说明 |
 |---|---|---|
 | `from`、`to` | integer | 以微秒表示的窗口，两者都必填。`to` 必须大于 `from`。 |
-| `q`、`filters`、`where` | string | 与列表相同。 |
+| `q`、`filters`、`where`、`expression` | string | 与列表相同。 |
 | `bucket_micros` | integer | 一个时间桶的长度，单位为微秒。不小于 `1000`。 |
 | `origin_micros` | integer | 第一个时间桶的起点，单位为微秒。不晚于 `from`。 |
 
@@ -130,7 +141,7 @@ GET /api/v1/web/traces/histogram
 <RequestExample>
 ```bash cURL
 curl -G "http://localhost:5080/api/v1/web/traces/histogram" \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   --data-urlencode 'from=1790000100000000' \
   --data-urlencode 'to=1790003700000000' \
   --data-urlencode 'bucket_micros=900000000' \
@@ -165,6 +176,62 @@ curl -G "http://localhost:5080/api/v1/web/traces/histogram" \
 | `busy` | 该角色正在运行的查询已达到 [`[search.admission]`](/zh-Hans/configuration) 允许的数量。 |
 | `scan_limit` | 窗口内的行数超过了 `[querier].max_scan_rows` 允许单次查询读取的数量。 |
 
+## 读取请求指标
+
+```http
+GET /api/v1/web/traces/red
+GET /api/v1/web/traces/red/breakdown
+```
+
+读取列表查询匹配的请求的速率、错误和耗时：总计、逐个时间桶，以及按耗时分布。拆分接口按某个字段的每个取值读取同样的指标。一个请求就是一个 Span。默认读取服务接收请求的 Span：server 或 consumer Span，或链路的根 Span；`scope=all` 读取所有 Span。
+
+作用于 Span 字段的过滤条件针对 Span 本身，因此 `service.name = 'api'` 读取的是 `api` 处理的请求。`trace_id` 和 `duration_ns` 取自 Span，`span_count` 和 `error_count` 取自 Span 所属的链路。
+
+**查询参数**
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `from`、`to`、`bucket_micros`、`origin_micros` | integer | 与按时间统计链路数量相同。 |
+| `q`、`filters`、`where`、`expression` | string | 与列表相同。 |
+| `scope` | string | `entry`（默认）或 `all`。 |
+| `by` | string | 仅用于拆分，且为必填：按哪个字段分组请求，使用数据流中的字段名。 |
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces/red" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'from=1790000100000000' \
+  --data-urlencode 'to=1790003700000000' \
+  --data-urlencode 'bucket_micros=60000000' \
+  --data-urlencode 'origin_micros=1790000100000000' \
+  --data-urlencode "expression=service.name = 'checkout'"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "bucket_micros": 60000000,
+  "origin_micros": 1790000100000000,
+  "scope": "entry",
+  "total": { "requests": 1840, "errors": 12, "p50_ns": 41000000.0, "p95_ns": 180000000.0, "p99_ns": 320000000.0 },
+  "buckets": [
+    { "start_micros": 1790000100000000, "requests": 31, "errors": 0, "p50_ns": 40000000.0, "p95_ns": 150000000.0, "p99_ns": 210000000.0 }
+  ],
+  "latency": [
+    { "from_ns": 0, "to_ns": 50000000, "requests": 1203, "errors": 2 },
+    { "from_ns": 50000000, "to_ns": null, "requests": 637, "errors": 10 }
+  ]
+}
+```
+</ResponseExample>
+
+`buckets` 只列出含有请求的时间桶，按时间从早到晚。`latency` 按耗时从短到长列出请求，最后一段没有上限。无法判断失败时 `errors` 为 `null`；耗时以纳秒为单位，没有请求或耗时被遮掩时为 `null`。
+
+拆分接口返回 `field`、`bucket_micros`、`origin_micros`、`scope` 和 `groups`：最常见的 50 个取值排在前面，每个取值带有自己的指标，以及由 `requests`、`errors` 和 `p95_ns` 组成的时间桶 `series`。没有该字段取值的请求，其 `value` 为 `null`。取值多于所列时，`more` 为 `true`。
+
+指标无法读取时，两个接口仍返回 `200`，并带上 `unavailable`：`time_budget`、`busy` 和 `scan_limit` 的含义与链路统计相同；时间对读取者被遮掩时为 `timestamp_masked`；拆分字段被遮掩或加密时为 `field_protected`。
+
 ## 列出 Span
 
 ```http
@@ -178,7 +245,7 @@ GET /api/v1/web/traces/spans
 | 参数 | 类型 | 说明 |
 |---|---|---|
 | `from`、`to` | integer | 以微秒表示的窗口。默认是最近 24 小时，截至当前。`to` 必须大于 `from`。 |
-| `q`、`filters`、`where` | string | 与链路列表相同。 |
+| `q`、`filters`、`where`、`expression` | string | 与链路列表相同。 |
 | `sort` | string | `latest`（默认）、`earliest`、`duration_desc` 或 `duration_asc`。 |
 | `limit` | integer | 页大小。默认 `100`。取值限制在 1 到 5000 之间。 |
 | `cursor` | string | 之前某一页返回的 `next_cursor` 或 `previous_cursor`。游标携带其页面的查询；更换 `limit` 会返回 `400`。 |
@@ -311,6 +378,6 @@ Span 会保存指向其来源 Span 的链接，链路详情随 Span 一起返回
 
 | 状态码 | 原因 |
 |---|---|
-| `400` | 参数无效：`to` 不大于 `from`、过滤条件使用了未知的字段或运算符（`unsupported trace filter field: nope`）、`in` 过滤条件没有值或超过 64 个值、`where` 不是条件树或超出其限制、游标与查询不匹配、`fields` 中的字段未知或是文档，或 `trace_id` 的字符或长度无效。统计时还包括：缺少窗口或时间桶参数、`bucket_micros` 小于 `1000`、`origin_micros` 晚于 `from`，或请求覆盖的时间桶超过 512 个。链路详情及其反向链接还包括：只提供了 `from` 与 `to` 中的一个，或窗口超过 31 天。 |
-| `403` | Token 缺少 `streams.query`。 |
+| `400` | 参数无效：`to` 不大于 `from`、过滤条件使用了未知的字段或运算符（`unsupported trace filter field: nope`）、`in` 过滤条件没有值或超过 64 个值、`where` 不是条件树或超出其限制、`expression` 与 `q`、`filters` 或 `where` 同时给出或含有读不懂的部分、游标与查询不匹配、`fields` 中的字段未知或是文档，或 `trace_id` 的字符或长度无效。统计时还包括：缺少窗口或时间桶参数、`bucket_micros` 小于 `1000`、`origin_micros` 晚于 `from`，或请求覆盖的时间桶超过 512 个。链路详情及其反向链接还包括：只提供了 `from` 与 `to` 中的一个，或窗口超过 31 天。 |
+| `403` | Token 缺少 `traces.read`。 |
 | `404` | 窗口内找不到该链路，或链路已被采样丢弃。 |

@@ -12,27 +12,33 @@ MoleSignal 在 API 与数据面执行租户和授权控制，位置低于 Web �
 
 跨工作区访问必须使用显式 IAM 授权或支持的资源共享。资源不匹配时，系统不会静默切换组织。
 
-`_sys` 组织是受保护的平台范围。租户 JWT 与 `ms_*` API Token 无法用于枚举平台管理员或 MoleSignal 平台遥测。
+`_sys` 组织是受保护的平台范围。租户会话与 `ms_*` API Token 无法用于枚举平台管理员或 MoleSignal 平台遥测。
 
 ## 身份验证与授权
 
 MoleSignal 接受：
 
-- 登录 JWT，包括切换工作区后新签发的限定范围 JWT；
-- 形如 `ms_<prefix>_<secret>` 的 API Token；
+- 保存在 HttpOnly Cookie 中的浏览器会话，切换工作区后按新的范围重写；
+- 在 `Authorization` 请求头中发送、形如 `ms_<prefix>_<secret>` 的 API Token；
 - 用于窄范围公开或集成路由的专用自验证 Token。
 
-用户可以用密码登录，也可以通过管理员在 **身份与访问 → SSO 服务商** 中配置的 OIDC、SAML 或 LDAP 服务商登录。
+用户可以用密码登录，也可以通过管理员在 **身份与访问 → SSO 服务商** 中配置的 OIDC、OAuth 2.0、SAML 或 LDAP 服务商登录。
 
 API Token 前缀用于查找，Secret 以哈希形式保存。完整 Token 只在创建时显示。
 
 身份验证后，服务器会解析数据库中的权限、角色、绑定、资源关系与目标所有权。详见[身份与访问](/zh-Hans/identity)。
 
+## 浏览器会话
+
+登录会写下两个 Cookie：每个 API 请求都携带的 Access Token，有效期 15 分钟；以及在会话结束前为它续期的 Refresh Token，会话在 `[auth].session_ttl_secs` 之后结束。两个 Cookie 都是 `HttpOnly`，页面脚本无法读取；都是 `SameSite=Strict`，经 HTTPS 访问时还带 `Secure`。用会话修改数据的请求必须来自 MoleSignal 的页面，浏览器会在 `Sec-Fetch-Site` 中标明来源。跨域调用 API 时不会携带凭据。
+
+服务端不保存会话记录，两个 Token 都是签名的 JWT。退出登录会删除该浏览器中的 Cookie，从浏览器中复制出去的 Token 在过期之前仍然有效。要立即切断某个用户，请停用该账号，每个请求和每次续期都会检查账号状态。轮换签名密钥后，所有会话在 24 小时宽限期结束时失效。
+
 ## JWT 签名密钥
 
-JWT 签名密钥会在首次启动时引导写入数据库。元数据端点不会返回原始密钥字节。轮换之后，新的 Token 用新密钥签发，用已退役密钥签发的 Token 在 24 小时内仍然有效。
+JWT 签名密钥会在首次启动时引导写入数据库。元数据端点不会返回原始密钥字节。轮换之后，新的 Token 用新密钥签发，用已退役密钥签发的 Token 在 24 小时内仍然有效。所有节点不用重启就会用上新密钥。
 
-列出或轮换签名密钥需要平台权限 `sys.settings.manage`：
+列出或轮换签名密钥需要平台权限 `sys.signing_keys.rotate`：
 
 ```text
 GET  /api/v1/auth/jwt/secrets
@@ -43,9 +49,9 @@ POST /api/v1/auth/jwt/rotate
 
 ## 审计
 
-安全相关与产品修改路径会记录操作者、组织、操作、目标、时间与安全元数据。具备 `audit.read` 后，可在**设置 → 审计**查询组织事件。
+安全相关与产品修改路径会记录操作者、组织、操作、目标、时间与安全元数据。具备 `audit.read` 后，可在**设置 → 审计**查询组织事件。同样的事件也是 `_audit` 数据流里的行，参见[审计数据流](/zh-Hans/settings/data-security#审计数据流)。
 
-审计记录默认保留 90 天。系统每天删除所有组织和平台中早于保留期的记录，删除后无法恢复。在 `_sys` 组织的**设置 → 审计保留**中修改保留天数，需要 `sys.settings.manage`；填 `0` 表示永久保留。每次修改保留天数都会以 `audit_retention.update` 记入平台审计。
+审计记录默认保留 90 天。系统每天删除所有组织和平台中早于保留期的记录，删除后无法恢复。在 `_sys` 组织的**设置 → 审计保留**中修改保留天数，需要 `sys.settings.retention.manage`；填 `0` 表示永久保留。每次修改保留天数都会以 `audit_retention.update` 记入平台审计。
 
 凭据、模型密钥、敏感 Webhook 请求头与原始签名材料不会写入审计负载。
 
@@ -59,7 +65,7 @@ POST /api/v1/auth/jwt/rotate
 
 创建数据流时把字段标记为加密字段。MoleSignal 会在值写入 Parquet 之前用 AES-256-GCM 加密它们，普通查询返回的是密文，SQL 用 `decrypt(field)` 还原明文，参见[数据流](/zh-Hans/streams#加密字段)。
 
-组织数据密钥由 `MS_CIPHER_KEY` 中的加密根密钥封装，密钥材料创建后不会返回。读取密钥元数据需要 `org.settings.read`；创建、轮换或删除密钥需要 `org.settings.manage`。
+组织数据密钥由 `MS_CIPHER_KEY` 中的加密根密钥封装，密钥材料创建后不会返回。读取密钥元数据需要 `org.cipher_keys.read`；创建、轮换或删除密钥需要 `org.cipher_keys.manage`。
 
 <Warning>
   丢失 `MS_CIPHER_KEY` 可能导致加密字段无法恢复。请使用密钥管理器保存，并独立于 PostgreSQL 与对象存储备份。
@@ -78,9 +84,11 @@ POST /api/v1/auth/jwt/rotate
 
 `router` 角色对每个组织的接入与查询请求执行令牌桶限流，并返回带 `Retry-After` 响应头的 `429`，`standalone` 节点不应用这些限制，参见[分角色部署](/zh-Hans/deployment/role-based#速率限制)。超过 2 MiB 的接入请求体会被拒绝并返回 `413`。
 
+密码登录按账号和来源地址计算失败次数，到限后回答带 `Retry-After` 的 `429`，不再核对密码。锁只落在发起请求的地址上，账号本身只限速，不会被别人输错密码锁在外面。不存在的账号一样计数、一样回答。参见[登录限速](/zh-Hans/settings/platform#登录限速)。
+
 ## 生产环境加固
 
-在真实数据到达之前，请替换沙箱的默认值：root 账号、`MS_CIPHER_KEY`、数据库与对象存储凭据，参见[生产检查清单](/zh-Hans/deployment/production-checklist)。
+在真实数据到达之前，请替换沙箱的默认值：root 账号、`MS_CIPHER_KEY`、数据库与对象存储凭据，参见[生产检查清单](/zh-Hans/deployment/production-checklist)。部署在内网时，只把外部回调和公开页面开放到公网，见[公网访问](/zh-Hans/public-access)。
 
 <Card title="自身可观测性" icon="heart-pulse" href="/zh-Hans/self-observability">
   配置受保护的 `_sys` 遥测、尾采样与节点本地诊断。

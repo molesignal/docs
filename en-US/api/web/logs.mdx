@@ -1,0 +1,149 @@
+---
+title: "Log search"
+description: "List the records of a logs stream page by page, count them over time, and describe the values of a field."
+"zh-Hans_link": "/zh-Hans/api/web/logs"
+---
+
+These calls read one logs stream of the organization, the way the **Logs** page reads it. A stream that does not exist answers an empty result. All calls require `logs.read`, or `sys.telemetry.read` in the system scope.
+
+Each call takes `POST` with a JSON body, or `GET` with the same fields in the query string: `filters` and `free_text` as the text of a JSON list, and `where` as the text of a JSON object. Send a query too long for an address as a `POST`.
+
+## What a call matches
+
+A call matches the records of the stream in the window that pass all of these:
+
+| Field | Type | Notes |
+|---|---|---|
+| `filters` | list | Filters that all hold. At most 32, counted with the filters of `where`. |
+| `free_text` | list | Words or phrases to find in the `message` field, each up to 512 bytes. A lower-case word of letters and digits, up to 40 bytes, matches whatever its case; other text matches as written. At most 8, counted with the text of `where`. |
+| `where` | object | A condition tree for alternatives: a filter, `{"text": "..."}`, `{"and": [...]}`, or `{"or": [...]}`. |
+| `expression` | string | A field query as the **Logs** page writes it. It stands for `filters`, `free_text`, and `where`: send one or the other. |
+
+A filter is an object with `field`, `op`, `value`, and `quoted`. It names its field as the stream names it.
+
+| Operator | Fields | Matches |
+|---|---|---|
+| `=`, `!=` | Any scalar field | The value, or every other value. With an empty value, whether the field has a value at all: `=` matches the records without one. |
+| `>`, `>=`, `<`, `<=` | Numbers and timestamps | The comparison. |
+| `contains` | Text | The value anywhere in the field. |
+| `match` | Any field | The value as a substring, whatever its case. An empty value matches nothing. |
+| `match_text` | Text with a full-text index | A full-text search: words, phrases, and wildcards. A field without a full-text index answers `400`. |
+
+`eq`, `ne`, and `like` are aliases of `=`, `!=`, and `contains`. `quoted` is `true` for a value written in quotes: a word, never a number. A JSON field is not filterable here; query it with SQL.
+
+`expression` takes the text of the **Logs** page: comparisons, `MATCH(field, 'text')` and `MATCH_TEXT(field, 'words')`, words to find, a phrase in quotes, `AND` and `OR` in any case with `AND` binding tighter, and brackets. The server reads it into the `filters`, `free_text`, and `where` the page sends, and checks them as above. The text is at most 8 KiB and nests brackets at most 32 deep. A part it cannot read, such as an unclosed bracket or a comparison with nothing, answers `400` and names the part.
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/logs" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'stream=app' \
+  --data-urlencode "expression=level = 'error' AND (service.name = 'checkout' OR timeout)"
+```
+
+## List records
+
+```http
+POST /api/v1/web/logs
+GET  /api/v1/web/logs
+```
+
+Returns the matching records, newest first, with cursor pagination.
+
+| Field | Type | Notes |
+|---|---|---|
+| `stream` | string | Required. The logs stream. |
+| `from`, `to` | integer | The window in microseconds. The defaults are the last 24 hours until now. `to` must be greater than `from`. |
+| `filters`, `free_text`, `where`, `expression` | | What the call matches. |
+| `limit` | integer | Page size. Default `20`, clamped to 1 through 5000. |
+| `cursor` | string | The `next_cursor` or `previous_cursor` of an earlier page. It keeps the window and the match of the first page. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/web/logs \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"stream":"app","expression":"level = '\''error'\''","limit":2}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    { "_timestamp": 1790000000000000, "level": "error", "message": "db pool exhausted", "trace_id": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "next_cursor": "eyJ2IjoxLC...",
+  "previous_cursor": null,
+  "has_more": true
+}
+```
+</ResponseExample>
+
+Each item holds the fields of a record. `_timestamp` is in microseconds. A request with a `cursor` and a different stream, window, `limit`, or match answers `400`.
+
+## Count records over time
+
+```http
+POST /api/v1/web/logs/histogram
+GET  /api/v1/web/logs/histogram
+```
+
+Counts the matching records in time buckets.
+
+| Field | Type | Notes |
+|---|---|---|
+| `stream` | string | Required. |
+| `from`, `to` | integer | Required. The window in microseconds. |
+| `filters`, `free_text`, `where`, `expression` | | What the call matches. |
+| `bucket_micros` | integer | The length of one bucket in microseconds. At least `1000`. |
+| `origin_micros` | integer | The start of the first bucket. Not after `from`. |
+
+A request covers at most 512 buckets from `origin_micros` to `to`.
+
+```json
+{
+  "bucket_micros": 60000000,
+  "origin_micros": 1790000100000000,
+  "buckets": [{ "start_micros": 1790000100000000, "total": 120, "errors": 4 }],
+  "split": true
+}
+```
+
+`buckets` lists the buckets that hold a record, oldest first. `errors` counts the records at level `ERROR`, read from `level` or `body_level`. `split` is `false` when the stream has neither field or the level is masked for the reader; `errors` is then `0`. When the count is not available, the call answers `200` with empty `buckets` and `unavailable`: `time_budget`, `busy`, or `scan_limit`, as for the [trace count](/en-US/api/web/trace#count-traces-over-time).
+
+## Describe a field
+
+```http
+POST /api/v1/web/logs/field-stats
+GET  /api/v1/web/logs/field-stats
+```
+
+Describes the values one field takes in the matching records.
+
+| Field | Type | Notes |
+|---|---|---|
+| `stream` | string | Required. |
+| `from`, `to` | integer | The window in microseconds. |
+| `filters`, `free_text`, `where`, `expression` | | What the call matches. |
+| `field` | string | Required. The field, as the stream names it. |
+
+```json
+{
+  "kind": "text",
+  "total": 1840,
+  "present": 1840,
+  "distinct": 3,
+  "distinct_exact": true,
+  "top": [{ "value": "info", "count": 1500 }, { "value": "warn", "count": 300 }, { "value": "error", "count": 40 }],
+  "top_skipped": false
+}
+```
+
+`kind` is `number`, `time`, `text`, or `bool`. `total` counts the matching records and `present` those with a value. `top` lists the commonest values, commonest first; `top_skipped` is `true` when nearly every value differs and none is listed. `range` gives the smallest and the largest value as text. A number field adds `spread` and `bars`. `trend` counts the commonest values over the window, and is absent where no value is commoner than the rest.
+
+## Errors
+
+| Status | Cause |
+|---|---|
+| `400` | A parameter is invalid: `stream` is missing, `to` is not greater than `from`, a filter names an unknown field or uses an operator its type does not take, the lists or the tree go past their limits, `expression` comes with `filters`, `free_text`, or `where` or has a part it cannot read, the cursor does not match the query, or a histogram parameter is missing or covers more than 512 buckets. |
+| `403` | The token lacks `logs.read`. |

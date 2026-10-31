@@ -1,0 +1,99 @@
+---
+title: "Inhibit rules"
+description: "Manage inhibit rules, preview what a rule would hold back now, and release an inhibited incident."
+"zh-Hans_link": "/zh-Hans/api/alerting/inhibit-rules"
+---
+
+The rules of [inhibition](/en-US/alerting/inhibition). Reading takes `alerts.inhibitions.read`, changing takes `alerts.inhibitions.manage`.
+
+```http
+GET    /api/v1/alerts/inhibit-rules
+POST   /api/v1/alerts/inhibit-rules
+GET    /api/v1/alerts/inhibit-rules/{id}
+PUT    /api/v1/alerts/inhibit-rules/{id}
+DELETE /api/v1/alerts/inhibit-rules/{id}
+```
+
+**Request body**
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | Required, at most 255 characters. |
+| `enabled` | boolean | `true` by default. |
+| `source.matchers` | array | Label conditions of the source: `{label, op, value}`, where `op` is `eq`, `neq`, `re` or `nre`. All must hit. |
+| `source.min_severity` | string | Severity at least this; none means any. |
+| `target.matchers` | array | Label conditions of the target. None means every incident. |
+| `target.max_severity` | string | Severity at most this; none means any. |
+| `equal` | array | Labels both sides must carry with the same value, at most 16. `source.matchers` and `equal` cannot both be empty. |
+| `more_severe_only` | boolean | The source must be strictly more severe than the target. `true` by default. |
+| `wait_secs` | integer | How long a target's notifications wait, 0 to 600, 60 by default; under 15 counts as 15. |
+| `linger_secs` | integer | How long a recovered source keeps holding targets back, 0 to 3600, 120 by default. |
+| `comment` | string | A comment. |
+
+In label conditions, `service` and `host` take the affected service and host when the incident has no such label, and `alert.rule_id` is the rule or source that opened it. A regular expression that does not parse gives `400`.
+
+Each rule in the list and in the detail has `inhibiting` as well: how many incidents it holds back now.
+
+<RequestExample>
+```bash cURL
+curl -X POST "http://localhost:5080/api/v1/alerts/inhibit-rules" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "On one service, the worse holds back the lesser",
+    "equal": ["service"],
+    "more_severe_only": true
+  }'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "019a2c1e-…",
+  "org_id": "default",
+  "name": "On one service, the worse holds back the lesser",
+  "enabled": true,
+  "source": { "matchers": [], "min_severity": null },
+  "target": { "matchers": [], "max_severity": null },
+  "equal": ["service"],
+  "more_severe_only": true,
+  "wait_secs": 60,
+  "linger_secs": 120,
+  "comment": "",
+  "created_by": "019a2b00-…",
+  "created_at": 1761897600000000,
+  "updated_at": 1761897600000000,
+  "inhibiting": 0
+}
+```
+</ResponseExample>
+
+## Preview
+
+```http
+POST /api/v1/alerts/inhibit-rules/preview
+```
+
+The body is the same (`name` may be left out and the rule need not be saved), and it takes `alerts.inhibitions.read`. Runs this rule alone over the incidents active now, whatever `enabled` says.
+
+| Field | Description |
+|---|---|
+| `pairs[].source_incident_id`, `source_summary`, `source_severity` | The incident holding another back. |
+| `pairs[].target_incident_id`, `target_summary`, `target_severity` | The incident held back. |
+
+## Release an incident
+
+```http
+POST /api/v1/alerts/incidents/{id}/inhibition/lift
+```
+
+Takes `alerts.incidents.update` on the incident. Its held notifications go out now and it is not inhibited again; this is recorded in the timeline and the audit log. It does nothing when the incident is not held back, and gives `409` when it is resolved or merged. Returns the incident.
+
+In an incident's JSON the state of inhibition is in these fields:
+
+| Field | Description |
+|---|---|
+| `inhibition` | Held back now: `rule_id`, `rule_name`, `source_incident_id`, `source_summary`, `since`, and `ending_at` counting down once the source recovered. It stays after the incident resolves, saying it did not notify then. |
+| `inhibition_wait_until` | Notifications wait until then (microseconds), to see whether a source comes. |
+| `inhibition_lifted_by` | Who said to notify as usual. |

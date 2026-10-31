@@ -1,32 +1,33 @@
 ---
 title: "签发 API Token"
-description: "为用户或服务账号创建 API Token。"
+description: "签发个人 API Token，或为服务账号签发 Token，并只给它需要的权限。"
 "en_link": "/en-US/api/auth/issue-token"
 ---
 
 ```http
-POST /api/v1/auth/tokens
+POST /api/v1/me/api-tokens
 ```
 
-创建形如 `ms_<prefix>_<secret>` 的长期 Token。响应是明文 Token 唯一出现的一次，请立即保存。该调用需要在组织范围内具备 `api_tokens.manage` 权限。
+签发形如 `ms_<prefix>_<secret>` 的个人 Token，它以当前登录用户的身份执行。响应是明文 Token 唯一出现的一次，请立即保存。该调用必须来自登录会话，不能用另一个 Token 发起，并且需要 `personal_tokens.manage`。
 
 **请求体**
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `name` | string | 是 | 显示名称，不能为空。 |
-| `role_id` | string | 否 | Token 的组织角色。默认为内置的 **Intake token** 角色，只有 `streams.write` 和 `apm.deploy` 权限。该角色不能包含调用者没有的权限，`rum_client` 角色会被拒绝。设置了 `service_account_id` 时请省略该字段。 |
-| `service_account_id` | string | 否 | 为服务账号签发 Token，Token 继承该账号的角色。已禁用的账号会被拒绝。 |
+| `name` | string | 是 | 显示名称，1 到 255 个字符。 |
+| `policy_id` | string | 否 | Token 跟随的[权限策略](/zh-Hans/identity/roles#权限策略)的 ID，例如 `builtin:data_intake`。你必须拥有策略中的每一项权限。 |
+| `permissions` | string[] | 否 | 为 Token 固定的组织权限。你必须拥有其中每一项。 |
 | `expires_in_days` | integer | 否 | 有效天数，限制在 1 到 1825 之间。省略则 Token 永不过期。 |
+
+`policy_id` 与 `permissions` 只能二选一。两者都不给时，Token 能做你能做的一切。Token 能做的永远不超过你在请求那一刻能做的：你失去某项权限后，你的 Token 也随之失去。
 
 <RequestExample>
 ```bash cURL
-curl -X POST http://localhost:5080/api/v1/auth/tokens \
-  -H "authorization: Bearer $MS_JWT" \
+curl -b ms-cookies.txt -X POST http://localhost:5080/api/v1/me/api-tokens \
   -H 'content-type: application/json' \
   -d '{
     "name": "grafana-readonly",
-    "role_id": "<viewer-role-id>",
+    "permissions": ["streams.read", "streams.query", "dashboards.read"],
     "expires_in_days": 90
   }'
 ```
@@ -37,27 +38,48 @@ curl -X POST http://localhost:5080/api/v1/auth/tokens \
 {
   "id": "3KE5hOsEc3lMC9qr9RWnPn0pqWF",
   "prefix": "l2XcQd8UoQzK3pLm",
-  "token": "ms_l2XcQd8UoQzK3pLm_<secret>",
-  "role_id": "<viewer-role-id>",
-  "role_key": "viewer",
-  "role_name": "Viewer",
+  "name": "grafana-readonly",
   "token_kind": "personal",
+  "user_id": "<user-id>",
+  "policy_id": null,
+  "permissions": ["dashboards.read", "streams.query", "streams.read"],
   "application_id": null,
   "service_account_id": null,
   "expires_at_micros": 1798000000000000,
-  "created_at_micros": 1790000000000000
+  "last_used_at_micros": null,
+  "revoked": false,
+  "created_at_micros": 1790000000000000,
+  "token": "ms_l2XcQd8UoQzK3pLm_<secret>"
 }
 ```
 </ResponseExample>
 
-用 `GET /api/v1/roles` 列出角色 id。内置的组织角色有 `owner`、`admin`、`editor`、`viewer` 与 `intake`。
+`ms-cookies.txt` 保存的是[登录](/zh-Hans/api/auth/login)得到的会话。`GET /api/v1/me/api-tokens/scopes` 列出 Token 可以限定到的权限策略和组织权限。在 `Authorization` 请求头中发送 Token：`Authorization: Bearer ms_…`。
 
-像使用登录 Token 一样发送它：`Authorization: Bearer ms_…`。使用默认角色的 Token 可以发送数据，但不能查询数据。
+## 为服务账号签发
+
+```http
+POST /api/v1/auth/tokens
+```
+
+签发以服务账号身份执行的 Token。请求体相同，另加 `service_account_id`，该调用需要 `api_tokens.issue`。与个人 Token 不同，它可以用 API Token 签发。`policy_id` 与 `permissions` 都不给时，Token 能做该账号角色允许的一切，并随角色变化。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/auth/tokens \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "collector-production",
+    "service_account_id": "<service-account-id>",
+    "policy_id": "builtin:data_intake",
+    "expires_in_days": 365
+  }'
+```
 
 **错误**
 
 | 状态码 | 原因 |
 |---|---|
-| `400` | `name` 为空、使用了 `rum_client` 角色，或同时设置了 `role_id` 与 `service_account_id`。 |
-| `403` | 角色包含调用者没有的权限，或调用者缺少 `api_tokens.manage`。 |
-| `404` | 系统范围没有 API Token，或角色、服务账号不存在。 |
+| `400` | `name` 为空、同时给了 `policy_id` 与 `permissions`、权限列表为空、权限或策略不存在，或服务账号已禁用。 |
+| `403` | 权限范围包含你没有的权限、用 API Token 申请个人 Token，或缺少所需权限（`personal_tokens.manage` 或 `api_tokens.issue`）。 |
+| `404` | 系统范围没有 API Token，或服务账号不存在。 |

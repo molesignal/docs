@@ -1,18 +1,20 @@
 ---
 title: "Connectors"
 sidebarTitle: "Connectors"
-description: "Bring logs in from CloudWatch Logs, Amazon Data Firehose, Cloudflare Logpush, and Heroku, and deliver pipeline output to S3, Kafka, or an HTTP endpoint."
+description: "Bring logs in from CloudWatch Logs, Kafka topics, S3 objects, Amazon Data Firehose, Cloudflare Logpush, and Heroku, and deliver pipeline output to S3, Kafka, or an HTTP endpoint."
 "zh-Hans_link": "/zh-Hans/connectors"
 ---
 
 A **connector** is a managed integration with an external platform. Connectors work in two directions:
 
-- **Sources** bring logs in from another service and write them to a stream. MoleSignal pulls CloudWatch Logs on a schedule. Amazon Data Firehose, Cloudflare Logpush, and Heroku push their logs to MoleSignal.
+- **Sources** bring logs in from another service and write them to a stream. MoleSignal pulls CloudWatch Logs, Kafka topics, and S3 objects on a schedule. Amazon Data Firehose, Cloudflare Logpush, and Heroku push their logs to MoleSignal.
 - **Destinations** receive the output of a [scheduled pipeline](/en-US/pipelines#sinks-and-connector-egress): Amazon S3 and S3-compatible storage, Apache Kafka, and any HTTP endpoint.
 
 | Kind | Connector | Direction | Authentication |
 |---|---|---|---|
 | `aws_cloudwatch_logs` | AWS CloudWatch Logs | Source, pulled every 30 seconds | [AWS credentials](#aws-authentication) |
+| `kafka_source` | Kafka topic | Source, pulled every 30 seconds | None, SASL, or a client certificate |
+| `s3_source` | S3 objects | Source, pulled every 30 seconds | AWS credentials |
 | `aws_kinesis_firehose` | Amazon Data Firehose | Source, pushed | [Push token](#push-sources) |
 | `cloudflare_logpush` | Cloudflare Logpush | Source, pushed | Push token |
 | `heroku_drain` | Heroku log drain | Source, pushed | Push token |
@@ -41,7 +43,7 @@ Over the API, a connector is a `name`, a `kind`, and a `config_json` whose keys 
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/connectors \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
         "name": "archive",
@@ -145,7 +147,7 @@ CloudWatch Logs is a **pull** source: MoleSignal calls `FilterLogEvents` every 3
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/connectors \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
         "name": "cw-prod",
@@ -166,6 +168,80 @@ curl -X POST http://localhost:5080/api/v1/connectors \
 | `target_stream` | Destination stream. Default `default`. |
 
 One node polls a connector at a time. The `alert` nodes divide the connectors between them, and a node claims a connector before it polls. See [Work division between alert nodes](/en-US/deployment/role-based#work-division-between-alert-nodes). Each event becomes a log with `message`, `log_stream`, and `log_group`. A connector that is turned off is not polled.
+
+### Kafka topics
+
+A `kafka_source` connector reads a topic every 30 seconds and goes on from where the last read that was written left off. It takes the partitions by assignment, not as a member of a consumer group, and keeps its offsets in MoleSignal, so it needs only the permission to read the topic, and no consumer group shows up on the cluster.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "orders",
+        "kind": "kafka_source",
+        "config_json": {
+          "brokers": "b-1.example.com:9096,b-2.example.com:9096",
+          "topic": "orders",
+          "tls": true,
+          "auth": "sasl_scram_sha_512",
+          "sasl_username": "molesignal",
+          "sasl_password": "<password>",
+          "target_stream": "orders",
+          "start_from": "latest"
+        }
+      }'
+```
+
+| Field | Notes |
+|---|---|
+| `brokers`, `topic`, `tls`, `tls_ca_cert`, `auth` and its keys | As for a [Kafka destination](#apache-kafka). |
+| `target_stream` | Destination stream. Default `default`. |
+| `start_from` | Where the first read starts: `latest`, the default, for what arrives from now on, or `earliest` for everything the brokers hold. A partition added later is read from its beginning. UI: **Start from**. |
+
+- A message whose value is a JSON object gives the fields of the log. Any other value becomes its `message`. Each log also has `kafka_topic`, `kafka_partition`, `kafka_offset`, `kafka_key` when the message has a key, and `source`. Its time is the message's timestamp.
+- One read takes up to 10,000 messages or 32 MiB, and the next one follows at once while there is more, for up to 2 minutes in a pull.
+- The offsets move only once the logs are written. A read or a write that fails is tried again from the same place 30 seconds later, so a message can be written twice but not lost. Offsets that the brokers have aged out go on from the oldest message they still hold.
+- Changing the `topic` starts over from `start_from`, since the offsets belong to the topic.
+
+### S3 objects
+
+An `s3_source` connector lists a bucket every 30 seconds and reads the objects it has not read, oldest first, from AWS S3 or an S3-compatible store.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "elb-logs",
+        "kind": "s3_source",
+        "config_json": {
+          "bucket": "acme-logs",
+          "region": "us-east-1",
+          "prefix": "AWSLogs/123456789012/",
+          "auth": "node_role",
+          "target_stream": "elb",
+          "start_from": "latest"
+        }
+      }'
+```
+
+| Field | Notes |
+|---|---|
+| `bucket`, `region`, `endpoint`, `virtual_hosted_style`, `auth` and its keys | As for an [S3 destination](#amazon-s3). The credentials need `s3:ListBucket` on the bucket and `s3:GetObject` on the objects. |
+| `prefix` | Only objects under this prefix are read. Each pull lists it whole, so give a source a prefix of its own. |
+| `target_stream` | Destination stream. Default `default`. |
+| `start_from` | Where the first read starts: `latest`, the default, for objects that appear from now on, or `earliest` for everything under the prefix. UI: **Start from**. |
+
+- An object is read as lines. A line that is a JSON object gives the fields of a log, one that holds only `Records`, as CloudTrail writes, gives a log per record, and any other line becomes a `message`. `.gz` and `.zst` objects are decompressed by their names. Each log also has `s3_bucket`, `s3_key`, and `source`. Its time is when the object was last modified.
+- One pull reads up to 100 objects or until 50,000 logs, and the next one follows at once while there is more, for up to 2 minutes.
+- The read state moves only once the logs are written. An object that cannot be fetched stops the pull there and is tried again 30 seconds later, so a log can be written twice but not lost.
+- An object that cannot be read is skipped and said on the connector, since trying it again would hold back everything after it. That is one that is corrupt, over 256 MiB, over 512 MiB once decompressed, over a million logs, or with a line over 64 MiB.
+- An object is recognized by its key and its time of modification, with a margin of 5 minutes. An object that is written again under the same key within that margin is not read again, and one whose time of modification is more than 5 minutes older than the newest object read is not read at all. S3 dates a multipart upload from when it began, so a slower upload than that goes unread.
+
+### How a pull is going
+
+The connector's page shows when a source last received. A source whose last read failed shows a warning beside that, with the reason in its tooltip and in the connector's settings, and what a source last skipped is said there too. Over the API, `read_state` holds `last_error` and `last_warning`, each with `at_micros` and `text`, and `position`, where it has got to. Saving a connector leaves its place.
 
 ## Destinations
 
@@ -227,7 +303,7 @@ TLS and SASL combine: SCRAM over TLS connects as `SASL_SSL`.
 | `header` | **Custom header** | `header_name`, `header_value` | The value in the named header, such as `X-API-Key` or `DD-API-KEY`. |
 | `hmac` | **HMAC signature** | `hmac_secret` | A signature of the body. The secret needs at least 16 characters. |
 
-A custom header cannot be one that the delivery sets itself: `Host`, `Content-Type`, `Content-Length`, `Content-Encoding`, `Transfer-Encoding`, `Connection`, `X-MoleSignal-Timestamp`, or `X-MoleSignal-Signature`.
+A custom header cannot be one that the delivery sets itself: `Host`, `Content-Type`, `Content-Length`, `Content-Encoding`, `Transfer-Encoding`, `Connection`, `X-MoleSignal-Timestamp`, or `X-MoleSignal-Sign`.
 
 A delivery follows these rules:
 
@@ -243,7 +319,7 @@ With `hmac`, every request carries two headers:
 | Header | Content |
 |---|---|
 | `X-MoleSignal-Timestamp` | The time of the request in Unix seconds. |
-| `X-MoleSignal-Signature` | `sha256=<hex>`, the HMAC-SHA256 of `<timestamp>.<body>` under the shared secret. |
+| `X-MoleSignal-Sign` | `sha256=<hex>`, the HMAC-SHA256 of `<timestamp>.<body>` under the shared secret. |
 
 To verify a request, compute the HMAC-SHA256 of the timestamp, a `.`, and the raw body bytes with the same secret, and compare the result with the signature in constant time. Refuse a timestamp older than a few minutes, so that a captured request cannot be sent again later.
 
@@ -321,12 +397,14 @@ The token is exchanged at the regional STS endpoint of the connector's `region`,
 | `kafka` | Reads the topic's metadata from the brokers, which proves the connection, TLS, and authentication, and that the topic exists. Writes no message. |
 | `http` | Sends one event marked as a test: `"message": "MoleSignal connection test"` and `"molesignal_connection_test": true`. |
 | `aws_cloudwatch_logs` | Reads at most one event of the last minute of the log group. Writes nothing to the stream and leaves the read position where it was. |
+| `kafka_source` | Reads the topic's metadata from the brokers, as for `kafka`. Reads no message and leaves the read position where it was. |
+| `s3_source` | Lists one object under the prefix, which proves the credentials and `s3:ListBucket`. Reads nothing and leaves the read position where it was. |
 
 A test gives up after 25 seconds. Over the API, `POST /api/v1/connectors/test` takes the `kind` and the `config_json` to try. With the `id` of a saved connector of the same kind, `***` stands for the secret that the connector holds. Settings that cannot work answer `400`, as on save.
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/connectors/test \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
         "id": "<connector id>",
@@ -372,7 +450,7 @@ curl -X POST http://localhost:5080/api/v1/connectors/test \
 | `POST /api/v1/connectors/test` | `pipelines.edit` | Test settings before saving them. |
 | `GET /api/v1/connectors/aws-external-id` | `pipelines.read` | Return the organization's external ID as `external_id`. |
 
-A connector reads as `id`, `name`, `kind`, `config_json` with masked secrets, `secret_keys`, `enabled`, `last_run_at_micros`, `created_at_micros`, and `updated_at_micros`.
+A connector reads as `id`, `name`, `kind`, `config_json` with masked secrets, `secret_keys`, `enabled`, `last_run_at_micros`, `read_state`, `created_at_micros`, and `updated_at_micros`.
 
 ## Permissions
 

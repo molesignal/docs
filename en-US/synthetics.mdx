@@ -15,8 +15,8 @@ Probe locations.
 | **HTTP / API** | Validate a URL, method, headers, body, response status, content, and timing. |
 | **Browser** | Run a browser journey and assert page or step outcomes. |
 | **TCP** | Confirm that a host and port accept a connection. |
-| **DNS** | Resolve records and validate the returned answer. |
-| **ICMP / Ping** | Measure basic host reachability and latency. |
+| **DNS** | Resolve any record type (A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, CAA, PTR) through the system or a named resolver, optionally require DNSSEC, and validate the answers and the response code. |
+| **ICMP / Ping** | Send a few pings and check packet loss and mean round-trip time. |
 | **TLS** | Validate a TLS handshake, certificate identity, and expiry. |
 | **gRPC** | Call a gRPC endpoint and validate the response. |
 | **Heartbeat** | Expect an external job or service to report before its deadline. |
@@ -69,9 +69,125 @@ Assertions inspect protocol-specific fields such as response status, body, heade
 certificate properties, or browser outcomes. A failed **Warning** assertion produces a degraded
 result; a failed **Critical** assertion produces a failing result.
 
+Each kind of check offers the values its reply carries:
+
+| Check type | Assertion sources |
+|---|---|
+| **HTTP / API** | `status`, `body`, `json:<JSONPath>`, `header:<name>`, `duration_ms`, `size_bytes`, `timing.dns_ms`, `timing.connect_ms`, `timing.tls_ms`, `timing.first_byte_ms` |
+| **TCP** | `response`, `duration_ms` |
+| **DNS** | `answers`, `answer_count`, `rcode`, `duration_ms` |
+| **gRPC** | `status` (the serving status the health service returns, such as `SERVING`), `duration_ms` |
+
+A source the check does not offer is rejected when the revision is saved.
+
+`json:` takes a JSONPath (RFC 9535) into the JSON in the first 4 MiB of the body: one string reads
+as the string, any other value as JSON, several values as a JSON array of them, and nothing found or
+a body that is not JSON as empty. `body` also takes the **Matches JSON Schema** assertion, which
+reads the same 4 MiB and names the first place the body departs from the schema; a schema cannot
+`$ref` an external URL or file. `size_bytes` counts the body up to 16 MiB, and `timing.*` are the step's own phases, 0 for a
+phase it did not go through. An extraction by JSONPath needs no pattern: it takes the value found.
+
+A target that cannot be resolved or reached, drops the connection, fails the TLS handshake, or does
+not answer within the timeout fails the run, as a failed critical assertion does. A run is unknown
+only when the check cannot run as configured: the egress policy blocks the target, a secret is
+missing, or a setting is not supported.
+
 The monitor health state is calculated from consecutive successes and failures across its selected
 locations. Configure the failure threshold, recovery threshold, and location policy to avoid
 flapping or declaring a global outage from one isolated network.
+
+## HTTP connection
+
+The **Connection** section of an HTTP check decides how it reaches the server. Empty fields keep the
+defaults:
+
+| Setting | Effect |
+|---|---|
+| **HTTP version** | **Negotiate** offers HTTP/2 and HTTP/1.1 in TLS and lets the server choose, with HTTP/1.1 over plain HTTP. **HTTP/1.1 only** offers nothing else. **HTTP/2 only** fails a run when the server does not agree to HTTP/2, and speaks HTTP/2 over plain HTTP by prior knowledge (h2c). |
+| **DNS server** | Resolve host names on this server, written as `host` or `host:port`. The server passes the egress policy too. |
+| **Host bindings** | Send a host name to chosen IP addresses, as a hosts file does. The Host header and certificate checks still use the original name, which suits checking one origin server or CDN node. |
+| **Client certificate** | The certificate chain and private key shown when the server asks for mutual TLS, in PEM, uploaded as files or pasted; a file holding both fills both fields. The key is stored encrypted and never shown again; leave it empty when editing the check to keep it. |
+
+The result of every step records the address it reached (`remote_address`) and the HTTP version the
+server answered in (`http_version`).
+
+## Trace context and failure diagnostics
+
+The **Diagnostics** section of a check holds two switches, both on by default.
+
+**Trace context**: every request of an HTTP check, redirects included, and every gRPC call carries a
+W3C `traceparent`. The requests of one attempt belong to one trace, each request a span of it; a
+step that sets its own `traceparent` header or metadata keeps it. Steps and results record the
+`trace_id`, and **View trace** in the result detail opens the trace the service under test kept for
+the request; it finds nothing when the service is not traced. The metadata a gRPC check sets goes
+out with the call too.
+
+**Traceroute on failure**: when an HTTP, TCP, TLS, gRPC, SSH, or ICMP check cannot reach its target
+(the connection fails, times out, or breaks off, the TLS handshake fails, or pings go unanswered or
+get lost), the Agent runs one ICMP traceroute to the address it last tried: up to 30 hops, 4 probes
+a hop, at most 12 seconds. The result detail draws it as a table of hops: the address, the loss, and
+the best, average, and worst round trip. A traceroute needs raw sockets (root or `CAP_NET_RAW`) or
+unprivileged ICMP sockets (macOS, and Linux groups within `net.ipv4.ping_group_range`); without
+them the step says why it did not run.
+
+An older Agent sends no `traceparent` and runs no traceroute; the outcome of a check is the same.
+
+**RUM session**: a browser check tells the page it is a test before any script of the page runs. A page that runs the [browser RUM SDK](/en-US/rum/browser-sdk) then records a session of type `synthetics`, which **Open the RUM session of this run** in the attempt opens with its replay and events. Such a session is [left out of the figures of real users](/en-US/rum/test-traffic). The page itself decides whether it runs the SDK; nothing is added to a page that does not.
+
+## Time range and availability
+
+The overview, the list of checks, the results, and the overview of a check carry a time range on the
+right of their navigation card. They open on the last 24 hours, and the range can be changed.
+
+- **Availability** = available runs ÷ runs with an outcome. Passing, flaky, and degraded runs are
+  available, failing ones are not; unknown and skipped runs do not count.
+- The overview gives the availability of all checks over the range with its trend, and colours the
+  map by location; the list of checks gains a column with each check's availability; a check's
+  overview gives its availability, median response time, and p95 over the range, and **Response by
+  location** draws each location's median duration step by step.
+- The **latest runs** strip still shows the latest runs, whatever the range.
+
+Availability comes from `GET /api/v1/synthetics/availability`, with `from` and `to` (microseconds),
+`monitor_id`, `location_id`, and `step` (seconds, chosen from the range when left out). It returns
+the runs, available runs, failures, undecided runs, availability, and P50, P95, and maximum duration
+in all, by check, by location, and step by step; for one check it also returns each location step
+by step. The result list `GET /api/v1/synthetics/results` takes `from_micros` and `to_micros`.
+
+## Result stream and retention
+
+Every scheduled run (test runs aside) is also written as a row of the organization's
+`_synthetic_results` log stream, at the moment the run started, besides its full result. A field a
+run has no value for is left out.
+
+| Field | Content |
+|---|---|
+| `check_id`, `check_name`, `check_kind`, `revision_id` | The check and the revision it ran |
+| `location_id`, `location_name`, `agent_id` | Where it ran, and the Agent that ran it |
+| `result_id`, `outcome`, `available`, `attempts` | The outcome, whether it was available (absent when unknown or skipped), the attempts |
+| `duration_ms`, `dns_ms`, `connect_ms`, `tls_ms`, `first_byte_ms` | The total and the phases of the last attempt |
+| `status_code`, `error_category`, `skip_reason`, `trace_id` | The HTTP status, the failure category, why it was skipped, its trace |
+| `team_id`, `tags` | The check's team and tags (comma separated) |
+
+Dashboard panels and alert rules read the stream with SQL, and a panel's time range applies to the
+query. For example, each check's availability and p95 duration:
+
+```sql
+SELECT check_name,
+       avg(CASE WHEN available THEN 1.0 ELSE 0.0 END) AS availability,
+       approx_percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95_ms
+FROM _synthetic_results
+WHERE available IS NOT NULL
+GROUP BY check_name
+```
+
+A scheduled alert rule reads the same and is [split](/en-US/alerting/rules#split-a-rule-by-columns)
+by `location_name`, so each location whose availability drops below the threshold opens an incident
+of its own.
+
+Full results are kept for 30 days by default, set under **Synthetic results** on the platform's
+**Data retention** page (0 keeps them for good); see [Platform settings](/en-US/settings/platform#data-retention).
+Older runs, their artifacts, and finished tasks are deleted once a day. The `_synthetic_results`
+stream follows its stream retention, which its stream page changes.
 
 ## Locations and Probe Agents
 
@@ -128,6 +244,119 @@ Probe Agent. Through a proxy, the connect time of a result measures the connecti
 including the request for the tunnel. The proxy makes the connection to the target, so the address
 that the egress policy approved is not enforced for the target. Limit what the proxy can reach.
 
+An Agent offers ICMP checks only when its process may send pings: on Linux it needs `CAP_NET_RAW`,
+or a group within `net.ipv4.ping_group_range`. The in-process runner of the embedded Local location
+follows the same rule.
+
+Agents report a feature level with every heartbeat. A check that uses settings older Agents do not
+support is handed only to Agents recent enough to run it: a DNS record type other than A and AAAA,
+a named resolver, DNSSEC, ICMP, assertions on TCP, DNS, and gRPC checks, and for HTTP checks
+JSONPath, JSON Schema, the size and timing sources, HTTP/2 only, a DNS server, host bindings,
+and a client certificate. Upgrade `probe-agent` before an Agent Pool runs such checks.
+
+An Agent without a heartbeat for a minute is marked offline, and a location's health follows its
+Agents: online when all of them are online, degraded when only some are, and offline when none is.
+A run that no Agent takes before its deadline is recorded as **Skipped** with the reason: no Agent
+online, no Agent that runs that kind of check, Agents too old for its settings, or every Agent busy.
+
+### Run Agents on Kubernetes
+
+The Helm chart `probe-agent` runs Agents as a StatefulSet. Each replica registers on its own and keeps
+its identity and its unsent results on its own persistent volume, so a replaced pod stays the same
+Agent. The chart does not deploy the server. The chart `molesignal` deploys the server, in the same
+cluster or anywhere else.
+
+<Warning>
+External Agents need a version later than 26.2.0.0, on the server and in the Agent image. In 26.2.0.0
+the server cannot register an Agent, and an Agent never gets past the **Registered** status.
+</Warning>
+
+<Steps>
+  <Step title="Give the server an address the Agents can reach">
+    Agents connect to ports 5084 and 5085 of a **Standalone** or **Alert** node. `server_names` has to
+    contain the host name they use, and by default it only contains `localhost`. For Agents in the same
+    cluster as the chart `molesignal`, set the name of the Service in the values of that chart. In
+    `distributed` mode, use the Service of the `alert` role.
+
+    ```yaml
+    config:
+      probe:
+        register_endpoint: https://molesignal.molesignal.svc.cluster.local:5084
+        control_endpoint: https://molesignal.molesignal.svc.cluster.local:5085
+        server_names: [molesignal.molesignal.svc.cluster.local]
+    ```
+
+    For Agents elsewhere, expose the two ports with a `LoadBalancer` or `NodePort` Service. Nothing in
+    between may terminate TLS: an Agent only trusts the CA of the server, and the control stream
+    authenticates it with a client certificate.
+  </Step>
+  <Step title="Create a location and a token">
+    Open **Synthetics → Locations**, select **Add private location**, and create a token:
+
+    | Token | Where | Registers | Valid for |
+    |---|---|---|---|
+    | One-time token | **Register agent** | One Agent | Up to 60 minutes |
+    | Agent Token | **Synthetics → Agents → Create Agent Token** | Any number of Agents, until it expires or is disabled | 30 days to one year, or no expiry |
+
+    Use an Agent Token for more than one replica. Both tokens are shown once, with a register command.
+    The next step uses its `--endpoint` and `--ca-certificate-base64`.
+  </Step>
+  <Step title="Install the chart">
+    Store the token in a Secret. The chart has no default token and never writes one to a ConfigMap.
+
+    ```bash
+    kubectl create namespace probes
+    ```
+
+    ```bash
+    kubectl --namespace probes create secret generic probe-agent-registration --from-literal=token=<token>
+    ```
+
+    ```bash
+    helm repo add molesignal https://charts.molesignal.com
+    ```
+
+    ```bash
+    helm install probe-agent molesignal/probe-agent --namespace probes --set registration.endpoint=<endpoint> --set registration.caCertificateBase64=<base64-ca> --set registration.existingSecret=probe-agent-registration
+    ```
+
+    Check the endpoint and the CA. The test tries to register with a token that the server refuses.
+
+    ```bash
+    helm test probe-agent --namespace probes
+    ```
+
+    The Agents then appear under **Synthetics → Agents**.
+  </Step>
+</Steps>
+
+| Behavior | Detail |
+|---|---|
+| Registration | An init container registers when the volume holds no identity, and does nothing otherwise. A one-time token that has been used is therefore not a problem for a replaced pod. |
+| The token | Read only until an Agent has an identity. A new token restarts nothing, and the Secret can be deleted once the Agents are online. A replica with no identity and no token waits in `Init` and says so in its log. |
+| Scaling down and uninstalling | The volumes stay, so an Agent comes back with its identity. To retire an Agent, revoke it and delete its PersistentVolumeClaim, `state-<release>-probe-agent-<ordinal>`. |
+| An Agent that stays away | Its certificate is valid for `[probe].certificate_days`, 30 by default, and is renewed when the Agent connects with less than a week left. After that the Agent cannot return: revoke it, delete its volume, and let it register again. |
+| Pings | The chart sets `net.ipv4.ping_group_range` for the pod, so ICMP checks need no capability. |
+| Image | `ghcr.io/molesignal/probe-agent`. `global.imageRegistry` replaces the registry host. |
+
+Browser checks need a decision about the sandbox of Chromium. The chart starts Chromium with
+`--no-sandbox` by default. Its sandbox needs unprivileged user namespaces, which the `RuntimeDefault`
+seccomp profile blocks. The pod then contains Chromium: it does not run as root, has no capabilities
+and no service account token, and has a read-only root file system. A page that exploits Chromium gets
+the rights of that pod, including the private key of the Agent. To use the sandbox, set
+`browser.sandbox` to `true` and `securityContext.seccompProfile.type` to `Unconfined`. The nodes then
+have to allow unprivileged user namespaces, which on Ubuntu 23.10 and later takes
+`kernel.apparmor_restrict_unprivileged_userns=0`. The `baseline` and `restricted` Pod Security Standards
+do not allow `Unconfined`.
+
+`/dev/shm` needs no configuration. The Agent starts Chromium with `--disable-dev-shm-usage`, so shared
+memory goes to `/tmp`, which `browser.tmp` configures. The default resources, a request of 512 MiB and
+a limit of 2 GiB, fit one browser check at a time. Add at least 1 GiB to the limit for each additional
+`browser.maxConcurrent`. With `browser.maxConcurrent` set to `0`, the Agent offers no browser checks.
+
+See the [chart README](https://github.com/molesignal/molesignal-helm/tree/main/charts/probe-agent) for
+every value and for troubleshooting.
+
 ## Variables, secrets, and evidence
 
 Use variables for reusable non-sensitive values and encrypted secrets for credentials. Secret
@@ -145,11 +374,14 @@ A failing check opens an alert incident, which pages the people on call the same
 | **Degraded** | Opens one, severity `warning`, when **Alert when degraded** is on. |
 | **Flaky** | Opens one, severity `warning`, when **Alert when flaky** is on. |
 | **Passed** | Resolves it. |
+| **No results** | Opens a separate one, severity `warning`, when **Alert when there are no results** is on (it is by default). Resolves it when results come back. |
 
-- A check has at most one active incident. When the check moves between failed, degraded, and flaky, the open incident takes the new severity, and a higher one restarts escalation. An acknowledged incident stays as it is until someone resolves it.
-- The check's **Escalation policy** pages people. With **No escalation policy** nobody is paged, and the notify policies still deliver the incident.
+- A check has at most one active incident for its state. When the check moves between failed, degraded, and flaky, the open incident takes the new severity as the [alert pipelines](/en-US/pipelines/alert-events#severity-changes) decide it, unless someone set its severity by hand, and a higher one restarts escalation. An acknowledged incident stays as it is until someone resolves it.
+- A run that no Agent takes in time is recorded as skipped and leaves its location's state as it was. A location that skips as many runs in a row as fail it is missing results; when as many locations as the location policy needs are missing, the check has **No results**. Its page says so, with the locations and the reason the last run was skipped. The no-results incident carries `synthetic.state` = `no_data` and `alert.condition` = `no_data`, and can be open beside the state incident. Resolved by hand, it does not open again until results have come back.
+- Pausing or archiving a check resolves its open and acknowledged incidents: no run is left to resolve them.
+- The check's **Escalation policy** pages people. With **Routed**, [alert routing](/en-US/alerting/routing) picks the team and the escalation policy; with **No escalation policy** nobody is paged, and the notify policies still deliver the incident.
 - The incident is titled with the check's name. It carries the labels `alert.source` = `synthetic`, `synthetic.kind`, and `synthetic.state`, and `synthetic.tags` and `team_id` when the check has tags and a team, so notify policies can route it. Its detail links back to the check.
-- Notifications are titled with the severity and the check's name, for example `ERROR · Checkout API`, and say `Synthetic check Checkout API is failing.`
+- Notifications are titled with the severity and the check's name, for example `ERROR · Checkout API`, and say `Synthetic check Checkout API is failing.` A no-results notification is titled `NO DATA · Checkout API` and says where and why in the workspace's default language, for example `Synthetic check Checkout API has no results from Frankfurt (3 missed in a row): no Agent was online there.`
 - Only the state of the whole check counts: the state its consecutive failures, recoveries, and location policy give. A single location does not open an incident.
 
 ## Publish failures to a status page
@@ -162,8 +394,12 @@ or automatic publishing. See [Status pages](/en-US/status-pages#publication-auto
 
 | Permission | Capability |
 |---|---|
-| <code>synthetics.read</code> | Read checks, revisions, schedules, runs, results, locations, and Agent state. |
-| <code>synthetics.manage</code> | Create, test, publish, pause, resume, run, and archive checks. |
+| <code>synthetics.monitors.read</code> | Read checks, revisions, and schedules. |
+| <code>synthetics.results.read</code> | Read runs and results. |
+| <code>synthetics.locations.read</code> | Read locations and Agent state. |
+| <code>synthetics.secrets.read</code> | Read the names of encrypted synthetic-monitoring secrets. |
+| <code>synthetics.monitors.manage</code> | Create, test, publish, pause, and resume checks. |
+| <code>synthetics.monitors.run</code>, <code>synthetics.monitors.archive</code> | Run a check now; archive one. |
 | <code>synthetics.locations.manage</code> | Manage locations, Agent pools, register tokens, and egress policies. |
 | <code>synthetics.secrets.manage</code> | Create, rotate, and remove encrypted synthetic-monitoring secrets. |
 

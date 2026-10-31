@@ -16,7 +16,7 @@ policy creation, fallback routes, or delivery history.
 |---|---|---|---|
 | `slack_webhook` | `{ "text": "..." }` | Credential in webhook URL | `fixed_group`, `webhook` |
 | `lark_webhook` | Lark `msg_type: text` | Credential in URL, optional signature | `fixed_group`, `webhook` |
-| `webhook` | MoleSignal target and message envelope | Custom JSON headers | All target types |
+| `webhook` | MoleSignal event JSON, or the notify template body | Custom JSON headers, optional signature | All target types |
 
 For `fixed_group`, the connector sends to the configured URL. For `webhook`, the target value must
 be an absolute URL and overrides the configured URL for that delivery.
@@ -90,42 +90,165 @@ response.
 
 ## Generic webhook
 
-Configure the default URL, method, headers, and timeout:
+Configure the default URL, method, body, signing secret, headers, and timeout:
 
 ```json
 {
   "url": "https://notify.example.com/molesignal",
   "method": "post",
+  "body": "event",
+  "signing_secret": "<at-least-16-characters>",
   "headers": {
-    "Authorization": "Bearer <token>",
     "X-Environment": "production"
   },
   "timeout_secs": 10
 }
 ```
 
-The method can be `post`, `put`, or `patch`. Header names and values must be valid HTTP headers.
-MoleSignal sends this envelope:
+The method can be `post`, `put`, or `patch`. Header names and values must be valid HTTP syntax, and
+cannot be `Content-Type` or the `X-MoleSignal-*` names below.
+
+### The body
+
+With `body` set to `event`, the default and **MoleSignal event** in the console, the body is JSON for
+machines to read:
 
 ```json
 {
-  "target": {
-    "type": "fixed_group",
-    "value": "platform-oncall",
-    "metadata": {}
+  "version": 1,
+  "event": {
+    "id": "alert.triggered:3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "type": "alert.triggered",
+    "occurred_at": "2026-10-28T08:00:00Z",
+    "organization_id": "<organization-id>"
   },
+  "alert": {
+    "id": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "status": "open",
+    "severity": "critical",
+    "title": "High error rate · checkout",
+    "url": "https://molesignal.example.com/alerts/incidents/3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "started_at": "2026-10-28T08:00:00Z",
+    "acknowledged_at": null,
+    "resolved_at": null,
+    "acknowledged_by": null,
+    "resolved_by": null,
+    "assignees": ["<user-id>"],
+    "team_id": "<team-id>",
+    "service": "checkout",
+    "environment": "production",
+    "affected_services": ["checkout"],
+    "labels": { "service": "checkout", "env": "production" },
+    "annotations": { "runbook_url": "https://runbooks.example.com/checkout" },
+    "value": 120.0,
+    "threshold": 50.0
+  },
+  "rule": { "id": "<rule-id>", "name": "High error rate", "description": "Share of 5xx answers." },
+  "target": { "type": "fixed_group", "value": "platform-oncall", "metadata": {} },
   "message": {
-    "title": "Checkout error rate is high",
+    "title": "[CRITICAL] High error rate · checkout",
     "text": "The error rate exceeded 5%.",
     "markdown": "**Checkout** error rate exceeded 5%.",
     "html": null,
-    "metadata": {}
+    "metadata": { "event_type": "alert.triggered", "alert_id": "3KEDNEyqouYJeBDTLTMTBui7XHW" }
   }
 }
 ```
 
-Any 2xx response is successful. If the response includes `X-Request-ID`, MoleSignal records the
-header value as the provider message ID.
+| Field | Content |
+|---|---|
+| `version` | The version of the body's structure, now `1`. Fields are only ever added; it goes up only for a change that breaks readers. |
+| `event` | The notification's `id`, `type` (for example `alert.triggered`, `alert.escalated`, `oncall.shift.starting`), `occurred_at`, and `organization_id`. |
+| `alert` | Alert notifications only: the status, severity, title, the incident's address (with `http.external_url` set), when it started, was acknowledged and resolved, the assignees, team, service, environment, labels, annotations, value and threshold. Times are RFC 3339 in UTC, and people and teams are IDs. |
+| `rule` | The alert's rule: `id`, `name`, `description`. |
+| `escalation` | Escalation notifications only: `step`, `loop`, `reason` (why it went out; see [Act on an incident](/en-US/alerting/incidents#act-on-an-incident)), and `target` (`kind` and `id`). |
+| `data` | For notifications that are not alerts, such as an on-call handover or missing coverage, the event's attributes as they are. |
+| `target` | The target of this delivery: `type`, `value`, `metadata`. |
+| `message` | The rendered message: `title`, `text`, `markdown`, `html`, `metadata`. |
+
+With `body` set to `template`, **Notify template body**, the body is the template the notify policy chose
+for the webhook channel, sent as written: a JSON template goes as `application/json`, with values escaped
+as JSON strings, and other formats as `text/plain; charset=utf-8`. When the policy chose no template for
+the webhook channel, the body of the general template or of the event's own message is sent. See
+[Conditions](/en-US/notification-channels#conditions) for writing templates.
+
+### Headers and the signature
+
+| Header | Content |
+|---|---|
+| `Content-Type` | `application/json`, or `text/plain; charset=utf-8` for a template body that is not JSON. |
+| `X-MoleSignal-Event` | The notification type, the same as `event.type`. |
+| `X-MoleSignal-Delivery` | The ID of this delivery, by which the receiver can drop repeated requests. |
+| `X-MoleSignal-Timestamp` | With a signing secret only: the Unix time of sending, in seconds. |
+| `X-MoleSignal-Sign` | With a signing secret only: `sha256=<hex>`, the HMAC-SHA256 of `<timestamp>.<body>` under the signing secret. |
+
+The receiver computes it again over the raw body with the same secret, compares it with
+`X-MoleSignal-Sign` in constant time, and refuses a timestamp too far from now, for example more than 5
+minutes. Compute over the raw bytes, not over JSON parsed and written again:
+
+<CodeGroup>
+```python Python
+import hashlib, hmac, time
+
+def verify(secret: str, headers, body: bytes, tolerance: int = 300) -> bool:
+    timestamp = headers.get("X-MoleSignal-Timestamp", "")
+    signature = headers.get("X-MoleSignal-Sign", "")
+    if not timestamp.isdigit() or abs(time.time() - int(timestamp)) > tolerance:
+        return False
+    mac = hmac.new(secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256)
+    return hmac.compare_digest("sha256=" + mac.hexdigest(), signature)
+```
+
+```javascript Node.js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+export function verify(secret, headers, body, toleranceSecs = 300) {
+  const timestamp = headers['x-molesignal-timestamp'] ?? '';
+  const signature = Buffer.from(headers['x-molesignal-sign'] ?? '');
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > toleranceSecs) return false;
+  const expected = Buffer.from(
+    'sha256=' + createHmac('sha256', secret).update(`${timestamp}.`).update(body).digest('hex'),
+  );
+  return expected.length === signature.length && timingSafeEqual(expected, signature);
+}
+```
+
+```go Go
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+func verify(secret string, r *http.Request, body []byte, tolerance time.Duration) bool {
+	timestamp := r.Header.Get("X-MoleSignal-Timestamp")
+	seconds, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil || time.Since(time.Unix(seconds, 0)).Abs() > tolerance {
+		return false
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp + "."))
+	mac.Write(body)
+	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(expected), []byte(r.Header.Get("X-MoleSignal-Sign")))
+}
+```
+</CodeGroup>
+
+A signing secret has at least 16 characters, such as one from `openssl rand -hex 32`; the HTTP targets
+of connectors sign the same way; see [Connectors](/en-US/connectors).
+
+### Responses and outbound requests
+
+Any 2xx response is successful. If the response contains `X-Request-ID`, MoleSignal records the header
+value as the provider message ID. MoleSignal connects only to the addresses the host resolves to,
+refuses cloud metadata addresses, and does not follow redirects. Webhook notifications are never
+[merged](/en-US/notification-channels#merge-notifications).
 
 ## Create and test over the API
 
@@ -133,7 +256,7 @@ Create a generic webhook connector:
 
 ```bash
 curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors" \
-  -H "Authorization: Bearer $MS_JWT" \
+  -H "Authorization: Bearer $MS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "platform webhook",
@@ -142,6 +265,8 @@ curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors" \
     "config": {
       "url": "https://notify.example.com/molesignal",
       "method": "post",
+      "body": "event",
+      "signing_secret": "<at-least-16-characters>",
       "headers": {"Authorization": "Bearer <token>"},
       "timeout_secs": 10
     }
@@ -152,7 +277,7 @@ Save the returned connector `id`, then send a test:
 
 ```bash
 curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors/$CONNECTOR_ID/test" \
-  -H "Authorization: Bearer $MS_JWT" \
+  -H "Authorization: Bearer $MS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "target_type": "fixed_group",
@@ -170,14 +295,15 @@ During an existing connector update, send the unchanged `***` value to preserve 
 ## Security and limitations
 
 - MoleSignal encrypts the complete connector configuration at rest.
-- API responses mask `url`, `webhook_url`, `headers`, `secret`, tokens, and passwords.
+- API responses mask `url`, `webhook_url`, `headers`, `secret`, `signing_secret`, tokens, and passwords.
 - Treat a webhook URL as a credential even when no additional secret is configured.
 - Prefer `https`; use `http` only on a trusted network.
 - Restrict outbound access from MoleSignal to required connector destinations.
 - A disabled connector cannot send tests or notifications.
 
-<Warning>
-  The current connector registry does not include native DingTalk or WeCom adapters. Use a generic
-  webhook only when the target accepts the MoleSignal envelope, or place a transformation relay in
-  front of the provider endpoint.
-</Warning>
+<Note>
+  DingTalk, WeCom, Teams, and Google Chat have connectors of their own; see
+  [Configure each provider](/en-US/notification-channels#configure-each-provider). When the target wants
+  another JSON shape, write it with a JSON webhook template and choose **Notify template body** as the
+  body; no transformation relay is needed.
+</Note>

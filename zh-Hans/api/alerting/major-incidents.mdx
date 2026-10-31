@@ -1,0 +1,154 @@
+---
+title: "重大事件"
+description: "把事件宣布为重大事件：指派指挥官、沟通负责人和记录员，建作战室和会议，按清单分工，统一发进展。"
+"en_link": "/en-US/api/alerting/major-incidents"
+---
+
+影响面大、要多人协作的事件可以宣布为重大事件：它有三个角色，可以有作战室（飞书或 Slack 群）和会议，有一张任务清单，进展统一发到作战室并通知相关的人。组织也可以设自动规则，让满足条件的新事件一开出来就是重大事件。页面上的用法见[重大事件与复盘](/zh-Hans/alerting/major-incidents)。
+
+| 方法与路径 | 作用 | 权限 |
+|---|---|---|
+| `GET /api/v1/alerts/incidents/{id}/response` | 事件的重大事件处置和任务。 | 对事件的 `alerts.incidents.read` |
+| `POST /api/v1/alerts/incidents/{id}/declare` | 宣布为重大事件。 | 对事件的 `alerts.incidents.escalate` |
+| `PUT /api/v1/alerts/incidents/{id}/roles` | 指派或撤下一个角色。 | 对事件的 `alerts.incidents.update` |
+| `POST /api/v1/alerts/incidents/{id}/tasks` | 加一项任务。 | 对事件的 `alerts.incidents.update` |
+| `PUT /api/v1/alerts/incidents/{id}/tasks/{task_id}` | 改任务：标题、负责人、完成与否。 | 对事件的 `alerts.incidents.update` |
+| `DELETE /api/v1/alerts/incidents/{id}/tasks/{task_id}` | 删除任务。 | 对事件的 `alerts.incidents.update` |
+| `POST /api/v1/alerts/incidents/{id}/status-updates` | 发一次进展。 | 对事件的 `alerts.incidents.update` |
+| `GET /api/v1/alerts/response/settings` | 组织的重大事件设置。 | `alerts.response.read` |
+| `PUT /api/v1/alerts/response/settings` | 保存组织的重大事件设置。 | `alerts.response.manage` |
+
+宣布、指派角色、建作战室、加任务、做完任务和发进展都记在事件的[时间线](/zh-Hans/api/alerting/incident-timeline)上；宣布和保存设置还记进审计日志。
+
+## 宣布
+
+```http
+POST /api/v1/alerts/incidents/{id}/declare
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `commander_id` | string | 否 | 指挥官；不填时是宣布的人。 |
+
+已经宣布过的事件原样返回；已解决的事件不能宣布。宣布时按组织的设置：
+
+1. 把设置里的检查清单加成任务。
+2. 按 `meeting` 开会：`feishu_vc` 用飞书 App 预约一场 6 小时的飞书视频会议，指挥官是会议所有人；`tencent_meeting` 预约一场 6 小时的腾讯会议；`zoom` 开一场即时会议；`google_meet` 建一个会议空间；`fixed_url` 用固定的会议链接。
+3. 用设置里的连接器建群（飞书 App、Slack App、钉钉或企业微信），群名是 `[严重度] 事件摘要`，拉进事件的负责人、各角色和关注人（按各人在这个连接器里绑定的身份），钉钉和企业微信的群主是指挥官；发一段开场白、事件链接和入会链接。
+4. 在开了 `on_major_incident` 的[工单连接器](/zh-Hans/api/alerting/tickets)上建单。
+
+作战室、会议和工单都是尽力而为：做不成只记日志，宣布照样成立。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/declare \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"commander_id": "<user-id>"}'
+```
+</RequestExample>
+
+宣布、读取和指派角色都返回 `{ "response": { ... }, "tasks": [ ... ] }`；事件没有宣布时 `response` 为 `null`。
+
+<ResponseExample>
+```json 200
+{
+  "response": {
+    "incident_id": "<incident-id>",
+    "org_id": "<organization-id>",
+    "declared_at": 1790000000000000,
+    "declared_by": "<user-id>",
+    "roles": { "commander": "<user-id>" },
+    "war_room": {
+      "platform": "lark_app",
+      "connector_id": "<connector-id>",
+      "chat_id": "oc_5ad11d72b830411d72b836c20",
+      "url": "https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=<token>"
+    },
+    "meeting_url": "https://vc.feishu.cn/j/123456789",
+    "updated_at": 1790000000000000
+  },
+  "tasks": [
+    {
+      "id": "3KJ9a1C7vXe2Rf8MbN4qLw0TzHd",
+      "org_id": "<organization-id>",
+      "incident_id": "<incident-id>",
+      "title": "Open a status page incident",
+      "assignee_id": null,
+      "done": false,
+      "done_by": null,
+      "done_at": null,
+      "position": 0,
+      "created_by": "<user-id>",
+      "created_at": 1790000000000000
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| 字段 | 说明 |
+|---|---|
+| `declared_by` | 宣布的人；组织的自动规则宣布的为 `null`。 |
+| `roles` | `commander`（指挥官）、`communications`（沟通负责人）和 `scribe`（记录员）到用户 ID 的映射，没指派的不出现。 |
+| `war_room` | 作战室：`platform`（`lark_app`、`slack_app`、`dingtalk_app` 或 `wecom_app`）、连接器、群 ID 和入群链接；钉钉和企业微信的群没有入群链接，`url` 为空串。没建群时为 `null`。 |
+| `meeting_url` | 会议链接；没有会议时为 `null`。 |
+
+## 角色与任务
+
+指派角色的请求体是 `{ "role": "scribe", "user_id": "<user-id>" }`，`user_id` 为 `null` 时撤下这个角色。事件要先宣布。
+
+加任务的请求体是 `{ "title": "…", "assignee_id": "<user-id>" }`，标题 1 到 200 个字符，一个事件最多 50 项。改任务时只传要改的字段：`title`、`assignee_id`（传 `null` 撤下负责人）和 `done`；做完时记下 `done_by` 和 `done_at`。加任务和改任务都返回任务，删除返回 `{ "deleted": true }`。
+
+## 发进展
+
+```http
+POST /api/v1/alerts/incidents/{id}/status-updates
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `impact` | string | 影响。 |
+| `current` | string | 现状。 |
+| `next` | string | 下一步。 |
+
+三项至少写一项，每项最多 2000 个字符；事件要先宣布。进展记进时间线，发到作战室，并以通知事件 `incident.status_update` 交给通知引擎：收件人是事件的负责人、各角色和设置里的关注人，由内置策略[重大事件进展：通知关注人](/zh-Hans/notification-channels#内置策略)发出；事件属性里的 `status_update` 带 `impact`、`current`、`next` 和发的人 `author`。返回 `{ "sent": true }`。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/status-updates \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"impact": "EU checkout failing for 30% of users", "current": "Rolling back v2026.10.28", "next": "Confirm the error rate drops"}'
+```
+</RequestExample>
+
+## 组织设置
+
+```http
+PUT /api/v1/alerts/response/settings
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `war_room_connector_id` | string | 建作战室用的通知连接器，要能建群：`lark_app`、`slack_app`、`dingtalk_app` 或 `wecom_app`；`null` 时不建群。 |
+| `meeting` | string | `none`（默认，不开会议）、`feishu_vc`、`tencent_meeting`、`zoom`、`google_meet` 或 `fixed_url`。 |
+| `meeting_url` | string | `fixed_url` 时的会议链接，`https://` 开头。 |
+| `meeting_connector_id` | string | `feishu_vc` 时预约会议用的飞书 App 连接器；`null` 时用建群的连接器，它也要是飞书 App。 |
+| `tencent_meeting` | object | `tencent_meeting` 时必填：企业自建应用的 `app_id`、`sdk_id`（应用有才填）、`secret_id`，和会议创建人的 `userid`。 |
+| `zoom` | object | `zoom` 时必填：服务器到服务器 OAuth 应用的 `account_id`、`client_id`，和主持人 `host`（邮箱或用户 ID）。 |
+| `google_meet` | object | `google_meet` 时必填：组织者 `organizer`（邮箱），服务账号代这个人建会议。 |
+| `secrets` | object | 只写：新填的会议密钥，键是 `tencent_meeting.secret_key`、`zoom.client_secret` 或 `google_meet.credentials`（服务账号密钥 JSON 的文本）。留空的保持原样；只保留所选会议的那一个。 |
+| `checklist` | array | 宣布时加成任务的条目，最多 30 条，每条最多 200 个字符。 |
+| `stakeholder_ids` | array | 关注人：进展会通知这些人，建群时也拉进来。 |
+| `auto` | object | 自动宣布：`{ "enabled": true, "min_severity": "critical", "conditions": [ ... ] }`。新开的事件严重度不低于 `min_severity`、标签满足 `conditions` 时自动宣布，`declared_by` 为 `null`；`conditions` 的写法同[路由规则的条件](/zh-Hans/api/alerting/create-routing-rule)。 |
+
+请求体是完整的设置，返回保存后的设置；没保存过时读到的是默认值。密钥用根密钥加密保存，读出来的设置里只有 `secrets_set`（已经设了的密钥的键），另有只读的 `war_room_types`：能建作战室的连接器类型。
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 事件已解决、事件还没宣布、字段超出限制，或连接器不是本组织的飞书 App 或 Slack App。 |
+| `403` | 缺少权限，或无权访问这个事件。 |
+| `404` | 事件或任务不存在。 |

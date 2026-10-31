@@ -1,0 +1,105 @@
+---
+title: "事件复盘"
+description: "为事件写内部复盘：Markdown 正文、状态、负责人和评审人，以及各有负责人和截止日期的改进项，一项可以建一张工单。"
+"en_link": "/en-US/api/alerting/postmortems"
+---
+
+内部复盘一个事件一份，正文是 Markdown。它和[状态页的事故复盘](/zh-Hans/status-pages#事故复盘)分开保存；页面上可以把复盘的摘要复制过去。页面上的用法见[重大事件与复盘](/zh-Hans/alerting/major-incidents#复盘)。
+
+| 方法与路径 | 作用 | 权限 |
+|---|---|---|
+| `GET /api/v1/alerts/postmortems` | 组织的复盘，新的在前，带改进项的数目。 | `postmortems.read` |
+| `GET /api/v1/alerts/incidents/{id}/postmortem` | 事件的复盘和改进项。 | 对事件的 `alerts.incidents.read`，以及 `postmortems.read` |
+| `POST /api/v1/alerts/incidents/{id}/postmortem` | 为事件起一份复盘。 | 对事件的 `alerts.incidents.read`，以及 `postmortems.manage` |
+| `PUT /api/v1/alerts/postmortems/{id}` | 改复盘：标题、正文、状态、负责人和评审人。 | `postmortems.manage` |
+| `POST /api/v1/alerts/postmortems/{id}/actions` | 加一项改进。 | `postmortems.manage` |
+| `PUT /api/v1/alerts/postmortems/{id}/actions/{action_id}` | 改一项改进。 | `postmortems.manage` |
+| `DELETE /api/v1/alerts/postmortems/{id}/actions/{action_id}` | 删除一项改进。 | `postmortems.manage` |
+| `POST /api/v1/alerts/postmortems/{id}/actions/{action_id}/ticket` | 为一项改进建工单。 | `postmortems.manage` |
+
+## 起草与修改
+
+```http
+POST /api/v1/alerts/incidents/{id}/postmortem
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `title` | string | 是 | 1 到 200 个字符。 |
+| `body` | string | 否 | Markdown 正文，最多 100000 个字符。 |
+
+事件已经有复盘时返回 `409`。页面会先按模板起好草稿（摘要、影响、时间线、根因、做得好的、做得不好的、改进项），再调用这个接口；创建记进审计日志。修改时只传要改的字段：`title`、`body`、`status`、`owner_id`（传 `null` 撤下）和 `reviewer_ids`。
+
+<RequestExample>
+```bash cURL
+curl -X PUT http://localhost:5080/api/v1/alerts/postmortems/$POSTMORTEM_ID \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"status": "in_review", "reviewer_ids": ["<user-id>"]}'
+```
+</RequestExample>
+
+读取、起草和修改都返回 `{ "postmortem": { ... }, "actions": [ ... ] }`；事件没有复盘时 `postmortem` 为 `null`。
+
+<ResponseExample>
+```json 200
+{
+  "postmortem": {
+    "id": "3KJbX2p8Lr0Ws4Nf6Qa1Hd9TcVe",
+    "org_id": "<organization-id>",
+    "incident_id": "<incident-id>",
+    "title": "Checkout errors after the payments deploy",
+    "status": "in_review",
+    "body": "# Checkout errors after the payments deploy\n\n## Summary\n…",
+    "owner_id": "<user-id>",
+    "reviewer_ids": ["<user-id>"],
+    "created_by": "<user-id>",
+    "created_at": 1790000000000000,
+    "updated_at": 1790003600000000,
+    "published_at": null
+  },
+  "actions": [
+    {
+      "id": "3KJbZ7m1Qe5Rt9Va2Xc8Lw0NdHf",
+      "org_id": "<organization-id>",
+      "postmortem_id": "3KJbX2p8Lr0Ws4Nf6Qa1Hd9TcVe",
+      "incident_id": "<incident-id>",
+      "title": "Alert on payments pool saturation",
+      "owner_id": "<user-id>",
+      "due_at": 1790600000000000,
+      "status": "open",
+      "ticket_id": "<ticket-id>",
+      "ticket_key": "OPS-57",
+      "ticket_url": "https://example.atlassian.net/browse/OPS-57",
+      "created_at": 1790003600000000,
+      "updated_at": 1790003600000000
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| 字段 | 说明 |
+|---|---|
+| `status` | `draft`（草稿）、`in_review`（评审中）或 `published`（已发布）。第一次改成 `published` 时记下 `published_at`。 |
+
+列表的每一行是复盘的各字段，另加事件摘要 `incident_summary`、没完成的改进项数 `open_actions`，以及过了截止日期还没完成的 `overdue_actions`。
+
+## 改进项
+
+加一项改进的请求体是 `{ "title": "…", "owner_id": "<user-id>", "due_at": 1790600000000000 }`，标题 1 到 300 个字符，一份复盘最多 50 项，`due_at` 是 Unix 微秒。修改时只传要改的字段：`title`、`owner_id`、`due_at`（这两项传 `null` 撤下）和 `status`（`open` 或 `done`）。加和改都返回改进项，删除返回 `{ "deleted": true }`。
+
+```http
+POST /api/v1/alerts/postmortems/{id}/actions/{action_id}/ticket
+```
+
+请求体是 `{ "connector_id": "<connector-id>" }`：在这个[工单连接器](/zh-Hans/api/alerting/tickets)上为改进项建一张单，返回带 `ticket_key` 和 `ticket_url` 的改进项；已经建过的原样返回。这张单不跟着事件写评论、流转，完结时也不会解决事件。
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 字段超出限制，或工单连接器已停用。 |
+| `403` | 缺少权限，或无权访问这个事件。 |
+| `404` | 事件、复盘、改进项或工单连接器不存在。 |
+| `409` | 事件已经有复盘。 |

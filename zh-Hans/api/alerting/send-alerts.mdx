@@ -1,0 +1,72 @@
+---
+title: "接入外部告警"
+description: "外部系统把告警发进来：触发、确认、恢复。"
+"en_link": "/en-US/api/alerting/send-alerts"
+---
+
+```http
+POST /api/v1/intake/alerts
+```
+
+外部系统用[告警来源](/zh-Hans/alerting/sources)的 Token 调用：请求头 `Authorization: Bearer <token>`，设不了请求头的放在地址上 `?token=<token>`。所有来源共用这个地址，Token 决定是哪个来源，来源的类型决定请求体按哪家的格式读。各家的格式见[配置发送方](/zh-Hans/alerting/sources#配置发送方)（邮件来源读 `Content-Type: message/rfc822` 的原始邮件），这里说明 **API** 类型的请求体。请求体最大 4 MiB。
+
+请求体是一个告警对象，或最多 100 个告警对象的数组。不认得的字段会被拒收。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `action` | string | `trigger`（默认）、`acknowledge` 或 `resolve`。 |
+| `dedup_key` | string | 来源内的去重键，最多 255 个字符；同一个键同时只有一个活动事件。`acknowledge` 与 `resolve` 必填。`trigger` 不带时按 `summary` 和 `labels` 算一个，响应里返回。 |
+| `summary` | string | 事件标题，`trigger` 必填，最多 1024 个字符。 |
+| `severity` | string | `critical`、`error`、`warning` 或 `info`；不带时用来源的默认严重度。 |
+| `priority` | string | 事件的优先级，`P1` 到 `P9`（也认 `1` 到 `9`），超出组织档数的落到最低一档；不带时不设。 |
+| `urgency` | string | 事件的紧急度，组织某一档的键，例如 `high`、`low`，组织没有的键不算；不带时按来源的升级策略定，没带 `severity` 的告警按 `high`。 |
+| `labels` | object | 标签，最多 64 个。键不能以 `alert.` 或 `__molesignal` 开头，也不能是 `external.kind`。 |
+| `annotations` | object | 注解，与链接合计最多 64 个。 |
+| `links` | array | 最多 10 个 `{"name": "…", "url": "https://…"}`，按 `name` 写进注解；没有 `name` 的叫 `link`。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/alerts \
+  -H "authorization: Bearer $SOURCE_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"dedup_key": "disk-full/web-1", "summary": "web-1 磁盘使用率 95%", "severity": "critical", "labels": {"host.name": "web-1"}, "links": [{"name": "Runbook", "url": "https://wiki.example.com/disk"}]}'
+```
+</RequestExample>
+
+响应按顺序给出每条告警的结果。`message` 说明读懂了却没有要处理的告警时的原因，例如 PagerDuty 的测试事件。
+
+<ResponseExample>
+```json 200
+{
+  "alerts": [
+    {
+      "dedup_key": "disk-full/web-1",
+      "outcome": "opened",
+      "incident_id": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+      "reason": null
+    }
+  ],
+  "message": null
+}
+```
+</ResponseExample>
+
+| `outcome` | 含义 |
+|---|---|
+| `opened` | 开了新事件。 |
+| `updated` | 改了活动事件的严重度，或通知分组里的告警。 |
+| `unchanged` | 活动事件已经是这样，或已被人确认。 |
+| `acknowledged` | 确认了事件。 |
+| `resolved` | 解决了事件，已确认的也解决。 |
+| `ignored` | 什么都没动，原因在 `reason` 中，例如没有活动事件，或这是比上一条更早的旧消息。 |
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 请求体读不懂，原因在 `message` 中。 |
+| `401` | 没带 Token、Token 不对，或来源不存在。 |
+| `403` | 组织已停用。 |
+| `409` | 来源已停用。 |
+| `413` | 请求体超过 4 MiB。 |
+| `503` | 来源的接收集群连不上，或这次没能处理完。重试即可，重试不会重复开事件。 |

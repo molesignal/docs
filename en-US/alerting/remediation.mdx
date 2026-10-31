@@ -1,0 +1,117 @@
+---
+title: "Remediation"
+description: "Define HTTP and Kubernetes remediation actions in advance, start one on an incident in one click, run it once approved, and check a few minutes later whether it worked."
+"zh-Hans_link": "/zh-Hans/alerting/remediation"
+---
+
+A remediation action is a fix defined in advance: a call to Jenkins, GitHub Actions, Argo, Rundeck, or a
+similar system, or a restart, scale, or rollback of a workload on a registered Kubernetes cluster. Whoever
+handles an incident starts it on the incident in one click; every run is approved, runs as soon as it is,
+and its outcome and the check after it go on the incident's timeline.
+
+Open **Alerts → Remediation**. Viewing requires `alerts.remediation.read`, defining actions and registering clusters
+requires `alerts.remediation.manage`, starting a run on an incident requires `alerts.incidents.remediate`, and approving one
+requires `agent.approve`.
+
+## Define a remediation action
+
+Select **New remediation action** and fill in:
+
+| Part | Settings |
+|---|---|
+| **Basics** | **Name** and **Description**. |
+| **How it runs** | **HTTP request** or **Kubernetes**; see below. |
+| **Asked when started** | Values to fill in when starting it, at most 10: the **Name** (written `{{params.name}}` in templates), **Label**, **Kind** (**Text**, **Number**, or **Choice**), **Choices**, **Default**, and **Required**. |
+| **Scope and approval** | **Services** (comma separated; empty applies to every incident); **Risk**: **L2 · one approver** or **L3 · two approvers**; **Check after**: how many minutes later to look at the result, 0 for no check; **It worked when**: **The incident recovered** or **The rule is healthy again**; and **Turned on**. |
+
+The list gives each action's services (**All incidents** when unrestricted) and risk, and marks the ones
+**Turned off**, which incidents do not offer.
+
+### HTTP request
+
+| Setting | Notes |
+|---|---|
+| **Method**, **Address** | `GET`, `POST`, `PUT`, or `PATCH`, and an address starting with `http://` or `https://`. |
+| **Headers** | For example `Authorization`. Values are stored encrypted and not shown again; left empty while editing, a value is kept. |
+| **Body** | JSON, written in a JSON editor; the filled-in values are escaped as JSON. A placeholder in quotes is a string, and one without quotes can stand for a number, as in `{"replicas": {{params.replicas}}}`. With every placeholder read as 0, the body has to be valid JSON, or it cannot be saved. |
+| **Signing secret** | When set, the request carries `X-MoleSignal-Timestamp` and `X-MoleSignal-Sign`, as for the [generic webhook signature](/en-US/notification-channels/webhooks#headers-and-the-signature), so the receiver can check it came from MoleSignal. |
+
+The address, headers, and body can use `{{incident.id}}`, `{{incident.summary}}`, `{{incident.severity}}`,
+`{{incident.status}}`, `{{incident.service}}`, `{{incident.url}}`, and `{{params.name}}`. Values filled into
+the address are percent-encoded.
+
+The request connects only to the IPs the address resolves to, never to cloud metadata addresses, follows no
+redirects, and times out after 30 seconds; a 2xx response counts as a successful run, and the start of the
+response is kept on the run.
+
+### Kubernetes
+
+| Setting | Notes |
+|---|---|
+| **Cluster** | A registered cluster; see [Register a Kubernetes cluster](#register-a-kubernetes-cluster). |
+| **Operation** | **Restart** (a rolling restart, as `kubectl rollout restart`), **Scale**, or **Roll back one revision** (as `kubectl rollout undo`). |
+| **Workload kind** | Deployment, StatefulSet, or DaemonSet. Only a Deployment can be rolled back, and a DaemonSet cannot be scaled. |
+| **Namespace**, **Workload name** | Can be templates, such as `{{incident.service}}`. |
+| **Replicas** | The replica count to scale to; can be `{{params.replicas}}`, filled in when starting. |
+
+## Register a Kubernetes cluster
+
+Under **Kubernetes clusters**, select **Add a cluster** and enter the **Name**, the **API server address**,
+the **CA certificate** (PEM; empty uses the system's trusted roots), and a **ServiceAccount token**. The
+token is stored encrypted and not shown again. **Test connection** reads the cluster version once.
+
+Give MoleSignal a ServiceAccount of its own with only what it needs: `get` and `patch` on the target
+workloads, the `scale` subresource for scaling, and listing ReplicaSets for rollbacks. For example, to allow
+only the workloads of the `shop` namespace:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: molesignal-remediation
+  namespace: shop
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["list"]
+```
+
+Connections go only to the IPs the API server address resolves to, never to cloud metadata addresses. A
+cluster that an action still uses cannot be deleted.
+
+## Run an action on an incident
+
+**Remediation** in the incident details lists the actions that apply to the incident: those without a
+service restriction, and those whose services match the incident's. Select **Run** beside one, fill in its
+values, write a **Reason** (for example "checkout ran out of connections, restart first"), and
+**Send for approval**. A resolved incident cannot start one.
+
+The run then waits for approval: one person with `agent.approve` for L2 and two for L3, and the requester
+cannot be an approver. Approvers select **Approve** or **Reject** on the same card, or handle it among
+[Mole Agent's approvals](/en-US/agent#approvals-and-executions). The run starts as soon as enough people
+approve.
+
+| State | Meaning |
+|---|---|
+| **Awaiting approval** | Not enough approvals yet. |
+| **Running** | Calling the address or changing the cluster. |
+| **Ran**, **Failed** | It finished; the start of the response or the error is beside it. |
+| **Not run** | The approval was rejected, expired, or cancelled. |
+| **Awaiting check** | It ran, and the result is checked after the set minutes. |
+| **Passed check**, **Failed check** | It passes when the incident has recovered (or the rule is healthy again) by then. |
+
+Starting, running, and checking go on the incident's [timeline](/en-US/alerting/incidents#incident-details),
+and starting is also recorded in the audit log.
+
+Mole Agent can list the remediation actions that apply to an incident and propose a run; a run it proposes
+always needs two approvals, whatever risk the action sets.
+
+## API
+
+| Operation | Endpoint |
+|---|---|
+| Manage actions and clusters | [`/api/v1/alerts/remediation/actions`, `/clusters`](/en-US/api/alerting/remediation) |
+| Start a run on an incident | [`POST /api/v1/alerts/incidents/{id}/remediations`](/en-US/api/alerting/remediation#run-an-action-on-an-incident) |

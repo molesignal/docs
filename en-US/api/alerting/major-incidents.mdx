@@ -1,0 +1,180 @@
+---
+title: "Major incidents"
+description: "Declare an incident major: assign a commander, a communications lead, and a scribe, open a war room and a meeting, split the work with a checklist, and post updates in one stream."
+"zh-Hans_link": "/zh-Hans/api/alerting/major-incidents"
+---
+
+An incident with wide impact that several people work on can be declared major: it gets three roles, can get
+a war room (a Feishu or Slack chat) and a meeting, has a task list, and its updates go to the war room and
+notify the people involved. The organization can also set a rule that makes matching new incidents major
+from the start. How the pages use it is in [Major incidents and postmortems](/en-US/alerting/major-incidents).
+
+| Method and path | What it does | Permission |
+|---|---|---|
+| `GET /api/v1/alerts/incidents/{id}/response` | The incident's major incident response and tasks. | `alerts.incidents.read` on the incident |
+| `POST /api/v1/alerts/incidents/{id}/declare` | Declares it major. | `alerts.incidents.escalate` on the incident |
+| `PUT /api/v1/alerts/incidents/{id}/roles` | Assigns or clears a role. | `alerts.incidents.update` on the incident |
+| `POST /api/v1/alerts/incidents/{id}/tasks` | Adds a task. | `alerts.incidents.update` on the incident |
+| `PUT /api/v1/alerts/incidents/{id}/tasks/{task_id}` | Changes a task: its title, assignee, or whether it is done. | `alerts.incidents.update` on the incident |
+| `DELETE /api/v1/alerts/incidents/{id}/tasks/{task_id}` | Deletes a task. | `alerts.incidents.update` on the incident |
+| `POST /api/v1/alerts/incidents/{id}/status-updates` | Posts an update. | `alerts.incidents.update` on the incident |
+| `GET /api/v1/alerts/response/settings` | The organization's major incident settings. | `alerts.response.read` |
+| `PUT /api/v1/alerts/response/settings` | Saves the organization's major incident settings. | `alerts.response.manage` |
+
+Declaring, assigning roles, opening the war room, adding and finishing tasks, and posting updates are
+recorded on the incident's [timeline](/en-US/api/alerting/incident-timeline); declaring and saving the
+settings are also recorded in the audit log.
+
+## Declare
+
+```http
+POST /api/v1/alerts/incidents/{id}/declare
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `commander_id` | string | No | The commander; the person declaring when left out. |
+
+An incident already declared is returned as it is; a resolved incident cannot be declared. Declaring
+follows the organization's settings:
+
+1. The settings' checklist becomes tasks.
+2. A meeting is set up by `meeting`: `feishu_vc` has a Feishu App book a 6-hour Feishu meeting owned by
+   the commander; `tencent_meeting` books a 6-hour Tencent Meeting; `zoom` starts an instant meeting;
+   `google_meet` creates a meeting space; `fixed_url` uses the fixed meeting link.
+3. The connector of the settings (a Feishu App, Slack App, DingTalk, or WeCom one) makes a group chat named
+   `[severity] incident summary` and adds the incident's assignees, roles, and stakeholders (by the
+   identities linked to that connector), with the commander owning DingTalk and WeCom groups; it posts an
+   opening message with the incident and meeting links.
+4. Ticket connectors with `on_major_incident` create a [ticket](/en-US/api/alerting/tickets).
+
+The war room, the meeting, and the tickets are best effort: what fails is only logged, and the declaration
+stands.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/declare \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"commander_id": "<user-id>"}'
+```
+</RequestExample>
+
+Declaring, reading, and assigning roles return `{ "response": { ... }, "tasks": [ ... ] }`; `response` is
+`null` when the incident is not declared.
+
+<ResponseExample>
+```json 200
+{
+  "response": {
+    "incident_id": "<incident-id>",
+    "org_id": "<organization-id>",
+    "declared_at": 1790000000000000,
+    "declared_by": "<user-id>",
+    "roles": { "commander": "<user-id>" },
+    "war_room": {
+      "platform": "lark_app",
+      "connector_id": "<connector-id>",
+      "chat_id": "oc_5ad11d72b830411d72b836c20",
+      "url": "https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=<token>"
+    },
+    "meeting_url": "https://vc.feishu.cn/j/123456789",
+    "updated_at": 1790000000000000
+  },
+  "tasks": [
+    {
+      "id": "3KJ9a1C7vXe2Rf8MbN4qLw0TzHd",
+      "org_id": "<organization-id>",
+      "incident_id": "<incident-id>",
+      "title": "Open a status page incident",
+      "assignee_id": null,
+      "done": false,
+      "done_by": null,
+      "done_at": null,
+      "position": 0,
+      "created_by": "<user-id>",
+      "created_at": 1790000000000000
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Field | Notes |
+|---|---|
+| `declared_by` | Who declared it; `null` when the organization's rule did. |
+| `roles` | `commander`, `communications` (communications lead), and `scribe` mapped to user IDs; unassigned roles are absent. |
+| `war_room` | The war room: `platform` (`lark_app`, `slack_app`, `dingtalk_app`, or `wecom_app`), the connector, the chat ID, and the join link; DingTalk and WeCom groups have no join link, so `url` is empty. `null` without one. |
+| `meeting_url` | The meeting link; `null` without a meeting. |
+
+## Roles and tasks
+
+Assigning a role takes `{ "role": "scribe", "user_id": "<user-id>" }`; a `null` `user_id` clears the role.
+The incident has to be declared first.
+
+Adding a task takes `{ "title": "…", "assignee_id": "<user-id>" }`, with a title of 1 to 200 characters
+and at most 50 tasks per incident. A change sends only the fields to change: `title`, `assignee_id` (`null`
+clears it), and `done`; finishing a task records `done_by` and `done_at`. Adding and changing return the
+task, and deleting returns `{ "deleted": true }`.
+
+## Post an update
+
+```http
+POST /api/v1/alerts/incidents/{id}/status-updates
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `impact` | string | The impact. |
+| `current` | string | Where things are. |
+| `next` | string | The next steps. |
+
+At least one part has to say something, and each is at most 2000 characters; the incident has to be
+declared first. The update is recorded on the timeline, posted to the war room, and handed to the notify
+engine as the event `incident.status_update`, addressed to the incident's assignees, roles, and the
+settings' stakeholders and sent by the built-in policy
+[Major incident update: notify the stakeholders](/en-US/notification-channels#built-in-policies). The
+event attribute `status_update` carries `impact`, `current`, `next`, and its `author`. Returns
+`{ "sent": true }`.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/status-updates \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"impact": "EU checkout failing for 30% of users", "current": "Rolling back v2026.10.28", "next": "Confirm the error rate drops"}'
+```
+</RequestExample>
+
+## Organization settings
+
+```http
+PUT /api/v1/alerts/response/settings
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `war_room_connector_id` | string | The notify connector that makes war rooms, one that can make group chats: `lark_app`, `slack_app`, `dingtalk_app`, or `wecom_app`; `null` makes none. |
+| `meeting` | string | `none` (default, no meeting), `feishu_vc`, `tencent_meeting`, `zoom`, `google_meet`, or `fixed_url`. |
+| `meeting_url` | string | The meeting link for `fixed_url`, starting with `https://`. |
+| `meeting_connector_id` | string | For `feishu_vc`: the Feishu App connector that books meetings; `null` uses the war room connector, which then has to be a Feishu App. |
+| `tencent_meeting` | object | Required for `tencent_meeting`: the self-built app's `app_id`, `sdk_id` (only if it has one), and `secret_id`, and the creator's `userid`. |
+| `zoom` | object | Required for `zoom`: the Server-to-Server OAuth app's `account_id` and `client_id`, and the `host` (an email or user ID). |
+| `google_meet` | object | Required for `google_meet`: the `organizer` (an email) the service account creates meetings for. |
+| `secrets` | object | Write only: newly typed meeting secrets, keyed `tencent_meeting.secret_key`, `zoom.client_secret`, or `google_meet.credentials` (the text of the service account's JSON key). An empty one keeps its value; only the chosen meeting's secret is kept. |
+| `checklist` | array | Entries added as tasks on declaring, at most 30 of up to 200 characters each. |
+| `stakeholder_ids` | array | Stakeholders: updates notify them, and war rooms add them. |
+| `auto` | object | Declaring on its own: `{ "enabled": true, "min_severity": "critical", "conditions": [ ... ] }`. A new incident at or above `min_severity` whose labels meet `conditions` is declared at once, with `declared_by` `null`; `conditions` are written as in [routing rules](/en-US/api/alerting/create-routing-rule). |
+
+The body is the whole settings object, and the saved settings are returned; before any save, a read
+returns the defaults. Secrets are stored encrypted with the root key: a read returns only `secrets_set`,
+the keys of the secrets that are set, plus the read-only `war_room_types`, the connector types that can
+make war rooms.
+
+**Errors**
+
+| Status | Reason |
+|---|---|
+| `400` | The incident is resolved or not declared yet, a field is beyond its limits, or the connector is not a Feishu App or Slack App of this organization. |
+| `403` | A permission is missing, or the incident is out of reach. |
+| `404` | The incident or task does not exist. |

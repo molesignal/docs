@@ -1,0 +1,165 @@
+---
+title: "工单"
+description: "连接 Jira、ServiceNow 或飞书项目（Meegle），在事件上建单，让工单跟着事件写评论、流转，并同步工单状态。"
+"en_link": "/en-US/api/alerting/tickets"
+---
+
+工单连接器连接 Jira（Cloud 或 Data Center / Server）、ServiceNow 或飞书项目（海外版 Meegle）。在事件上建单后，工单跟着事件走：确认、解决和备注可以写成评论，解决事件时可以把工单流转到完结；工单这边的状态每 5 分钟同步一次，Jira 还可以用 Webhook 实时推送。页面上的用法见[工单](/zh-Hans/alerting/tickets)。
+
+| 方法与路径 | 作用 | 权限 |
+|---|---|---|
+| `GET /api/v1/alerts/tickets/connectors` | 组织的工单连接器，返回 `{ "connectors": [ ... ] }`。 | `alerts.tickets.read` |
+| `POST /api/v1/alerts/tickets/connectors` | 新建连接器。 | `alerts.tickets.manage` |
+| `PUT /api/v1/alerts/tickets/connectors/{id}` | 替换连接器；不能改 `system`。 | `alerts.tickets.manage` |
+| `DELETE /api/v1/alerts/tickets/connectors/{id}` | 删除连接器。 | `alerts.tickets.manage` |
+| `POST /api/v1/alerts/tickets/connectors/{id}/test` | 测试连接：Jira 返回 `{ "ok": true, "detail": "<登录的人>" }`，飞书项目读一次工作项类型。 | `alerts.tickets.manage` |
+| `GET /api/v1/alerts/tickets/sites` | 飞书项目各平台的地址：`{ "meegle": [{ "key": "feishu", "url": "https://project.feishu.cn" }, { "key": "lark", "url": "https://meegle.com" }] }`。 | `alerts.tickets.read` |
+| `GET /api/v1/alerts/incidents/{id}/tickets` | 事件的工单，返回 `{ "tickets": [ ... ] }`。 | 对事件的 `alerts.incidents.read` |
+| `POST /api/v1/alerts/incidents/{id}/tickets` | 在一个连接器上为事件建单。 | 对事件的 `alerts.incidents.tickets` |
+| `POST /api/v1/public/tickets/jira/{connector_id}` | Jira 的 Webhook，不用登录。 | `X-Hub-Signature` |
+
+## 连接器
+
+**请求体**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | 名称。 |
+| `system` | string | 是 | `jira` 或 `meegle`。 |
+| `settings` | object | 是 | 站点、项目、类型和映射，见下文。 |
+| `secrets` | object | 新建时必填 | 凭证，加密保存，不再返回。Jira 用 `api_token`（Cloud 的 API Token 或 Data Center 的个人访问令牌）和可选的 `webhook_secret`；飞书项目用 `plugin_secret`。修改时留空的保持原样。 |
+| `comments` | object | 否 | `{ "acknowledged": true, "resolved": true, "notes": true }`：事件被确认、被解决时写评论，事件上的备注写成评论。都默认 `false`。 |
+| `transition_on_resolve` | boolean | 否 | 解决事件时把工单流转到完结。默认 `false`。 |
+| `resolve_incident_when_done` | boolean | 否 | 工单完结时解决事件，开着的和已确认的都解决，不记人。默认 `false`。 |
+| `auto` | object | 否 | 自动建单：`{ "enabled": true, "min_severity": "error", "conditions": [ ... ] }`。新事件严重度不低于 `min_severity`、标签满足 `conditions` 时自动建一张单；`conditions` 的写法同[路由规则的条件](/zh-Hans/api/alerting/create-routing-rule)。 |
+| `on_major_incident` | boolean | 否 | 宣布[重大事件](/zh-Hans/api/alerting/major-incidents)时建单。默认 `false`。 |
+| `enabled` | boolean | 否 | 默认 `true`。停用的连接器不建单、不同步，也不收 Webhook。 |
+
+**`settings`：Jira**
+
+| 字段 | 说明 |
+|---|---|
+| `site_url` | 站点地址，`https://` 开头，例如 `https://example.atlassian.net`。 |
+| `deployment` | `cloud`（默认）：账号邮箱加 API Token，用 REST API v3，正文是 Atlassian 文档格式。`data_center`：个人访问令牌，用 REST API v2。 |
+| `email` | Cloud 的账号邮箱。 |
+| `project_key`、`issue_type` | 项目 Key 和问题类型，例如 `OPS` 和 `Incident`。 |
+| `priorities` | 严重度到 Jira 优先级名字的映射，例如 `{ "critical": "Highest" }`；没写的不设优先级。 |
+| `labels` | 加到工单上的标签，另外总带 `molesignal`。 |
+| `fields` | 建单时其他字段的默认值，键是 Jira 字段 ID。 |
+| `resolve_transition` | 解决事件时走的流转，名字或 ID；空着时走第一个通往完结类状态的流转。 |
+
+**`settings`：飞书项目**
+
+| 字段 | 说明 |
+|---|---|
+| `site` | 平台：`feishu`（默认，飞书项目，地址 `https://project.feishu.cn`）或 `lark`（Meegle，地址 `https://meegle.com`）。地址随平台定，不能改。 |
+| `plugin_id` | 插件 ID，和 `plugin_secret` 一起换插件 Token。 |
+| `user_key` | 以谁的身份建单、写评论。 |
+| `project_key`、`work_item_type_key` | 空间和工作项类型。 |
+| `priority_field`、`priorities` | 优先级字段的 key，和严重度到优先级选项值的映射；空着不设优先级。 |
+| `fields` | 建单时其他字段的默认值，键是 field_key。 |
+| `resolve_transition_id` | 状态流的工作项：解决事件时走的流转 ID。 |
+| `resolve_node_id` | 节点流的工作项：解决事件时完成的节点 ID。 |
+| `done_states` | 算完结的状态 key。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/tickets/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "Jira OPS",
+    "system": "jira",
+    "settings": {
+      "site_url": "https://example.atlassian.net",
+      "deployment": "cloud",
+      "email": "oncall-bot@example.com",
+      "project_key": "OPS",
+      "issue_type": "Incident",
+      "priorities": { "critical": "Highest", "error": "High" }
+    },
+    "secrets": { "api_token": "<jira-api-token>", "webhook_secret": "<webhook-secret>" },
+    "comments": { "acknowledged": true, "resolved": true, "notes": true },
+    "transition_on_resolve": true,
+    "auto": { "enabled": true, "min_severity": "critical", "conditions": [] }
+  }'
+```
+</RequestExample>
+
+响应是保存的连接器：`secrets` 不返回，`secrets_set` 列出已经设了的凭证；Jira 连接器另有 `webhook_path`，即 `/api/v1/public/tickets/jira/<连接器 ID>`。新建、修改和删除记进审计日志。
+
+**`settings`：ServiceNow**
+
+| 字段 | 说明 |
+|---|---|
+| `instance_url` | 实例地址，https 开头。 |
+| `auth` | `basic`（默认，秘密 `password`）、`oauth`（客户端凭证，秘密 `client_secret`）或 `api_key`（秘密 `api_key`）。 |
+| `username`、`client_id` | 基本认证的用户名、OAuth 的客户端 ID。 |
+| `table` | 建单的表，默认 `incident`，要继承 `task`。 |
+| `assignment_group`、`caller_id`、`category` | 建单时写的字段；前两个写 `sys_id`。 |
+| `priorities` | 严重度或优先级 → `impact/urgency`，只写一个数字时两个都用它。 |
+| `fields` | 建单时其他字段的默认值（字段名 → 值）。 |
+| `resolve_state`、`close_code` | 解决事件时写的 `state` 和 `close_code`，默认 `6` 和 `Solution provided`。`close_code` 空着不写。 |
+| `done_states` | 算完结的 `state` 的值，默认 `6`、`7`、`8`。 |
+
+测试连接返回 `{ "ok": true, "detail": "<表名>" }`。
+
+## 在事件上建单
+
+```http
+POST /api/v1/alerts/incidents/{id}/tickets
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `connector_id` | string | 是 | 在哪个连接器上建单。这个连接器上已经有这个事件的单时，返回已有的那张。 |
+
+工单标题是 `[严重度] 事件摘要`；正文写事件的严重度与状态、服务、标签、触发查询、AI 根因的摘要和事件页的地址，用工作区的默认语言。建单记在事件的时间线上，并记进审计日志。
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KJ4m8T1qHd0Ue6WzB2nLc9RfPa",
+  "org_id": "<organization-id>",
+  "incident_id": "<incident-id>",
+  "connector_id": "<connector-id>",
+  "system": "jira",
+  "external_id": "10482",
+  "external_key": "OPS-42",
+  "url": "https://example.atlassian.net/browse/OPS-42",
+  "status": "To Do",
+  "done": false,
+  "incident_status": "open",
+  "created_by": "<user-id>",
+  "created_at": 1790000000000000,
+  "synced_at": 1790000000000000,
+  "last_error": "",
+  "action_item_id": null
+}
+```
+</ResponseExample>
+
+| 字段 | 说明 |
+|---|---|
+| `external_id`、`external_key` | Jira 的 issue ID 和 key；ServiceNow 的 `sys_id` 和编号；飞书项目都是工作项 ID。 |
+| `status`、`done` | 上次同步到的状态名，以及是否已完结。Jira 按状态类别 `done` 判断，飞书项目按连接器的 `done_states`。 |
+| `synced_at`、`last_error` | 上次同步的时间，和上次同步或写评论出的错（成功后清空）。 |
+| `action_item_id` | 为[复盘改进项](/zh-Hans/api/alerting/postmortems)建的单；这种单不跟着事件写评论、流转。 |
+
+## 状态同步与 Jira Webhook
+
+没完结的工单每 5 分钟同步一次状态。工单完结、连接器开了 `resolve_incident_when_done` 时，事件随之解决；为复盘改进项建的单除外。
+
+Jira 连接器设了 `webhook_secret` 后，可以在 Jira 的**系统设置 → Webhooks** 里添加一个 Webhook：地址填 MoleSignal 的外部地址加上 `webhook_path`，密钥填同一个 `webhook_secret`，事件选 issue 的更新。
+
+```http
+POST /api/v1/public/tickets/jira/{connector_id}
+```
+
+MoleSignal 用 `webhook_secret` 对请求体算 HMAC-SHA256，与 `X-Hub-Signature: sha256=<十六进制>` 比对。请求体最多 1 MiB。
+
+| 状态码 | 原因 |
+|---|---|
+| `204` | 收下了；请求体里的 issue 不是 MoleSignal 建的单时也是 `204`。 |
+| `401` | 签名对不上，或连接器没设 `webhook_secret`，不收 Webhook。 |
+| `404` | 连接器不存在、已停用或不是 Jira。 |

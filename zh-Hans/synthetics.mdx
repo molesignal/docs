@@ -13,8 +13,8 @@ description: "创建 HTTP、浏览器、网络与心跳检查，从内置或私�
 | **HTTP / API** | 验证 URL、方法、Header、Body、响应状态、内容与耗时。 |
 | **浏览器** | 运行浏览器旅程，并验证页面或步骤结果。 |
 | **TCP** | 确认主机与端口可以建立连接。 |
-| **DNS** | 解析记录并验证返回结果。 |
-| **ICMP / Ping** | 测量基础连通性与延迟。 |
+| **DNS** | 通过系统或指定的解析器解析任意类型的记录（A、AAAA、CNAME、MX、NS、TXT、SOA、SRV、CAA、PTR），可要求 DNSSEC，并验证解析结果与返回码。 |
+| **ICMP / Ping** | 发送若干个 ping，检查丢包率与平均往返时间。 |
 | **TLS** | 验证 TLS 握手、证书身份与到期时间。 |
 | **gRPC** | 调用 gRPC Endpoint 并验证响应。 |
 | **Heartbeat** | 要求外部任务或服务在截止时间前主动上报。 |
@@ -52,7 +52,85 @@ Heartbeat 不发起出站请求，而是等待任务在截止时间前上报。�
 
 断言可以检查响应状态、Body、Header、DNS 答案、证书属性或浏览器步骤等协议字段。**警告**断言失败会得到降级结果；**严重**断言失败会得到失败结果。
 
+每种检查只能断言它的返回里有的值：
+
+| 检查类型 | 断言来源 |
+|---|---|
+| **HTTP / API** | `status`、`body`、`json:<JSONPath>`、`header:<名称>`、`duration_ms`、`size_bytes`、`timing.dns_ms`、`timing.connect_ms`、`timing.tls_ms`、`timing.first_byte_ms` |
+| **TCP** | `response`、`duration_ms` |
+| **DNS** | `answers`、`answer_count`、`rcode`、`duration_ms` |
+| **gRPC** | `status`（健康检查服务返回的服务状态，例如 `SERVING`）、`duration_ms` |
+
+检查不提供的来源在保存修订时就会被拒绝。
+
+`json:` 后面跟 JSONPath（RFC 9535），读取响应体前 4 MiB 中的 JSON：找到一个字符串时取字符串本身，其他值取 JSON 文本，找到多个值时取它们组成的 JSON 数组，什么也没找到或响应体不是 JSON 时为空。`body` 还可以用**符合 JSON Schema**断言，同样读前 4 MiB，断言失败时给出第一处不符合的地方；Schema 不能用 `$ref` 引用外部的 URL 或文件。`size_bytes` 是响应体的字节数，最多读 16 MiB；`timing.*` 是这个步骤自己的分段耗时，没有经过的阶段为 0。用 JSONPath 提取变量时可以不写正则，直接取到的值。
+
+目标无法解析、无法连接、中途断开连接、TLS 握手失败或在超时内没有应答，这次运行就算失败，与严重断言失败相同。只有检查无法按设置运行时才算未知：出站策略拦下了目标、缺少密钥，或者用到了不支持的设置。
+
 Monitor 健康状态根据连续成功与失败次数及所选地点计算。配置失败阈值、恢复阈值与地点策略，避免状态抖动，也避免单个网络异常被误判为全局故障。
+
+## HTTP 连接
+
+HTTP 检查的**连接**一节决定怎样连到服务器，不填时按默认处理：
+
+| 设置 | 作用 |
+|---|---|
+| **HTTP 版本** | **自动协商**时在 TLS 中同时提供 HTTP/2 与 HTTP/1.1，由服务器选择，明文 HTTP 用 HTTP/1.1；**仅 HTTP/1.1** 时只提供 HTTP/1.1；**仅 HTTP/2** 时服务器不同意 HTTP/2 就算失败，明文 HTTP 按事先约定直接使用 HTTP/2（h2c）。 |
+| **DNS 服务器** | 用这台服务器解析域名，写作 `主机` 或 `主机:端口`。它本身也要经过出站策略。 |
+| **Host 绑定** | 把域名指向指定的 IP，像 hosts 文件一样。请求里的 Host 和证书校验仍用原域名，适合检查某台源站或某个 CDN 节点。 |
+| **客户端证书** | 服务器要求双向 TLS 时出示的证书链与私钥，PEM 格式，可以上传文件或直接粘贴；同一个文件里的证书和私钥会分别填好。私钥加密保存，保存后不再显示，修改检查时留空即沿用。 |
+
+每个步骤的结果都会记录实际连到的地址（`remote_address`）和服务器使用的 HTTP 版本（`http_version`）。
+
+## 链路关联与失败诊断
+
+检查的**诊断**一节有两个开关，默认都打开。
+
+**关联链路**：HTTP 检查的每个请求（包括跟随的重定向）和 gRPC 检查的调用都会带上 W3C `traceparent`。同一次尝试的请求属于同一条链路，每个请求是其中一个 span；步骤自己设了 `traceparent` 请求头或 metadata 时保留它，不再另加。步骤和结果会记下 `trace_id`，在结果详情里点**查看链路**，打开被测服务为这次请求记下的链路；被测服务没有接入链路追踪时查不到。gRPC 检查配置的 metadata 也会随调用发出。
+
+**失败时 traceroute**：HTTP、TCP、TLS、gRPC、SSH、ICMP 检查连不上目标时（连接失败、超时、连接中断、TLS 握手失败，或者 ping 没有回应、丢包），Agent 对最后尝试连接的地址跑一次 ICMP traceroute：最多 30 跳，每跳 4 个探测，最多 12 秒。结果详情把它画成逐跳的表格：地址、丢包，以及最快、平均、最慢的往返时间。traceroute 需要原始套接字（root 或 `CAP_NET_RAW`），或者无特权的 ICMP 套接字（macOS，以及 `net.ipv4.ping_group_range` 内的 Linux 组）；都没有时，这一步写明没跑的原因。
+
+旧版 Agent 只是不发 `traceparent`、不跑 traceroute，检查的结论不受影响。
+
+**RUM 会话**：浏览器拨测在页面的任何脚本运行之前告诉页面这是一次测试。页面运行[浏览器 RUM SDK](/zh-Hans/rum/browser-sdk) 时会记录一个 `synthetics` 类型的会话，在尝试里点 **打开这次拨测的 RUM 会话** 可以看到它的回放和事件。这样的会话[不计入真实用户的数字](/zh-Hans/rum/test-traffic)。页面是否运行 SDK 由页面决定，不运行 SDK 的页面不会多出任何东西。
+
+## 时间范围与可用率
+
+概览、检查列表、结果页和检查详情的概览，在导航卡片右侧有时间范围，打开时默认近 24 小时，可以改成别的范围。
+
+- **可用率** = 可用的运行 ÷ 有结论的运行。通过、不稳定、降级都算可用，失败不算；未知和跳过不计入。
+- 概览给出范围内全部检查的可用率和走势，地图按地点着色；检查列表多一列每个检查的可用率；检查详情给出范围内的可用率、响应时间中位数与 p95，**各位置响应时间** 按步长画出每个地点的中位耗时。
+- **最近运行** 的小条仍然是最近若干次运行，不随时间范围变化。
+
+可用率来自 `GET /api/v1/synthetics/availability`，参数 `from`、`to`（微秒）、`monitor_id`、`location_id`、`step`（秒，不传时按范围选择）。它返回合计、按检查、按地点和按步长的运行数、可用数、失败数、未定数、可用率，以及 P50、P95 和最大耗时；指定了检查时还返回每个地点按步长的数据。结果列表 `GET /api/v1/synthetics/results` 接受 `from_micros`、`to_micros`。
+
+## 结果数据流与保留期
+
+每次计划内的运行（测试运行除外）除了保存结果明细，还会写一行到组织的 `_synthetic_results` 日志数据流，时间取运行开始的时刻。没有值的字段不写。
+
+| 字段 | 内容 |
+|---|---|
+| `check_id`、`check_name`、`check_kind`、`revision_id` | 检查与它运行的修订 |
+| `location_id`、`location_name`、`agent_id` | 在哪个地点、由哪个 Agent 运行 |
+| `result_id`、`outcome`、`available`、`attempts` | 结果、是否可用（未知与跳过时没有）、尝试次数 |
+| `duration_ms`、`dns_ms`、`connect_ms`、`tls_ms`、`first_byte_ms` | 最后一次尝试的总耗时与分段耗时 |
+| `status_code`、`error_category`、`skip_reason`、`trace_id` | HTTP 状态码、失败类别、跳过原因、链路 |
+| `team_id`、`tags` | 检查所属的团队与标签（逗号分隔） |
+
+仪表盘面板和告警规则用 SQL 查这个数据流，面板的时间范围会加在查询上。例如每个检查的可用率与 p95 耗时：
+
+```sql
+SELECT check_name,
+       avg(CASE WHEN available THEN 1.0 ELSE 0.0 END) AS availability,
+       approx_percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95_ms
+FROM _synthetic_results
+WHERE available IS NOT NULL
+GROUP BY check_name
+```
+
+定时告警规则查同样的数据，并按 `location_name` [按维度拆分](/zh-Hans/alerting/rules#按维度拆分)，每个地点的可用率低于阈值时各开一个事件。
+
+结果明细默认保留 30 天，在平台设置 **数据保留** 的 **拨测结果** 修改（0 表示永久保留），见[平台设置](/zh-Hans/settings/platform#数据保留)。更早的运行结果、它们的附件和已结束的任务每天清理一次。`_synthetic_results` 数据流按数据流的保留期保留，可以在数据流页面修改。
 
 ## 地点与 Probe Agent
 
@@ -100,6 +178,88 @@ server_names = ["molesignal.example.com"]
 
 HTTP 检查会使用 Probe Agent 环境中的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY`。经过代理时，结果中的连接耗时衡量的是到代理的连接，包含建立隧道的请求。到目标的连接由代理发起，因此出站策略批准的地址不会对目标强制生效。请限制代理可以访问的范围。
 
+Agent 的进程能发送 ping 时才提供 ICMP 检查：在 Linux 上需要 `CAP_NET_RAW`，或者让 Agent 所在的组落在 `net.ipv4.ping_group_range` 内。内置本地地点的进程内执行器遵循同样的规则。
+
+Agent 每次心跳都会上报功能级别。用到旧 Agent 不支持的设置的检查只会交给足够新的 Agent 执行：A、AAAA 以外的 DNS 记录类型、指定解析器、DNSSEC、ICMP，TCP、DNS、gRPC 检查上的断言，以及 HTTP 检查的 JSONPath、JSON Schema、响应大小与分段耗时、仅 HTTP/2、DNS 服务器、Host 绑定和客户端证书。Agent Pool 要运行这类检查，需先升级 `probe-agent`。
+
+一分钟没有心跳的 Agent 会被标为离线，地点的健康状态随它的 Agent 变化：全部在线为在线，部分在线为降级，都不在线为离线。截止前没有 Agent 领取的运行记为**已跳过**，并写明原因：没有在线的 Agent、没有支持该类型检查的 Agent、Agent 版本太旧，或者 Agent 都在忙。
+
+### 在 Kubernetes 上运行 Agent
+
+Helm Chart `probe-agent` 把 Agent 部署为 StatefulSet。每个副本各自注册，把身份和尚未送达的结果保存在自己的持久卷上，因此替换 Pod 后仍是同一个 Agent。这个 Chart 不部署服务端。服务端由 Chart `molesignal` 部署，可以在同一集群，也可以在其他地方。
+
+<Warning>
+外部 Agent 需要 26.2.0.0 之后的版本，服务端和 Agent 镜像都要升级。在 26.2.0.0 上，服务端无法注册 Agent，Agent 也无法越过**已接入**状态。
+</Warning>
+
+<Steps>
+  <Step title="让服务端有 Agent 能连到的地址">
+    Agent 连接 **Standalone** 或 **Alert** 节点的 5084 与 5085 端口。`server_names` 必须包含 Agent 使用的主机名，默认只有 `localhost`。Agent 与 Chart `molesignal` 在同一集群时，在该 Chart 的 values 中写 Service 的名称。`distributed` 模式下使用 `alert` 角色的 Service。
+
+    ```yaml
+    config:
+      probe:
+        register_endpoint: https://molesignal.molesignal.svc.cluster.local:5084
+        control_endpoint: https://molesignal.molesignal.svc.cluster.local:5085
+        server_names: [molesignal.molesignal.svc.cluster.local]
+    ```
+
+    Agent 在其他地方时，用 `LoadBalancer` 或 `NodePort` 类型的 Service 暴露这两个端口。中间不能终止 TLS：Agent 只信任服务端自己的 CA，控制流还要用客户端证书认证 Agent。
+  </Step>
+  <Step title="创建地点和 Token">
+    打开**拨测 → 地域**，选择**添加私有地域**，再创建 Token：
+
+    | Token | 创建位置 | 可注册 | 有效期 |
+    |---|---|---|---|
+    | 一次性 Token | **接入 Agent** | 1 个 Agent | 最长 60 分钟 |
+    | Agent Token | **拨测 → Agents → 创建 Agent Token** | 任意数量的 Agent，直到过期或被禁用 | 30 天到 1 年，或永不过期 |
+
+    多于一个副本时使用 Agent Token。两种 Token 都只显示一次，并附带接入命令。下一步要用命令里的 `--endpoint` 与 `--ca-certificate-base64`。
+  </Step>
+  <Step title="安装 Chart">
+    把 Token 存入 Secret。Chart 没有默认 Token，也不会把 Token 写进 ConfigMap。
+
+    ```bash
+    kubectl create namespace probes
+    ```
+
+    ```bash
+    kubectl --namespace probes create secret generic probe-agent-registration --from-literal=token=<token>
+    ```
+
+    ```bash
+    helm repo add molesignal https://charts.molesignal.com
+    ```
+
+    ```bash
+    helm install probe-agent molesignal/probe-agent --namespace probes --set registration.endpoint=<endpoint> --set registration.caCertificateBase64=<base64-ca> --set registration.existingSecret=probe-agent-registration
+    ```
+
+    检查地址与 CA。测试用服务端会拒绝的 Token 尝试注册。
+
+    ```bash
+    helm test probe-agent --namespace probes
+    ```
+
+    之后 Agent 出现在**拨测 → Agents** 中。
+  </Step>
+</Steps>
+
+| 行为 | 说明 |
+|---|---|
+| 注册 | 卷上没有身份时，init 容器执行注册，否则什么也不做。因此替换 Pod 不受一次性 Token 已用过的影响。 |
+| Token | 只在 Agent 还没有身份时读取。更换 Token 不会重启任何 Pod，Agent 上线后可以删除 Secret。既没有身份也没有 Token 的副本停在 `Init`，并在日志中说明原因。 |
+| 缩容与卸载 | 卷会保留，Agent 回来时身份不变。要停用一个 Agent，撤销它并删除它的 PersistentVolumeClaim：`state-<release>-probe-agent-<ordinal>`。 |
+| 长期离线的 Agent | 证书的有效期是 `[probe].certificate_days`，默认 30 天，Agent 连接时如果剩余不足一周就会续期。证书过期后 Agent 无法再连接：撤销它，删除它的卷，让它重新注册。 |
+| Ping | Chart 为 Pod 设置 `net.ipv4.ping_group_range`，ICMP 检查不需要额外的 capability。 |
+| 镜像 | `ghcr.io/molesignal/probe-agent`。`global.imageRegistry` 会替换镜像仓库地址。 |
+
+浏览器检查需要对 Chromium 的沙箱做出选择。Chart 默认用 `--no-sandbox` 启动 Chromium，因为沙箱需要非特权 user namespace，而 `RuntimeDefault` seccomp 配置会阻止它。这时由 Pod 限制 Chromium：不以 root 运行，没有 capability 和服务账号 Token，根文件系统只读。攻破 Chromium 的页面会拥有这个 Pod 的权限，包括 Agent 的私钥。要使用沙箱，把 `browser.sandbox` 设为 `true`，把 `securityContext.seccompProfile.type` 设为 `Unconfined`。节点还必须允许非特权 user namespace，在 Ubuntu 23.10 及之后的版本上需要设置 `kernel.apparmor_restrict_unprivileged_userns=0`。Pod 安全标准的 `baseline` 与 `restricted` 级别都不允许 `Unconfined`。
+
+`/dev/shm` 不需要配置。Agent 用 `--disable-dev-shm-usage` 启动 Chromium，共享内存写入 `/tmp`，由 `browser.tmp` 配置。默认资源（请求 512 MiB，限制 2 GiB）适合同时运行一个浏览器检查。`browser.maxConcurrent` 每增加 1，内存限制至少增加 1 GiB。`browser.maxConcurrent` 设为 `0` 时，Agent 不提供浏览器检查。
+
+全部配置项与排错参见 [Chart README](https://github.com/molesignal/molesignal-helm/tree/main/charts/probe-agent)。
+
 ## 变量、密钥与证据
 
 使用变量复用非敏感值，使用加密密钥保存凭据。密钥是只写字段，API 不会返回明文。结果详情会记录有界的请求/响应证据、耗时、尝试元数据、地点与生效修订，但不会暴露已保存的密钥。
@@ -114,11 +274,14 @@ HTTP 检查会使用 Probe Agent 环境中的 `HTTP_PROXY`、`HTTPS_PROXY`、`AL
 | **降级** | 打开**降级时告警**时开一个，严重程度 `warning`。 |
 | **不稳定** | 打开**不稳定时告警**时开一个，严重程度 `warning`。 |
 | **通过** | 解决它。 |
+| **没有结果** | 打开**没有结果时告警**（默认打开）时另开一个，严重程度 `warning`；有结果后解决它。 |
 
-- 一个检查同时最多一个活动事件。检查在失败、降级、不稳定之间变化时，开着的事件跟着改严重程度，改到更高时重新从头升级。已确认的事件保持原样，直到有人解决。
-- 检查的**升级策略**负责叫人。选**不关联升级策略**时不叫人，通知策略照常发送这个事件。
+- 一个检查同时最多一个状态事件。检查在失败、降级、不稳定之间变化时，开着的事件按[告警流水线](/zh-Hans/pipelines/alert-events#严重度变化)重新判定的结果改严重程度（手动设置过的除外），改到更高时重新从头升级。已确认的事件保持原样，直到有人解决。
+- 截止前没有 Agent 领取的运行记为跳过，地点的状态保持不变。一个地点连续跳过的次数达到失败阈值时算作没有结果；没有结果的地点数达到多地点策略的要求时，检查就是**没有结果**。检查页面会写明是哪些地点、最近一次为什么跳过。无数据事件带 `synthetic.state` = `no_data` 与 `alert.condition` = `no_data`，可以和状态事件同时开着。手动解决后，要等结果回来过一次才会再开。
+- 暂停或归档检查时，开着和已确认的事件都会解决：已经没有运行能让它们恢复。
+- 检查的**升级策略**负责叫人。选**按路由分派**时由[告警路由](/zh-Hans/alerting/routing)选出团队和升级策略；选**不关联升级策略**时不叫人，通知策略照常发送这个事件。
 - 事件标题是检查的名称，带标签 `alert.source` = `synthetic`、`synthetic.kind` 与 `synthetic.state`；检查设了标签和团队时还有 `synthetic.tags` 与 `team_id`，通知策略可以按它们分发。事件详情链接回检查。
-- 通知标题写作严重程度加检查名称，例如 `ERROR · Checkout API`，正文是 `Synthetic check Checkout API is failing.`
+- 通知标题写作严重程度加检查名称，例如 `ERROR · Checkout API`，正文是 `Synthetic check Checkout API is failing.` 没有结果的通知标题是 `NO DATA · Checkout API`，正文用工作区的默认语言写明哪里、为什么没有结果，例如 `检查 Checkout API 没有结果：法兰克福 连续 3 次没有运行，那里没有在线的 Agent。`
 - 只看整个检查的状态，即连续失败、恢复次数和多地点策略算出的状态；单个地点的变化不开事件。
 
 ## 发布故障到状态页
@@ -129,8 +292,12 @@ HTTP 检查会使用 Probe Agent 环境中的 `HTTP_PROXY`、`HTTPS_PROXY`、`AL
 
 | 权限 | 能力 |
 |---|---|
-| <code>synthetics.read</code> | 读取检查、修订、调度、运行、结果、地点与 Agent 状态。 |
-| <code>synthetics.manage</code> | 创建、测试、发布、暂停、恢复、执行和归档检查。 |
+| <code>synthetics.monitors.read</code> | 读取检查、修订与调度。 |
+| <code>synthetics.results.read</code> | 读取运行与结果。 |
+| <code>synthetics.locations.read</code> | 读取地点与 Agent 状态。 |
+| <code>synthetics.secrets.read</code> | 读取加密密钥的名称。 |
+| <code>synthetics.monitors.manage</code> | 创建、测试、发布、暂停和恢复检查。 |
+| <code>synthetics.monitors.run</code>、<code>synthetics.monitors.archive</code> | 立即执行检查；归档检查。 |
 | <code>synthetics.locations.manage</code> | 管理地点、Agent Pool、注册 Token 与出站策略。 |
 | <code>synthetics.secrets.manage</code> | 创建、轮换和删除拨测加密密钥。 |
 

@@ -1,32 +1,33 @@
 ---
 title: "Issue an API token"
-description: "Create an API token for a user or a service account."
+description: "Issue a personal API token, or a token for a service account, narrowed to what it needs."
 "zh-Hans_link": "/zh-Hans/api/auth/issue-token"
 ---
 
 ```http
-POST /api/v1/auth/tokens
+POST /api/v1/me/api-tokens
 ```
 
-Creates a long-lived token of the form `ms_<prefix>_<secret>`. The response is the only time that the plaintext token appears, so store it immediately. The call requires the permission `api_tokens.manage` in an organization scope.
+Issues a personal token of the form `ms_<prefix>_<secret>` that acts as the signed-in user. The response is the only time that the plaintext token appears, so store it immediately. The call comes from a signed-in session, never from another token, and requires `personal_tokens.manage`.
 
 **Body**
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `name` | string | Yes | Display name. Must not be empty. |
-| `role_id` | string | No | Organization role of the token. Defaults to the built-in **Intake token** role, which holds only `streams.write` and `apm.deploy`. The role cannot hold a permission that the caller lacks. The `rum_client` role is rejected. Omit the field when `service_account_id` is set. |
-| `service_account_id` | string | No | Issues the token for a service account. The token inherits the role of the account. A disabled account is rejected. |
+| `name` | string | Yes | Display name, 1 to 255 characters. |
+| `policy_id` | string | No | The id of a [permission policy](/en-US/identity/roles#permission-policies) that the token follows, such as `builtin:data_intake`. You must hold every permission of the policy. |
+| `permissions` | string[] | No | Organization permissions fixed for the token. You must hold each of them. |
 | `expires_in_days` | integer | No | Lifetime in days, limited to 1 through 1825. Omit the field for a token that never expires. |
+
+Give `policy_id` or `permissions`, not both. With neither, the token may do whatever you may. A token never does more than you may at the time of a request: when you lose a permission, your tokens lose it too.
 
 <RequestExample>
 ```bash cURL
-curl -X POST http://localhost:5080/api/v1/auth/tokens \
-  -H "authorization: Bearer $MS_JWT" \
+curl -b ms-cookies.txt -X POST http://localhost:5080/api/v1/me/api-tokens \
   -H 'content-type: application/json' \
   -d '{
     "name": "grafana-readonly",
-    "role_id": "<viewer-role-id>",
+    "permissions": ["streams.read", "streams.query", "dashboards.read"],
     "expires_in_days": 90
   }'
 ```
@@ -37,27 +38,48 @@ curl -X POST http://localhost:5080/api/v1/auth/tokens \
 {
   "id": "3KE5hOsEc3lMC9qr9RWnPn0pqWF",
   "prefix": "l2XcQd8UoQzK3pLm",
-  "token": "ms_l2XcQd8UoQzK3pLm_<secret>",
-  "role_id": "<viewer-role-id>",
-  "role_key": "viewer",
-  "role_name": "Viewer",
+  "name": "grafana-readonly",
   "token_kind": "personal",
+  "user_id": "<user-id>",
+  "policy_id": null,
+  "permissions": ["dashboards.read", "streams.query", "streams.read"],
   "application_id": null,
   "service_account_id": null,
   "expires_at_micros": 1798000000000000,
-  "created_at_micros": 1790000000000000
+  "last_used_at_micros": null,
+  "revoked": false,
+  "created_at_micros": 1790000000000000,
+  "token": "ms_l2XcQd8UoQzK3pLm_<secret>"
 }
 ```
 </ResponseExample>
 
-List the role ids with `GET /api/v1/roles`. The built-in organization roles are `owner`, `admin`, `editor`, `viewer`, and `intake`.
+`ms-cookies.txt` holds the session that [Log in](/en-US/api/auth/login) started. `GET /api/v1/me/api-tokens/scopes` lists the policies and the organization permissions that a token can be limited to. Send the token in the `Authorization` header: `Authorization: Bearer ms_…`.
 
-Send the token like a login token: `Authorization: Bearer ms_…`. A token with the default role can send data and cannot query it.
+## For a service account
+
+```http
+POST /api/v1/auth/tokens
+```
+
+Issues a token that acts as a service account. The body is the same, plus `service_account_id`, and the call requires `api_tokens.issue`. Unlike a personal token, this one may be issued with an API token. With neither `policy_id` nor `permissions`, the token may do whatever the role of the account allows, and it follows the role when the role changes.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/auth/tokens \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "collector-production",
+    "service_account_id": "<service-account-id>",
+    "policy_id": "builtin:data_intake",
+    "expires_in_days": 365
+  }'
+```
 
 **Errors**
 
 | Status | Cause |
 |---|---|
-| `400` | Empty `name`, a `rum_client` role, or a `role_id` together with `service_account_id`. |
-| `403` | The role holds permissions that the caller lacks, or the caller lacks `api_tokens.manage`. |
-| `404` | The system scope has no API tokens, or the role or the service account does not exist. |
+| `400` | An empty `name`, both `policy_id` and `permissions`, an empty list, an unknown permission or policy, or a disabled service account. |
+| `403` | The scope holds a permission that you lack, a personal token was asked for with an API token, or the permission (`personal_tokens.manage` or `api_tokens.issue`) is missing. |
+| `404` | The system scope has no API tokens, or the service account does not exist. |

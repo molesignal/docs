@@ -1,0 +1,175 @@
+---
+title: "在 Grafana 中查询"
+description: "用 MoleSignal 数据源插件，在 Grafana 的仪表盘、Explore 和告警规则中读取 MoleSignal 的指标、日志和链路。"
+"en_link": "/en-US/query/grafana"
+---
+
+MoleSignal 数据源是一个 Grafana 插件。Grafana 用 PromQL 读取指标，用 **日志** 和 **链路** 页面的字段查询读取日志和链路，用 SQL 读取任意数据流。信号之间的跳转也一并带上：日志行可以打开它的链路，exemplar 可以打开它的链路，每个结果都能链接回 MoleSignal。
+
+<Note>
+插件的后端运行在 Grafana 服务器上，由 Grafana 作为子进程启动。所有对 MoleSignal 的请求都从 Grafana 服务器发出，带着数据源的 Token；浏览器从不直接访问 MoleSignal。Grafana Cloud 通过 Private data source connect 访问内网中的 MoleSignal。
+</Note>
+
+## 前提条件
+
+| 项目 | 要求 |
+|---|---|
+| Grafana | 12.3 或更高版本，包括 13.x。 |
+| MoleSignal | 支持 [`POST /api/v1/query`](/zh-Hans/api/query/execute) 的 `step` 字段，以及[日志](/zh-Hans/api/web/logs)和[链路](/zh-Hans/api/web/trace)读取接口 `expression` 参数的版本。**Save & test** 会拒绝更早的版本，因为它们会不加过滤地返回字段查询的结果。 |
+| 网络 | Grafana 服务器能访问 MoleSignal 的 HTTP 端口，默认 5080。 |
+| Token | **Viewer** 角色的服务账号的 API Token。数据源用到 `streams.read`、`streams.query`、`logs.read`、`traces.read` 和 `metrics.read`，注解和变量用到 `dashboards.read` 和 `dashboards.annotations.read`，发布注解用到 `apm.deployments.read`，事件注解用到 `alerts.incidents.read`。 |
+
+## 为 Grafana 创建 Token
+
+1. 打开 **身份与访问 → 服务账号**，点击 **创建服务账号**。
+2. **名称** 填 `grafana`，**角色** 选 **Viewer**。
+3. 点击 **创建账号和 Token**，复制 Token。它 365 天后过期，且只显示一次。
+
+若要让 Grafana 只能读取，可以为该账号签发一个范围更窄的 Token：打开 **身份与访问 → API tokens**，点击 **为服务账号签发 Token**，选择该账号，**权限范围** 选 **只读观察者** 策略。参见 [API Token 与服务账号](/zh-Hans/identity/tokens)。
+
+一个数据源读取一个组织，即其 Token 所属的组织。能使用该数据源的每个 Grafana 用户，读到的都是 Token 能读到的数据。用 Grafana 的数据源权限限制谁能使用它，或者为每个团队配置各自的数据源和 Token。
+
+## 安装插件
+
+用 Grafana CLI 安装发布包，或者把它解压到 Grafana 的插件目录，Linux 安装包和 Docker 镜像中为 `/var/lib/grafana/plugins`：
+
+```bash
+grafana cli --pluginUrl https://github.com/molesignal/molesignal-grafana-plugin/releases/download/v0.1.0/molesignal-datasource-0.1.0.zip plugins install molesignal-datasource
+```
+
+插件尚未签名。在 `grafana.ini` 中，或用环境变量 `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=molesignal-datasource`，允许 Grafana 加载它，然后重启 Grafana：
+
+```ini
+[plugins]
+allow_loading_unsigned_plugins = molesignal-datasource
+```
+
+## 添加数据源
+
+1. 在 Grafana 中打开 **Connections → Data sources**，点击 **Add new data source**，选择 **MoleSignal**。
+2. 填写 MoleSignal 的 **URL**，例如 `https://molesignal.example.com`，粘贴 **API Token**。
+3. 点击 **Save & test**。
+
+**Save & test** 会读取 MoleSignal 的版本，检查 Token 是否持有 `streams.read` 和 `streams.query`，统计各类型数据流的数量，并检查 MoleSignal 能否读懂字段查询。
+
+| 设置 | 默认值 | 说明 |
+|---|---|---|
+| **URL** | | MoleSignal 的地址，不含 `/api/v1`。 |
+| **API Token** | | 加密保存在 Grafana 服务器上。 |
+| **跳过 TLS 证书校验** | 关闭 | 只用于使用自签名证书的测试实例。 |
+| **CA 证书** | | 签发 MoleSignal 证书的证书颁发机构，PEM 格式。 |
+| **日志数据流** | | 新建日志查询默认使用的数据流。Explore 的临时过滤从它提供字段。 |
+| **日志字段** | `message`、`level`、`trace_id` | 保存日志正文、级别和链路的字段。 |
+| **采集间隔** | `15s` | 指标上报的间隔。`$__rate_interval` 至少是它的 4 倍。 |
+| **联邦集群** | 本集群 | 每个 SQL 和 PromQL 查询都会查询的集群，用逗号分隔。 |
+| **MoleSignal 网页地址** | URL | **Open in MoleSignal** 链接指向的地址。 |
+| **超时（秒）** | `60` | 一次请求 MoleSignal 最长等待的时间。 |
+| **同时执行的查询数** | `10` | 一个面板、Explore 窗格或告警规则中同时执行的查询数。 |
+
+## 查询类型
+
+| 查询类型 | 读取 | 展示 |
+|---|---|---|
+| **PromQL** | 指标：按面板的间隔做 range 查询，或做 instant 查询 | 时间序列、表格和 exemplar |
+| **SQL** | 任意数据流 | 表格、时间序列或日志行 |
+| **日志** | 字段查询匹配的日志数据流中最新的记录 | 日志行 |
+| **链路** | 按 ID 读取一条链路 | 链路视图 |
+| **链路搜索** | 字段查询匹配的链路 | 可以打开每条链路的表格 |
+| **RED** | 字段查询匹配的 Span 的每秒请求数、每秒错误数、错误率或某个耗时分位数 | 时间序列；**拆分** 指定了字段时，每个取值一条 |
+| **服务拓扑** | 服务之间的调用 | 节点图 |
+
+### PromQL
+
+range 查询每个步长读取一个点。步长取面板的间隔，不小于 **最小步长**，每条序列不超过 11,000 步。**图例** 为每条序列命名，`{{label}}` 代表某个标签的值。**Exemplar** 画出序列的 exemplar，每个都能打开对应的链路。MoleSignal 实现的是 [PromQL 的子集](/zh-Hans/query/promql-subset)。
+
+### 字段查询
+
+**日志**、**链路搜索** 和 **RED** 使用 MoleSignal **日志** 和 **链路** 页面的字段查询，同一个查询在两处含义相同：
+
+```text
+level = 'error' AND (service.name = 'checkout' OR timeout)
+```
+
+| 写法 | 含义 |
+|---|---|
+| `AND`、`OR`、括号 | `AND` 优先于 `OR`，括号用于分组。 |
+| `=`、`!=`、`>`、`>=`、`<`、`<=`、`contains` | 把字段与值比较。 |
+| `field in ('a', 'b')` | 多个值之一，用于链路查询。 |
+| `MATCH(field, 'text')`、`MATCH_TEXT(field, 'words')` | 对字段做全文搜索，用于日志查询。 |
+| 单独的词或引号中的短语 | 要查找的文本。 |
+
+**添加条件** 一行用 **字段**、**运算符** 和 **值** 组成一个比较，并用 `AND` 加入查询。**RED** 读取 **入口 Span**（服务接收请求的地方）或 **所有 Span**。
+
+### SQL
+
+SQL 读取任意数据流。**数据流** 指定规划语句时使用的数据流，为空时使用 `FROM` 后面的表。**格式** 可选 **表格**、**时间序列** 或 **日志**。以下宏按面板的时间窗口展开：
+
+| 宏 | 展开为 |
+|---|---|
+| `$__timeFilter(_timestamp)` | `_timestamp >= <from> AND _timestamp < <to>` |
+| `$__timeGroup(_timestamp, $__interval)` | `date_bin(INTERVAL '<interval>', _timestamp)` |
+| `$__timeFrom()`、`$__timeTo()` | 时间窗口两端的时间戳 |
+
+`$__interval`、`$__rate_interval` 和 `$__range` 在 PromQL 和 SQL 中都可以使用，告警规则中也可以。
+
+## Explore
+
+| 操作 | 效果 |
+|---|---|
+| 执行日志查询 | 在日志行上方按级别画出日志量。 |
+| 打开某行的上下文 | 显示它前后各 50 条记录。 |
+| 在某行的详情中只看或排除某个值 | 用 `AND` 把 `field = 'value'` 或 `field != 'value'` 加入查询。 |
+| 点击某行的 trace ID，或一个 exemplar | 在查询旁边打开对应的链路。 |
+| 点击 **Open in MoleSignal** | 在 MoleSignal 中打开同样的查询和时间窗口。 |
+
+## 变量与临时过滤
+
+查询变量列出以下之一：
+
+| 列出 | 取值 |
+|---|---|
+| **数据流** | 某种类型的数据流。 |
+| **字段** | 某个数据流的字段。 |
+| **字段取值** | 日志数据流中某个字段最常见的取值。 |
+| **指标** | 指标名，可以只列出包含某段文字的指标。 |
+| **标签取值** | 某个指标的某个标签的取值。 |
+| **SQL** | 语句结果的第一列。 |
+
+选中多个值的变量按各语言读取列表的方式写入：PromQL 中为 `(a|b)`，供 `=~` 使用；SQL 中为 `'a', 'b'`，供 `IN (...)` 使用；链路字段查询中为 `'a', 'b'`，供 `in (...)` 使用。
+
+临时过滤（ad hoc filter）在 PromQL 中作为每个选择器的标签匹配条件，在字段查询中作为 `AND` 条件。它的字段和取值来自数据源的 **日志数据流**。
+
+## 注解
+
+注解查询在仪表盘的面板上标出一种 **来源**：
+
+| 来源 | 标出 |
+|---|---|
+| **注解** | MoleSignal 的注解，可以只看带某个 **标签** 的。 |
+| **部署** | [应用性能](/zh-Hans/apm/deployments)记录的部署，可以只看某个服务的。 |
+| **事件** | 事件从开始到解决的时段，可以只看某个服务的。 |
+
+## 告警
+
+Grafana 告警规则通过插件后端执行 PromQL 和 SQL 查询。[MoleSignal 的告警](/zh-Hans/alerting)功能更完整，包括实时规则、事件、值班和升级。Grafana 中触发的告警仍可以作为[外部告警](/zh-Hans/alerting/sources#grafana)推送到 MoleSignal。
+
+## 仪表盘
+
+数据源的 **Dashboards** 标签页可以导入两个仪表盘：
+
+| 仪表盘 | 内容 |
+|---|---|
+| **MoleSignal · Services** | 每个服务的请求数、错误和耗时，服务拓扑，以及最慢的链路。 |
+| **MoleSignal · Logs** | 某个日志数据流的日志量和最新的错误。 |
+
+## 限制
+
+| 项目 | 限制 |
+|---|---|
+| 日志查询 | 最新的 1,000 条记录，用 **行数上限** 最多 5,000 条。 |
+| 链路搜索 | 100 条链路，用 **行数上限** 最多 5,000 条。 |
+| 链路 | 在时间窗口内开始、且在窗口最后 31 天内的链路。 |
+| PromQL | 每条序列 11,000 步，每个查询 100,000 个点。超过时，MoleSignal 为每条序列均匀保留点。 |
+| SQL | 10,000 行，用 **行数上限** 最多 1,000,000 行。 |
+
+Grafana 的 Logs、Traces、Metrics Drilldown 应用只读取 Loki、Tempo 和 Prometheus，因此不会打开这个数据源。

@@ -1,6 +1,6 @@
 ---
 title: "Log in"
-description: "Exchange email and password for a JWT."
+description: "Start a browser session with an email and a password."
 "zh-Hans_link": "/zh-Hans/api/auth/login"
 ---
 
@@ -8,18 +8,19 @@ description: "Exchange email and password for a JWT."
 POST /api/v1/auth/signin
 ```
 
-Exchange email + password for a JWT. This route is **unauthenticated**.
+Starts a session of the web UI. This route is **unauthenticated**. The response sets the session cookies and returns who signed in under `login`. The body carries no token. For an account with multi-factor authentication, see [The second step](#the-second-step).
 
 **Body**
 
-| Field | Type | Required |
-|---|---|---|
-| `email` | string | ✅ |
-| `password` | string | ✅ |
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `email` | string | Yes | |
+| `password` | string | Yes | |
+| `remember` | boolean | No | Keeps the session after the browser closes. Defaults to `false`. |
 
 <RequestExample>
 ```bash cURL
-curl -X POST http://localhost:5080/api/v1/auth/signin \
+curl -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
   -H 'content-type: application/json' \
   -d '{"email":"admin@example.com","password":"admin"}'
 ```
@@ -28,24 +29,108 @@ curl -X POST http://localhost:5080/api/v1/auth/signin \
 <ResponseExample>
 ```json 200
 {
-  "token": "eyJhbGciOi...",
-  "user_id": "<user-id>",
-  "email": "admin@example.com",
-  "display_name": "root",
-  "org_id": "<organization-id>",
-  "org_name": "default",
-  "display_role": "Owner",
-  "roles": [
-    {
-      "id": "<role-id>",
-      "key": "owner",
-      "name": "Owner",
-      "builtin": true
-    }
-  ]
+  "login": {
+    "user_id": "<user-id>",
+    "email": "admin@example.com",
+    "display_name": "root",
+    "org_id": "<organization-id>",
+    "org_name": "default",
+    "display_role": "Owner",
+    "roles": [
+      {
+        "id": "<role-id>",
+        "key": "owner",
+        "name": "Owner",
+        "builtin": true
+      }
+    ],
+    "scope": "organization"
+  }
 }
 ```
 </ResponseExample>
 
-Use the returned token as `Authorization: Bearer <token>`. Sign-in selects the user's first
-organization membership; use an API token for unattended integrations.
+Sign-in selects the first organization membership of the user that lets the sign-in in. Programs send an API token in the `Authorization` header instead. The header does not accept a session token. See [Issue an API token](/en-US/api/auth/issue-token).
+
+## Too many failed attempts
+
+After too many failed passwords, the answer is `429` with a `Retry-After` header in seconds, the code `signin_limited`, and the same text for an account that exists and one that does not. The password is not checked. A wrong password or an unknown account answers `401`; a right password on a disabled or pending account answers `403` with the reason. See [Sign-in limits](/en-US/settings/platform#sign-in-limits).
+
+```json
+{
+  "error": "resource_exhausted",
+  "code": "signin_limited",
+  "message": "too many failed password attempts; try again in 14 minutes"
+}
+```
+
+## The second step
+
+For an account with [multi-factor authentication](/en-US/identity/mfa), the password alone sets no cookies. The answer has `mfa` instead of `login`, with what the account can finish with:
+
+```json
+{
+  "mfa": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp", "recovery_code"],
+    "expires_at_micros": 1790000000000000
+  }
+}
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/auth/signin/verify` | Finishes the sign-in. Takes `challenge` and either `method` (`totp` or `recovery_code`) with `code`, or `method` `passkey` with `ceremony` and `credential`. Answers `{"login": …}` with the session cookies, and `recovery_codes_left` after a recovery code. |
+| `POST /api/v1/auth/signin/verify/passkey` | Takes `challenge` and returns `ceremony` and `options` for a passkey check. `options` goes to `navigator.credentials.get()`; `ceremony` comes back with the answer and works once. |
+
+## A second factor set up on the spot
+
+When the organization [requires multi-factor authentication](/en-US/identity/sso#sign-in-requirements) and the account has no second factor yet, the answer has `enroll` instead of `login`:
+
+```json
+{
+  "enroll": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp"],
+    "organization_name": "default",
+    "expires_at_micros": 1790000000000000
+  }
+}
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/auth/signin/enroll/totp` | Takes `challenge` and returns `setup`, `secret`, `otpauth_url`, `qr_svg`, and `expires_at_micros`. |
+| `POST /api/v1/auth/signin/enroll/totp/confirm` | Takes `challenge`, `setup`, and `code`. Answers `{"login": …, "recovery_codes": […]}` with the session cookies. |
+| `POST /api/v1/auth/signin/enroll/passkey/options` | Takes `challenge` and returns `ceremony` and `options` for `navigator.credentials.create()`. |
+| `POST /api/v1/auth/signin/enroll/passkey` | Takes `challenge`, `ceremony`, `credential`, and optionally `name`. Answers `{"login": …, "recovery_codes": […]}` with the session cookies. |
+
+An organization that [only allows single sign-on](/en-US/identity/sso#sign-in-requirements) answers `403` to the password. When the account belongs to several organizations, sign-in selects the first one that lets it in.
+
+## Passkey sign-in
+
+A [passkey](/en-US/identity/mfa#with-a-passkey-without-a-password) signs in without a password or a second step.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/auth/signin/passkey/options` | Returns `ceremony` and `options`. `400` when the instance's `[http].external_url` can't be a passkey's [relying party](/en-US/identity/mfa#what-the-instance-needs). |
+| `POST /api/v1/auth/signin/passkey` | Takes `ceremony`, `credential`, and optionally `remember`. Answers `{"login": …}` with the session cookies. |
+
+## Session cookies
+
+| Cookie | Path | Holds | Lifetime |
+|---|---|---|---|
+| `accessToken` | `/api` | The access token, sent with every API request. | 15 minutes, renewed with `POST /api/v1/auth/refresh`. |
+| `refreshToken` | `/api/v1/auth` | The refresh token, used only to renew the access token. | Until the session ends, `[auth].session_ttl_secs` after sign-in. 24 hours by default. |
+
+Both cookies are `HttpOnly` and `SameSite=Strict`, and `Secure` when the browser reaches MoleSignal over HTTPS. Without `remember`, the browser drops them when it closes. Both tokens are signed JWTs. The server keeps no record of them and checks each one by its signature, purpose, and expiry. Disabling or deleting the user ends the session at the next request.
+
+## Session endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/auth/refresh` | Issues a new access token from the refresh token and answers `204` with a new `accessToken` cookie. The session keeps its end time. An expired session, a disabled user, or a missing cookie answers `401` and clears both cookies. |
+| `GET /api/v1/auth/session` | Returns the identity of the current session, in the shape of `login` in the sign-in response. |
+| `POST /api/v1/auth/signout` | Clears both cookies and answers `204`. |
+
+A request that changes data with the session cookie must come from a MoleSignal page. A browser request marked with `Sec-Fetch-Site` other than `same-origin` receives `403`.

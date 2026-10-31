@@ -1,0 +1,149 @@
+---
+title: "日志检索"
+description: "分页列出日志数据流的记录，按时间统计记录数量，并描述某个字段的取值。"
+"en_link": "/en-US/api/web/logs"
+---
+
+这些调用读取组织的一个日志数据流，读法与**日志**页相同。数据流不存在时返回空结果。所有调用都需要 `logs.read`，系统范围内则需要 `sys.telemetry.read`。
+
+每个调用都接受带 JSON 请求体的 `POST`，或在查询字符串中带同样字段的 `GET`：`filters` 和 `free_text` 写成 JSON 列表的文本，`where` 写成 JSON 对象的文本。查询太长、放不进地址时请用 `POST` 发送。
+
+## 调用匹配的记录
+
+调用匹配窗口内同时满足以下各项的记录：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `filters` | list | 全部需满足的过滤条件。最多 32 个，与 `where` 中的过滤条件合计。 |
+| `free_text` | list | 在 `message` 字段中查找的词或短语，每个最长 512 字节。由字母和数字组成、不超过 40 字节的小写词不区分大小写匹配；其余文本按原样匹配。最多 8 个，与 `where` 中的文本合计。 |
+| `where` | object | 表达多个可选分支的条件树：一个过滤条件、`{"text": "..."}`、`{"and": [...]}` 或 `{"or": [...]}`。 |
+| `expression` | string | **日志**页写法的字段查询。它代替 `filters`、`free_text` 和 `where`，二者只能选其一。 |
+
+过滤条件是带 `field`、`op`、`value` 和 `quoted` 的对象，字段名使用数据流中的字段名。
+
+| 运算符 | 字段 | 匹配 |
+|---|---|---|
+| `=`、`!=` | 任意标量字段 | 该值，或除它以外的值。值为空时判断字段是否有值：`=` 匹配没有该字段值的记录。 |
+| `>`、`>=`、`<`、`<=` | 数字和时间戳 | 比较结果。 |
+| `contains` | 文本 | 字段中任意位置出现该值。 |
+| `match` | 任意字段 | 作为子串出现该值，不区分大小写。值为空时不匹配任何记录。 |
+| `match_text` | 建有全文索引的文本 | 全文检索：多词、短语和通配符。字段没有全文索引时返回 `400`。 |
+
+`eq`、`ne` 和 `like` 分别是 `=`、`!=` 和 `contains` 的别名。值写在引号中时 `quoted` 为 `true`：表示一个词，而不是数字。这里不能过滤 JSON 字段，请改用 SQL 查询。
+
+`expression` 接收**日志**页的文本：比较、`MATCH(field, 'text')` 和 `MATCH_TEXT(field, 'words')`、要查找的词、引号中的短语、不区分大小写的 `AND` 和 `OR`（`AND` 优先），以及括号。服务端把它读成页面会发送的 `filters`、`free_text` 和 `where`，再按上文校验。文本最长 8 KiB，括号最多嵌套 32 层。读不懂的部分（例如未闭合的括号，或比较的值为空）返回 `400`，并指出该部分。
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/logs" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'stream=app' \
+  --data-urlencode "expression=level = 'error' AND (service.name = 'checkout' OR timeout)"
+```
+
+## 列出记录
+
+```http
+POST /api/v1/web/logs
+GET  /api/v1/web/logs
+```
+
+按时间从新到旧返回匹配的记录，使用游标分页。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `stream` | string | 必填，日志数据流。 |
+| `from`、`to` | integer | 以微秒表示的窗口，默认是截至当前的最近 24 小时。`to` 必须大于 `from`。 |
+| `filters`、`free_text`、`where`、`expression` | | 调用匹配的记录。 |
+| `limit` | integer | 每页条数，默认 `20`，限定在 1 到 5000 之间。 |
+| `cursor` | string | 之前某页的 `next_cursor` 或 `previous_cursor`。它保留第一页的窗口和匹配条件。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/web/logs \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"stream":"app","expression":"level = '\''error'\''","limit":2}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    { "_timestamp": 1790000000000000, "level": "error", "message": "db pool exhausted", "trace_id": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "next_cursor": "eyJ2IjoxLC...",
+  "previous_cursor": null,
+  "has_more": true
+}
+```
+</ResponseExample>
+
+每一项是一条记录的字段，`_timestamp` 以微秒为单位。带着 `cursor` 却更换了数据流、窗口、`limit` 或匹配条件的请求返回 `400`。
+
+## 按时间统计记录数量
+
+```http
+POST /api/v1/web/logs/histogram
+GET  /api/v1/web/logs/histogram
+```
+
+把匹配的记录统计到时间桶中。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `stream` | string | 必填。 |
+| `from`、`to` | integer | 必填，以微秒表示的窗口。 |
+| `filters`、`free_text`、`where`、`expression` | | 调用匹配的记录。 |
+| `bucket_micros` | integer | 一个时间桶的长度，单位微秒，至少 `1000`。 |
+| `origin_micros` | integer | 第一个时间桶的起点，不晚于 `from`。 |
+
+一个请求从 `origin_micros` 到 `to` 最多覆盖 512 个时间桶。
+
+```json
+{
+  "bucket_micros": 60000000,
+  "origin_micros": 1790000100000000,
+  "buckets": [{ "start_micros": 1790000100000000, "total": 120, "errors": 4 }],
+  "split": true
+}
+```
+
+`buckets` 只列出含有记录的时间桶，按时间从早到晚。`errors` 统计级别为 `ERROR` 的记录，级别取自 `level` 或 `body_level`。数据流没有这两个字段，或级别对读取者被遮掩时，`split` 为 `false`，`errors` 为 `0`。统计无法完成时，调用仍返回 `200`，`buckets` 为空，并带上 `unavailable`：`time_budget`、`busy` 或 `scan_limit`，含义与[链路统计](/zh-Hans/api/web/trace#按时间统计链路数量)相同。
+
+## 描述字段
+
+```http
+POST /api/v1/web/logs/field-stats
+GET  /api/v1/web/logs/field-stats
+```
+
+描述某个字段在匹配记录中的取值。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `stream` | string | 必填。 |
+| `from`、`to` | integer | 以微秒表示的窗口。 |
+| `filters`、`free_text`、`where`、`expression` | | 调用匹配的记录。 |
+| `field` | string | 必填，使用数据流中的字段名。 |
+
+```json
+{
+  "kind": "text",
+  "total": 1840,
+  "present": 1840,
+  "distinct": 3,
+  "distinct_exact": true,
+  "top": [{ "value": "info", "count": 1500 }, { "value": "warn", "count": 300 }, { "value": "error", "count": 40 }],
+  "top_skipped": false
+}
+```
+
+`kind` 为 `number`、`time`、`text` 或 `bool`。`total` 是匹配的记录数，`present` 是其中有该字段值的记录数。`top` 按从多到少列出最常见的取值；几乎每个值都不相同时 `top_skipped` 为 `true`，不列出取值。`range` 以文本给出最小值和最大值。数字字段还会给出 `spread` 和 `bars`。`trend` 统计最常见取值随时间的变化，没有哪个值明显更常见时不出现。
+
+## 错误
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 参数无效：缺少 `stream`、`to` 不大于 `from`、过滤条件使用了未知字段或其类型不支持的运算符、列表或条件树超出限制、`expression` 与 `filters`、`free_text` 或 `where` 同时给出或含有读不懂的部分、游标与查询不匹配，或统计缺少参数、覆盖的时间桶超过 512 个。 |
+| `403` | Token 缺少 `logs.read`。 |

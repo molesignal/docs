@@ -1,0 +1,78 @@
+---
+title: "换班申请"
+description: "请排班里的另一个人替自己值一段班：发起、接受或拒绝、撤回，以及管理员批准或驳回。"
+"en_link": "/en-US/api/alerting/schedule-swaps"
+---
+
+换班申请请排班里的另一个人替发起人值一段班。对方接受后，排班加上一条[临时替班](/zh-Hans/alerting/on-call#临时替班)，申请生效；排班开了**换班需要批准**（`swap_needs_approval`）时，接受后还要有排班管理权限的人批准。时间段结束时还没定下来的申请记成过期。每一步都通知相关的人，见内置通知策略[换班：通知相关的人](/zh-Hans/notification-channels#内置策略)，并记进审计日志。
+
+| 方法与路径 | 作用 | 权限 |
+|---|---|---|
+| `GET /api/v1/schedules/swaps` | 当前用户发起的和被请替班的申请，各排班都在内。 | `schedules.read` |
+| `GET /api/v1/schedules/{id}/swaps` | 一个排班的申请，新的在前。 | 对排班的 `schedules.read` |
+| `POST /api/v1/schedules/{id}/swaps` | 发起申请。 | 对排班的 `schedules.swaps.request` |
+| `POST /api/v1/schedules/{id}/swaps/{swap_id}/accept` | 接受。只有被请的人能做。 | 对排班的 `schedules.swaps.request` |
+| `POST /api/v1/schedules/{id}/swaps/{swap_id}/decline` | 拒绝。只有被请的人能做。 | 对排班的 `schedules.swaps.request` |
+| `POST /api/v1/schedules/{id}/swaps/{swap_id}/cancel` | 撤回。只有发起人能做，定下来之前都可以。 | 对排班的 `schedules.swaps.request` |
+| `POST /api/v1/schedules/{id}/swaps/{swap_id}/approve` | 批准对方已经接受的申请，替班随即生效。 | 对排班的 `schedules.swaps.approve` |
+| `POST /api/v1/schedules/{id}/swaps/{swap_id}/reject` | 驳回对方已经接受的申请。 | 对排班的 `schedules.swaps.approve` |
+
+## 发起申请
+
+**请求体**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `target_id` | string | 是 | 接班的人，要是这个排班的成员，不能是自己。 |
+| `start_at_micros`、`end_at_micros` | integer | 是 | 要换的时间段，Unix 微秒。要在将来，结束晚于开始。 |
+| `note` | string | 否 | 备注，最多 500 字。 |
+
+这段时间排班上只能有发起人一个人在值班；同一排班里，和还没定下来的申请重叠的时间段不能再申请。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/$SCHEDULE_ID/swaps \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"target_id": "<user-id>", "start_at_micros": 1790060400000000, "end_at_micros": 1790146800000000, "note": "Travelling on Friday"}'
+```
+</RequestExample>
+
+各个调用都返回申请；列表返回 `{ "swaps": [ ... ] }`。
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KHq2nB7yZ0d4kVwXc1sPa9LmQe",
+  "org_id": "<organization-id>",
+  "schedule_id": "<schedule-id>",
+  "schedule_name": "Payments primary",
+  "requester_id": "<user-id>",
+  "target_id": "<another-user-id>",
+  "start_at": 1790060400000000,
+  "end_at": 1790146800000000,
+  "note": "Travelling on Friday",
+  "status": "pending",
+  "override_id": null,
+  "decided_by": null,
+  "decided_at": null,
+  "created_at": 1790000000000000,
+  "updated_at": 1790000000000000
+}
+```
+</ResponseExample>
+
+| 字段 | 说明 |
+|---|---|
+| `status` | `pending`（等对方答复）、`awaiting_approval`（对方接受了，等批准）、`accepted`（已生效）、`declined`（对方拒绝）、`rejected`（管理员驳回）、`cancelled`（已撤回）或 `expired`（过期）。 |
+| `override_id` | 生效后加上的替班。 |
+| `decided_by`、`decided_at` | 最后一次答复、批准、驳回或撤回的人和时间。 |
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 时间段不对、接班的人不是排班成员，或这段时间不只发起人在值班，或和没定下来的申请重叠。 |
+| `403` | 缺少权限，或不是能做这一步的人。 |
+| `404` | 排班或申请不存在。 |
+| `409` | 申请已经不在这一步（例如已接受、已过期），或同时有人改了它；重新读取后再试。 |

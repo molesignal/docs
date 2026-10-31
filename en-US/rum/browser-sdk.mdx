@@ -6,7 +6,7 @@ description: "Install and configure the MoleSignal Browser RUM SDK, identify use
 ---
 
 The MoleSignal Browser RUM SDK collects page views, user interactions, frontend errors, Web Vitals, network
-resources, long tasks, and trace correlation context, and sends them as [RUM events](/en-US/rum/events).
+resources, long tasks, [logs](/en-US/rum/logs), and trace correlation context, and sends them as [RUM events](/en-US/rum/events).
 
 ## Prerequisites
 
@@ -170,11 +170,54 @@ rum.addFeatureFlagEvaluation('new_checkout', true);
 const vital = rum.startDurationVital('checkout_form_ready', { description: 'form is usable' });
 rum.stopDurationVital(vital);
 
+// The page is ready when the application says so: this replaces the loading time of the view.
+rum.setViewLoadingTime();
+
+// Logs.
+rum.logger.warn('cart is stale', { age_ms: 90000 });
+
 await rum.flush();
 ```
 
 Call `rum.flush()` before a controlled navigation or shutdown to wait for queued events. Call `rum.stop()` to remove
-instrumentation and flush the client.
+instrumentation and flush the client. [Alert rules](/en-US/rum/alerts#figures-the-application-measures) can watch custom timings and
+vitals, and [feature flags](/en-US/rum/feature-flags) have a page of their own. [Logs](/en-US/rum/logs) go to the stream `rum_logs`.
+
+## Link to the replay of a session
+
+`getSessionReplayLink()` answers the address of the current session in MoleSignal, to attach to a support ticket or to the report
+of an error. It answers `undefined` before the SDK has started, for a session that is not sampled, and without consent. The
+address is made from `appUrl`, which defaults to `site`: set it when people open MoleSignal somewhere other than where the SDK sends.
+
+```ts
+ticket.replay = molesignalRum.getSessionReplayLink();
+```
+
+Opening the link takes signing in and `rum.replay.read`.
+
+## React
+
+`@molesignal/browser-rum/react` makes the routes of a router the views of the SDK, named by their patterns
+(`/orders/:id`, not `/orders/42`), and reports what a tree of components throws. React is an optional peer.
+
+```tsx
+import { init } from '@molesignal/browser-rum';
+import { reactPlugin, RumErrorBoundary, trackReactRouter } from '@molesignal/browser-rum/react';
+
+init({ /* … */ plugins: [reactPlugin()] });
+trackReactRouter(router); // a router of createBrowserRouter; trackTanStackRouter for TanStack Router
+
+root.render(
+  <RumErrorBoundary fallback={<Oops />}>
+    <RouterProvider router={router} />
+  </RumErrorBoundary>,
+);
+```
+
+## Remote configuration
+
+With `remoteConfiguration: true`, the SDK reads the [SDK settings of the application](/en-US/rum/applications#sdk-remote-configuration)
+before it starts, so sample rates and the privacy level change without a new release of the page.
 
 ## Automatic collection defaults
 
@@ -185,13 +228,17 @@ instrumentation and flush the client.
 | Long animation frames and long tasks | `trackLongTasks` | `true` |
 | Web Vitals on the view | `trackWebVitals` | `true` |
 | Clicks | `trackUserInteractions` | `false` |
+| How far down the page a view went | `trackScroll` | `true` |
 | Rage, dead, and error clicks | `trackFrustrations` | Same as interaction tracking |
 | Runtime errors, unhandled rejections, failed requests | built in | Enabled |
 | `console.error` | `trackConsoleErrors` | `false` |
+| The console as [logs](/en-US/rum/logs) | `forwardConsoleLogs` | `[]` |
+| What goes wrong in the SDK, as logs | `trackSdkErrors` | `true` |
+| Headers of requests and responses | `trackResourceHeaders` | `[]` |
 | Restoring a page from the back/forward cache | `trackBfcacheViews` | `false` |
 | DOM session replay | `sessionReplaySampleRate` | `0` |
 
-Resources, errors, and long tasks that start while a click is running carry its `action.id` and are counted on it. A failed
+A session driven by a test says so; see [test traffic](/en-US/rum/test-traffic). Resources, errors, and long tasks that start while a click is running carry its `action.id` and are counted on it. A failed
 request is an error of source `network` with the failing request in `error.resource`. FCP, LCP, and FID describe the page load
 and are reported on the initial view. INP and CLS come from `web-vitals`, which measures them once per page load: the SDK reports
 each on the view in which the decisive interaction or layout shift happened.
@@ -231,10 +278,19 @@ allowedTracingUrls: [
 | `sessionReplaySampleRate` | `0` | Percentage of collected sessions that record replay |
 | `sessionInactivityTimeout` | `900000` | Idle time after which a session ends, in milliseconds |
 | `maxSessionDuration` | `14400000` | Longest a session lasts, in milliseconds |
-| `defaultPrivacyLevel` | `mask` | `mask` or `allow`: whether action names, selectors, and element hints carry page text and IDs |
+| `defaultPrivacyLevel` | `mask` | `mask`, `mask-user-input`, or `allow`: how much of what is on the page and typed into it is sent. See [Privacy](/en-US/rum/privacy) |
 | `trackUrlQueryString` | `false` | Keep query strings in reported URLs |
 | `excludedUrls` | `[]` | String, RegExp, or callback URL exclusions for requests |
 | `allowedTracingUrls` | same origin | Requests that receive and contribute trace context |
+| `traceSampleRate` | `100` | Percentage of the traces requests start that a back end is asked to keep (the W3C sampled flag). The others still carry a trace context, so the request and its trace ID stay joined |
+| `trackResourceHeaders` | `[]` | Headers of a fetch or XHR to keep, by name or RegExp. Credentials never are kept |
+| `forwardConsoleLogs` | `[]` | Console methods that also write logs: `'all'`, or some of `debug`, `log`, `info`, `warn`, and `error` |
+| `trackSdkErrors` | `true` | Say what goes wrong in the SDK as logs of the application, a few per page load |
+| `trackScroll` | `true` | Keep how far down the page each view goes |
+| `compressIntakeRequests` | `false` | Gzip the requests of events where the browser can |
+| `remoteConfiguration` | `false` | Read what the [settings of the application](/en-US/rum/applications#sdk-remote-configuration) decide before starting |
+| `appUrl` | `site` | Where people open MoleSignal, for `getSessionReplayLink` |
+| `plugins` | `[]` | What extends the SDK, such as `reactPlugin()` |
 | `enablePersistentQueue` | `true` | Recover unsent telemetry from IndexedDB after a reload |
 | `flushInterval`, `batchSize` | `5000`, `50` | When and how many events go in a request. Batches are capped at 100 |
 | `maxQueueSize` | `1000` | Events kept while offline |
@@ -252,6 +308,12 @@ backoff after a network error, `408`, `425`, `429`, or `5xx`, and `Retry-After` 
 not retried: they are reported through `onError`. Any other `4xx` drops the batch. When the queue is full, resources go first, then long
 tasks, replay, vitals, actions, errors, and, last, views. When the page goes away, the most important events are sent first in one
 `keepalive` request. Tabs of the same application share the queue without sending each other's events twice.
+
+## Upgrade from 0.2
+
+- `defaultPrivacyLevel: 'allow'` now shows what is typed into a field, but for passwords, e-mail addresses, telephone numbers, and card or
+  one-time-code fields. What `allow` did before is `mask-user-input`: change to it to go on masking what is typed.
+- A click on what is not a control is reported as a click too.
 
 ## Upgrade from 0.1
 

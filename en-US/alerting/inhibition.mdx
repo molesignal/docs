@@ -1,0 +1,105 @@
+---
+title: "Inhibition"
+description: "While a worse or upstream incident is active, hold back the notifications of the lesser ones, so people hear about the one that matters."
+"zh-Hans_link": "/zh-Hans/alerting/inhibition"
+---
+
+The database is down, and the ten services that depend on it all report errors. Whoever is on call needs to hear about the database; the rest only makes their phone ring. An inhibit rule says just that: **while an incident of the source side is active, incidents of the target side that share the named labels have their notifications held back.**
+
+An incident held back still opens, is recorded and shows on the pages. Its notifications wait and it does not escalate. Once the source recovers, targets still open notify as usual.
+
+Open **Alerts → Inhibition**. Viewing takes `alerts.inhibitions.read`; creating, changing and deleting take `alerts.inhibitions.manage`.
+
+## Inhibition and silences
+
+| | Silence | Inhibition |
+|---|---|---|
+| When it applies | During a time window | While a matching incident is active |
+| Good for | Planned maintenance, known noise | The chain of alerts one failure sets off |
+| Who decides what is held back | A person, in advance, by time | The system, from the incidents active now |
+
+Both hold back only notifications and escalation. Neither affects the incident itself, [status pages](/en-US/status-pages) or [tickets](/en-US/alerting/tickets).
+
+## Create a rule
+
+Click **New inhibit rule**:
+
+| Setting | Description |
+|---|---|
+| **Name**, **Enabled** | A rule that is off holds nothing back. |
+| Source **Severity at least**, label conditions | What can hold others back. Empty means any incident, but then **These labels must match** is required. |
+| Target **Severity at most**, label conditions | What is held back. Empty means every incident. |
+| **These labels must match** | Comma separated. Both sides must carry the label with the same value; a missing label does not match. Empty ignores labels, and then the source must be named: otherwise any incident would hold back every other. |
+| **The source must be worse than the target** | On by default: the source must be strictly more severe, so one rule says "on one service, the worse holds back the lesser". Turn it off for dependencies (the database holds back what uses it). |
+| **Target waits (seconds)** | 60 by default, at least 15, at most 600. See [Two buffers in time](#two-buffers-in-time). |
+| **Holds on after recovery (seconds)** | 120 by default, at most 3600. |
+
+Label conditions are written as in [silence policies](/en-US/alerting/silences): all of them must hit, and `=~` and `!~` are regular expressions over the whole value. Besides an incident's labels, three more are understood:
+
+- `service` and `host`: when the incident has no such label, its affected service or host;
+- `alert.rule_id`: the ID of the rule or alert source that opened it, for "rule A holds back rule B".
+
+Click **Run it** to run the rule, saved or not, over the incidents active right now and list what would be held back by what.
+
+## Common rules
+
+**On one service, the worse holds back the lesser.** This is how a new rule starts:
+
+- These labels must match: `service`
+- The source must be worse than the target: on
+
+**The database is down: no need to report what uses it.** Whatever the severities:
+
+- Source label condition: `service` `=` `database`
+- Target label condition: `tier` `=` `api`
+- These labels must match: `region` (only in the same region)
+- The source must be worse than the target: off
+
+## How it is decided
+
+Escalation dispatch decides each round (10 seconds by default) and writes the result on the incident. To guarantee that **an incident held back always has one upstream that really tells someone**:
+
+- **A silenced incident is no source.** Nobody hears about it, so holding others back would leave nobody told.
+- **An acknowledged incident stays a source.** Someone is on it.
+- **An incident merged into another counts on neither side.**
+- **An incident a person opened is never held back**, though it can hold others back.
+- **Holding back chains.** When A holds back B and B holds back C, neither B nor C notifies; A does.
+- **Incidents holding each other back leave one.** When two rules say A holds back B and B holds back A, the worse one (the earlier among equals) notifies as usual.
+
+## Two buffers in time
+
+**The target waits.** Symptoms often report before their cause: the error rate crosses its line first, and the database rule evaluates in its next round. When an incident that could be held back opens, its notifications wait for **Target waits**. A source that arrives in that time holds it back; if none does, it notifies as usual. Set to 0 it still waits 15 seconds: the next dispatch round decides, and the first notification must not run ahead of it.
+
+Only incidents that could be held back wait: the most severe ones do not when the source must be worse, nor do those without the labels that must match.
+
+**Holding on after recovery.** When the cause recovers its symptoms soon follow, and nobody needs paging for them. After a source recovers, its targets stay held back this long, and longer if another source arrives. Held notifications go out only for what is still open then.
+
+## What happens to notifications
+
+| Notification | While held back | After inhibition ends |
+|---|---|---|
+| Triggered, escalated | Not sent; escalation stays at its level. | For incidents still unacknowledged and open, the triggered notification goes out and escalation goes on; the level's acknowledgement timeout counts from then. Incidents acknowledged or resolved meanwhile get none. |
+| Later steps of a person's order, a policy's acknowledgement timeout | Not sent. | Sent if still unacknowledged. |
+| Acknowledged, resolved | Sent if the triggered notification went out; otherwise not. | Sent as usual. |
+
+## On the pages
+
+- **Incident list**: an incident held back says **Inhibited** in its summary line, and an **Inhibited** view appears while there are any.
+- **Incident page**: says which incident and which rule hold it back, with a link to the source; one that is waiting says until when. **Notify as usual** beside it releases the incident: its held notifications go out now and it is not inhibited again. That takes `alerts.incidents.update`, and is recorded in the timeline and the audit log.
+- **Timeline**: an entry when it starts being held back and when that ends (source recovered, rule changed or deleted, someone released it).
+- **Rule list**: a rule whose incidents are all held back shows **Firing (inhibited)**.
+- **Inhibition page**: each rule says how many incidents it holds back now. Deleting one that does says they will notify at once.
+
+Escalating now, reassigning and adding responders mean a person wants someone paged, so they release the incident too.
+
+## Several clusters
+
+Inhibit rules sync through [cluster federation](/en-US/settings/data-plane#cross-cluster-federation), and each cluster decides from its own incidents: an incident in one cluster holds back nothing in another.
+
+## Inhibition API
+
+| Action | Endpoint |
+|---|---|
+| Manage inhibit rules | [`/api/v1/alerts/inhibit-rules`](/en-US/api/alerting/inhibit-rules) |
+| Preview a rule | [`POST /api/v1/alerts/inhibit-rules/preview`](/en-US/api/alerting/inhibit-rules#preview) |
+| Release an incident | [`POST /api/v1/alerts/incidents/{id}/inhibition/lift`](/en-US/api/alerting/inhibit-rules#release-an-incident) |

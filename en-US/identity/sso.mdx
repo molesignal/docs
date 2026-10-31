@@ -1,32 +1,67 @@
 ---
 title: "Single sign-on"
-description: "Let people sign in through OIDC, SAML 2.0, or LDAP, map their groups to roles, and limit the email domains that may join a workspace."
+description: "Let people sign in through Google, Microsoft, GitHub, Feishu and other platforms, or through generic OIDC, OAuth 2.0, SAML 2.0, or LDAP, map their groups to roles, and limit who may sign in and which email domains may join a workspace."
 "zh-Hans_link": "/zh-Hans/identity/sso"
 ---
 
-Single sign-on lets people use the accounts of the company directory instead of a MoleSignal
-password. Open **Identity & Access → SSO providers** and **Email domains**. Reading the providers and
-domains requires `org.settings.read`, and changing them requires `org.settings.manage`.
+Single sign-on lets people use the accounts of the company directory or a common platform instead
+of a MoleSignal password. Open **Identity & Access → SSO providers** and **Email domains**. Reading
+the providers and domains requires `org.sso.read`, and changing them requires
+`org.sso.manage`.
 
 ## Before adding a provider
 
-Set `[http].external_url` to the public address of MoleSignal. The **Redirect URI** of OIDC and the
-**Assertion consumer URL (ACS)** of SAML are derived from it, and the identity provider must call
-them back. Provider settings are stored in the database and apply without a restart.
+Set `[http].external_url` to the public address of MoleSignal. The **Redirect URI** of OIDC and
+OAuth 2.0, the **Assertion consumer URL (ACS)** of SAML, and the default **SP entity ID** are derived
+from it, and the identity provider must call them back. Provider settings are stored in the database
+and apply without a restart.
 
 ## Add a provider
 
 1. Open **SSO providers** and select **New provider**.
-2. Enter a **Name** and choose the **Kind**: **OIDC**, **SAML**, or **LDAP**.
-3. Fill in the settings of the kind.
-4. Map the identity fields and the roles. See [Identity field mapping](#identity-field-mapping) and
-   [Role binding](#role-binding).
-5. Select **Create provider**.
+2. Pick the platform under **Popular platforms** or **Enterprise directories**, or **OIDC**,
+   **OAuth 2.0**, **SAML**, or **LDAP** under **Generic protocols**. Select **Change platform** to
+   pick again.
+3. When the platform offers more than one protocol, choose it under **Protocol**.
+4. Fill in what the platform asks for, and register the **Redirect URI** or **Assertion consumer URL
+   (ACS)** the form shows at the identity provider as its hint describes.
+5. Check the [identity field mapping](#identity-field-mapping), the [role binding](#role-binding),
+   and the [sign-in scope](#sign-in-scope).
+6. Select **Create provider**.
 
-| Kind | Settings |
+## Preset platforms
+
+A preset platform fills in the endpoints, the scopes, and the field mapping. An OIDC or OAuth 2.0
+platform needs only the fields below plus the **Client ID** and **Client secret**; the endpoints that
+follow from them are listed under **Endpoints and scopes**.
+
+| Platform | Protocols | Fields | Groups |
+|---|---|---|---|
+| Google | OIDC, SAML | Nothing else for OIDC | None for OIDC; group membership for SAML |
+| Microsoft Entra ID | OIDC, SAML | **Directory (tenant) ID** and **Cloud** (global, or operated by 21Vianet) | Group object IDs |
+| GitHub | OAuth 2.0 | **Deployment**; **Server host** for GitHub Enterprise Server | Organizations (`my-org`) and teams (`my-org/sre`) |
+| GitLab | OIDC | **Instance URL**, `https://gitlab.com` by default | `groups` |
+| Okta | OIDC, SAML | **Okta domain** and **Authorization server** | The `groups` claim |
+| Auth0 | OIDC | **Tenant domain** | A custom claim |
+| Keycloak | OIDC | **Server URL** and **Realm** | `groups` from a Group Membership mapper |
+| authentik | OIDC | **Server URL** and **Application slug** | `groups` |
+| Feishu / Lark | OAuth 2.0 | **Edition** (Feishu or Lark) | None |
+| AD FS | SAML | IdP metadata | Token-Groups |
+| JumpCloud | SAML | IdP metadata | `memberOf` |
+| Active Directory, OpenLDAP, FreeIPA | LDAP | Server URL, base DN, and search account | `memberOf` |
+
+GitHub is read in a fixed way: the subject is the account's numeric ID, the email is the verified
+primary address, and reading organizations and teams needs `read:org`. Where an organization
+restricts OAuth app access, an owner must approve the app before its organizations and teams can be
+read. Feishu needs the permission to read user email granted to the app on the open platform.
+
+## Generic protocols
+
+| Protocol | Settings |
 |---|---|
-| OIDC | **Issuer URL**, **Authorization URL**, **Token URL**, **UserInfo URL**, **JWKS URL**, **Client ID**, **Client secret**, and the **Scopes**, separated by spaces. Register the **Redirect URI** that the form shows, with **Copy redirect URI**, as an allowed callback at the identity provider. |
-| SAML | **SP entity ID**, **IdP entity ID**, **IdP SSO URL**, and the **IdP signing certificate (PEM)**. Register the **Assertion consumer URL (ACS)** that the form shows, with **Copy ACS URL**, at the identity provider. |
+| OIDC | **Issuer URL**, **Authorization URL**, **Token URL**, **UserInfo URL**, **JWKS URL**, **Client ID**, **Client secret**, and the **Scopes**, separated by spaces. After entering the **Issuer URL**, select **Discover** to fill in the other endpoints from `.well-known/openid-configuration`. |
+| OAuth 2.0 | For identity providers that issue no ID token: **Authorization URL**, **Token URL**, **UserInfo URL**, **Client ID**, **Client secret**, and **Scopes**. After sign-in the **UserInfo URL** is read with the access token, and the field mapping picks the account out of it. |
+| SAML | **SP entity ID**, **IdP entity ID**, **IdP SSO URL**, and the **IdP signing certificate (PEM)**. Under **IdP metadata**, enter the metadata URL, or select **Paste XML** and paste the metadata, then select **Import** to fill in the last three. Only an HTTP-Redirect sign-on URL is supported. |
 | LDAP | **LDAP server URL**: `ldaps://`, or `ldap://` with **StartTLS** on. **User base DN**, for example `ou=people,dc=example,dc=com`. A **User search filter** that contains `{username}`, which is escaped before the search. A **Search bind DN** and its **Search bind password**: leave both empty only when the directory allows anonymous search. |
 
 When editing a provider, leave **Client secret** or **Search bind password** empty to keep the saved
@@ -36,14 +71,15 @@ value.
 
 **Identity field mapping** tells MoleSignal where to read four fields of a person:
 
-| MoleSignal field | OIDC | SAML | LDAP |
+| MoleSignal field | OIDC and OAuth 2.0 | SAML | LDAP |
 |---|---|---|---|
-| **Stable subject** | A claim. Dotted paths such as `realm_access.roles` work. | An attribute name, or `NameID` for the subject of the assertion. | An attribute, or `dn` for the DN of the entry. |
-| **Email** | A claim. | An attribute name. | An attribute. |
-| **Display name** | A claim. | An attribute name. | An attribute. |
-| **Groups** | A claim. | An attribute name. | An attribute. |
+| **Stable subject** | A claim or JSON field. Dotted paths such as `realm_access.roles` work. | An attribute name, or `NameID` for the subject of the assertion. | An attribute, or `dn` for the DN of the entry. |
+| **Email** | A claim or JSON field. | An attribute name. | An attribute. |
+| **Display name** | A claim or JSON field. | An attribute name. | An attribute. |
+| **Groups** | A claim or JSON field. | An attribute name. | An attribute. |
 
-A sign-in without a valid email is refused.
+For OIDC and OAuth 2.0, `|` lists several sources and the first one with a value is taken, for
+example `email | preferred_username`. A sign-in without a valid email is refused.
 
 ## Role binding
 
@@ -53,27 +89,141 @@ role. A person receives the role of every mapping that matches, and the roles ar
 each sign-in.
 
 **Default role** applies when no mapping matches. Without it, the role of self-service joining
-applies.
+applies. A platform that sends no groups uses the default role only.
+
+## Sign-in scope
+
+With **Groups allowed to sign in** set, only accounts in one of these groups can sign in through the
+provider.
+
+Anyone can create an account at Google, GitHub.com, GitLab.com, and Microsoft's tenant-independent
+endpoints. Such a provider can be enabled only while the workspace has [email domains](#email-domains)
+or the provider has **Groups allowed to sign in**, and its sign-ins accept only email addresses the
+identity provider has verified. If the email domains are emptied after it is enabled, such a provider
+refuses sign-ins.
+
+## Test sign-in
+
+Check a provider before relying on it: select **Test** in the provider list or in the provider's
+settings. A test goes through a real sign-in with the saved settings and leaves nothing behind: no
+session starts, no account is created or linked, no role changes, and your own sign-in stays as it
+is. A disabled provider can be tested too, so test it before enabling it. A test needs
+`org.sso.manage`, can't be started with an API token, and each provider takes 10 a minute.
+
+| Provider | How the test runs |
+|---|---|
+| OIDC, OAuth 2.0, SAML | A new tab goes to the identity provider and comes back on the result page. The redirect URI or ACS URL is the one registered for sign-ins. |
+| LDAP | Enter a directory account and its password. This is a real bind, so a wrong password counts toward the directory's lockout policy and this instance's sign-in limits. The password isn't stored. |
+
+The result page shows:
+
+- **Whether it went through.** If not, why, what to do, and the message of the server or the identity
+  provider. A rule that would refuse the sign-in fails the test too, such as allowed groups, email
+  domains, or a disabled account.
+- **What the provider returned:** the email, the name, the subject, and the groups.
+- **What a real sign-in would do:** the account it reaches (signs in, its owner confirms a link, or a
+  new account), and the roles after it, including any it would replace.
+
+If the identity provider shows an error page of its own, the browser never comes back, and after 10
+minutes the result says that nothing returned. The usual cause is a redirect URI it doesn't have
+registered.
+
+A result counts only for the settings it ran on. Changing the endpoints, a secret, the mappings, or
+the allowed groups voids it, and the list shows **Settings changed**. Renaming, enabling, or disabling
+the provider doesn't. Each provider keeps its latest 20 tests. Tokens, assertions, secrets, and
+passwords aren't shown, stored, or logged. Each test is audited as `org.sso_provider.test`, without
+the identity.
+
+## Sign-in requirements
+
+**Sign-in requirements** at the top of **Identity & Access → SSO providers** decide what entering this
+workspace asks of a sign-in. They need `org.sso.manage`. A change reaches every session within 15 minutes:
+a session that doesn't meet it ends at its next renewal and has to sign in again. Changes are audited.
+
+| Requirement | Effect |
+|---|---|
+| **Require multi-factor authentication** | A session entering the workspace needs [multi-factor authentication](/en-US/identity/mfa). A session that came through this workspace's OIDC, OAuth 2.0, or SAML provider counts: the identity provider is responsible for it. LDAP and another workspace's single sign-on don't count. |
+| **Only allow single sign-on** | The only way in is this workspace's OIDC, OAuth 2.0, or SAML provider: account passwords, passkeys, and LDAP can't enter. The root user is the exception, to get in when the identity provider is down. It needs one such provider enabled, and while it is on, the last one can't be disabled or deleted. Turning it on while no enabled provider has passed a [test sign-in](#test-sign-in) with its current settings warns you and asks for the workspace's name; the audit event records `sso_tested: false`. |
+
+When a sign-in doesn't meet them:
+
+| Case | Result |
+|---|---|
+| Signing in, with an account in several workspaces | Enters the first workspace that lets it in. |
+| Signing in, and only multi-factor authentication is missing | A passkey or an authenticator app is set up on the spot. The session comes with it, and the recovery codes are shown. |
+| Signing in, with an account only in single sign-on only workspaces | Refused, and the sign-in page says why. |
+| Switching to a workspace that requires multi-factor authentication | With a second factor, verify once on the spot. Without one, turn it on under **Security & sign-in** first. |
+| Switching to a single sign-on only workspace | Offers to sign in through its providers. |
+| Self-service sign-up | Refused in a single sign-on only workspace. Where multi-factor authentication is required, the account is created and sets it up when signing in. |
+| Account login from a database client | Refused with either requirement, and clients already connected stop working at their next request. Use an [API token](/en-US/identity/tokens). |
+| API tokens | Unaffected. |
+
+While a workspace of the account requires multi-factor authentication, its owner can't remove the last
+second factor. An [administrator's reset](/en-US/identity/mfa#reset-by-an-administrator) still works,
+and the member sets one up at the next sign-in.
+
+The platform organization's requirement is under **Settings → Sign-in requirements** in the `_sys`
+organization. It needs `sys.settings.signin.manage`, and it has only **Require multi-factor authentication**.
 
 ## What happens at sign-in
 
-The sign-in page shows a button for each enabled provider. For an LDAP provider, enter the directory
-user name and password in the form first, then select the button of the provider.
+The sign-in page shows a row with the platform's mark for each enabled provider. For an LDAP
+provider, select its row, then enter the directory user name and the password, one at a time.
 
-1. The provider confirms the person, and MoleSignal reads the mapped fields.
-2. A person without a MoleSignal account gets one, when the email passes the
+1. The browser goes to the identity provider and returns to MoleSignal after authentication.
+2. The provider confirms the person: an OIDC ID token is verified with a key from the JWKS (RSA, EC,
+   or EdDSA) or with the client secret (HMAC); OAuth 2.0 reads the user endpoint. MoleSignal reads
+   the mapped fields.
+3. An account outside **Groups allowed to sign in** is refused.
+4. An identity that has signed in before is linked to an account and signs in to it. MoleSignal
+   finds it by the provider and the identity's subject, not by its email.
+5. An identity signing in for the first time with the email of an existing MoleSignal account waits
+   for the owner of that account to confirm. See [Link an existing account](#link-an-existing-account).
+6. A person without a MoleSignal account gets one, when the email passes the
    [email domains](#email-domains) of the workspace.
-3. A person who is not yet a member joins the workspace of the provider with the mapped roles, or
+7. A person who is not yet a member joins the workspace of the provider with the mapped roles, or
    the default role.
-4. For an existing member, the roles of matching mappings replace the earlier ones. A disabled
+8. For an existing member, the roles of matching mappings replace the earlier ones. A disabled
    account cannot sign in.
+9. The browser returns to the sign-in page, finishes signing in, and opens the page asked for before
+   sign-in. When the sign-in fails, the sign-in page shows the reason.
+
+## Link an existing account
+
+A provider vouches for the people of its own workspace only, so the email it sends is not enough to
+enter an account that already exists: that account may belong to someone else with the same
+address. The first time an identity signs in with the email of an existing account, the sign-in
+page asks the owner of the account to confirm, in the same browser.
+
+| Method | Offered when | How |
+|---|---|---|
+| **Password** | The account has a password. | Enter the account's password. |
+| **Email code** | The instance can [send email](/en-US/configuration#alerting-and-email). | Select **Send code**, then enter the six digits from the email. One code a minute. |
+
+The code works only on the page that asked for it, so a code email that arrives without a sign-in
+of one's own can be ignored. After five wrong tries, or after 30 minutes, sign in through the
+provider again. Once confirmed, the identity is linked, and later sign-ins through it go straight
+in. For an account with [multi-factor authentication](/en-US/identity/mfa), the confirmation is
+followed by the second step (a passkey, the authenticator, or a recovery code) before the link is made. An account without a password on an instance that cannot send email cannot be confirmed here:
+sign in the way used before, or ask an administrator to set up email.
+
+An account created by a workspace's own provider stays in that workspace until its email is proven:
+neither an administrator nor another provider can add it to another workspace. Resetting the
+password from the emailed link, or confirming a link with an email code, proves the email. Accounts
+created through Google, GitHub.com, GitLab.com, or Microsoft's tenant-independent endpoints are not
+held, because these providers accept verified emails only.
+
+Each person sees and unlinks their linked identities under
+[Account settings → Security & sign-in](/en-US/account#security-and-sessions).
 
 ## Manage providers
 
-The list shows each provider with its kind, whether it is enabled, and when it changed.
+The list shows each provider with its platform, kind, whether it is enabled, how its
+[test sign-in](#test-sign-in) stands, and when it changed.
 
 | Action | Effect |
 |---|---|
+| **Test** | Goes through a [test sign-in](#test-sign-in). |
 | **Edit** | Changes the settings and the mappings. |
 | **Disable** / **Enable** | A disabled provider leaves the sign-in page and refuses sign-ins. |
 | **Delete** | Removes the provider. People who depend on it can no longer sign in through it. |
@@ -82,5 +232,5 @@ The list shows each provider with its kind, whether it is enabled, and when it c
 
 **Email domains** limits which email addresses may join the workspace through an
 [invitation](/en-US/identity/members#invitations) or single sign-on. Select **Add domain** and enter a
-domain such as `example.com`. While the list is empty, any address may join. **Remove** deletes a
-domain from the list.
+domain such as `example.com`. While the list is empty, any address may join, but a provider open to
+public accounts cannot be enabled. **Remove** deletes a domain from the list.

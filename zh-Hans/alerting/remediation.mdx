@@ -1,0 +1,94 @@
+---
+title: "修复动作"
+description: "事先定义 HTTP 和 Kubernetes 修复动作，在事件上一键发起，审批通过后执行，并在几分钟后验证有没有效果。"
+"en_link": "/en-US/alerting/remediation"
+---
+
+修复动作是事先定义好的一步处置：调一次 Jenkins、GitHub Actions、Argo、Rundeck 这类系统的地址，或在登记的 Kubernetes 集群上重启、扩缩容、回滚一个工作负载。处理事件的人在事件上一键发起，每次都要审批，批准后立即执行，结果和验证都记在事件的时间线上。
+
+打开 **告警 → 修复动作**。查看需要 `alerts.remediation.read`，定义动作和登记集群需要 `alerts.remediation.manage`，在事件上发起需要 `alerts.incidents.remediate`，批准需要 `agent.approve`。
+
+## 定义修复动作
+
+点击 **新建修复动作**，填写：
+
+| 部分 | 设置 |
+|---|---|
+| **基本信息** | **名称** 和 **说明**。 |
+| **执行方式** | **HTTP 请求** 或 **Kubernetes**，见下文。 |
+| **发起时填的参数** | 发起时要填的值，最多 10 个：**名字**（模板里写 `{{params.name}}`，name 换成这个名字）、**显示名**、**类型**（**文本**、**数字** 或 **选项**）、**选项**、**默认值** 和 **必填**。 |
+| **适用范围与审批** | **适用的服务**（逗号分隔，空着时所有事件都能用）；**风险等级**：**L2 · 一人批准** 或 **L3 · 两人批准**；**执行后验证**：多少分钟后看结果，0 不验证；**怎样算有效**：**事件恢复了** 或 **规则回到健康**；**启用**。 |
+
+列表列出每个动作适用的服务（没限定时为 **所有事件**）和风险等级，停用的标着 **已停用**，在事件上看不到。
+
+### HTTP 请求
+
+| 设置 | 说明 |
+|---|---|
+| **方法**、**地址** | `GET`、`POST`、`PUT` 或 `PATCH`，地址以 `http://` 或 `https://` 开头。 |
+| **请求头** | 例如 `Authorization`。值加密保存，保存后不再显示；编辑时留空保持原值。 |
+| **请求体** | JSON，在 JSON 编辑器里写；填进去的值按 JSON 转义。占位符写在引号里是字符串，不带引号可以当数字用，例如 `{"replicas": {{params.replicas}}}`。把占位符都换成 0 以后要是合法的 JSON，否则保存不了。 |
+| **签名密钥** | 设了就带 `X-MoleSignal-Timestamp` 和 `X-MoleSignal-Sign`，与[通用 Webhook 的签名](/zh-Hans/notification-channels/webhooks#请求头与签名)相同，接收方可以验证请求来自 MoleSignal。 |
+
+地址、请求头和请求体里可以用 `{{incident.id}}`、`{{incident.summary}}`、`{{incident.severity}}`、`{{incident.status}}`、`{{incident.service}}`、`{{incident.url}}` 和 `{{params.name}}`。填进地址的值按百分号编码。
+
+请求只连地址解析出的 IP，不连云厂商的元数据地址，不跟随跳转，30 秒超时；返回 2xx 算执行成功，响应的开头记在执行记录里。
+
+### Kubernetes
+
+| 设置 | 说明 |
+|---|---|
+| **集群** | 登记的集群，见[登记 Kubernetes 集群](#登记-kubernetes-集群)。 |
+| **操作** | **重启**（滚动重启，同 `kubectl rollout restart`）、**扩缩容** 或 **回滚到上一版本**（同 `kubectl rollout undo`）。 |
+| **工作负载类型** | Deployment、StatefulSet 或 DaemonSet。只有 Deployment 能回滚，DaemonSet 不能扩缩容。 |
+| **命名空间**、**工作负载名称** | 可以写模板，例如 `{{incident.service}}`。 |
+| **副本数** | 扩缩容时的副本数，可以写 `{{params.replicas}}`，在发起时填。 |
+
+## 登记 Kubernetes 集群
+
+在 **Kubernetes 集群** 里点击 **添加集群**，填写 **名称**、**API Server 地址**、**CA 证书**（PEM 格式，空着用系统信任的根证书）和 **ServiceAccount Token**。Token 加密保存，不再显示。**测试连接** 读一次集群版本。
+
+给 MoleSignal 单独建一个 ServiceAccount，只授予要用的权限：对目标工作负载的 `get` 和 `patch`，扩缩容还要 `scale` 子资源，回滚还要能列出 ReplicaSet。例如只允许操作 `shop` 命名空间里的工作负载：
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: molesignal-remediation
+  namespace: shop
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["list"]
+```
+
+连接只连 API Server 地址解析出的 IP，不连云厂商的元数据地址。还有动作在用的集群不能删除。
+
+## 在事件上执行
+
+事件详情的 **修复动作** 列出适用于这个事件的动作：动作没限定服务，或事件的服务对得上。点击动作旁的 **执行**，填好参数，写一句 **原因**（例如「checkout 连接池耗尽，先重启」），然后 **提交审批**。事件已经解决时不能发起。
+
+提交后，这次执行等审批：L2 要一位、L3 要两位有 `agent.approve` 的人批准，发起人不能批准自己发起的。审批人在同一张卡片上点 **批准** 或 **驳回**，也可以在 [Mole Agent 的审批](/zh-Hans/agent#审批与执行)里处理。批准够人数后立即执行。
+
+| 状态 | 含义 |
+|---|---|
+| **等审批** | 还没批准够人数。 |
+| **执行中** | 正在调地址或操作集群。 |
+| **已执行**、**执行失败** | 执行完了，旁边是响应或错误的开头。 |
+| **没有执行** | 审批被驳回、过期或撤销。 |
+| **等验证** | 执行成功，到设定的分钟数后看结果。 |
+| **验证通过**、**验证没通过** | 到点时事件已经恢复（或规则回到健康）就算通过。 |
+
+发起、执行和验证都记在事件的[时间线](/zh-Hans/alerting/incidents#事件详情)上，发起还记进审计日志。
+
+Mole Agent 能列出事件适用的修复动作，也能提议执行；它提议的执行不论动作设的风险等级，一律要两人批准。
+
+## API
+
+| 操作 | 端点 |
+|---|---|
+| 管理修复动作和集群 | [`/api/v1/alerts/remediation/actions`、`/clusters`](/zh-Hans/api/alerting/remediation) |
+| 在事件上发起 | [`POST /api/v1/alerts/incidents/{id}/remediations`](/zh-Hans/api/alerting/remediation#在事件上执行) |

@@ -1,6 +1,6 @@
 ---
 title: "Create a pipeline"
-description: "Create a realtime or scheduled pipeline."
+description: "Create a realtime, scheduled, or alert pipeline."
 "zh-Hans_link": "/zh-Hans/api/intake/create-pipeline"
 ---
 
@@ -8,17 +8,17 @@ description: "Create a realtime or scheduled pipeline."
 POST /api/v1/scheduled_pipelines
 ```
 
-Creates a pipeline. The path keeps the name `scheduled_pipelines` for both modes. The call requires `pipelines.create`.
+Creates a pipeline. The path keeps the name `scheduled_pipelines` for every mode. The call requires `pipelines.create`.
 
 **Body**
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `name` | string | Yes | Pipeline name. |
-| `source_stream` | string | Yes | The first stream that the pipeline reads. |
-| `target_stream` | string | Yes | The first stream that the pipeline writes. In a scheduled pipeline, a stream that the pipeline reads answers `409`. |
-| `function_steps` | object | Yes | The steps, the mode, and the settings of a scheduled pipeline. See below. |
-| `cron` | string | Yes | `every:30s`, `every:5m`, or `every:1h` for a scheduled pipeline. An empty string for a realtime pipeline. |
+| `source_stream` | string | Yes | The first stream that the pipeline reads. An empty string for an alert pipeline. |
+| `target_stream` | string | Yes | The first stream that the pipeline writes. In a scheduled pipeline, a stream that the pipeline reads answers `409`. An empty string for an alert pipeline. |
+| `function_steps` | object | Yes | The steps, the mode, and the settings of a scheduled pipeline or the conditions of an alert pipeline. See below. |
+| `cron` | string | Yes | `every:30s`, `every:5m`, or `every:1h` for a scheduled pipeline. An empty string for a realtime or an alert pipeline. |
 | `lookback_secs` | integer | No | Seconds that the first scheduled run of a source reads back. Default 300. A scheduled pipeline needs a positive value. |
 | `enabled` | boolean | No | Default `true`. |
 
@@ -26,22 +26,24 @@ Creates a pipeline. The path keeps the name `scheduled_pipelines` for both modes
 
 | Field | Notes |
 |---|---|
-| `mode` | `scheduled` (default) or `realtime`. |
-| `signal_type` | `logs`, `metrics`, or `traces`. A realtime pipeline supports `logs` only. |
-| `steps` | Ordered steps. A VRL step has `transform_name`, `script`, and `kind` set to `vrl`. A routing step has `kind` set to `builtin`, `operation` set to `route`, and a `routing` object. |
+| `mode` | `scheduled` (default), `realtime`, or `alert`. |
+| `signal_type` | `logs`, `metrics`, or `traces`, and for a realtime pipeline also `profiles`. A realtime metrics, traces, or profiles pipeline changes its stream in place: `target_stream` equals `source_stream`, and it has no routing step and no `retain_source`. See [Metrics and traces](/en-US/pipelines#metrics-and-traces). A profiles pipeline has `default` as its source; see [Profiles](/en-US/pipelines#profiles). An alert pipeline has none. |
+| `steps` | Ordered steps. A VRL step has `transform_name`, `script`, and `kind` set to `vrl`. A routing step has `kind` set to `builtin`, `operation` set to `route`, and a `routing` object. An alert pipeline takes up to 20 steps and no routing step. An AI summary step has `transform_name`, `kind` set to `ai_summary`, `prompt`, and `annotation`, the annotation that the answer goes into (default `ai_summary`). An API call step has `kind` set to `http_enrich` and `connector_id`, an HTTP connector of the organization. A query step has `kind` set to `query_enrich`, `language` (`sql`, the default, or `promql`), `stream`, `stream_type` (`logs`, the default, `metrics`, or `traces`), `statement`, `window_secs` (default 300, at most 86400), `max_rows` (default 5, at most 50), and `annotation` (default `query_result`). See [Steps of alert pipelines](/en-US/pipelines/alert-events#steps). |
+| `alert` | Alert only. When it runs, the conditions, and the order: `stage` (`open`, the default, or `notify`), `policies`, the notification policies a `notify` pipeline is for (empty: every policy of an alert event), `sources` (`rule`, `external`, `synthetic`, `no_data`, and for `notify` also `manual`), `severities` (`info`, `warning`, `error`, `critical`), `labels`, an object of labels that the event must have with these values, and `order`, an integer (default 0). An empty list takes every source or severity. See [Alert pipelines](/en-US/pipelines/alert-events#create-one-through-the-api). |
 | `sources` | The streams to read. `source_stream` is read first, and a scheduled pipeline also reads every other stream in the list, up to 8 in all. A realtime pipeline accepts only `[source_stream]`. |
 | `sinks` | The streams to write. `target_stream` comes first, and every other stream in the list takes every event, up to 8 in all. A realtime pipeline accepts only `[target_stream]`. |
 | `sink_connectors` | Scheduled only. Ids of the connectors that receive every event. |
+| `sink_tables` | Scheduled only. Names of up to 8 extend tables that take a row for every event. See [Write to an extend table](/en-US/pipelines#write-to-an-extend-table). |
 | `delay_secs` | Scheduled only. Seconds that the latest stretch of time is left for late events before a run reads it. 0 to 3600, default 60. |
 | `retry` | Scheduled only. `run_retries`, the further attempts at a window whose read or write failed, and `delivery_retries`, the further attempts at a connector delivery. Each 0 to 10, default 3. |
 | `dead_letter_stream` | Scheduled only. The logs stream for events that could not be processed, written, or delivered. It cannot be a stream that the pipeline reads or writes. |
 | `dedupe_field` | Scheduled only. Within one run, an event whose value of this field was already seen is dropped. |
-| `retain_source` | Realtime only. Keeps the original event in the source stream. |
+| `retain_source` | Realtime logs only. Keeps the original event in the source stream. |
 
 <RequestExample>
 ```bash cURL
 curl -X POST http://localhost:5080/api/v1/scheduled_pipelines \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
     "name": "normalize-app",
@@ -81,6 +83,9 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines \
   "last_run_at_micros": null,
   "read_until_micros": {},
   "retry": null,
+  "alert_record": null,
+  "audit_reader_id": null,
+  "audit_reader": null,
   "created_at_micros": 1790000000000000,
   "updated_at_micros": 1790000000000000
 }
@@ -91,7 +96,8 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines \
 
 | Status | Cause |
 |---|---|
-| `400` | A schedule outside `every:Ns/m/h`, a non-positive lookback, a realtime pipeline for a signal other than logs, a VRL step that does not compile, an invalid stream name, more than 8 streams to read or to write, a routing step whose fixed stream or fallback stream is a source, a dead letter stream that the pipeline reads or writes, or `delay_secs` or a retry count out of range. |
-| `409` | A scheduled pipeline that would write a stream that it reads, or a realtime pipeline that is already enabled for the source stream. |
+| `400` | A schedule outside `every:Ns/m/h`, a non-positive lookback, a scheduled pipeline on profiles, a profiles pipeline on a stream other than `default`, a realtime metrics, traces, profiles, or RUM pipeline that writes another stream, routes, or retains its source, a step of such a pipeline that changes a [kept field](/en-US/pipelines#metrics-and-traces) of a sample, a step that can drop events on `rum_views` or `rum_vitals`, a VRL step that does not compile, an invalid stream name, more than 8 streams to read or to write or more than 8 extend tables, a routing step whose fixed stream or fallback stream is a source, a dead letter stream that the pipeline reads or writes, a [RUM stream](/en-US/pipelines#rum-streams) to write or to route to, `rum_sessions` as the source of a realtime pipeline, a [platform stream](/en-US/pipelines#platform-streams) to write, to route to, or to change in realtime, `delay_secs` or a retry count out of range, or an alert pipeline with an unknown source or severity, a routing step, an AI summary step without a prompt, an API call step whose connector is not an HTTP connector of the organization, a query step that is not a single query, reads `_audit`, or has a placeholder outside a string or one the event does not have, a `notify` pipeline with a step that goes outside MoleSignal, an `open` pipeline with `policies` or the source `manual`, or more than 20 steps. |
+| `403` | The pipeline reads `_audit`, and the token lacks `audit.read` or belongs to a service account. |
+| `409` | A scheduled pipeline that would write a stream that it reads, or a realtime pipeline when another one is already enabled for the same kind of data and source stream (`a realtime pipeline is already enabled for this <signal> stream`). |
 
 See [Pipelines](/en-US/pipelines) for the realtime mode, the routing step, read positions, and retries.

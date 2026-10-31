@@ -1,6 +1,6 @@
 ---
 title: "Create a rule"
-description: "Create a scheduled, real-time, or anomaly alert rule."
+description: "Create a scheduled, real-time, anomaly, forecast, outlier, composite, or heartbeat alert rule."
 "zh-Hans_link": "/zh-Hans/api/alerting/create-rule"
 ---
 
@@ -8,11 +8,11 @@ description: "Create a scheduled, real-time, or anomaly alert rule."
 POST /api/v1/alerts/rules
 ```
 
-Creates an alert rule. The call requires `alerts.manage`.
+Creates an alert rule. The call requires `alerts.rules.manage`.
 
 ## How a rule evaluates
 
-The `alert` role evaluates every enabled `scheduled` and `anomaly` rule every `[alert].eval_interval_secs`, 30 seconds by default. A `real_time` rule is matched on the intake path and opens its incident as records arrive.
+The `alert` role evaluates every enabled rule every `[alert].eval_interval_secs`, 30 seconds by default, except a `real_time` rule: that one is matched on the intake path and opens its incident as records arrive. The steps below are for `scheduled` and `anomaly` rules; how `forecast`, `outlier`, `composite`, and `heartbeat` rules judge is in [Forecast rules](#forecast-rules), [Outlier rules](#outlier-rules), [Composite rules](#composite-rules), and [Heartbeat rules](#heartbeat-rules), and what follows the judgement (consecutive matches, recovery, incidents) is the same as here.
 
 1. The evaluator runs `query.statement` over the window from `now - period_secs` to `now`. A `sql` statement runs in the SQL engine. A `promql` statement runs in the PromQL engine as an instant query at `now`. An APM rule reads its figure from the APM aggregates of the window instead, and a RUM rule from the RUM data of the window. See [APM rules](#apm-rules) and [RUM rules](#rum-rules).
 2. The evaluator reads the first column of the first row as a number. A result without a number counts as no data; `trigger.no_data` decides what that does, see [Recovery and missing data](#recovery-and-missing-data). A `promql` result lists the sample `value` first, so the first series decides. Aggregate the expression to one series, for example with `sum(...)`, or split the rule by labels with `query.group_by`; see [Rules split by columns](#rules-split-by-columns).
@@ -30,10 +30,10 @@ For `scheduled` and `anomaly` rules, the call does not check that the stream or 
 | `name` | string | Yes | Must not be empty. The name becomes the incident summary. |
 | `description` | string | No | Default empty. |
 | `enabled` | boolean | No | Default `true`. The evaluator skips a disabled rule. The test and trigger calls still work. |
-| `kind` | string | No | `scheduled` (default), `real_time`, or `anomaly`. A `real_time` rule is matched on the intake path. See [Real-time rules](/en-US/alerting/rules#real-time-rules). |
+| `kind` | string | No | `scheduled` (default), `real_time`, `anomaly`, `forecast`, `outlier`, `composite`, or `heartbeat`. A `real_time` rule is matched on the intake path. See [Real-time rules](/en-US/alerting/rules#real-time-rules). |
 | `query` | object | Yes | The statement and its window. See below. |
 | `trigger` | object | Yes | The condition. See below. |
-| `thresholds` | array | No | Severity tiers for `scheduled` and `real_time` rules. When not empty, the tiers replace the condition of `trigger`. An `anomaly` rule ignores tiers. |
+| `thresholds` | array | No | Severity tiers for `scheduled` and `real_time` rules. When not empty, the tiers replace the condition of `trigger`. An `anomaly` rule ignores tiers; `forecast`, `outlier`, `composite`, and `heartbeat` rules fire at one severity and answer `400` with tiers. |
 | `severity` | string | No | `info`, `warning`, `error`, or `critical`. Applies when `thresholds` is empty. |
 | `anomaly_params` | object | For `anomaly` | Baseline settings. Ignored for the other kinds. |
 | `escalation_policy_id` | string | No | Default `default`, an alias for the escalation policy named `default` in the organization. An explicit id must belong to a policy of the organization, or the call answers `400`. See [Create an escalation policy](/en-US/api/alerting/create-escalation). |
@@ -50,7 +50,16 @@ For `scheduled` and `anomaly` rules, the call does not check that the stream or 
 | `stream` | object | Yes, except in an APM or a RUM rule | `{ "name": "app", "stream_type": "logs" }`. The primary stream of the statement. |
 | `apm` | object | For an APM rule | The APM figure the rule watches in place of a statement. See [APM rules](#apm-rules). |
 | `rum` | object | For a RUM rule | The RUM figure the rule watches in place of a statement. See [RUM rules](#rum-rules). |
-| `group_by` | array | No | Columns of the result to split a `scheduled` rule by, for example `["host"]`. Up to 8 names, each 1 to 128 characters, without repeats. See [Rules split by columns](#rules-split-by-columns). |
+| `group_by` | array | No | Columns of the result to split a `scheduled` or an `outlier` rule by, for example `["host"]`. Up to 8 names, each 1 to 128 characters, without repeats. See [Rules split by columns](#rules-split-by-columns). |
+| `forecast` | object | For a `forecast` rule | See [Forecast rules](#forecast-rules). |
+| `outlier` | object | For an `outlier` rule | See [Outlier rules](#outlier-rules). |
+| `composite` | object | For a `composite` rule | See [Composite rules](#composite-rules). |
+| `heartbeat` | object | For a `heartbeat` rule | See [Heartbeat rules](#heartbeat-rules). |
+| `delay_secs` | integer | No | How many seconds each round's window moves back, 0 to 3600; when left out, automatic (0 on a single process, the instance setting in a role-split cluster, 60 by default). See [Evaluation delay](/en-US/alerting/rules#evaluation-delay). |
+| `home_cluster` | string | No | For a real-time rule in a federation: the id of the cluster that decides, adding up the counts of the clusters the organization is mapped to; this cluster or an enabled remote cluster. Left out, each cluster decides by its own count. Other kinds drop it. See [Real-time rules in a federation](/en-US/alerting/rules#real-time-rules-in-a-federation). |
+| `discovery` | object | For a discovery rule | The rule's source is [discovery](/en-US/alerting/discovery): `{"kinds": [...], "subjects": [...], "environments": [...], "min_severity": "warning"}`, each left out to take all. Saving gives the rule its one shape (split by finding, severity by finding, `statement` `discovery`); see [Discovery](/en-US/api/alerting/discovery). |
+
+`query` keeps only the parameters of the rule's kind: a `forecast` object on a `scheduled` rule, for example, is dropped. `composite` and `heartbeat` rules run no query: they take no `statement`, `stream`, `apm`, `rum`, or `group_by`, and answer `400` with `apm`, `rum`, or `group_by`.
 
 Columns named `service`, `host`, and `trace_id` in the first row enrich the incident. Such columns add the `service` and `host` labels and fill `affected_services`, `host_ids`, and `trace_ids`.
 
@@ -64,8 +73,10 @@ Columns named `service`, `host`, and `trace_id` in the first row enrich the inci
 | `silence_secs` | integer | Yes | Cool-down in seconds. After an incident opens, the rule opens no new incident for this long, even when the incident is resolved sooner. `0` turns the cool-down off. A [manual trigger](/en-US/api/alerting/trigger-rule) ignores it. |
 | `recovery` | object | No | When an open incident recovers. See [Recovery and missing data](#recovery-and-missing-data). |
 | `no_data` | object | No | What an evaluation without a value counts as. See [Recovery and missing data](#recovery-and-missing-data). |
+| `priority` | string | No | The priority incidents open with, one of the organization's priorities (`P1` to `P5` by default); when left out, incidents have no priority. |
+| `urgency` | string | No | The urgency incidents open with, the key of one of the organization's [urgency levels](/en-US/alerting/on-call#urgency-and-priority-levels); when left out, the incident's escalation policy decides, see [Urgency](/en-US/alerting/on-call#urgency). A discovery rule defaults to `low`. |
 
-An `anomaly` rule ignores `operator` and `threshold` and still uses `for_periods`. A rule with `thresholds` ignores `operator`, `threshold`, and `for_periods` of `trigger`, but the object stays required.
+`anomaly`, `outlier`, `composite`, and `heartbeat` rules ignore `operator` and `threshold` and still use `for_periods`; a `forecast` rule compares its forecast with them. A rule with `thresholds` ignores `operator`, `threshold`, and `for_periods` of `trigger`, but the object stays required.
 
 **`thresholds`**
 
@@ -89,7 +100,7 @@ Without tiers, the severity of an incident is the rule `severity`, then a `sever
 
 | Field | Type | Notes |
 |---|---|---|
-| `recovery.threshold` | number | The line an open incident waits for the value to cross back over, for example `80` for a rule that fires above `90`. It has to be on the healthy side of every threshold: no higher than one the value fires above, no lower than one it fires below, and every tier has to fire on the same side. Not for `anomaly` rules. Without it, the incident recovers once the value stops meeting the threshold. |
+| `recovery.threshold` | number | The line an open incident waits for the value to cross back over, for example `80` for a rule that fires above `90`. It has to be on the healthy side of every threshold: no higher than one the value fires above, no lower than one it fires below, and every tier has to fire on the same side. Not for `anomaly`, `forecast`, `outlier`, `composite`, or `heartbeat` rules. Without it, the incident recovers once the value stops meeting the threshold. |
 | `recovery.for_periods` | integer | Evaluations in a row on the healthy side before the incident recovers. `0` and `1` are one. At most 1440. |
 
 `trigger.no_data` decides what an evaluation without a value counts as: the query returned no row or no number, or a group of a [rule split by columns](#rules-split-by-columns) is missing from the result.
@@ -101,20 +112,90 @@ Without tiers, the severity of an incident is the rule `severity`, then a `sever
 | `alert` | Like `keep`, and after `no_data.for_periods` evaluations in a row without a value it opens a no-data incident. The incident resolves at the first evaluation with a value. |
 | `zero` | Compares the missing value as `0`. Suits a count, where no series or no row means nothing happened. |
 
-A no-data incident has its own fingerprint, so it can be open beside an incident the threshold opened. It carries the label `alert.condition` = `no_data` and the summary of the rule or group, and notifications title it `NO DATA · <summary>`. Its severity is the rule's `severity`, then a `severity` label, then `warning`. `silence_secs` applies to it as well. When someone resolves it while the value is still missing, it is not reopened before data returns, and a group of a split rule in that case is no longer followed. A `real_time` rule takes neither `recovery` nor `no_data`.
+A no-data incident has its own fingerprint, so it can be open beside an incident the threshold opened. It carries the label `alert.condition` = `no_data` and the summary of the rule or group, and notifications title it `NO DATA · <summary>`. Its severity is the rule's `severity`, then a `severity` label, then `warning`. `silence_secs` applies to it as well. When someone resolves it while the value is still missing, it is not reopened before data returns, and a group of a split rule in that case is no longer followed. A `real_time` rule takes neither `recovery` nor `no_data`; `composite` and `heartbeat` rules always reach a verdict and take no `no_data`.
 
 ## Rules split by columns
 
-A `scheduled` rule with `query.group_by` evaluates every group of its result on its own. A group is the rows that have the same values in those columns, matched to the columns of the result without regard to case. An APM, a RUM, a `real_time`, or an `anomaly` rule with `group_by` answers `400`.
+A `scheduled` rule with `query.group_by` evaluates every group of its result on its own. A group is the rows that have the same values in those columns, matched to the columns of the result without regard to case. An APM or a RUM rule, or any rule other than `scheduled` and `outlier`, answers `400` with `group_by`. An `outlier` rule has to be split: it compares its groups with each other rather than with a threshold; see [Outlier rules](#outlier-rules).
 
 1. A `sql` statement runs with a limit of 101 rows. A `promql` statement returns every series. Return one row for each group, the worst first.
 2. The first row of a group gives its value: the first numeric column other than the named columns and `_timestamp`, `ts`, `time`, or `timestamp`.
 3. The value is compared with `trigger` or `thresholds`, and the group counts its own `for_periods`.
 4. A group that fires opens its own incident. The incident gets the values of the group as labels, and the rule name followed by the values as its summary, for example `Errors per host · web-1`. `silence_secs` applies to every group on its own.
 5. A group that meets the recovery condition has its open incident resolved. A group that was in an earlier result and is not in this one has no value this evaluation, and `trigger.no_data` decides what that does for it.
-6. `last_state` is `firing` while any group fires, `no_data` while any group has no value and keeps its state, `pending` while any group matches, and `healthy` otherwise.
+6. `last_state` is `firing` while any group fires (`dropped` when an [alert pipeline](/en-US/pipelines/alert-events#what-becomes-of-an-event) dropped the incident of a group in that evaluation), `no_data` while any group has no value and keeps its state, `pending` while any group matches, and `healthy` otherwise.
 
 A round reads at most 100 groups. When the result has more, the rest are not evaluated, and in that round a group missing from the result keeps its incident. When the result has rows but no column of a name in `group_by`, the round fails and changes nothing. [Test a rule](/en-US/api/alerting/test-rule) reports every group.
+
+## Forecast rules
+
+A `forecast` rule adds each round's query value to a series and projects the series forward: when the
+forecast meets `trigger.operator` and `trigger.threshold` within the lead time, the round matches. When the
+rule is new, or its query, window, or lookback changed, it first queries past moments once each to fill in
+up to 48 points; the fill stops at the first failure and the series carries on from the next round. The
+series keeps at most 168 points, at least one evaluation window apart, and makes no judgement with fewer
+than 6.
+
+| Field | Type | Notes |
+|---|---|---|
+| `forecast.lookback_days` | integer | How many past days of the series to project from, 1 to 30. Default `7`. |
+| `forecast.lead_secs` | integer | The lead time: the rule fires when the line is forecast to be crossed within this many seconds, 900 to 604800 (7 days). Default `86400`. |
+| `forecast.model` | string | `linear`: a robust Theil–Sen trend. `daily`, `weekly`: the value one period earlier at the same moment plus the trend, for figures with a daily or weekly rhythm. `daily` needs a full day of series; `weekly` needs `lookback_days` of at least 7 and a full week of series. |
+
+The incident it opens carries the annotations `forecast_crossing_at` (when the line is forecast to be
+crossed, in UTC), `forecast_value` (the forecast value then), and `forecast_model`. When the last point has
+already crossed, the crossing is at that point. APM and RUM figures can be forecast too, except new and
+regressed RUM issues.
+
+## Outlier rules
+
+An `outlier` rule is split by `query.group_by` and compares the groups' values with each other. A group's
+deviation is its value minus the median of the groups, over a scale: the larger of 1.4826 times the median
+absolute deviation (MAD) and 5% of the median's absolute value, so that groups that are nearly the same do
+not turn a small wobble into an outlier. Each group whose deviation is beyond the tolerance opens its own
+incident, annotated with `outlier_score`. With fewer than 3 groups that have a value, the round makes no
+judgement.
+
+| Field | Type | Notes |
+|---|---|---|
+| `outlier.tolerance` | number | How many scales away counts as an outlier, 0.5 to 10. Default `3`. Smaller is more sensitive. |
+| `outlier.direction` | string | `both` (default, high or low), `above` (high only), or `below` (low only). |
+
+## Composite rules
+
+A `composite` rule combines other rules: a combined rule is true while it has an active incident, its truth
+goes into the expression, and the round matches when the expression is true. It runs no query.
+
+| Field | Type | Notes |
+|---|---|---|
+| `composite.expression` | string | Single capital letters stand for rules, combined with `&&` (and), `\|\|` (or), `!` (not), and brackets, for example `A && (B \|\| !C)`. At most 200 characters. |
+| `composite.rules` | object | Letters mapped to rule IDs, for example `{ "A": "<rule-id>", "B": "<rule-id>" }`. At most 10. Every letter of the expression needs a rule, every letter given has to be used, and the rules cannot repeat or be the rule itself. |
+| `composite.merge_children` | boolean | Default `false`. When `true`, once the composite rule opens an incident, the active incidents of the combined rules are [merged](/en-US/api/alerting/merge-incidents) into it, and new ones are merged every round after, so they notify no one on their own. |
+
+A combined rule cannot be a composite rule, and a composite rule cannot be combined into another, so no
+cycle can form. A combined rule that is deleted counts as false. The incident carries the annotation
+`composite_active`: the letters that were true. A composite rule cannot be
+[tested](/en-US/api/alerting/test-rule).
+
+## Heartbeat rules
+
+A `heartbeat` rule waits for a job such as a cron task or a backup script to check in: the round matches
+when no check-in arrived within the period plus the grace, or when the last check-in reported a failure. It
+runs no query, and a check-in judges a round at once.
+
+| Field | Type | Notes |
+|---|---|---|
+| `heartbeat.period_secs` | integer | How often the job checks in, 60 to 604800 (7 days). |
+| `heartbeat.grace_secs` | integer | How much longer to wait after the period before a check-in counts as missed, 0 to 86400. Default `0`. |
+
+The first time a heartbeat rule is saved (created, or changed into a heartbeat rule from another kind), the
+response has an extra `heartbeat_address`:
+`{ "path": "/api/v1/intake/heartbeats/<token>", "url": "<external address>/api/v1/intake/heartbeats/<token>" }`,
+with `url` `null` when no external address is set. The address is given only this once; a lost one can
+only be [reset](/en-US/api/alerting/heartbeats). The incident carries the annotations `heartbeat_due_at`,
+`heartbeat_last_checkin_at`, `heartbeat_status`, and the check-in's message `heartbeat_message`. A
+heartbeat rule cannot be [tested](/en-US/api/alerting/test-rule). How to check in is in
+[Heartbeat check-ins](/en-US/api/alerting/heartbeats).
 
 ## APM rules
 
@@ -176,7 +257,7 @@ the incident. See [RUM alerts](/en-US/rum/alerts#incidents).
 <RequestExample>
 ```bash cURL
 curl -X POST http://localhost:5080/api/v1/alerts/rules \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   --data-binary @- <<'EOF'
 {
@@ -199,7 +280,7 @@ EOF
 ```
 ```bash APM rule
 curl -X POST http://localhost:5080/api/v1/alerts/rules \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   --data-binary @- <<'EOF'
 {
@@ -225,7 +306,7 @@ EOF
 ```
 ```bash RUM rule
 curl -X POST http://localhost:5080/api/v1/alerts/rules \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   --data-binary @- <<'EOF'
 {
@@ -284,8 +365,8 @@ EOF
 
 | Status | Cause |
 |---|---|
-| `400` | `name` or `query.statement` is empty, `query.stream` is missing, an APM rule is not `scheduled` or its `query.apm` is invalid (`APM alert service is invalid`, `an SLO burn-rate alert names its SLO`), a RUM rule is `real_time`, names an application that does not exist, or has an invalid `query.rum` (a `page` or a `version` that its figure cannot take, a `min_samples` on a count, a window outside 60 to 21,600 seconds), `escalation_policy_id` names no policy of the organization, the `anomaly_params` of an `anomaly` rule are missing or invalid, or a `real_time` rule breaks the limits above. The response is JSON with the code `invalid_argument` and a message such as `anomaly detector not yet supported: prophet`. |
-| `403` | The token lacks `alerts.manage`. |
+| `400` | `name` or `query.statement` is empty, `query.stream` is missing, the rule reads the [`_audit` stream](/en-US/settings/data-security#audit-stream) through `query.stream` or anywhere in `query.statement`, an APM rule is not `scheduled` or its `query.apm` is invalid (`APM alert service is invalid`, `an SLO burn-rate alert names its SLO`), a RUM rule is `real_time`, names an application that does not exist, or has an invalid `query.rum` (a `page` or a `version` that its figure cannot take, a `min_samples` on a count, a window outside 60 to 21,600 seconds), `escalation_policy_id` names no policy of the organization, the `anomaly_params` of an `anomaly` rule are missing or invalid, or a `real_time` rule breaks the limits above. The response is JSON with the code `invalid_argument` and a message such as `anomaly detector not yet supported: prophet`. |
+| `403` | The token lacks `alerts.rules.manage`. |
 | `422` | A required field is missing or a value has the wrong type, for example an unknown `operator`. The response is plain text. |
 
 See [Alerting and incident response](/en-US/alerting) for the console workflow.

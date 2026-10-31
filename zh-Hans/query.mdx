@@ -84,6 +84,8 @@ Content-Type: application/json
 | `Prefer: respond-async` | 总是创建搜索任务。 |
 | `Prefer: respond-sync` | 在请求内同步运行查询，即使时间范围很长。 |
 
+查询 `_audit` 总在请求内执行，与时间范围和 `Prefer` 请求头无关；提交读取它的搜索任务返回 `400`，参见[审计数据流](/zh-Hans/settings/data-security#审计数据流)。
+
 用以下端点跟踪任务：
 
 | 端点 | 用途 |
@@ -101,7 +103,7 @@ Content-Type: application/json
 
 任务还会返回 `kind`（`query` 或 `backfill`，回填任务带有 `pipeline_id`）、`attempt`、提交的 `request`，以及以 `user_id` 和 `submitted_by` 表示的提交人。
 
-调用方可以读取和修改自己提交的任务。拥有 `org.settings.manage` 的调用方可以读取和修改组织内的全部任务。其他用户的任务返回 `404`，与不存在的任务相同。列表和汇总只统计调用方可以读取的任务。**数据流** 下的 **搜索任务** 页面显示同样的任务，参见[数据流](/zh-Hans/streams#搜索任务)。
+调用方可以读取和修改自己提交的任务。拥有 `org.running_queries.cancel` 的调用方可以读取和修改组织内的全部任务。其他用户的任务返回 `404`，与不存在的任务相同。列表和汇总只统计调用方可以读取的任务。**数据流** 下的 **搜索任务** 页面显示同样的任务，参见[数据流](/zh-Hans/streams#搜索任务)。
 
 ## SQL
 
@@ -110,7 +112,7 @@ SQL 语句在 `FROM` 中写出数据流名称，请求中的 `stream` 字段指�
 ```bash
 NOW=$(date +%s)000000
 curl -X POST http://localhost:5080/api/v1/query \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d "{\"org_id\":\"$MS_ORG\",\"language\":\"sql\",
        \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
@@ -140,12 +142,34 @@ WHERE l.level = 'error'
 | `MATCH(field, 'text')` | 对任意字段做不区分大小写的子串匹配。`%`、`_` 与 `*` 都按字面字符处理。 |
 | `MATCH_TEXT(field, 'query')` | 对 `index_type` 为 `full_text` 的字段做全文搜索。没有该索引的字段会失败，并报 `MATCH_TEXT: field ... has no full-text index configured`。 |
 
-`MATCH_TEXT` 把多个词理解为 token 级 AND，`"a b"` 表示短语，`error*` 与 `*error` 是通配符，另有 `a OR b`，以及用 `-a` 排除某个词。创建数据流或编辑 schema 时添加该索引，参见[数据流](/zh-Hans/streams#schema-与字段)。
+`MATCH_TEXT` 里用空格分开的几个词都要出现，每个词是不区分大小写的子串，可以出现在值的任意位置；`"a b"` 是短语，引号里的文字要连着出现；带 `*` 的词匹配整个值，`error*` 是以 error 开头的值，`*error` 是以 error 结尾的值；另有 `a OR b`，以及用 `-a` 排除某个词。中文不用分词，`登录超时` 匹配连着出现这四个字的值。创建数据流或编辑 schema 时添加该索引，参见[数据流](/zh-Hans/streams#schema-与字段)。
 
 ```sql
 SELECT * FROM app WHERE MATCH(msg, 'timeout');
 SELECT * FROM app WHERE MATCH_TEXT(msg, 'panic "disk full" -debug');
 ```
+
+### IP 网段
+
+| 函数 | 行为 |
+|---|---|
+| `CIDR_MATCH(field, 'network')` | 地址落在网段里时为 true，网段写成 `10.0.0.0/8`、`2001:db8::/32` 或单个地址。IPv4 映射进 IPv6 比较，`10.0.0.0/8` 也匹配 `::ffff:10.1.2.3`。值不是地址时为 false，网段写错时查询失败。 |
+
+```sql
+SELECT client_ip, count(*) FROM access WHERE CIDR_MATCH(client_ip, '10.0.0.0/8') GROUP BY client_ip
+```
+
+### 跳过文件的条件
+
+`WHERE` 顶层用 `AND` 连起来的条件对每一行都成立，MoleSignal 用字段的索引跳过不可能有这样的行的文件；同一列上用 `OR` 连起来的条件整体算一个条件。跨列的 `OR` 与 `NOT` 不用来跳过文件，结果照样正确，只是读的文件多一些。
+
+| 条件 | 用到的索引 |
+|---|---|
+| `=`、`IN` | `exact`、`bloom`、`skip` |
+| `<`、`<=`、`>`、`>=`、`BETWEEN`、`!=`、`NOT IN`、`LIKE 'abc%'` | `exact`、`bloom`、`skip` 记下的最小值与最大值，以及 `skip` 记下的值集合 |
+| `MATCH`、`MATCH_TEXT`、`LIKE`、`ILIKE` 的字面量 | `full_text`、`ngram` |
+| `CIDR_MATCH`、对一个地址的 `=` | `ip` |
+| 分片字段上的 `=`、`IN`、`LIKE 'abc%'` | [按字段分片](/zh-Hans/streams#按字段分片)：哈希用于 `=`、`IN`，首字符三种都用 |
 
 ### SQL 中的时间戳
 
@@ -173,7 +197,7 @@ LIMIT 5
 
 ## PromQL
 
-把 `language` 设为 `promql`，即可对指标数据流运行 PromQL。指标选择器指定一个指标，装着它的每个指标数据流都会参与回答：`metric_name` 保存指标名，`value` 列保存样本，其余列是标签。通过该端点时，MoleSignal 把表达式作为 instant 查询，在 `time_range.end` 处求值，每个时间序列返回一行，先是 `value`，再是各个标签：
+把 `language` 设为 `promql`，即可对指标数据流运行 PromQL。指标选择器指定一个指标，装着它的每个指标数据流都会参与回答：`metric_name` 保存指标名，`value` 列保存样本，其余列是标签。不带 `step` 时，MoleSignal 把表达式作为 instant 查询，在 `time_range.end` 处求值，每个时间序列返回一行，先是 `value`，再是各个标签。带上以微秒为单位的 `step` 时，它从 `time_range.start` 到 `time_range.end` 按 range 查询求值，每个时间序列的每一步返回一行，先是 `_timestamp` 和 `value`；每个时间序列至多 11,000 步，`limit` 通过为每个序列均匀取点来限制行数：
 
 ```json
 {
@@ -201,7 +225,7 @@ LIMIT 5
 - `GET /api/v1/query/running` 与 `POST /api/v1/query/{id}/cancel` 供组织管理员查看和取消活动查询。
 - `GET /api/v1/query/sql/capabilities` 与 `GET /api/v1/query/promql/capabilities` 列出供编辑器使用的受支持函数。
 
-普通查询需要 `streams.query`；活动查询管理需要 `org.settings.read` 或 `org.settings.manage`。
+普通查询需要 `streams.query`；活动查询管理需要 `org.running_queries.read` 或 `org.running_queries.cancel`。
 
 ## 联邦搜索
 

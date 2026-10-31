@@ -1,0 +1,93 @@
+---
+title: "Import and export rules"
+description: "Export alert rules as a bundle that names its references, or import a bundle or a Prometheus alerting rule file."
+"zh-Hans_link": "/zh-Hans/api/alerting/rule-transfer"
+---
+
+```http
+GET  /api/v1/alerts/rules/export
+POST /api/v1/alerts/rules/import
+```
+
+## Export
+
+Requires `alerts.rules.read`. The query parameter `ids` takes rule ids separated by commas; empty exports every
+rule. The response is a bundle:
+
+```json
+{
+  "format": "molesignal.alert-rules/v1",
+  "exported_at": "2026-10-28T08:00:00Z",
+  "rules": [
+    {
+      "name": "High error rate",
+      "description": "",
+      "enabled": true,
+      "kind": "scheduled",
+      "query": {"language": "promql", "statement": "sum(rate(http_requests_total{code=~\"5..\"}[5m]))", "period_secs": 60, "stream": {"name": "http_requests_total", "stream_type": "metrics"}},
+      "trigger": {"operator": "gt", "threshold": 5, "for_periods": 2, "silence_secs": 300},
+      "thresholds": [],
+      "severity": "error",
+      "escalation_policy": "Payments on-call",
+      "labels": {"service": "checkout"},
+      "annotations": {}
+    }
+  ]
+}
+```
+
+A rule keeps its whole definition but no id, organization, evaluation state, or times.
+`escalation_policy` is the name of the escalation policy, and absent for the default one; the
+`query.composite.rules` of a composite rule name its child rules. The check-in address of a heartbeat
+rule is not in the bundle.
+
+## Import
+
+Requires `alerts.rules.manage`.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `content` | string | Yes | A bundle (JSON or YAML, with `format`), or a Prometheus alerting rule file (top-level `groups`, or the `spec.groups` of a `PrometheusRule`); up to 4 MiB and 500 rules. |
+| `dry_run` | boolean | No | `true` by default, which only tries it; `false` writes. |
+| `create_only` | boolean | No | With `true`, existing rules with the same name are left as they are. |
+
+Each rule is matched by name: a new name is created, a name with one rule compared field by field, and a
+name with several rules fails, as does a name the file gives twice. Each rule is checked as saving a rule checks it. When any rule fails,
+nothing is written; otherwise the import is written in one transaction, a federation change event is sent
+for each rule, and one audit event `alert_rules.imported` is recorded. See
+[Import and export](/en-US/alerting/rules#import-and-export) for how a Prometheus rule becomes a
+MoleSignal rule.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content rules.yaml '{content: $content, dry_run: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "prometheus",
+  "items": [
+    {"name": "HighErrorRate", "action": "create", "rule_id": "3KF1..."},
+    {"name": "DiskFull", "action": "update", "changes": ["query", "trigger"], "rule_id": "3KC9..."},
+    {"name": "TargetDown", "action": "error", "error": "no escalation policy is named `ops`"}
+  ],
+  "notes": ["recording rule `job:errors:rate5m` in group `api` is not imported"],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` is `create`, `update`, `unchanged`, `skip` (an existing rule with `create_only`), or `error`.
+`applied` says whether anything was written.
+
+**Errors**
+
+| Status | Reason |
+|---|---|
+| `400` | The content is neither a bundle nor a Prometheus rule file, names another format, or is too large or has too many rules. |
+| `403` | The token lacks the permission. |

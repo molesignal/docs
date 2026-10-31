@@ -1,0 +1,99 @@
+---
+title: "抑制规则"
+description: "管理抑制规则，预览一条规则现在会压住哪些事件，放开一个被抑制的事件。"
+"en_link": "/en-US/api/alerting/inhibit-rules"
+---
+
+[抑制](/zh-Hans/alerting/inhibition)的规则。看要 `alerts.inhibitions.read`，改要 `alerts.inhibitions.manage`。
+
+```http
+GET    /api/v1/alerts/inhibit-rules
+POST   /api/v1/alerts/inhibit-rules
+GET    /api/v1/alerts/inhibit-rules/{id}
+PUT    /api/v1/alerts/inhibit-rules/{id}
+DELETE /api/v1/alerts/inhibit-rules/{id}
+```
+
+**请求体**
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `name` | string | 必填，最多 255 个字符。 |
+| `enabled` | boolean | 默认 `true`。 |
+| `source.matchers` | array | 源事件的标签条件：`{label, op, value}`，`op` 是 `eq`、`neq`、`re`、`nre`，全部命中才算。 |
+| `source.min_severity` | string | 严重度不低于它才算；不写不限。 |
+| `target.matchers` | array | 目标事件的标签条件。不写是所有事件。 |
+| `target.max_severity` | string | 严重度不高于它才算；不写不限。 |
+| `equal` | array | 这些标签两边都要有、取值相同才压，最多 16 个。`source.matchers` 和 `equal` 不能都空。 |
+| `more_severe_only` | boolean | 源事件必须严格比目标事件严重。默认 `true`。 |
+| `wait_secs` | integer | 目标事件的通知先等多久，0 到 600，默认 60；不到 15 时按 15。 |
+| `linger_secs` | integer | 源事件恢复后再压多久，0 到 3600，默认 120。 |
+| `comment` | string | 说明。 |
+
+标签条件里的 `service`、`host` 在事件没带这个标签时取受影响的服务、主机，`alert.rule_id` 是开事件的规则或来源。正则写错时返回 `400`。
+
+列表和详情的每条规则多一个 `inhibiting`：此刻压着几个事件。
+
+<RequestExample>
+```bash cURL
+curl -X POST "http://localhost:5080/api/v1/alerts/inhibit-rules" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "同一个服务，严重的压住次要的",
+    "equal": ["service"],
+    "more_severe_only": true
+  }'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "019a2c1e-…",
+  "org_id": "default",
+  "name": "同一个服务，严重的压住次要的",
+  "enabled": true,
+  "source": { "matchers": [], "min_severity": null },
+  "target": { "matchers": [], "max_severity": null },
+  "equal": ["service"],
+  "more_severe_only": true,
+  "wait_secs": 60,
+  "linger_secs": 120,
+  "comment": "",
+  "created_by": "019a2b00-…",
+  "created_at": 1761897600000000,
+  "updated_at": 1761897600000000,
+  "inhibiting": 0
+}
+```
+</ResponseExample>
+
+## 预览
+
+```http
+POST /api/v1/alerts/inhibit-rules/preview
+```
+
+请求体同上（`name` 可以不写，规则不用先存），需要 `alerts.inhibitions.read`。用这条规则算一遍此刻进行中的事件，别的规则不算，`enabled` 不看。
+
+| 字段 | 说明 |
+|---|---|
+| `pairs[].source_incident_id`、`source_summary`、`source_severity` | 压别人的事件。 |
+| `pairs[].target_incident_id`、`target_summary`、`target_severity` | 被压的事件。 |
+
+## 放开一个事件
+
+```http
+POST /api/v1/alerts/incidents/{id}/inhibition/lift
+```
+
+需要对这个事件有 `alerts.incidents.update`。压着的通知马上发出，这个事件之后不再被抑制；记进时间线和审计日志。没压着时什么也不做，事件已解决或已并入别处时返回 `409`。返回事件本身。
+
+事件的 JSON 里，抑制的状态在这几个字段：
+
+| 字段 | 说明 |
+|---|---|
+| `inhibition` | 正被抑制：`rule_id`、`rule_name`、`source_incident_id`、`source_summary`、`since`，源事件恢复后的倒计时 `ending_at`。事件解决后留在事件上，说明它当时没有通知。 |
+| `inhibition_wait_until` | 通知先等到这一刻（微秒），看源事件会不会来。 |
+| `inhibition_lifted_by` | 谁说了照常通知。 |

@@ -1,0 +1,285 @@
+---
+title: "Alert pipelines"
+sidebarTitle: "Alert pipelines"
+description: "Change, enrich, re-grade, or drop alert events before their incidents open, add a model's summary or the answer of your own systems, and change what one notification policy sends."
+"zh-Hans_link": "/zh-Hans/pipelines/alert-events"
+---
+
+An **alert pipeline** runs on alert events before their incidents open. Its steps can rewrite the title of the incident, change its severity, add or remove labels and annotations, name the affected services, or drop the event so that no incident opens. [Routing](/en-US/alerting/routing) and notifications then work on the incident as the pipelines left it.
+
+An alert event comes from one of four sources:
+
+| Source | Events |
+|---|---|
+| **Alert rules** | An [alert rule](/en-US/alerting/rules) fires. |
+| **External sources** | An [alert source](/en-US/alerting/sources) receives an alert from another system. |
+| **Synthetic checks** | A [synthetic check](/en-US/synthetics#alert-incidents) fails or has no results. |
+| **No data** | A rule opens a [no-data incident](/en-US/alerting/rules#recovery-and-missing-data). |
+
+An incident opened by hand does not go through alert pipelines before it opens.
+
+A pipeline can also run [before a notification](#before-a-notification): on a copy of the event, changing only what one notification policy sends.
+
+## Create an alert pipeline
+
+Open **Pipelines**, select **New pipeline**, and set **Execution mode** to **Alert events**. The **Signal type** shows **Alert events**, and the settings take an [**Order**](#order) instead of a schedule. The flow has three nodes:
+
+| Node | Meaning |
+|---|---|
+| **Alert events** | The alert events that the pipeline takes. See [Conditions](#conditions). |
+| **Processing** | The steps, in the order in which they run. See [Steps](#steps). |
+| **Back into the incident** | The incident opens as the steps leave the event. |
+
+**Test** runs the steps on a sample alert event before saving. The steps see it as an event of an alert rule whose incident is about to open: `%source` is `rule` and `%event` is `opened`. Edit the **Sample event** to try other values, then select **Run test**. The result shows the event after each step, or the step that dropped it. Nothing is stored and nothing outside is called: an **AI summary** step and an **Add query results** step write `…` into their annotations, and a **Call an API** step passes the event on as it is, marked **not called in a test**.
+
+**Use a recent alert event** offers the latest 20 incidents of the last 7 days to anyone with `alerts.incidents.read`. Picking one fills the **Sample event** with its event, and the steps read its rule and source. It is the incident as it was stored, so it already shows what the pipelines did when it opened.
+
+The switch **Process alert events** in the settings turns the pipeline on or off: a pipeline that is off lets every alert event go past it. Select **Create pipeline** to save. A saved change reaches every node within 10 seconds.
+
+## Conditions
+
+Select the **Alert events** node to choose the events that the pipeline takes:
+
+- **Sources**: **Alert rules**, **External sources**, **Synthetic checks**, and **No data**. The no-data incident of a rule counts as **No data**, not as **Alert rules**, and the no-results incident of a synthetic check counts as **Synthetic checks**.
+- **Severities**: **Critical**, **Error**, **Warning**, and **Info**.
+- **Labels**: **Add a label condition** adds a label and a value. The event must have each label with exactly that value.
+- **Time**: **Any time**, **Only inside these hours**, or **Only outside these hours**, as weekly ranges in one timezone, judged at the moment the incident opens. For example, drop one kind of alert only during the two hours a nightly ETL job runs.
+
+**When** above them says when the pipeline runs: **Before the incident opens**, the default, or [**Before a notification**](#before-a-notification).
+
+A list with nothing ticked takes every source or every severity, and a pipeline without conditions takes every alert event. An event that the conditions do not take goes past the pipeline untouched.
+
+## Order
+
+Alert pipelines run one after another, lowest **Order** first. Pipelines with the same order run in the order of their names. Each pipeline takes the event as the pipelines before it left it and checks its conditions against that event, so a pipeline that raises the severity can bring the event into the conditions of a later one.
+
+## Steps
+
+**Add step** offers the parse and field steps of other pipelines, **Look up an extend table** included, **Filter events**, **AI summary**, **Call an API**, **Add query results**, and **Custom VRL**. See [Processing steps](/en-US/pipelines#processing-steps). In an alert pipeline, **Rename by pattern** and **Keep only these fields** start on `labels`. An alert pipeline neither samples nor routes: when a pipeline becomes an alert pipeline, a **Sample** or **Route to stream** step that it has must be removed before it can be saved.
+
+### The alert event
+
+The steps see the alert event as JSON:
+
+```json
+{
+  "summary": "Checkout error rate above 5%",
+  "severity": "error",
+  "labels": { "service": "checkout", "env": "prod", "host_name": "web-01" },
+  "annotations": { "runbook": "https://wiki.example.com/checkout" },
+  "affected_services": ["checkout"]
+}
+```
+
+| Field | Content | What a step may set |
+|---|---|---|
+| `summary` | The title of the incident. | Text that is not empty. Text beyond 512 characters is cut off. |
+| `severity` | The severity of the incident. | `info`, `warning`, `error`, or `critical`, in any case. `warn` and `crit` are read as `warning` and `critical`. |
+| `labels` | The labels of the incident. | An object of text values. A number or a boolean becomes its text, and `null` removes the label. |
+| `annotations` | The annotations of the incident. | The same as `labels`. |
+| `affected_services` | The names of the affected services. | A list of names. Repeats and empty names are dropped. |
+
+A field that a step adds beside these is left out, and a field that a step removes keeps its value: set `.labels = {}` to clear the labels. A value outside these rules, such as an object inside `labels`, makes the pipeline fail. See [What becomes of an event](#what-becomes-of-an-event).
+
+### Where the event comes from
+
+A step reads the origin of the event from metadata. The values do not become fields of the incident.
+
+| Metadata | Value |
+|---|---|
+| `%source` | `rule`, `external`, `synthetic`, or `no_data`. |
+| `%rule_id` | The ID of the rule, of the alert source, or of the synthetic check. |
+| `%rule_name` | The name of the rule, of the alert source, or of the synthetic check. |
+| `%event` | `opened` before the incident opens, and `severity_changed` when the source fires again while the incident is open. See [Severity changes](#severity-changes). |
+
+```ruby
+# alerts from staging page no higher than warning
+if .labels.env == "staging" && (.severity == "critical" || .severity == "error") {
+  .severity = "warning"
+}
+
+# the team that owns the host, from the extend table host_owner
+owner = lookup("host_owner", .labels.host_name)
+if is_object(owner) {
+  .labels.team = owner.team
+}
+
+# a known false alarm opens no incident
+if %rule_name == "Disk inode usage" && .labels.mount == "/boot" {
+  abort
+}
+```
+
+The `team` label that the second step sets can send the incident to that team. See [Routing order](/en-US/alerting/routing#routing-order). `lookup` and `geoip_lookup` work in alert pipelines as in any VRL step. See [Look up tables and IP addresses](/en-US/functions#look-up-tables-and-ip-addresses).
+
+### AI summary
+
+An **AI summary** step sends the alert event, as the earlier steps left it, to the model of the organization with its **Prompt**, and writes the answer into the annotation named in **Annotation**, `ai_summary` by default. A prompt might read:
+
+```text
+Summarize this alert for the on-call engineer in two sentences: what is wrong, and what to check first.
+```
+
+- The model is asked once, when the incident opens. A [severity change](#severity-changes) does not ask again.
+- The step uses the most recently updated enabled [model provider](/en-US/agent#set-up-a-model-provider) that has an API key, with its **Default model**. The answer is at most the **Max output tokens** of the provider, or 512 tokens when none is set.
+- The step sends the title, severity, labels, annotations, and affected services of the alert to the model provider.
+- The calls count toward the organization's [daily token budget](/en-US/agent#usage-and-budget) and appear as **LLM functions** in the usage by source. `[functions].llm_eval_enabled` does not apply to them.
+- When the model cannot answer, because no provider is set up, the budget for the day is used up, or the call fails, the step fails, and with it the whole pipeline: its other changes are left out too. Put an **AI summary** step in a pipeline of its own, ordered after the others, when their changes should stay either way.
+
+### Call an API
+
+A **Call an API** step posts the alert event to one of the organization's [HTTP connectors](/en-US/connectors#destinations) and takes what the answer changes. The connector's address and credential are used, and so are its outbound checks: the host is resolved first and the connection stays with what it resolved to, a cloud metadata address is refused, and redirects are not followed.
+
+The body is the event as the earlier steps left it, with where it came from beside its fields:
+
+```json
+{
+  "summary": "Checkout error rate above 5%",
+  "severity": "error",
+  "priority": null,
+  "urgency": null,
+  "labels": { "service": "checkout" },
+  "annotations": {},
+  "affected_services": ["checkout"],
+  "metadata": { "rule_id": "…", "rule_name": "Checkout errors", "source": "rule", "event": "opened" }
+}
+```
+
+- Of the JSON object that comes back, only `summary`, `severity`, `priority`, `urgency`, `labels`, `annotations`, and `affected_services` are taken, under the rules of [The alert event](#the-alert-event). `labels` and `annotations` are merged key by key, and `null` removes a key, so a service can answer with just what it adds. An empty answer changes nothing.
+- The call has 5 seconds and runs once, when the incident opens. A [severity change](#severity-changes) does not call again.
+- When the call fails (no answer in time, a status outside 2xx, a body that is not a JSON object or is over 1 MiB, a field that breaks the rules, a connector that is switched off or gone), only this step counts as not done. The event goes on as it was before the step, the later steps run, and the changes of the earlier ones stay. The [timeline](#what-becomes-of-an-event) and the [counts](#daily-counts) say why.
+
+### Add query results
+
+An **Add query results** step runs a query with values of the event in it and writes the rows into an annotation:
+
+```sql
+SELECT count(*) AS errors FROM app_logs WHERE level = 'error' AND host = '{{labels.host_name}}'
+```
+
+| Field | Meaning |
+|---|---|
+| **Language** | SQL or PromQL. PromQL reads a metrics stream. |
+| **Stream type**, **Stream** | The stream that the query reads. `_audit` cannot be read here: the step runs where nobody's `audit.read` applies. |
+| **Query** | One query, with placeholders. |
+| **Look back (seconds)** | How far before the moment the incident opens the query looks. 300 by default, at most 86,400. |
+| **Rows** | How many rows go into the annotation. 5 by default, at most 50. |
+| **Annotation** | The annotation that the rows go into, `query_result` by default. |
+
+A placeholder stands for a value of the event: `{{labels.<key>}}`, `{{annotations.<key>}}`, `{{summary}}`, `{{severity}}`, `{{priority}}`, `{{urgency}}`, `{{rule_id}}`, `{{rule_name}}`, or `{{source}}`. Labels can come from other systems, so a placeholder has to stand inside a string of the statement, between quotes, where its value is escaped. Anywhere else, the save answers `400`.
+
+- The annotation holds one line per row: a lone value by itself, several as `column=value, column=value`. It holds at most 4,000 characters. A query with no rows leaves the annotation out.
+- The query has 10 seconds and runs once, when the incident opens.
+- When the query fails, or the event has no value for a placeholder, only this step counts as not done, as with [**Call an API**](#call-an-api).
+
+## What becomes of an event
+
+Each pipeline that takes an event ends in one of three outcomes:
+
+| Outcome | Cause | Effect |
+|---|---|---|
+| **Processed** | The steps ran to the end. | The event goes on with their changes. |
+| **Dropped** | A step ran `abort`. | No incident opens, and the later pipelines do not run. |
+| **Failed** | A step failed, or the steps left a field that breaks the rules of [The alert event](#the-alert-event). A **Call an API** or **Add query results** step that fails also counts here. | The changes of this pipeline are left out, except when only such a step failed: then the other steps' changes stay. The event goes on to the next pipeline, and the incident still opens. |
+
+The [timeline](/en-US/alerting/incidents#incident-details) of the incident has a row for each pipeline that changed something or failed: **Went through pipeline Payments routing: severity error → critical, labels +team=payments**, and the reason of a failure. A pipeline that changed nothing leaves no row, and neither does a [severity change](#severity-changes). A row shows up to 40 changes and counts the rest, and a long value is cut at 200 characters.
+
+A rule that keeps firing is dropped again at each evaluation. The [rule list](/en-US/alerting/rules#the-rule-list) shows its state as **Dropped by pipeline**, and its `last_state` in the API is `{"kind": "dropped"}`. The pipeline that dropped the event counts the drop, and its **Overview** names the rule of the latest one. An external alert that a pipeline drops shows **Ignored** under [**Recently received**](/en-US/alerting/sources#recently-received) of its alert source, next to the pipeline and the step that dropped it.
+
+## Severity changes
+
+While an incident is open, each time its alert rule fires again, its external source sends the alert again, or its synthetic check changes its state, the alert pipelines decide its severity again:
+
+- The event is built the way it was when the incident opened, with the severity that the source reports now. It runs through the pipelines that take it, without their **AI summary**, **Call an API**, and **Add query results** steps, and `%event` is `severity_changed`.
+- Only the severity that the steps leave is taken, and the incident changes to it when it differs. The title, labels, annotations, and services stay as they were set when the incident opened.
+- A drop or a failure in a pipeline changes nothing: the incident stays open, and the next pipeline runs.
+
+A step that lowers the severity of staging alerts therefore keeps doing so when the rule reports a higher severity later. An acknowledged incident keeps its severity, and so does an incident whose severity someone set by hand.
+
+## Before a notification
+
+Set **When** to **Before a notification** on the **Alert events** node, and the pipeline runs when a [notification policy](/en-US/notification-channels) is about to send about an alert event: on a copy of the event, for each policy it applies to, and each time the policy sends, its later steps and its escalation included. Use it to shorten a title for an SMS policy, to add a label for one team's webhook, or to keep one policy quiet at night, with the incident itself left as it is.
+
+- **Notification policies** names the policies the pipeline is for. With none ticked, it is for every policy of an alert event. The policy has already matched by then, on the event as it came.
+- The other conditions work as before, judged on the notification's event: the time is when the event happened, and **Sources** adds **Incidents opened by hand**.
+- The steps stay inside MoleSignal. **AI summary**, **Call an API**, and **Add query results** run only when an incident opens, and a pipeline with one of them answers `400` here.
+- The flow ends in **Into the notification**. The policy sends the title, severity, priority, urgency, labels, annotations, and services that the steps leave: in its [templates](/en-US/notification-channels#template-variables), in the body of its webhooks, and in the default text. The people it reaches are worked out from the event as it came.
+- A step that runs `abort` keeps this policy from sending. The delivery log shows a **Skipped** record with the reason, which names the pipeline and the step in the workspace's default language (`error_code` `dropped_by_pipeline`), and the timeline of the incident says so. It is not a failure: the policy is not retried, and its acknowledgement-timeout escalation does not go on.
+- A pipeline that fails has its changes left out, and the notification goes on as it came. The failure shows in the [counts](#daily-counts), not on the timeline.
+
+Besides `%rule_id`, `%rule_name`, and `%source`, the steps read `%policy_id` and `%policy_name`, and `%event` is `triggered`, `escalated`, `acknowledged`, or `resolved`. `%rule_name` is the name of the rule, or the title of the event when no rule opened it. **Test** runs with the sample values `triggered` and `On-call alerts`.
+
+```ruby
+# on-call alerts of the staging environment go out only for what is critical
+if %policy_name == "On-call alerts" && .labels.env == "staging" && .severity != "critical" {
+  abort
+}
+```
+
+## Daily counts
+
+An alert pipeline has no runs, so it has no run history, and **More → Backfill** is not available for it. It counts what it did on the current day (UTC) instead:
+
+- In the list, the **Status** of an enabled alert pipeline is **Waiting for alert events**, and the **Last run** column shows the counts, such as **Today: 41 processed · 3 dropped · 0 failed**.
+- On the **Overview** of the pipeline, **Processed**, **Dropped**, and **Failed** show the same counts. **Dropped** names the rule or the source of the latest drop and when it happened, and **Failed** shows the reason of the latest failure.
+
+The counts start from zero at midnight UTC. An event that the conditions do not take and the runs for a [severity change](#severity-changes) are not counted. The API returns the counts as `alert_record`. See [Manage pipelines](/en-US/api/intake/scheduled-pipelines#get).
+
+## Limits
+
+| Limit | Value |
+|---|---|
+| Steps in one alert pipeline | 20 |
+| Prompt of an **AI summary** step | 8 KiB |
+| Annotation name | 255 bytes |
+| Answer of a **Call an API** step | 1 MiB, within 5 seconds |
+| Statement of an **Add query results** step | 8 KiB |
+| Rows of an **Add query results** step | 50, within 10 seconds |
+| Text an **Add query results** step writes | 4,000 characters |
+
+## Create one through the API
+
+An alert pipeline is saved like any pipeline, with `function_steps.mode` set to `alert` and empty streams and schedule:
+
+```bash
+curl -X POST http://localhost:5080/api/v1/scheduled_pipelines \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "staging-alerts",
+    "source_stream": "",
+    "target_stream": "",
+    "cron": "",
+    "enabled": true,
+    "function_steps": {
+      "mode": "alert",
+      "alert": {
+        "sources": ["rule", "external"],
+        "severities": [],
+        "labels": { "env": "staging" },
+        "order": 10
+      },
+      "steps": [
+        { "transform_name": "cap-severity", "kind": "vrl",
+          "script": "if .severity == \"critical\" { .severity = \"warning\" }" },
+        { "transform_name": "summary", "kind": "ai_summary",
+          "prompt": "Summarize this alert in two sentences for the on-call engineer.",
+          "annotation": "ai_summary" }
+      ]
+    }
+  }'
+```
+
+A pipeline before notifications sets `alert.stage` to `notify` and may name `alert.policies`:
+
+```json
+{
+  "mode": "alert",
+  "alert": { "stage": "notify", "policies": ["<policy id>"], "labels": { "env": "staging" }, "order": 10 },
+  "steps": [
+    { "transform_name": "quiet", "kind": "vrl", "script": "if .severity != \"critical\" { abort }" }
+  ]
+}
+```
+
+See [Create a pipeline](/en-US/api/intake/create-pipeline) for every field. Alert pipelines take the [permissions of all pipelines](/en-US/pipelines#permissions).

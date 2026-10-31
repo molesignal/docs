@@ -7,12 +7,12 @@ description: "List, inspect, edit, run, pause, and delete pipelines."
 | Operation | Endpoint | Permission |
 |---|---|---|
 | List | `GET /api/v1/scheduled_pipelines` | `pipelines.read` |
-| Create | `POST /api/v1/scheduled_pipelines` | `pipelines.create` |
+| Create | `POST /api/v1/scheduled_pipelines` | `pipelines.create`, and `audit.read` when it reads `_audit` |
 | Get | `GET /api/v1/scheduled_pipelines/{id}` | `pipelines.read` |
-| Update | `PUT /api/v1/scheduled_pipelines/{id}` | `pipelines.edit`, and `pipelines.pause` when `enabled` changes |
+| Update | `PUT /api/v1/scheduled_pipelines/{id}` | `pipelines.edit` for a change of configuration, with `audit.read` when it reads `_audit`, and `pipelines.pause` when `enabled` changes |
 | Delete | `DELETE /api/v1/scheduled_pipelines/{id}` | `pipelines.delete` |
 | Run history | `GET /api/v1/scheduled_pipelines/{id}/runs` | `pipelines.read` |
-| Backfill | `POST /api/v1/scheduled_pipelines/{id}/backfill` | `pipelines.run` |
+| Backfill | `POST /api/v1/scheduled_pipelines/{id}/backfill` | `pipelines.run`, and `audit.read` when it reads `_audit` |
 
 ## List
 
@@ -33,6 +33,9 @@ The list returns every pipeline with the state of its latest run and a 24-hour s
     "last_run_at_micros": 1790000000000000,
     "read_until_micros": { "app_raw": 1789999940000000, "nginx_raw": 1789999940000000 },
     "retry": null,
+    "alert_record": null,
+    "audit_reader_id": null,
+    "audit_reader": null,
     "created_at_micros": 1789900000000000,
     "updated_at_micros": 1789900000000000,
     "last_run_state": "succeeded",
@@ -77,6 +80,9 @@ Returns the pipeline with the read position of each source and the planned retry
     "next_at_micros": 1790000030000000,
     "error": "read: <reason>"
   },
+  "alert_record": null,
+  "audit_reader_id": null,
+  "audit_reader": null,
   "created_at_micros": 1789900000000000,
   "updated_at_micros": 1789900000000000
 }
@@ -87,12 +93,23 @@ Returns the pipeline with the read position of each source and the planned retry
 |---|---|
 | `read_until_micros` | The read position of each source, in microseconds. The events of the source before it have been handled. A source that has not been read yet has no entry. |
 | `retry` | The soonest planned retry of a window that failed, or `null`. `source` names the source, `attempt` is the attempt that the retry will be, `next_at_micros` is when it is due, and `error` is what the last attempt failed on. |
+| `alert_record` | The counts of an alert pipeline for the latest UTC day on which it took an event: `day` (`YYYY-MM-DD`), `processed`, `dropped`, and `failed`, and the latest drop and failure of that day as `last_dropped` and `last_failed`, each with `at_micros`, `rule` (the rule, alert source, or synthetic check), and `reason`. A missing count is 0. `null` for other pipelines and for an alert pipeline that has taken no event yet. See [Daily counts](/en-US/pipelines/alert-events#daily-counts). |
+| `audit_reader_id` | Whose access the pipeline reads `_audit` with: whoever last saved it. `null` for a pipeline that does not read `_audit`. See [Audit stream](/en-US/settings/data-security#audit-stream). |
+| `audit_reader` | That person's `id`, `display_name`, and `email`, for anyone with `pipelines.read`. `null` when the user no longer exists or cannot be read, which leaves `audit_reader_id` alone. |
 
 See [Schedule and read positions](/en-US/pipelines#schedule-and-read-positions) and [Retries and dead letters](/en-US/pipelines#retries-and-dead-letters).
 
 ## Update and delete
 
-`PUT` takes the same body as [Create a pipeline](/en-US/api/intake/create-pipeline) and replaces the configuration. Changing only `enabled` needs `pipelines.pause`, and any other change needs `pipelines.edit`. Changing `enabled` from `false` to `true` resets the read positions, so every source reads back `lookback_secs` again. `DELETE` answers `{"deleted": true}`.
+`PUT` takes the same body as [Create a pipeline](/en-US/api/intake/create-pipeline) and replaces the configuration. Changing only `enabled` needs `pipelines.pause`, and any other `PUT`, one that changes nothing included, needs `pipelines.edit`. Changing `enabled` from `false` to `true` resets the read positions, so every source reads back `lookback_secs` again. `DELETE` answers `{"deleted": true}`.
+
+On a pipeline that reads `_audit`, a `PUT` also decides whose access the pipeline reads with. See [Audit stream](/en-US/settings/data-security#audit-stream).
+
+| The `PUT` | Also needs | Whose access the pipeline reads `_audit` with |
+|---|---|---|
+| Changes the configuration | `audit.read`, and a token that is not a service account's | The caller's from then on. |
+| Changes nothing | Nothing | The caller's from then on when the caller holds `audit.read` and the token is not a service account's. Otherwise unchanged, with no error. |
+| Changes only `enabled` | Nothing | Unchanged. |
 
 ## Run history
 
@@ -100,7 +117,7 @@ See [Schedule and read positions](/en-US/pipelines#schedule-and-read-positions) 
 GET /api/v1/scheduled_pipelines/{id}/runs?limit=50&before_micros=<cursor>
 ```
 
-Returns the runs of a scheduled pipeline, newest first. A realtime pipeline records no runs.
+Returns the runs of a scheduled pipeline, newest first. A realtime or an alert pipeline records no runs.
 
 <ResponseExample>
 ```json 200
@@ -151,7 +168,7 @@ POST /api/v1/scheduled_pipelines/{id}/backfill
 <RequestExample>
 ```bash cURL
 curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backfill \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"start_micros": 1790000000000000, "end_micros": 1790086400000000}'
 ```
@@ -178,4 +195,4 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backf
 
 The backfill submits one search job per source. Each job reads its source over the window, applies the steps, and writes, delivers, and keeps dead letters the way a scheduled run does. The read positions of the pipeline do not move. Follow each job with its `monitor` path. See [Query](/en-US/query#time-ranges-and-asynchronous-jobs).
 
-A realtime pipeline answers `400` (`realtime pipelines do not support backfill`).
+A realtime or an alert pipeline answers `400` (`realtime and alert pipelines do not support backfill`). A pipeline that reads `_audit` answers `403` when the token lacks `audit.read` or belongs to a service account. The job checks the submitter again when it runs, and fails when they no longer hold `audit.read`.

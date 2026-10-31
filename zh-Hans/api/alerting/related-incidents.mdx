@@ -1,0 +1,122 @@
+---
+title: "相似事件与最近变更"
+description: "列出和一个事件相似的过往事件，以及它触发前后上报的部署、配置和开关变更。"
+"en_link": "/en-US/api/alerting/related-incidents"
+---
+
+两个调用都需要对事件的 `alerts.incidents.read`。
+
+## 相似事件
+
+```http
+GET /api/v1/alerts/incidents/{id}/similar
+```
+
+在同一组织于事件触发前 90 天内开过的事件里找出最像它的，最多 5 个，得分高的在前，同分的新的在前。并入它的事件和它并入的事件不算。得分是下面各项之和，至少 2 分才列出：
+
+| 依据 | `reasons` 中的值 | 得分 |
+|---|---|---|
+| 同一告警指纹 | `fingerprint` | 5 |
+| 同一条规则（指纹不同时） | `rule` | 3 |
+| 涉及的服务有重合 | `services` | 重合度 × 2 |
+| 标签相近：相同的键值对占两边全部键值对的比例至少 0.3 | `labels` | 比例 × 2 |
+| 标题相近：三字串相似度至少 0.3，做法同 PostgreSQL `pg_trgm`，汉字也算 | `title` | 相似度 × 2 |
+| 分派到同一个团队 | `team` | 1 |
+
+重合度是两边交集除以并集。
+
+<RequestExample>
+```bash cURL
+curl http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/similar \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "incidents": [
+    {
+      "id": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+      "summary": "High error rate · checkout",
+      "severity": "critical",
+      "status": "resolved",
+      "created_at": 1789400000000000,
+      "resolved_at": 1789401800000000,
+      "resolved_by": "<user-id>",
+      "score": 7.6,
+      "reasons": ["fingerprint", "services", "labels", "team"],
+      "notes": 2,
+      "root_cause": "Connection pool exhausted after the payments client stopped releasing connections."
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| 字段 | 说明 |
+|---|---|
+| `score`、`reasons` | 得分和得分的依据，见上表。 |
+| `resolved_by` | 解决它的人；规则自行恢复或还没恢复时为 `null`。 |
+| `notes` | 它的[备注](/zh-Hans/api/alerting/add-incident-note)条数。 |
+| `root_cause` | 它的 [AI 根因](/zh-Hans/api/alerting/incident-rca)正文里第一句说事的话（跳过标题与空行），最长 200 字；没有分析时省略。 |
+
+## 最近变更
+
+```http
+GET /api/v1/alerts/incidents/{id}/changes
+```
+
+列出事件触发前 30 分钟到触发后 10 分钟之间，事件涉及的服务（受影响的服务和 `service` 标签）及其下游服务[上报的变更](/zh-Hans/apm/deployments#从-ci-上报发布)，最多 20 条，按时间先后。下游服务从 APM 服务地图读出，最多看事件的前 3 个服务；没有服务地图时只看事件自己的服务。事件的规则在触发前 24 小时内改过时，也列一条 `rule`。
+
+<RequestExample>
+```bash cURL
+curl http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/changes \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "from": 1789998200000000,
+  "to": 1790000600000000,
+  "changes": [
+    {
+      "kind": "deployment",
+      "at": 1789999100000000,
+      "service": "payments",
+      "downstream": true,
+      "version": "v2026.10.28",
+      "status": "succeeded",
+      "commit": "9f2c1e4",
+      "author": "dana",
+      "link": "https://ci.example.com/pipelines/4821"
+    },
+    {
+      "kind": "rule",
+      "at": 1789960000000000,
+      "downstream": false,
+      "rule_id": "3KEDBLvTYO6DnWi8H9S9MNLpPT7",
+      "rule_name": "Checkout error rate"
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| 字段 | 说明 |
+|---|---|
+| `from`、`to` | 看的时间范围，Unix 微秒。 |
+| `kind` | `deployment`、`configuration`、`feature_flag`，或 `rule`（事件的规则被改过）。 |
+| `downstream` | 变更属于下游服务、不是事件自己的服务时为 `true`。 |
+| `version`、`status`、`commit`、`description`、`author` | 上报时带的内容；没带的省略。 |
+| `link` | 上报的流水线地址，没有时是合并请求地址。 |
+| `rule_id`、`rule_name` | `rule` 变更的规则。 |
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `403` | Token 缺少 `alerts.incidents.read`，或无权访问这个事件。 |
+| `404` | 事件不存在。 |

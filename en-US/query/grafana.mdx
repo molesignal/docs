@@ -1,0 +1,175 @@
+---
+title: "Query from Grafana"
+description: "Read MoleSignal metrics, logs, and traces in Grafana dashboards, Explore, and alert rules with the MoleSignal datasource plugin."
+"zh-Hans_link": "/zh-Hans/query/grafana"
+---
+
+The MoleSignal datasource is a Grafana plugin. Grafana reads metrics with PromQL, logs and traces with the field query of the **Logs** and **Traces** pages, and any stream with SQL. The jumps between signals come along: a log line opens its trace, an exemplar opens its trace, and every result links back to MoleSignal.
+
+<Note>
+The plugin has a backend that runs on the Grafana server, started by Grafana as a child process. Every request to MoleSignal leaves from the Grafana server with the datasource's token; browsers never reach MoleSignal. Grafana Cloud reaches a MoleSignal in a private network through Private data source connect.
+</Note>
+
+## Requirements
+
+| Item | Requirement |
+|---|---|
+| Grafana | 12.3 or later, 13.x included. |
+| MoleSignal | A version that accepts the `step` field of [`POST /api/v1/query`](/en-US/api/query/execute) and the `expression` parameter of the [logs](/en-US/api/web/logs) and [trace](/en-US/api/web/trace) reads. **Save & test** refuses an older version, which would answer field queries unfiltered. |
+| Network | The Grafana server reaches the HTTP port of MoleSignal, 5080 by default. |
+| Token | An API token of a service account with the **Viewer** role. The datasource uses `streams.read`, `streams.query`, `logs.read`, `traces.read`, and `metrics.read`; `dashboards.read` and `dashboards.annotations.read` for annotations and variables; `apm.deployments.read` for deployment annotations; and `alerts.incidents.read` for incident annotations. |
+
+## Create a token for Grafana
+
+1. Open **Identity & Access → Service accounts** and select **Create service account**.
+2. Enter the **Name** `grafana` and choose the **Viewer** role.
+3. Select **Create account and token**, and copy the token. It expires in 365 days and is shown only once.
+
+To keep Grafana to reading, issue the account a narrower token: open **Identity & Access → API tokens**, select **Issue service account token**, choose the account, and choose the **Read-only observer** policy as the **Scope**. See [API tokens and service accounts](/en-US/identity/tokens).
+
+One datasource reads one organization: the organization of its token. Every Grafana user who may use the datasource reads what the token may read. Restrict the datasource with Grafana's datasource permissions, or give each team its own datasource and token.
+
+## Install the plugin
+
+Install the release archive with the Grafana CLI, or unpack it into the plugins directory of Grafana, `/var/lib/grafana/plugins` in the Linux packages and the Docker image:
+
+```bash
+grafana cli --pluginUrl https://github.com/molesignal/molesignal-grafana-plugin/releases/download/v0.1.0/molesignal-datasource-0.1.0.zip plugins install molesignal-datasource
+```
+
+The plugin is not signed yet. Allow Grafana to load it in `grafana.ini`, or with the environment variable `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=molesignal-datasource`, then restart Grafana:
+
+```ini
+[plugins]
+allow_loading_unsigned_plugins = molesignal-datasource
+```
+
+## Add the datasource
+
+1. In Grafana, open **Connections → Data sources**, select **Add new data source**, and choose **MoleSignal**.
+2. Enter the **URL** of MoleSignal, such as `https://molesignal.example.com`, and paste the **API token**.
+3. Select **Save & test**.
+
+**Save & test** reads the version of MoleSignal, checks that the token holds `streams.read` and `streams.query`, counts the streams of each type, and checks that MoleSignal reads field queries.
+
+| Setting | Default | Description |
+|---|---|---|
+| **URL** | | The address of MoleSignal, without `/api/v1`. |
+| **API token** | | Kept encrypted on the Grafana server. |
+| **Skip TLS certificate verification** | Off | Only for a test instance with a self-signed certificate. |
+| **CA certificate** | | The certificate authority that signed the certificate of MoleSignal, in PEM. |
+| **Logs stream** | | The stream a new logs query starts on. Explore's ad hoc filters offer its fields. |
+| **Log fields** | `message`, `level`, `trace_id` | The fields that hold the line, its level, and its trace. |
+| **Scrape interval** | `15s` | How often metrics arrive. `$__rate_interval` is at least four of them. |
+| **Federated clusters** | This cluster | The clusters every SQL and PromQL query reaches, comma separated. |
+| **MoleSignal web address** | The URL | Where **Open in MoleSignal** links lead. |
+| **Timeout (seconds)** | `60` | The longest wait for one request to MoleSignal. |
+| **Queries at once** | `10` | The queries of one panel, Explore pane, or alert rule that run at the same time. |
+
+## Query types
+
+| Query type | Reads | Draws |
+|---|---|---|
+| **PromQL** | Metrics, as a range query at the panel's interval or an instant query | Time series, a table, and exemplars |
+| **SQL** | Any stream | A table, time series, or log lines |
+| **Logs** | The newest records of a logs stream that a field query matches | Log lines |
+| **Trace** | One trace by its ID | The trace view |
+| **Trace search** | The traces that a field query matches | A table that opens each trace |
+| **RED** | Requests per second, errors per second, the error ratio, or a duration percentile of the spans that a field query matches | Time series, one per value of a field when **By** names one |
+| **Service graph** | The calls between services | A node graph |
+
+### PromQL
+
+A range query reads one point per step. The step is the panel's interval, never finer than **Min step** and never more than 11,000 steps per series. **Legend** names each series, with `{{label}}` for the value of a label. **Exemplars** draws the exemplars of the series, each of which opens its trace. MoleSignal implements a [subset of PromQL](/en-US/query/promql-subset).
+
+### Field queries
+
+**Logs**, **Trace search**, and **RED** take the field query of the MoleSignal **Logs** and **Traces** pages, so a query means the same in both places:
+
+```text
+level = 'error' AND (service.name = 'checkout' OR timeout)
+```
+
+| Element | Meaning |
+|---|---|
+| `AND`, `OR`, brackets | `AND` binds tighter than `OR`. Brackets group. |
+| `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains` | Compare a field with a value. |
+| `field in ('a', 'b')` | One of several values, in trace queries. |
+| `MATCH(field, 'text')`, `MATCH_TEXT(field, 'words')` | Full-text search of a field, in logs queries. |
+| A bare word or a quoted phrase | Text to find. |
+
+The **Add a condition** row builds a comparison from a **Field**, an **Operator**, and a **Value**, and adds it with `AND`. **RED** reads the **Entry spans**, where a service took a request in, or **All spans**.
+
+### SQL
+
+SQL reads any stream. **Stream** names the stream the statement is planned against, the table after `FROM` when empty. **Format** draws a **Table**, **Time series**, or **Logs**. These macros take the panel's window:
+
+| Macro | Becomes |
+|---|---|
+| `$__timeFilter(_timestamp)` | `_timestamp >= <from> AND _timestamp < <to>` |
+| `$__timeGroup(_timestamp, $__interval)` | `date_bin(INTERVAL '<interval>', _timestamp)` |
+| `$__timeFrom()`, `$__timeTo()` | The ends of the window as timestamps |
+
+`$__interval`, `$__rate_interval`, and `$__range` work in PromQL and SQL, in alert rules too.
+
+## Explore
+
+| Action | Effect |
+|---|---|
+| Run a logs query | Draws the log volume by level above the lines. |
+| Open the context of a line | Shows the 50 records before and after it. |
+| Filter for or out a value in the details of a line | Adds `field = 'value'` or `field != 'value'` to the query with `AND`. |
+| Select the trace ID of a line, or an exemplar | Opens the trace beside the query. |
+| Select **Open in MoleSignal** | Opens the same query and window in MoleSignal. |
+
+## Variables and ad hoc filters
+
+A query variable lists one of these:
+
+| List | Values |
+|---|---|
+| **Streams** | The streams of a type. |
+| **Fields** | The fields of a stream. |
+| **Field values** | The commonest values of a field of a logs stream. |
+| **Metrics** | Metric names, optionally those that contain a text. |
+| **Label values** | The values of a label of a metric. |
+| **SQL** | The first column of a statement. |
+
+A variable with several values selected is written as each language reads a list: `(a|b)` for `=~` in PromQL, `'a', 'b'` for `IN (...)` in SQL, and `'a', 'b'` for `in (...)` in a trace field query.
+
+Ad hoc filters narrow PromQL as label matchers in every selector, and field queries as `AND` conditions. Their keys and values come from the **Logs stream** of the datasource.
+
+## Annotations
+
+An annotation query marks one **Source** on the panels of a dashboard:
+
+| Source | Marks |
+|---|---|
+| **Annotations** | The annotations of MoleSignal, optionally only those with a **Tag**. |
+| **Deployments** | The deployments that [APM](/en-US/apm/deployments) recorded, optionally of one service. |
+| **Incidents** | Incidents from their start to their resolution, optionally of one service. |
+
+## Alerting
+
+Grafana alert rules run PromQL and SQL queries through the backend of the plugin. The [alerting of MoleSignal](/en-US/alerting) goes further with real-time rules, incidents, on-call, and escalation. An alert that fires in Grafana can still reach MoleSignal as an [external alert](/en-US/alerting/sources#grafana).
+
+## Dashboards
+
+The **Dashboards** tab of the datasource imports two dashboards:
+
+| Dashboard | Shows |
+|---|---|
+| **MoleSignal · Services** | Requests, errors, and duration of every service, the service graph, and the slowest traces. |
+| **MoleSignal · Logs** | The log volume and the newest errors of a logs stream. |
+
+## Limits
+
+| Item | Limit |
+|---|---|
+| Logs query | The newest 1,000 records, or up to 5,000 with **Row limit**. |
+| Trace search | 100 traces, or up to 5,000 with **Row limit**. |
+| Trace | A trace that began in the window, within its last 31 days. |
+| PromQL | 11,000 steps per series and 100,000 points per query. Above that, MoleSignal keeps evenly spaced points of each series. |
+| SQL | 10,000 rows, or up to 1,000,000 with **Row limit**. |
+
+The Logs, Traces, and Metrics Drilldown apps of Grafana read Loki, Tempo, and Prometheus only, so they do not open this datasource.

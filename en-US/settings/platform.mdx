@@ -1,20 +1,23 @@
 ---
 title: "Platform settings"
-description: "Settings that apply to the whole instance, made in the _sys organization: organizations, client IP recognition, default retention, metric cardinality, and audit retention."
+description: "Settings that apply to the whole instance, made in the _sys organization: organizations, sign-in limits, client IP recognition, default retention, metric cardinality, intake usage, and audit retention."
 "zh-Hans_link": "/zh-Hans/settings/platform"
 ---
 
 Platform settings live in the protected `_sys` organization. Switch to it with the workspace
-switcher; platform administrators and the Owners of enabled organizations can enter it. The pages
-appear under **Settings** there, and each requires a platform permission.
+switcher; the super administrator and accounts granted a platform role can enter it. The pages
+appear under **Settings** there, and each requires a platform permission: reading a page takes the
+`.read` permission of its group, and changing it the `.manage` one.
 
 | Section | Group | Permission |
 |---|---|---|
-| **Organization management** | Platform | `sys.organizations.manage` |
-| **Client IP recognition** | Data plane | `sys.settings.manage` |
-| **Data retention** | Data plane | `sys.settings.manage` |
-| **Metric cardinality** | Data plane | `sys.settings.manage` |
-| **Audit retention** | Data security | `sys.settings.manage` |
+| **Organization management** | Platform | `sys.organizations.read` |
+| **Sign-in limits** | Platform | `sys.settings.signin.manage` |
+| **Client IP recognition** | Data plane | `sys.settings.signin.manage` |
+| **Data retention** | Data plane | `sys.settings.retention.manage` |
+| **Metric cardinality** | Data plane | `sys.settings.limits.manage` |
+| **Intake usage** | Data plane | `sys.settings.limits.manage` |
+| **Audit retention** | Data security | `sys.settings.retention.manage` |
 
 Every node reads these settings from the database, so a change needs no restart.
 
@@ -35,11 +38,57 @@ changed. Manage the members of an organization from its own
 [Identity & Access](/en-US/identity/members), after **Manage IAM** on
 [Organizations](/en-US/identity/teams#organizations).
 
+## Sign-in limits
+
+**Sign-in limits** stop credential stuffing and password guessing without letting anyone lock someone
+else out by getting a password wrong. They count failed checks of an account password: password
+sign-in, LDAP sign-in, account login from a database client, the password confirmation when
+[linking an existing account](/en-US/identity/sso), and the one before
+[adding a second factor](/en-US/identity/mfa). The access password of a
+[public link](/en-US/resource-sharing#access-password-limits) counts too, with each link as one account.
+Passkeys and OIDC, OAuth 2.0, and SAML single sign-on are neither counted nor limited.
+
+| Setting | Default | At the limit |
+|---|---|---|
+| **One account from one address** | 5 failures | This address is locked out of this account. Other addresses are not affected. |
+| **One address, any account** | 30 failures | This address can no longer sign in with a password. People sharing the address are affected too. |
+| **One account from all addresses** | 20 failures | The account is not locked; its passwords are slowed down. An address that signed in during the last 30 days is not slowed down. The count clears after one counting period without a new failure. |
+| **While slowed down, check a password every** | 60 seconds | From 1 to 600 seconds. |
+| **Lock and count for** | 15 minutes | How long an address stays locked, and how far back failures count. From 1 to 1440 minutes. |
+
+Enter `0` to turn a count off; counts go up to 100000. A change applies at once and is recorded in the
+platform audit as `signin_limits.update`.
+
+| Case | Result |
+|---|---|
+| A refused request | Answers `429` with `Retry-After`. The password is not checked and no lock is extended, so a lock lasts the set time at most. |
+| An account that does not exist | Counts and answers like one that does, so the answer never says whether an account exists. |
+| The right password | Clears the failures of this account from this address. The counts of the address and the account only give back this one attempt; they do not clear. |
+| A service that is unavailable, such as an unreachable directory | Does not count as a failure. |
+| Reaching a limit | Recorded in the platform audit as `signin.lockout`, with the address and which limit it was. The account is recorded only when it exists. |
+| A successful password reset | Unlocks the account at once, and this address is no longer slowed down. |
+| A public link's access password | Each link counts as one account, and an address that opened the link during the last 30 days is not slowed down. Wrong access passwords and failed sign-ins add up in **One address, any account**, so reaching it also stops this address from signing in with a password. |
+| Reaching a limit on a public link | Recorded as `resource_share.lockout` in the audit of the workspace that owns the link, with the link, the address, and which limit it was. Reaching **One address, any account** is also recorded in the platform audit as `signin.lockout`. |
+
+The address comes from [Client IP recognition](#client-ip-recognition), and IPv6 counts per /64. A
+private address does not count as an address by default: behind a proxy nobody has set up, everyone
+has the proxy's address, and counting it would let anyone lock everyone out with a few wrong passwords.
+Then only **One account from all addresses** applies. When people really connect from a private
+network, turn on **Count private addresses as clients**.
+
+**Your address** on the page shows what address this request was taken to come from and whether it
+counts. A request that carries forwarding headers while the address is the connection's gets a warning:
+there is probably a proxy nobody has set up.
+
+To unlock early when that is really needed, run `DELETE FROM signin_attempts` on the metadata database,
+which clears every count.
+
 ## Client IP recognition
 
 RUM intake records the address of each browser or device, and looks it up for the country, the subdivision,
-and the city. **Client IP recognition** decides where the address comes from. It applies to every
-organization.
+and the city; [sign-in limits](#sign-in-limits) count failures per address; and the audit of
+[public links](/en-US/resource-sharing#audit-and-permissions) records each visitor's address.
+**Client IP recognition** decides where the address comes from. It applies to every organization.
 
 | **Address source** | Use |
 |---|---|
@@ -54,13 +103,29 @@ Behind a proxy, also set:
 | **Client IP header** | The header to read. `Authorization`, `Cookie`, API key, and client certificate headers are refused. |
 | **Trusted proxy CIDRs** | One IPv4 or IPv6 CIDR per line, up to 64. The header is read only from a connection whose peer is in these networks. A `/0` network trusts every source of its address family: use it only behind a protected ingress. |
 | **Fall back to connection address** | Uses the TCP peer when the header is missing, malformed, too long, or holds no usable address. |
-| **Allow private addresses from headers** | Accepts private, loopback, and link-local addresses from the header. Keep it off for public browser traffic. |
+
+**Count private addresses as clients** can be set with any address source. It accepts private, loopback,
+and link-local addresses from a trusted header, and makes [sign-in limits](#sign-in-limits) count them.
+Turn it on when people connect from a private network. Keep it off behind a proxy that is not set up here,
+or everyone counts as one address.
 
 ## Data retention
 
 **Data retention** sets how many days a stream without a retention of its own is kept: 30 by
 default, from 1 to 3650. Each stream can set its own under [Streams](/en-US/streams#retention-and-deletion).
 Data older than the retention is deleted in the next cleanup and cannot be recovered.
+
+While a shorter retention is typed, the page estimates from the file catalog what the change would
+delete: the rows, size, and oldest data of each stream, largest first. Saving then asks for
+confirmation, and asks for the days to be typed again from 1 GiB or a million rows on, or when the
+estimate is not available. A longer retention asks nothing. Session replays and profile archives
+follow this setting too and are not counted.
+
+**Synthetic results**, on the same page, sets how many days the runs of synthetic checks are kept:
+30 by default, from 0 to 3650, where 0 keeps them for good. Older runs, their artifacts, and finished
+tasks are deleted once a day; a run a location shows as its latest, or the test a revision was
+published on, is kept. The `_synthetic_results` stream that availability reads follows its own stream
+retention; see [Synthetics](/en-US/synthetics#result-stream-and-retention).
 
 ## Metric cardinality
 
@@ -76,9 +141,23 @@ At a limit, writes of new series are refused while the existing series keep bein
 that receives no data for a while is no longer active. Nodes read the limits again every 30 seconds.
 Find the labels that create series with the cardinality view of [Metrics](/en-US/metrics).
 
+## Intake usage
+
+**Intake usage** sets how long the record of [what each source took in](/en-US/streams#intake-usage-and-budgets)
+is kept, and how many services are counted apart.
+
+| Field | Default | Meaning |
+|---|---|---|
+| **Keep records for** | 90 days | Hourly records older than this are deleted once a day. From 35 to 3650 days: at least 35, so that a monthly budget can always be read back. |
+| **Services per organization** | 1,000 | How many services an organization has counted apart in an hour, on each node. From 1 to 100,000. Past it, the rest are counted together as **Other services**, so that a sender cannot grow the records by naming services. |
+
 ## Audit retention
 
 **Audit retention** sets how many days the audit records of every organization and of the platform
 are kept: 90 by default, from 0 to 3650, where `0` keeps them forever. Older records are deleted once
 a day and cannot be recovered. Each change is recorded in the platform audit as
 `audit_retention.update`.
+
+While a shorter retention is typed, the page counts the records the change would delete. Saving then
+asks for confirmation, and asks for the days to be typed again from 1,000 records on, or when the
+records cannot be counted.

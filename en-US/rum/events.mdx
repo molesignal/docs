@@ -66,8 +66,8 @@ The answer reports every event on its own, so one bad event does not discard the
 
 | Field | Meaning |
 |---|---|
-| `accepted` | The number of events that were written. |
-| `rejected` | One entry for each event that was not written: its position in the request (`index`, from `0`) and the `reason`. |
+| `accepted` | The number of events taken: those neither rejected nor counted in `sampled`. An event that a [realtime pipeline](/en-US/pipelines#rum-streams) drops on purpose counts here too, although it is not stored. |
+| `rejected` | One entry for each event that was refused: its position in the request (`index`, from `0`) and the `reason`. |
 | `sampled` | The number of events that were left out on purpose, because the application [keeps a share of its sessions](/en-US/rum/sampling#keep-a-share-of-sessions-at-the-server) and these belong to sessions it does not keep. The errors of those sessions are not among them when the application keeps every error. Only present when there are some. They are not rejected, and are not counted in `accepted`. |
 
 A request whose events are all bad still answers `200`, with `accepted` set to `0`. A request that
@@ -85,6 +85,7 @@ An event is rejected for one of these reasons:
 | ``application `<id>` does not exist`` | The application was deleted, or never created. |
 | `application.id is required` | The credential is not a client token and the event names no application. |
 | `line is not JSON` | A line of an NDJSON body cannot be parsed. |
+| ``<stream>: realtime transform `<step>` …`` | A step of the stream's [realtime pipeline](/en-US/pipelines#rum-streams) failed on the event, changed a column that the pipeline keeps, or dropped a view or a vital. |
 
 An SDK reports rejected events through its error callback and does not send them again.
 
@@ -114,7 +115,7 @@ An SDK reports rejected events through its error callback and does not send them
 
 | Attribute | Type | Notes |
 |---|---|---|
-| `type` | string | Required: `view`, `action`, `error`, `resource`, `long_task`, or `vital`. |
+| `type` | string | Required: `view`, `action`, `error`, `resource`, `long_task`, `vital`, or `log`. |
 | `date` | integer | Required. Epoch milliseconds. |
 | `source` | string | Required: `browser`, `android`, `ios`, `flutter`, `react-native`, `kotlin-multiplatform`, `unity`, `roku`, `electron`, or `other`. |
 | `session` | object | Required. `id` is required. `type` is `user` (default), `synthetics`, or `ci_test`. `start` is epoch milliseconds. `has_replay` is a boolean. |
@@ -131,7 +132,9 @@ An SDK reports rejected events through its error callback and does not send them
 | `browser`, `os`, `device` | object | Browser name and version, operating system, and device type (`mobile`, `desktop`, `tablet`, `tv`, `gaming_console`, `bot`, or `other`), model, brand, architecture, locale, time zone, battery, and memory. |
 | `sdk` | object | `name`, `version`, `session_sample_rate`, and `replay_sample_rate`. |
 | `context` | object | Free-form attributes of the application. |
-| `feature_flags` | object | Free-form feature flag evaluations. |
+| `feature_flags` | object | Free-form feature flag evaluations. Each key can be asked about as `feature_flags.<key>`; see [feature flags](/en-US/rum/feature-flags). |
+| `synthetics` | object | What a synthetic check says of the session it drives: `test_id`, `result_id`, and `location_id`. See [test traffic](/en-US/rum/test-traffic). |
+| `ci_test` | object | `test_execution_id`, for a session a CI test drives. |
 
 Identifiers match `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`, up to 128 characters. Text attributes of
 `usr`, `account`, and the device are limited to 256 characters.
@@ -150,6 +153,7 @@ A `view` event carries a `view` object with these fields next to the `url`, `nam
 | `loading_time`, `first_byte`, `dom_interactive`, `dom_content_loaded`, `dom_complete`, `load_event`, `network_settled_time`, `interaction_to_next_view_time` | Navigation timings in nanoseconds. |
 | `performance.fcp`, `performance.lcp`, `performance.fid`, `performance.inp`, `performance.cls`, `performance.fbc` | Web Vitals. LCP has `timestamp`, `target_selector`, `resource_url`, and `sub_parts` (`load_delay`, `load_time`, `render_delay`). INP has `duration`, `timestamp`, `target_selector`, and `sub_parts` (`input_delay`, `processing_duration`, `presentation_delay`). CLS has `score`. |
 | `custom_timings` | An object of named timings. |
+| `scroll` | How far down the page went: `max_depth` (CSS pixels from the top of the page to the bottom of the window), `max_depth_scroll_top`, `max_scroll_height`, and `max_scroll_height_time` (nanoseconds). The numbers of the scroll [heatmap](/en-US/rum/heatmaps). |
 | `action`, `error`, `resource`, `long_task`, `frustration`, `crash`, `frozen_frame` | Objects of the form `{ "count": n }` with the cumulative counts. |
 | `memory_average`, `memory_max`, `cpu_ticks_count`, `cpu_ticks_per_second`, `refresh_rate_average`, `refresh_rate_min`, `slow_frames_rate`, `freeze_rate` | Mobile measurements. |
 | `flutter_build_time`, `flutter_raster_time` | `{ min, max, average, metric_max }` in nanoseconds. |
@@ -161,8 +165,9 @@ A `view` event carries a `view` object with these fields next to the `url`, `nam
 | `id` | Required. |
 | `type` | Required: `custom`, `click`, `tap`, `scroll`, `swipe`, `application_start`, or `back`. |
 | `loading_time` | Nanoseconds. |
-| `target` | `name`, `selector`, `width`, and `height` of the element. |
+| `target` | `name`, `selector`, `width`, and `height` of the element, `path`, where it stands in the page by tags and places alone, and `offset`, the `x` and `y` of the click in the element. |
 | `position` | `x` and `y` of the pointer. |
+| `page_position` | `x` and `y` of the click on the page, in CSS pixels. |
 | `name_source` | How the name was found: `custom_attribute`, `mask_placeholder`, `standard_attribute`, `text_content`, `mask_disallowed`, or `blank`. |
 | `frustration.type` | A list of `rage_click`, `dead_click`, `error_click`, `rage_tap`, or `error_tap`. |
 | `error`, `crash`, `long_task`, `resource` | Objects of the form `{ "count": n }`. |
@@ -213,6 +218,19 @@ A `view` event carries a `view` object with these fields next to the `url`, `nam
 | `app_launch_metric`, `startup_type` | Required for `app_launch` together with `duration`: `ttid` or `ttfd`, and `cold_start` or `warm_start`. |
 | `step_type`, `operation_key`, `failure_reason` | For `operation_step`: `start`, `update`, `retry`, or `end`. |
 
+## Log
+
+A `log` event has `level` and `message` at its top, so that the stream reads as any log does, and a `log` object. See [browser logs](/en-US/rum/logs).
+
+| Field | Notes |
+|---|---|
+| `level` | Required: `debug`, `info`, `warn`, or `error`. |
+| `message` | Required. |
+| `log.id` | Required. |
+| `log.logger` | The name of the logger. |
+| `log.origin` | `logger`, `console`, `report`, or `sdk`. |
+| `log.error_type`, `log.stack` | The error the log is about. |
+
 ## What MoleSignal adds
 
 - **Place:** the country, subdivision, city, continent, and coordinates of the client IP address, looked up in
@@ -242,6 +260,9 @@ schema, so a value of the wrong type never changes a column.
 | `rum_resources` | One row for each request. It holds the most rows, so set a shorter retention for it in its stream settings. |
 | `rum_long_tasks` | One row for each long task. |
 | `rum_vitals` | One row for each vital. |
+| `rum_logs` | One row for each log. |
+
+Only RUM intake writes these streams. A realtime pipeline can change the custom parts of an event as it arrives, `context`, `usr.extra`, `feature_flags`, and `extra`, and a scheduled pipeline can read the streams. See [RUM streams](/en-US/pipelines#rum-streams).
 
 Columns are the flattened names of the event, such as `view.performance.lcp.timestamp` and `resource.status_code`.
 Browse them in the [RUM explorer](/en-US/rum/explorer), or query the streams with SQL on **Logs**.

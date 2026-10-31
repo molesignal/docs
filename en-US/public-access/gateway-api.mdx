@@ -1,0 +1,237 @@
+---
+title: "Gateway API"
+description: "Build the internal and public entry points with two Gateways: the internal HTTPRoute forwards every path, the public HTTPRoute matches only external callbacks and public pages by path and method."
+"zh-Hans_link": "/zh-Hans/public-access/gateway-api"
+---
+
+The configuration below follows the recommended way in [Public access](/en-US/public-access): one Gateway sits behind an internal load balancer and one behind a public load balancer, and one name, `molesignal.example.com`, resolves to each of them in the internal and the public DNS. The examples use Gateway API `v1` and fit every implementation. Source address allowlists, rate limits, body limits and access logs are not part of Gateway API; each implementation provides them with its own policies, see [Policies of the implementation](#policies-of-the-implementation). MoleSignal's Service is `molesignal` on port `5080` in the namespace `molesignal`; in a role-split deployment, use the router's Service instead.
+
+## Two Gateways
+
+Set `gatewayClassName` to the GatewayClass of the implementation in use. The internal Gateway must land on an internal load balancer: when the implementation supports `infrastructure`, use it to carry the cloud provider's annotations to the load balancer's Service; otherwise follow the implementation's documentation.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: molesignal-internal
+  namespace: molesignal
+spec:
+  gatewayClassName: <GatewayClass>
+  infrastructure:
+    annotations:
+      # Per cloud provider, for example Alibaba Cloud ACK:
+      service.beta.kubernetes.io/alibaba-cloud-loadbalancer-address-type: intranet
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: molesignal.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: molesignal-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: molesignal-public
+  namespace: molesignal
+spec:
+  gatewayClassName: <GatewayClass>
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: molesignal.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: molesignal-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+```
+
+## Internal HTTPRoute
+
+The internal HTTPRoute forwards every path. Live queries are streamed responses, so they get a longer timeout of their own:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: molesignal-internal
+  namespace: molesignal
+spec:
+  parentRefs:
+    - name: molesignal-internal
+  hostnames: [molesignal.example.com]
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: /api/v1/query/stream }
+      timeouts:
+        request: 600s
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    - matches:
+        - path: { type: PathPrefix, value: / }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+```
+
+## Public HTTPRoute
+
+The public HTTPRoute matches only the paths to open, with their methods; the gateway answers 404 to every request that matches nothing. Keep only the matches in use:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: molesignal-public
+  namespace: molesignal
+spec:
+  parentRefs:
+    - name: molesignal-public
+  hostnames: [molesignal.example.com]
+  rules:
+    # External callbacks: external alerts, heartbeat check-ins, the Jira ticket webhook, on-call calendar subscriptions, Mole Agent in Teams, replies to texts and calls, automation API triggers, push sources
+    - matches:
+        - { path: { type: Exact, value: /api/v1/intake/alerts }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/intake/heartbeats }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/intake/heartbeats }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/tickets/jira }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/calendar }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/im/teams }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/notify }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/automations }, method: POST }
+        - { path: { type: Exact, value: /api/v1/_kinesis_firehose }, method: POST }
+        - { path: { type: Exact, value: /api/v1/_cloudflare }, method: POST }
+        - { path: { type: Exact, value: /api/v1/_heroku }, method: POST }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    # RUM: POST and the browser's CORS preflight
+    - matches:
+        - { path: { type: Exact, value: /api/v1/rum/events }, method: POST }
+        - { path: { type: Exact, value: /api/v1/rum/events }, method: OPTIONS }
+        - { path: { type: Exact, value: /api/v1/rum/replay }, method: POST }
+        - { path: { type: Exact, value: /api/v1/rum/replay }, method: OPTIONS }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    # Synthetics Probe Agent artifact uploads
+    - matches:
+        - { path: { type: PathPrefix, value: /api/v1/synthetics/artifacts }, method: PUT }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    # Status pages, resource sharing and their web files
+    - matches:
+        - { path: { type: PathPrefix, value: /status }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/status-pages } }
+        - { path: { type: PathPrefix, value: /s }, method: GET }
+        - { path: { type: Exact, value: /shared }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/share } }
+        - { path: { type: PathPrefix, value: /assets }, method: GET }
+        - { path: { type: Exact, value: /favicon.ico }, method: GET }
+        - { path: { type: Exact, value: /favicon.svg }, method: GET }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+```
+
+`PathPrefix` matches by path element: `/s` matches `/s/<share token>` but not `/shared`. Matching by method is an extended feature of Gateway API that most implementations support; when the implementation in use does not, drop `method` and let MoleSignal answer `405` or `404` to the methods it does not take.
+
+## Policies of the implementation
+
+Source address allowlists, rate limits, body limits and real client address detection are not part of Gateway API; each implementation provides them with its own resources, for example:
+
+- **Envoy Gateway**: `SecurityPolicy` allows by source address, `BackendTrafficPolicy` limits rates, and `ClientTrafficPolicy` detects the real client address.
+- **Istio**: `AuthorizationPolicy` allows by source address.
+- **NGINX Gateway Fabric**: `ClientSettingsPolicy` sets the body limit.
+
+With another implementation, configure the same limits as its documentation describes. For example, to let only the ranges of the Azure service tag `AzureBotService` reach the Teams callback on Envoy Gateway, move the Teams match to an HTTPRoute of its own, `molesignal-public-teams`, and attach a `SecurityPolicy` to it:
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: molesignal-teams-allowlist
+  namespace: molesignal
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: molesignal-public-teams
+  authorization:
+    defaultAction: Deny
+    rules:
+      - action: Allow
+        principal:
+          clientCIDRs:
+            - 203.0.113.0/24
+            - 198.51.100.0/24
+```
+
+## Custom domains of status pages
+
+When a status page uses `status.example.org`, add a listener for that name to the public Gateway, and an HTTPRoute that opens only the status page's root paths, endpoints and web files:
+
+```yaml
+# Add to the listeners of molesignal-public
+- name: https-status
+  protocol: HTTPS
+  port: 443
+  hostname: status.example.org
+  tls:
+    mode: Terminate
+    certificateRefs:
+      - name: status-example-org-tls
+  allowedRoutes:
+    namespaces:
+      from: Same
+```
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: molesignal-status-domain
+  namespace: molesignal
+spec:
+  parentRefs:
+    - { name: molesignal-public, sectionName: https-status }
+  hostnames: [status.example.org]
+  rules:
+    - matches:
+        - { path: { type: Exact, value: / }, method: GET }
+        - { path: { type: Exact, value: /history }, method: GET }
+        - { path: { type: Exact, value: /uptime }, method: GET }
+        - { path: { type: PathPrefix, value: /incidents }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/status-pages } }
+        - { path: { type: PathPrefix, value: /assets }, method: GET }
+        - { path: { type: Exact, value: /favicon.ico }, method: GET }
+        - { path: { type: Exact, value: /favicon.svg }, method: GET }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+```
+
+## Check
+
+Confirm that both Gateways have addresses and that the HTTPRoutes report `Accepted` and `ResolvedRefs`:
+
+```bash
+kubectl -n molesignal get gateway,httproute
+```
+
+From the internet, the sign-in endpoint answers `404`, and alert intake without a token answers `401`:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://molesignal.example.com/api/v1/auth/signin
+```
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://molesignal.example.com/api/v1/intake/alerts
+```
+
+Finally, in the `_sys` organization, list the network of the public gateway's proxies as trusted proxies under **Settings → Client IP recognition**, see [Client IP recognition](/en-US/settings/platform#client-ip-recognition).

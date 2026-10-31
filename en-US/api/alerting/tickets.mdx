@@ -1,0 +1,178 @@
+---
+title: "Tickets"
+description: "Connect Jira, ServiceNow or Meegle (Feishu Project), create tickets for incidents, have them follow the incident with comments and transitions, and sync their status."
+"zh-Hans_link": "/zh-Hans/api/alerting/tickets"
+---
+
+A ticket connector connects Jira (Cloud, or Data Center / Server), ServiceNow or Feishu Project (Meegle outside
+China). A ticket created for an incident follows it: acknowledgements, resolutions, and notes can be
+written as comments, and resolving the incident can move the ticket to done. The ticket's status is synced
+every 5 minutes, and Jira can also push it at once through a webhook. How the pages use it is in
+[Tickets](/en-US/alerting/tickets).
+
+| Method and path | What it does | Permission |
+|---|---|---|
+| `GET /api/v1/alerts/tickets/connectors` | The organization's ticket connectors, as `{ "connectors": [ ... ] }`. | `alerts.tickets.read` |
+| `POST /api/v1/alerts/tickets/connectors` | Creates a connector. | `alerts.tickets.manage` |
+| `PUT /api/v1/alerts/tickets/connectors/{id}` | Replaces a connector; `system` cannot change. | `alerts.tickets.manage` |
+| `DELETE /api/v1/alerts/tickets/connectors/{id}` | Deletes a connector. | `alerts.tickets.manage` |
+| `POST /api/v1/alerts/tickets/connectors/{id}/test` | Tests the connection: Jira returns `{ "ok": true, "detail": "<signed-in user>" }`, Feishu Project reads the work item type once. | `alerts.tickets.manage` |
+| `GET /api/v1/alerts/tickets/sites` | The address of each Feishu Project platform: `{ "meegle": [{ "key": "feishu", "url": "https://project.feishu.cn" }, { "key": "lark", "url": "https://meegle.com" }] }`. | `alerts.tickets.read` |
+| `GET /api/v1/alerts/incidents/{id}/tickets` | The incident's tickets, as `{ "tickets": [ ... ] }`. | `alerts.incidents.read` on the incident |
+| `POST /api/v1/alerts/incidents/{id}/tickets` | Creates a ticket for the incident with a connector. | `alerts.incidents.tickets` on the incident |
+| `POST /api/v1/public/tickets/jira/{connector_id}` | Jira's webhook, without signing in. | `X-Hub-Signature` |
+
+## Connectors
+
+**Request body**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | string | Yes | A name. |
+| `system` | string | Yes | `jira` or `meegle`. |
+| `settings` | object | Yes | The site, project, type, and mappings; see below. |
+| `secrets` | object | When creating | Credentials, stored encrypted and never returned. Jira takes `api_token` (a Cloud API token or a Data Center personal access token) and an optional `webhook_secret`; Feishu Project takes `plugin_secret`. Left empty on a change, a secret keeps its value. |
+| `comments` | object | No | `{ "acknowledged": true, "resolved": true, "notes": true }`: comment when the incident is acknowledged or resolved, and write the incident's notes as comments. All default to `false`. |
+| `transition_on_resolve` | boolean | No | Move the ticket to done when the incident is resolved. Default `false`. |
+| `resolve_incident_when_done` | boolean | No | Resolve the incident when the ticket is done, whether it is open or acknowledged, with no one recorded. Default `false`. |
+| `auto` | object | No | Automatic tickets: `{ "enabled": true, "min_severity": "error", "conditions": [ ... ] }`. A new incident at or above `min_severity` whose labels meet `conditions` gets a ticket; `conditions` are written as in [routing rules](/en-US/api/alerting/create-routing-rule). |
+| `on_major_incident` | boolean | No | Create a ticket when a [major incident](/en-US/api/alerting/major-incidents) is declared. Default `false`. |
+| `enabled` | boolean | No | Default `true`. A disabled connector creates and syncs no tickets and takes no webhooks. |
+
+**`settings`: Jira**
+
+| Field | Notes |
+|---|---|
+| `site_url` | The site address, starting with `https://`, for example `https://example.atlassian.net`. |
+| `deployment` | `cloud` (default): the account email plus an API token, over REST API v3 with Atlassian Document Format bodies. `data_center`: a personal access token, over REST API v2. |
+| `email` | The Cloud account email. |
+| `project_key`, `issue_type` | The project key and issue type, for example `OPS` and `Incident`. |
+| `priorities` | Severities mapped to Jira priority names, for example `{ "critical": "Highest" }`; unmapped ones set no priority. |
+| `labels` | Labels added to tickets, besides the `molesignal` label every ticket gets. |
+| `fields` | Default values for other fields when creating, keyed by Jira field ID. |
+| `resolve_transition` | The transition taken when the incident is resolved, by name or ID; empty takes the first transition to a done status. |
+
+**`settings`: Feishu Project**
+
+| Field | Notes |
+|---|---|
+| `site` | The platform: `feishu` (default, Feishu Project, at `https://project.feishu.cn`) or `lark` (Meegle, at `https://meegle.com`). The address follows the platform and cannot be changed. |
+| `plugin_id` | The plugin ID, exchanged with `plugin_secret` for a plugin token. |
+| `user_key` | Whose name tickets and comments are written in. |
+| `project_key`, `work_item_type_key` | The space and the work item type. |
+| `priority_field`, `priorities` | The priority field's key, and severities mapped to priority option values; empty sets no priority. |
+| `fields` | Default values for other fields when creating, keyed by field_key. |
+| `resolve_transition_id` | For a status-flow work item: the transition ID taken when the incident is resolved. |
+| `resolve_node_id` | For a node-flow work item: the node ID completed when the incident is resolved. |
+| `done_states` | The status keys that count as done. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/tickets/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "Jira OPS",
+    "system": "jira",
+    "settings": {
+      "site_url": "https://example.atlassian.net",
+      "deployment": "cloud",
+      "email": "oncall-bot@example.com",
+      "project_key": "OPS",
+      "issue_type": "Incident",
+      "priorities": { "critical": "Highest", "error": "High" }
+    },
+    "secrets": { "api_token": "<jira-api-token>", "webhook_secret": "<webhook-secret>" },
+    "comments": { "acknowledged": true, "resolved": true, "notes": true },
+    "transition_on_resolve": true,
+    "auto": { "enabled": true, "min_severity": "critical", "conditions": [] }
+  }'
+```
+</RequestExample>
+
+The response is the saved connector: `secrets` is not returned, and `secrets_set` lists the credentials
+that are set. A Jira connector also has `webhook_path`, which is
+`/api/v1/public/tickets/jira/<connector ID>`. Creating, changing, and deleting are recorded in the audit log.
+
+**`settings` for ServiceNow**
+
+| Field | Description |
+|---|---|
+| `instance_url` | The instance address, starting with https. |
+| `auth` | `basic` (default, secret `password`), `oauth` (client credentials, secret `client_secret`) or `api_key` (secret `api_key`). |
+| `username`, `client_id` | The basic authentication user, the OAuth client ID. |
+| `table` | The table to create in, `incident` by default; it must extend `task`. |
+| `assignment_group`, `caller_id`, `category` | Fields written on creation; the first two are `sys_id`s. |
+| `priorities` | Severity or priority → `impact/urgency`; one number means both. |
+| `fields` | Defaults of other fields on creation (field name → value). |
+| `resolve_state`, `close_code` | The `state` and `close_code` written when the incident resolves, `6` and `Solution provided` by default. An empty `close_code` writes none. |
+| `done_states` | Values of `state` that count as done, `6`, `7` and `8` by default. |
+
+Testing the connector answers `{ "ok": true, "detail": "<table>" }`.
+
+## Create a ticket for an incident
+
+```http
+POST /api/v1/alerts/incidents/{id}/tickets
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `connector_id` | string | Yes | The connector to create it with. When the incident already has a ticket there, that ticket is returned. |
+
+The ticket's title is `[severity] incident summary`; its body gives the incident's severity and status,
+services, labels, triggering query, the summary of its AI root cause, and the incident page address, in the
+workspace's default language. The ticket is recorded on the incident's timeline and in the audit log.
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KJ4m8T1qHd0Ue6WzB2nLc9RfPa",
+  "org_id": "<organization-id>",
+  "incident_id": "<incident-id>",
+  "connector_id": "<connector-id>",
+  "system": "jira",
+  "external_id": "10482",
+  "external_key": "OPS-42",
+  "url": "https://example.atlassian.net/browse/OPS-42",
+  "status": "To Do",
+  "done": false,
+  "incident_status": "open",
+  "created_by": "<user-id>",
+  "created_at": 1790000000000000,
+  "synced_at": 1790000000000000,
+  "last_error": "",
+  "action_item_id": null
+}
+```
+</ResponseExample>
+
+| Field | Notes |
+|---|---|
+| `external_id`, `external_key` | The Jira issue ID and key; both are the work item ID in Feishu Project. |
+| `status`, `done` | The status name found at the last sync, and whether it is done. Jira goes by the `done` status category, Feishu Project by the connector's `done_states`. |
+| `synced_at`, `last_error` | When it was last synced, and the error from the last sync or comment (cleared after a success). |
+| `action_item_id` | Set on a ticket made for a [postmortem action item](/en-US/api/alerting/postmortems); such tickets get no comments or transitions from the incident. |
+
+## Status sync and the Jira webhook
+
+Tickets that are not done are synced every 5 minutes. When a ticket becomes done and its connector has
+`resolve_incident_when_done`, the incident is resolved, except for tickets made for postmortem action
+items.
+
+Once a Jira connector has a `webhook_secret`, add a webhook in Jira under **System settings → WebHooks**:
+the URL is MoleSignal's external address followed by `webhook_path`, the secret is the same
+`webhook_secret`, and the events are issue updates.
+
+```http
+POST /api/v1/public/tickets/jira/{connector_id}
+```
+
+MoleSignal computes HMAC-SHA256 over the body with `webhook_secret` and compares it with
+`X-Hub-Signature: sha256=<hex>`. The body is at most 1 MiB.
+
+| Status | Reason |
+|---|---|
+| `204` | Taken; also `204` when the body's issue is not a ticket MoleSignal created. |
+| `401` | The signature does not match, or the connector has no `webhook_secret` and takes no webhooks. |
+| `404` | The connector does not exist, is disabled, or is not Jira. |

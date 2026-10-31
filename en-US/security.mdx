@@ -16,18 +16,18 @@ verify the organization before reads or mutations.
 Cross-workspace access must use an explicit IAM grant or supported resource share. A mismatched
 resource lookup does not silently switch organizations.
 
-The `_sys` organization is a protected platform scope. Tenant JWTs and `ms_*` API tokens cannot
+The `_sys` organization is a protected platform scope. Tenant sessions and `ms_*` API tokens cannot
 enumerate platform administrators, or MoleSignal self-telemetry.
 
 ## Authentication and authorization
 
 MoleSignal accepts:
 
-- login JWTs, including newly scoped JWTs after a workspace switch;
-- API tokens shaped `ms_<prefix>_<secret>`;
+- browser sessions in HttpOnly cookies, rewritten for the new scope after a workspace switch;
+- API tokens shaped `ms_<prefix>_<secret>` in the `Authorization` header;
 - dedicated self-authenticating tokens for narrowly scoped public or integration routes.
 
-Users sign in with a password or through an OIDC, SAML, or LDAP provider that an administrator configures under **Identity & Access → SSO providers**.
+Users sign in with a password or through an OIDC, OAuth 2.0, SAML, or LDAP provider that an administrator configures under **Identity & Access → SSO providers**.
 
 The API-token prefix is stored for lookup, and the secret is hashed. The complete token is shown
 only at creation.
@@ -35,12 +35,26 @@ only at creation.
 After authentication, the server resolves database-backed permissions, roles, bindings, resource
 relationships, target ownership. See [Identity & access](/en-US/identity).
 
+## Browser sessions
+
+A sign-in sets two cookies: an access token that every API request carries, valid for 15 minutes,
+and a refresh token that renews it until the session ends after `[auth].session_ttl_secs`. Both are
+`HttpOnly`, so page scripts cannot read them, `SameSite=Strict`, and `Secure` over HTTPS. A request
+that changes data with the session must come from a MoleSignal page, as the browser marks it with
+`Sec-Fetch-Site`. Cross-origin calls to the API never carry credentials.
+
+The server keeps no session records: both tokens are signed JWTs. Signing out deletes the cookies of
+that browser, and a token copied out of a browser stays valid until it expires. To cut a user off at
+once, disable the account, which every request and every renewal checks. A rotation of the signing
+keys ends every session after its 24-hour grace period.
+
 ## JWT signing keys
 
 JWT signing keys are bootstrapped into the database on the first start. Raw key bytes are never returned by the
 metadata endpoint. A rotation signs new tokens with a new key, and tokens signed with the retired key stay valid for 24 hours.
+Every node picks up the new key without a restart.
 
-Listing or rotating signing keys requires the platform permission `sys.settings.manage`:
+Listing or rotating signing keys requires the platform permission `sys.signing_keys.rotate`:
 
 ```text
 GET  /api/v1/auth/jwt/secrets
@@ -52,12 +66,13 @@ Use `MS_AUTH_JWT_SECRET_OVERRIDE` only when deployment policy requires a fixed b
 ## Audit
 
 Security-relevant and product mutation paths record actor, organization, action, target, time, and
-safe metadata. Query organization events under **Settings → Audit** with `audit.read`.
+safe metadata. Query organization events under **Settings → Audit** with `audit.read`. The same events
+are rows of the `_audit` stream; see [Audit stream](/en-US/settings/data-security#audit-stream).
 
 Audit records are kept for 90 days by default. Once a day, records older than the retention period
 are deleted for every organization and for the platform, and cannot be recovered. Set the period
 under **Settings → Audit retention** in the `_sys` organization, which requires
-`sys.settings.manage`; `0` keeps records forever. Each change of the period is recorded in the
+`sys.settings.retention.manage`; `0` keeps records forever. Each change of the period is recorded in the
 platform audit as `audit_retention.update`.
 
 Credentials, model keys, sensitive webhook headers, and raw signing material are
@@ -80,8 +95,8 @@ the values reach Parquet, and a plain query returns ciphertext. SQL restores the
 `decrypt(field)`. See [Streams](/en-US/streams#encrypted-fields).
 
 Organization data keys are wrapped with the cipher root key from `MS_CIPHER_KEY`, and key material
-is not returned after creation. Reading key metadata requires `org.settings.read`; creating,
-rotating, or deleting keys requires `org.settings.manage`.
+is not returned after creation. Reading key metadata requires `org.cipher_keys.read`; creating,
+rotating, or deleting keys requires `org.cipher_keys.manage`.
 
 <Warning>
   Losing `MS_CIPHER_KEY` can make encrypted fields unrecoverable. Store the key in a secrets manager
@@ -106,11 +121,18 @@ The `router` role applies per-organization token buckets to intake and query req
 [Role-based deployment](/en-US/deployment/role-based#rate-limiting). An intake request body above
 2 MiB is rejected with `413`.
 
+Password sign-in counts failures per account and per source address. At a limit it answers `429` with
+`Retry-After` and no longer checks the password. A lock falls only on the address that made the requests;
+the account itself is only slowed down, so nobody can lock someone else out by getting a password wrong.
+An account that does not exist counts and answers the same way. See
+[Sign-in limits](/en-US/settings/platform#sign-in-limits).
+
 ## Hardening for production
 
 Replace the sandbox defaults before real data arrives: the root account, `MS_CIPHER_KEY`, database
 and object storage credentials. See the
-[Production checklist](/en-US/deployment/production-checklist).
+[Production checklist](/en-US/deployment/production-checklist). On an internal network, open only external
+callbacks and public pages to the internet, see [Public access](/en-US/public-access).
 
 <Card title="Self-observability" icon="heart-pulse" href="/en-US/self-observability">
   Configure protected `_sys` telemetry, tail sampling, and node-local diagnostics.

@@ -1,0 +1,130 @@
+---
+title: "Similar incidents and recent changes"
+description: "List past incidents like this one, and the deployments, configuration changes and feature flags reported around its trigger."
+"zh-Hans_link": "/zh-Hans/api/alerting/related-incidents"
+---
+
+Both calls require `alerts.incidents.read` on the incident.
+
+## Similar incidents
+
+```http
+GET /api/v1/alerts/incidents/{id}/similar
+```
+
+Finds the incidents opened in the same organization in the 90 days before this one was triggered that
+are most like it: at most 5, highest score first, newer first on a tie. Incidents merged into it and the
+incident it is merged into are left out. The score is the sum of the rows below, and an incident needs
+at least 2 to be listed:
+
+| Ground | Value in `reasons` | Score |
+|---|---|---|
+| The same alert fingerprint | `fingerprint` | 5 |
+| The same rule (when the fingerprint differs) | `rule` | 3 |
+| Shared services | `services` | overlap × 2 |
+| Similar labels: the shared key-value pairs are at least 0.3 of all pairs on both | `labels` | share × 2 |
+| A similar title: trigram similarity of at least 0.3, computed as PostgreSQL `pg_trgm` does, Chinese included | `title` | similarity × 2 |
+| Routed to the same team | `team` | 1 |
+
+Overlap is the intersection of both sides over their union.
+
+<RequestExample>
+```bash cURL
+curl http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/similar \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "incidents": [
+    {
+      "id": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+      "summary": "High error rate · checkout",
+      "severity": "critical",
+      "status": "resolved",
+      "created_at": 1789400000000000,
+      "resolved_at": 1789401800000000,
+      "resolved_by": "<user-id>",
+      "score": 7.6,
+      "reasons": ["fingerprint", "services", "labels", "team"],
+      "notes": 2,
+      "root_cause": "Connection pool exhausted after the payments client stopped releasing connections."
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Field | Description |
+|---|---|
+| `score`, `reasons` | The score and what it came from; see the table above. |
+| `resolved_by` | Who resolved it; `null` when its rule recovered on its own or it is still active. |
+| `notes` | How many [notes](/en-US/api/alerting/add-incident-note) it has. |
+| `root_cause` | The first sentence that says something in its [AI root cause](/en-US/api/alerting/incident-rca) (headings and blank lines skipped), at most 200 characters; left out when it has no analysis. |
+
+## Recent changes
+
+```http
+GET /api/v1/alerts/incidents/{id}/changes
+```
+
+Lists the [changes reported](/en-US/apm/deployments#report-deployments-from-ci) from 30
+minutes before the incident was triggered to 10 minutes after, for the incident's services (its affected
+services and its `service` label) and the services downstream of them: at most 20, oldest first.
+Downstream services come from the APM service map, for at most the incident's first 3 services; without
+a service map only the incident's own services count. When the incident's rule was edited in the 24 hours
+before the trigger, a `rule` change is listed too.
+
+<RequestExample>
+```bash cURL
+curl http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/changes \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "from": 1789998200000000,
+  "to": 1790000600000000,
+  "changes": [
+    {
+      "kind": "deployment",
+      "at": 1789999100000000,
+      "service": "payments",
+      "downstream": true,
+      "version": "v2026.10.28",
+      "status": "succeeded",
+      "commit": "9f2c1e4",
+      "author": "dana",
+      "link": "https://ci.example.com/pipelines/4821"
+    },
+    {
+      "kind": "rule",
+      "at": 1789960000000000,
+      "downstream": false,
+      "rule_id": "3KEDBLvTYO6DnWi8H9S9MNLpPT7",
+      "rule_name": "Checkout error rate"
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Field | Description |
+|---|---|
+| `from`, `to` | The time range looked at, in Unix microseconds. |
+| `kind` | `deployment`, `configuration`, `feature_flag`, or `rule` (the incident's rule was edited). |
+| `downstream` | `true` when the change belongs to a downstream service, not one of the incident's own. |
+| `version`, `status`, `commit`, `description`, `author` | What the report carried; left out when it did not. |
+| `link` | The reported pipeline address, or else the pull request address. |
+| `rule_id`, `rule_name` | The rule of a `rule` change. |
+
+**Errors**
+
+| Status | Reason |
+|---|---|
+| `403` | The token lacks `alerts.incidents.read`, or cannot access this incident. |
+| `404` | The incident does not exist. |

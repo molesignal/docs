@@ -1,0 +1,88 @@
+---
+title: "Heartbeat check-ins"
+description: "Check a scheduled job in at a heartbeat rule's address, read the last check-in, and reset the address."
+"zh-Hans_link": "/zh-Hans/api/alerting/heartbeats"
+---
+
+A [heartbeat rule](/en-US/api/alerting/create-rule#heartbeat-rules) waits for a job to check in after each
+run; it fires when no check-in arrives within the period plus the grace, or when a check-in reports a
+failure.
+
+| Method and path | What it does | Permission |
+|---|---|---|
+| `GET`, `POST /api/v1/intake/heartbeats/{token}` | Checks in, without signing in. | The token in the address |
+| `GET /api/v1/alerts/rules/{id}/heartbeat` | The last check-in and when the next one is due. | `alerts.rules.read` on the rule |
+| `POST /api/v1/alerts/rules/{id}/heartbeat-token` | Resets the check-in address. | `alerts.rules.manage` on the rule |
+
+## Check in
+
+```http
+GET /api/v1/intake/heartbeats/{token}
+POST /api/v1/intake/heartbeats/{token}
+```
+
+The address is given the first time a heartbeat rule is saved; see
+[Create a rule](/en-US/api/alerting/create-rule#heartbeat-rules). Request it when the job succeeds; add
+`?status=fail` when it fails, and the rule fires at once instead of waiting for the period. The start of a
+`POST` body (up to 1000 characters) is kept as the check-in's message and shows in the incident annotation
+`heartbeat_message`; a body over 64 KiB answers `413`. A check-in judges a round of the rule at once: a
+failure fires it, and a success lets an open incident recover under the recovery condition.
+
+<RequestExample>
+```bash cURL
+# The backup succeeded
+curl -fsS https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN
+
+# The backup failed: send its last lines of output
+tail -n 20 backup.log | curl -fsS -X POST --data-binary @- \
+  "https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN?status=fail"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "ok": true, "status": "fail" }
+```
+</ResponseExample>
+
+Only `status=fail` counts as a failure; any other value, or none, counts as a success. A wrong token, a
+deleted rule, or a reset address answers `404`.
+
+## Read the check-in state
+
+```http
+GET /api/v1/alerts/rules/{id}/heartbeat
+```
+
+<ResponseExample>
+```json 200
+{
+  "last_checkin_at": 1790000000000000,
+  "last_status": "ok",
+  "last_message": "",
+  "due_at": 1790003900000000,
+  "alarming": false,
+  "issued_at": 1789900000000000
+}
+```
+</ResponseExample>
+
+| Field | Notes |
+|---|---|
+| `last_checkin_at` | The last check-in, in Unix microseconds; `null` before the first. |
+| `last_status`, `last_message` | Whether the last check-in reported `ok` or `fail`, and its message. |
+| `due_at` | When the next check-in is due at the latest: the last check-in (or, before any, when the address was issued) plus the period and the grace. |
+| `alarming` | Whether the rule should fire now: the last check-in reported a failure, or `due_at` has passed. |
+| `issued_at` | When the current address was issued or reset. |
+
+A rule that is not a heartbeat rule, or has no address yet, answers `404`.
+
+## Reset the check-in address
+
+```http
+POST /api/v1/alerts/rules/{id}/heartbeat-token
+```
+
+Issues a new address; the old one stops working at once, and the check-in record is kept. Returns
+`{ "path": "...", "url": "..." }`, the address given only this once, with `url` `null` when no external
+address is set. The reset is recorded in the audit log. A rule that is not a heartbeat rule answers `400`.

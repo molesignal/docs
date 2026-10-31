@@ -5,7 +5,7 @@ description: "安装并配置 MoleSignal Browser RUM SDK，识别用户、添加
 "en_link": "/en-US/rum/browser-sdk"
 ---
 
-MoleSignal Browser RUM SDK 采集页面视图、用户交互、前端错误、Web Vitals、网络资源、长任务和链路关联上下文，并以 [RUM 事件](/zh-Hans/rum/events)的形式发送。
+MoleSignal Browser RUM SDK 采集页面视图、用户交互、前端错误、Web Vitals、网络资源、长任务、[日志](/zh-Hans/rum/logs)和链路关联上下文，并以 [RUM 事件](/zh-Hans/rum/events)的形式发送。
 
 ## 前提条件
 
@@ -148,7 +148,41 @@ rum.stopDurationVital(vital);
 await rum.flush();
 ```
 
-在受控的导航或关闭之前调用 `rum.flush()`，等待队列中的事件发送完成。调用 `rum.stop()` 会移除采集并刷新客户端。
+在受控的导航或关闭之前调用 `rum.flush()`，等待队列中的事件发送完成。调用 `rum.stop()` 会移除采集并刷新客户端。[告警规则](/zh-Hans/rum/alerts#应用自己度量的指标)可以监控自定义 timing 和 vital，[功能开关](/zh-Hans/rum/feature-flags)有自己的页面，[日志](/zh-Hans/rum/logs)写进 `rum_logs` 数据流。
+
+页面在你说就绪时才算就绪，`rum.setViewLoadingTime()` 用此刻取代视图的加载时间。
+
+## 链接到会话的回放
+
+`getSessionReplayLink()` 返回当前会话在 MoleSignal 里的地址，可以附在工单或错误报告里。SDK 还没启动、这个会话没有被采样或没有同意时返回 `undefined`。地址由 `appUrl` 拼成，默认等于 `site`；人们打开 MoleSignal 的地址和 SDK 发送的地址不同时要设置它。
+
+```ts
+ticket.replay = molesignalRum.getSessionReplayLink();
+```
+
+打开链接需要登录和 `rum.replay.read`。
+
+## React
+
+`@molesignal/browser-rum/react` 把路由器的路由变成 SDK 的视图，按路由模式命名（`/orders/:id`，而不是 `/orders/42`），并上报组件树抛出的错误。React 是可选的 peer 依赖。
+
+```tsx
+import { init } from '@molesignal/browser-rum';
+import { reactPlugin, RumErrorBoundary, trackReactRouter } from '@molesignal/browser-rum/react';
+
+init({ /* … */ plugins: [reactPlugin()] });
+trackReactRouter(router); // createBrowserRouter 的路由器；TanStack Router 用 trackTanStackRouter
+
+root.render(
+  <RumErrorBoundary fallback={<Oops />}>
+    <RouterProvider router={router} />
+  </RumErrorBoundary>,
+);
+```
+
+## 远程配置
+
+设置 `remoteConfiguration: true` 后，SDK 在启动前读取[应用的 SDK 设置](/zh-Hans/rum/applications#sdk-远程配置)，所以修改采样率和隐私级别不需要重新发布页面。
 
 ## 自动采集的默认值
 
@@ -159,13 +193,17 @@ await rum.flush();
 | 长动画帧与长任务 | `trackLongTasks` | `true` |
 | 视图上的 Web Vitals | `trackWebVitals` | `true` |
 | 点击 | `trackUserInteractions` | `false` |
+| 视图在页面上往下看到多远 | `trackScroll` | `true` |
 | Rage、Dead 和 Error 点击 | `trackFrustrations` | 与交互跟踪一致 |
 | 运行时错误、未处理的 rejection、失败的请求 | 内置 | 启用 |
 | `console.error` | `trackConsoleErrors` | `false` |
+| 把控制台写成[日志](/zh-Hans/rum/logs) | `forwardConsoleLogs` | `[]` |
+| SDK 自身的问题写成日志 | `trackSdkErrors` | `true` |
+| 请求和响应的头 | `trackResourceHeaders` | `[]` |
 | 从后退/前进缓存恢复页面 | `trackBfcacheViews` | `false` |
 | DOM 会话回放 | `sessionReplaySampleRate` | `0` |
 
-点击进行期间开始的资源、错误和长任务会带上它的 `action.id`，并计入这次点击。失败的请求是来源为 `network` 的错误，失败的请求写在 `error.resource` 中。FCP、LCP 和 FID 描述页面加载，在初始视图上报。INP 和 CLS 来自 `web-vitals`，它们每次页面加载只度量一次：SDK 把每个指标记在决定性的交互或布局偏移发生的那个视图上。
+测试驱动的会话会写明类型，见[测试流量](/zh-Hans/rum/test-traffic)。点击进行期间开始的资源、错误和长任务会带上它的 `action.id`，并计入这次点击。失败的请求是来源为 `network` 的错误，失败的请求写在 `error.resource` 中。FCP、LCP 和 FID 描述页面加载，在初始视图上报。INP 和 CLS 来自 `web-vitals`，它们每次页面加载只度量一次：SDK 把每个指标记在决定性的交互或布局偏移发生的那个视图上。
 
 ## 把浏览器请求关联到链路
 
@@ -198,10 +236,19 @@ allowedTracingUrls: [
 | `sessionReplaySampleRate` | `0` | 已采集会话中录制回放的百分比 |
 | `sessionInactivityTimeout` | `900000` | 会话因空闲而结束的时间，单位为毫秒 |
 | `maxSessionDuration` | `14400000` | 会话持续的最长时间，单位为毫秒 |
-| `defaultPrivacyLevel` | `mask` | `mask` 或 `allow`：操作名称、选择器和元素提示是否带有页面文本和 ID |
+| `defaultPrivacyLevel` | `mask` | `mask`、`mask-user-input` 或 `allow`：页面内容和输入内容发送多少。见[隐私](/zh-Hans/rum/privacy) |
 | `trackUrlQueryString` | `false` | 在上报的 URL 中保留查询字符串 |
 | `excludedUrls` | `[]` | 以字符串、RegExp 或回调形式排除请求的 URL |
 | `allowedTracingUrls` | 同源 | 接收并贡献 trace 上下文的请求 |
+| `traceSampleRate` | `100` | 请求发起的 trace 中，要求后端保留的百分比（W3C sampled 标志）。其余的仍带 trace 上下文，请求和 trace ID 的关联不变 |
+| `trackResourceHeaders` | `[]` | 要保留的 fetch、XHR 头，按名字或正则。凭据永远不保留 |
+| `forwardConsoleLogs` | `[]` | 同时写日志的控制台方法：`'all'`，或 `debug`、`log`、`info`、`warn`、`error` 中的几个 |
+| `trackSdkErrors` | `true` | 把 SDK 自身的问题写成应用的日志，每次页面加载几条 |
+| `trackScroll` | `true` | 记录每个视图在页面上往下看到多远 |
+| `compressIntakeRequests` | `false` | 浏览器支持时用 gzip 压缩事件请求 |
+| `remoteConfiguration` | `false` | 启动前读取[应用设置](/zh-Hans/rum/applications#sdk-远程配置)决定的值 |
+| `appUrl` | `site` | 人们打开 MoleSignal 的地址，用于 `getSessionReplayLink` |
+| `plugins` | `[]` | 扩展 SDK 的插件，例如 `reactPlugin()` |
 | `enablePersistentQueue` | `true` | 重新加载后从 IndexedDB 恢复未发送的遥测 |
 | `flushInterval`、`batchSize` | `5000`、`50` | 请求发送的时机和每个请求的事件数。批次上限为 100 |
 | `maxQueueSize` | `1000` | 离线时保留的事件数 |
@@ -214,6 +261,11 @@ allowedTracingUrls: [
 ## 发送
 
 事件会入队、分批发送，并保存在 IndexedDB 中，直到服务端接受。网络错误、`408`、`425`、`429` 或 `5xx` 之后，请求会以指数退避重试，并遵守 `Retry-After`。被 MoleSignal **拒绝**的事件不会重试，而是通过 `onError` 报告。其他 `4xx` 会丢弃整个批次。队列已满时，先丢资源，然后是长任务、回放、指标、操作、错误，最后才是视图。页面离开时，最重要的事件会先通过一个 `keepalive` 请求发送。同一应用的多个标签页共用队列，不会重复发送彼此的事件。
+
+## 从 0.2 升级
+
+- `defaultPrivacyLevel: 'allow'` 现在会显示输入框里输入的内容，但密码、邮箱地址、电话号码、银行卡和一次性验证码字段除外。`allow` 以前的行为现在是 `mask-user-input`：要继续遮罩输入内容就改成它。
+- 点在不是控件的地方也会上报为点击。
 
 ## 从 0.1 升级
 

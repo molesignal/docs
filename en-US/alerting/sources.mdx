@@ -1,0 +1,322 @@
+---
+title: "External alerts"
+description: "Let Alertmanager, Grafana, Datadog, PagerDuty, Zabbix, cloud monitors, email or your own systems send alerts in, open them as incidents, and escalate and notify them."
+"zh-Hans_link": "/zh-Hans/alerting/sources"
+---
+
+An alert source turns alerts sent by another system into [incidents](/en-US/alerting/incidents). They page people through an [escalation policy](/en-US/alerting/on-call#escalation-policies) and notify through [notify policies](/en-US/notification-channels) the same way incidents of rules do, and they resolve when the source reports recovery. Open **Alerts → Sources**. Reading requires `alerts.sources.read`; creating, editing, deleting and rotating tokens require `alerts.sources.manage`.
+
+## Source kinds
+
+Each source has a kind, which decides whose format the request body is read in.
+
+| Kind | Sender | One incident per |
+|---|---|---|
+| **API** | Scripts, CI and in-house systems calling the MoleSignal API | Dedup key |
+| **Alertmanager** | A webhook receiver of Prometheus Alertmanager | Notification group |
+| **Grafana** | A webhook contact point of Grafana Alerting | Notification group |
+| **Datadog** | The Datadog Webhooks integration | Monitor; each group of a multi-alert monitor |
+| **PagerDuty** | A PagerDuty V3 webhook subscription | PagerDuty incident |
+| **Alibaba Cloud CloudMonitor** | Threshold alarm callbacks and event subscription push channels | Object of an alarm rule, or system event |
+| **Tencent Cloud Observability Platform** | API callbacks of a notification template | One metric or event of one object under a policy, one per level on a leveled policy |
+| **Amazon CloudWatch** | Alarms sent to an SNS topic, through the topic's HTTPS subscription | One alarm |
+| **Zabbix** | A Zabbix webhook media type | One problem |
+| **Email** | An IMAP mailbox, or raw mail from a mail system you already run | A run of mails with the same subject |
+
+Systems that speak the Alertmanager webhook, such as the Alertmanager of Thanos, Cortex or Mimir, use the **Alertmanager** kind.
+
+## Create a source
+
+1. Open **Alerts → Sources** and click **New alert source**.
+2. Choose the **Kind** and enter a **Name**.
+3. Choose the **Escalation policy**. The default is **Routed (default)**, the same as in the rule workbench: [alert routing](/en-US/alerting/routing) picks the team and the escalation policy by the routing rules, the service's owning team and the team label, and otherwise the [default policy](/en-US/alerting/on-call#the-default-policy) named `default`. With a policy chosen, incidents take it and routing only picks the team. With **No escalation, notify policies only**, incidents still open and notify, but no escalation policy pages anyone.
+4. Choose the **Default severity**, used when an alert carries no severity of its own.
+5. Add **Extra labels** if needed, such as `team=payments`. They are added to every incident the source opens. A label the alert carries itself wins.
+6. Click **Create**. The source's page opens with a dialog that shows its token and the setup with the token filled in; Alibaba Cloud CloudMonitor needs only the intake address, so the dialog shows the address with the token in it.
+
+<Warning>
+  The token is shown only when the source is created or its token is rotated. After the dialog closes, only the prefix starting with `ms_` can be seen. If the token is lost, click **Rotate token** to get a new one; the old token stops working at once.
+</Warning>
+
+## Intake address and token
+
+Every source shares one intake address. The token tells which source an alert belongs to:
+
+```text
+https://<molesignal-host>/api/v1/intake/alerts
+```
+
+A token looks like `ms_<16>_<32>`, the same shape as an API token, but it only takes in alerts, and an API token cannot take in alerts. The sender puts it in a header:
+
+```text
+Authorization: Bearer <token>
+```
+
+A sender that cannot set headers (Alibaba Cloud CloudMonitor, Tencent Cloud Observability Platform, Amazon CloudWatch through SNS) carries the token in the address: `https://<molesignal-host>/api/v1/intake/alerts?token=<token>`.
+
+The sender must reach this address. When a firewall stands in front of MoleSignal, allow the egress addresses of the sender's site or region: Datadog lists them per site in the `webhooks` section of its `ip-ranges`, PagerDuty publishes them for its US and EU service regions, and Alibaba Cloud CloudMonitor lists its push ranges in its alarm callback docs. When MoleSignal runs on an internal network, see [Public access](/en-US/public-access) for opening only this address to the internet.
+
+## Set up the sender
+
+**Intake** on the source's page gives the intake address, the token and the setup of each kind in three steps. Replace `<TOKEN>` with the token of the source. Once the source receives its first request, the three steps are checked.
+
+### API
+
+```bash
+curl -X POST https://<molesignal-host>/api/v1/intake/alerts \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"dedup_key": "disk-full/web-1", "summary": "Disk almost full on web-1", "severity": "critical", "labels": {"host.name": "web-1"}}'
+```
+
+`action` is `trigger` (the default), `acknowledge` or `resolve`. Use the same `dedup_key` to acknowledge or resolve the same alert. [Send alerts](/en-US/api/alerting/send-alerts) describes every field.
+
+### Alertmanager
+
+Add a receiver to `alertmanager.yml` and route alerts to it:
+
+```yaml
+route:
+  receiver: molesignal
+receivers:
+  - name: molesignal
+    webhook_configs:
+      - url: https://<molesignal-host>/api/v1/intake/alerts
+        send_resolved: true
+        http_config:
+          authorization:
+            credentials: <token>
+```
+
+Keep `send_resolved` at `true`, or recoveries are never sent. Give every replica of one Alertmanager cluster the same `--web.external-url`: the external URL is part of the dedup key, so groups of the same name from Alertmanagers in several regions with the same routing are not merged into one incident.
+
+### Grafana
+
+1. In Grafana, open **Alerting → Contact points** and click **Add contact point**.
+2. Set **Integration** to **Webhook** and **URL** to the intake address.
+3. Under **Optional Webhook settings**, set **Authentication Header Scheme** to `Bearer` and **Authentication Header Credentials** to the token.
+4. Leave **Disable resolved message** cleared, save, and use the contact point in a notification policy.
+
+With file provisioning:
+
+```yaml
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: molesignal
+    receivers:
+      - uid: molesignal
+        type: webhook
+        settings:
+          url: https://<molesignal-host>/api/v1/intake/alerts
+          httpMethod: POST
+          authorization_scheme: Bearer
+          authorization_credentials: <token>
+```
+
+### Datadog
+
+1. In Datadog, open **Integrations → Webhooks** and add a webhook, named for example `molesignal`.
+2. Set **URL** to the intake address and **Custom Headers** to `{"Authorization": "Bearer <token>"}`. Leave **Encode as form** cleared.
+3. Set **Payload** to the template below. The field names are MoleSignal's and the values are Datadog variables; a request without this template is refused.
+
+```json
+{
+  "alert_id": "$ALERT_ID",
+  "alert_cycle_key": "$ALERT_CYCLE_KEY",
+  "transition": "$ALERT_TRANSITION",
+  "alert_type": "$ALERT_TYPE",
+  "priority": "$ALERT_PRIORITY",
+  "title": "$ALERT_TITLE",
+  "event_title": "$EVENT_TITLE",
+  "message": "$TEXT_ONLY_MSG",
+  "scope": "$ALERT_SCOPE",
+  "tags": "$TAGS",
+  "hostname": "$HOSTNAME",
+  "link": "$LINK",
+  "snapshot": "$SNAPSHOT",
+  "query": "$ALERT_QUERY",
+  "org_id": "$ORG_ID",
+  "last_updated": "$LAST_UPDATED"
+}
+```
+
+4. Mention `@webhook-molesignal` in the notification message of a monitor.
+
+Every Datadog site (`datadoghq.com`, `datadoghq.eu`, `us3`, `us5`, `ap1` and the others) can send to one source: the site is taken from the domain of `$LINK` and is part of the dedup key, together with the organization ID.
+
+### PagerDuty
+
+1. In PagerDuty, open **Integrations → Generic Webhooks (v3)** and click **New Webhook**.
+2. Set **Webhook URL** to the intake address and choose the **Scope Type** (the account, a service or a team).
+3. Under **Event Subscription**, select `incident.triggered`, `incident.acknowledged`, `incident.resolved`, `incident.reopened` and `incident.priority_updated`.
+4. Add the custom header `Authorization` with the value `Bearer <token>`.
+
+Accounts of the US and the EU service region can send to one source: the account domain (`<subdomain>.pagerduty.com` or `<subdomain>.eu.pagerduty.com`) is part of the dedup key and is written to the label `pagerduty.region`.
+
+### Alibaba Cloud CloudMonitor
+
+Add the token to the intake address:
+
+```text
+https://<molesignal-host>/api/v1/intake/alerts?token=<token>
+```
+
+- **Threshold alarms**: enter this address as the **alarm callback** of an alarm rule. CloudMonitor POSTs the callback form-encoded; MoleSignal also reads JSON.
+- **System events**: under **Event Center → Event Subscription → Push channels**, create a channel with the **Webhook** target type, the **POST** request method and the **JSON** data format, enter this address, and use the channel in a subscription policy.
+
+CloudMonitor waits 5 seconds for a system event callback and retries 3 times. MoleSignal waits at most 3 seconds when it passes a request on to the [receiving cluster](#multiple-clusters), and answers `503` on timeout so that CloudMonitor retries. The China and international sites and every region send the same format; the region is written to the label `aliyun.region`, and the account `userId` is part of the dedup key.
+
+### Tencent Cloud Observability Platform
+
+In Tencent Cloud Observability Platform (formerly Cloud Monitor), edit or create a template under **Alarm Management → Notification Templates**, enter the intake address as its **API callback**, and bind the template to your alarm policies. Tencent Cloud's callback cannot set headers, so the token goes in the address. Keep the address as a credential: the callback carries no signature, and the address is what identifies the source. Metric and event alarms both work, and triggers and recoveries are both pushed.
+
+- **Dedup**: the same account, alarm policy, metric or event name, and object make one alert. A leveled policy has one incident per level, each recovering on its own, as in Tencent Cloud.
+- **Severity**: `alarmLevel` Serious (`Serious`) is critical, Severe (`Warn`) is error and Reminder (`Remind`) is info. A policy without levels takes the source's default severity.
+- **Stateless events** (`alarmStatus` is `5`) open an incident with no recovery to wait for, so a person resolves it.
+- **Times** in the callback carry no time zone and are read as Beijing time.
+
+### Amazon CloudWatch
+
+CloudWatch alarms do not call outside addresses themselves; they go through SNS:
+
+1. In the alarm's notifications, send both entering **In alarm** (`ALARM`) and returning to **OK** to the same SNS topic. Without `OK`, incidents do not resolve on their own. For no-data alerts, send **Insufficient data** (`INSUFFICIENT_DATA`) too.
+2. Add an HTTPS subscription to the topic with the intake address as its endpoint, the token in the address:
+
+   ```bash
+   aws sns subscribe \
+     --topic-arn <ARN of the topic> \
+     --protocol https \
+     --notification-endpoint 'https://<molesignal-host>/api/v1/intake/alerts?token=<token>'
+   ```
+
+3. The subscription confirms itself: MoleSignal checks the signature of the confirmation message, then visits its `SubscribeURL`.
+
+MoleSignal checks the signature of every SNS message, so **Raw message delivery** has to stay off. With it on, messages are refused, and Recently received on the source's page says why. The signing certificate comes from `sns.<region>.amazonaws.com`, so the node taking the request must be able to reach that address.
+
+CloudWatch alarms have no severity, so incidents take the source's default. The alarm's ARN is the dedup key, for composite alarms too. The alarm's description and the reason for the state change go in annotations; the region, account, namespace, metric and dimensions go in labels, so a label like `aws.region` can drive routing.
+
+### Zabbix
+
+Works from Zabbix 6.0. Zabbix has no request format of its own: a media type's script sends the request. So the source's page, and the dialog when you create it, give you a media type with the address and token filled in:
+
+1. Save it as YAML and import it under **Alerts → Media types → Import**. Check the `token` parameter.
+2. Set the global macro `{$ZABBIX.URL}` to the address of the Zabbix frontend. It counts in the dedup key, so one source can take several Zabbix servers, and incidents link back to Zabbix. It works without it too.
+3. Give a user this media. **Send to** can be anything; the script does not use it.
+4. Add a trigger action whose **operations**, **recovery operations** and **update operations** all go to that user. Without recovery operations incidents do not resolve on their own.
+
+The media type's **Test** button needs real values: when macros are not expanded (`{EVENT.ID}` arrives as it is), MoleSignal answers `400` and says to use the media type from the docs.
+
+### Email
+
+There are two ways in, and both read mail into the same alerts.
+
+**Read a mailbox** (recommended): MoleSignal reads an IMAP mailbox on a schedule. All it needs is a way out and a mailbox: no public address, MX record, port 25 or certificate, which makes it the easiest choice when self-hosting. Send your monitoring system's alert mail to that mailbox, or forward it there with a mail rule.
+
+On the source's page, under **Read a mailbox**, fill in **IMAP server**, **Port**, **Encryption**, **User name**, **Password**, **Folder** (`INBOX` by default) and **Read every** (15 to 3600 seconds, 60 by default). Click **Test connection**, then **Save mailbox**.
+
+- **Read only**: it uses `EXAMINE` and `BODY.PEEK[]`, so nothing is marked as read or deleted. A read-only account will do.
+- **No backlog**: on first connecting it notes the position and reads only what arrives afterwards. A change of host, account or folder, or a server that rebuilt the mailbox (`UIDVALIDITY` changed), starts over from that moment. While the source is off nothing is read and no position is kept: it starts from the moment it is turned on again.
+- **The sender list is required**: anyone who knows the address can mail it. Under **Accept mail from** in the source's settings, write addresses or `@example.com` for a whole domain; `*` accepts everyone. The list reads `From`, which can be forged, so keep the mail provider's spam filtering and DMARC on. Mail from anyone else is recorded as **Refused** and opens nothing.
+- **Signing in**: a password, or an app password from the provider. Microsoft 365 no longer takes passwords: choose **OAuth 2.0** and fill in the token address `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token`, the client ID, the client secret and the scope `https://outlook.office365.com/.default`. The application needs the `IMAP.AccessAsApp` permission and access to this mailbox.
+- **No encryption** belongs only on a network you trust: the password crosses it in the clear.
+- When a read fails, the source's page says why, and the next round tries again. With several alert nodes each mailbox is read by one of them. With federation, the mailbox is set up on the source's receiving cluster and does not sync, so the password stays there.
+
+**Post the raw mail**: if you already run a mail system (Postfix's `pipe`, SES, Mailgun's raw MIME), POST the raw message to the intake address:
+
+```bash
+curl -X POST 'https://<molesignal-host>/api/v1/intake/alerts' \
+  -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: message/rfc822' \
+  --data-binary @alert.eml
+```
+
+This needs the intake address to be reachable from that mail system. The sender list is optional here, since the token already says who is calling; it applies if you write one.
+
+MoleSignal has no built-in SMTP receiver: that would take an open port 25, an MX record, a TLS certificate and spam filtering of its own, which most self-hosted deployments cannot offer.
+
+**How a mail is read** is set under **How mail is read** in the source's settings:
+
+| Setting | Description |
+|---|---|
+| **Subjects that recover** | A regular expression. Empty takes the built-in one: `resolved`, `recovered`, `recovery`, `cleared`, `恢复`, `已解决`, and `OK` at the start. Other mail triggers. |
+| **Dedup key from the subject** | A regular expression; its first group is taken, like `host=(\S+)`. Empty or no match uses the tidied subject: without `Re:` and `Fwd:`, status words (`PROBLEM`, `RECOVERY`, `告警`, `恢复` and so on), severities, dates and times, and percentages, ignoring case. So "CRITICAL: disk full on web-1 (91%)" and "RECOVERY: disk full on web-1 (40%)" are one alert, while `web-1` and `web-2` are two. The sender's domain counts in the key too. |
+| **Subjects that are no alerts** | A regular expression. Mail that matches is skipped, and shows under Recently received. |
+
+The severity comes from words in the subject (`critical`, `fatal`, `disaster`, `P1` are critical; `error`, `P2` error; `warning`, `P3` warning; `info`, `notice`, `P4`, `P5` info), or else the source's default; the high and low of `High CPU` and `Low disk` do not count. The body goes in the annotation `message` (HTML mail as text, at most 4096 characters), the sender in the label `email.from` and the annotation `from`, and the time comes from the `Date` header. Automatic replies (`Auto-Submitted: auto-replied`) and bounces (`multipart/report`) are no alerts. GBK, GB2312 and other character sets are understood. Mail over 4 MiB is recorded as **Refused** without its body being read.
+
+## How alerts become incidents
+
+| Kind | Dedup key | Trigger | Resolve | Severity |
+|---|---|---|---|---|
+| **API** | `dedup_key` | `trigger` | `resolve` | `severity` |
+| **Alertmanager** | External URL and `groupKey` | Group `status` `firing` | Group `status` `resolved`: every alert of the group recovered | The highest `severity` label among the firing alerts of the group |
+| **Grafana** | External URL, organization and `groupKey` | Same | Same | Same |
+| **Datadog** | Site, organization, monitor ID and scope | Any transition but `Recovered` | `Recovered` | `$ALERT_PRIORITY`; without it, Warn and No Data are warning and the rest follows `$ALERT_TYPE` |
+| **PagerDuty** | Account domain and PagerDuty incident ID | `incident.triggered`, `incident.reopened`; `incident.priority_updated` changes the severity | `incident.resolved` | Priority P1 to P5; without it, urgency high is error and low is warning |
+| **Alibaba Cloud CloudMonitor** | Account, rule ID and `dimensions`; for system events, account and `dedupId` | `ALERT`, `INSUFFICIENT_DATA`; system event `TRIGGERED` | `OK`; system event `RESOLVED` | `triggerLevel`; system event `severity` |
+| **Tencent Cloud Observability Platform** | Account, policy, metric or event name, level and object | `alarmStatus` is `1` or `5` | `alarmStatus` is `0` | `alarmLevel` |
+| **Amazon CloudWatch** | `AlarmArn` | `NewStateValue` is `ALARM` or `INSUFFICIENT_DATA` | `NewStateValue` is `OK` | None: the source's default severity |
+| **Zabbix** | Host of `{$ZABBIX.URL}` and `{EVENT.ID}` | `{EVENT.VALUE}` is 1; update operations too, with the severity following | `{EVENT.VALUE}` is 0, or an update operation closed the problem | `{EVENT.NSEVERITY}`: Disaster is critical, High error, Average and Warning warning, Information info |
+| **Email** | The sender's domain and the part taken from the subject | Other mail | A subject written as a recovery | Words in the subject |
+
+Priority and urgency are read apart: the API's `priority` and `urgency`, Datadog's `$ALERT_PRIORITY`, and PagerDuty's priority and urgency become the incident's priority and urgency. Without an urgency, the source's escalation policy decides, and an alert that reports no severity is high urgency; see [Urgency](/en-US/alerting/on-call#urgency).
+
+An alert without a severity takes the source's **Default severity**. The severity words of every sender are case-insensitive: `critical`, `crit`, `fatal`, `page` and `P1` are critical; `error`, `major`, `high` and `P2` are error; `warning`, `warn`, `minor`, `medium` and `P3` are warning; `info`, `low`, `P4` and `P5` are info. Any other word takes the default severity.
+
+- **Opening**: one source has at most one active incident per dedup key. The incident carries the labels `alert.source=external` and `external.kind=<kind>`, the alert's own labels (for Alertmanager and Grafana, the group's `commonLabels`) and the extra labels of the source. The label `service.name` or `service` becomes an affected service, and `host.name`, `host` or `hostname` becomes a host.
+- **Title**: API uses `summary`; Alertmanager and Grafana use the `summary` annotation, or `alertname` without one; Datadog uses `$ALERT_TITLE`; PagerDuty uses the incident title; Alibaba Cloud CloudMonitor uses "alarm name · instance name".
+- **Links**: addresses back to the sender are written to annotations, such as `alertmanager_url`, `generator_url`, `dashboard_url`, `datadog_url` and `pagerduty_url`, and the incident page shows them as links. The `links` of the API are written to annotations by `name`.
+- **Alerts of a group**: an incident from Alertmanager or Grafana keeps every alert of the group (up to 100) with its status, updated with each notification. **External alert** on the incident page lists them, with the labels that tell them apart.
+- **Severity changes**: an incident that is not yet acknowledged follows the severity of the alert, as the [alert pipelines](/en-US/pipelines/alert-events#severity-changes) decide it. When it rises, escalation starts over from the first step. A severity set by hand stays.
+- **Acknowledging**: the API's `acknowledge`, PagerDuty's `incident.acknowledged` and Zabbix update operations that acknowledge a problem acknowledge the incident and stop further escalation steps and calls. No user is recorded as the acknowledger.
+- **Resolving**: the incident resolves when the source reports recovery, acknowledged incidents included. No user is recorded as the resolver, and the timeline shows it as recovered.
+- **Late messages**: each dedup key remembers the latest sender time it used, and an older message is ignored. A late trigger does not open a zombie incident, and a late recovery does not close a new one. The API carries no time, so its messages are taken in the order they arrive.
+- **Resolved by a person first**: when the source still reports the alert, its next resend opens a new incident, as for rules.
+- **No data**: incidents opened by CloudMonitor's `INSUFFICIENT_DATA` and Datadog's No Data carry `alert.condition=no_data`, and their notification titles start with `NO DATA`.
+- **Turning off and deleting**: a turned-off source refuses alerts (`409`), and its open incidents stay. Deleting a source makes its token stop working at once and resolves its open incidents.
+
+[Silence policies](/en-US/alerting/silences), [semantic groups](/en-US/alerting/silences#semantic-groups) and [notify policies](/en-US/notification-channels) apply to external incidents as to any other. Match them by `external.kind`, the extra labels of a source, or the alert's own labels.
+
+## Recently received
+
+The top of the source's page says how the source stands: **Waiting for the first request**, **Receiving**, **Last request refused**, **No requests in 7 days** or **Turned off**. Beside it are the requests and alerts of the last 24 hours, and the incidents the source opened that are still open.
+
+Once requests have come in, **Recently received** on the source's page lists the requests the source received: the time, the result (**Handled**, **Refused** or **Forwarded**), the HTTP status, the number of alerts and what became of them (**Opened**, **Updated**, **Unchanged**, **Acknowledged**, **Resolved** or **Ignored**). Click a row to see each alert's title, severity, action, result and incident; a refused request also shows the reason and the start of its body (up to 16 KiB). The last 500 requests of each source are kept, for up to 7 days.
+
+## Multiple clusters
+
+With [cross-cluster federation](/en-US/settings/data-plane#cluster-federation) on:
+
+- Sources sync between clusters like other alerting configuration, tokens included, so one token works at the intake address of every cluster.
+- The incidents of a source open only on its **Receiving cluster**: the cluster it was created on, unless changed in the source's settings. Another cluster that receives an alert of the source passes it over gRPC to the receiving cluster, and returns the receiving cluster's answer to the sender. One external alert is therefore one incident, whichever cluster's address it arrives at.
+- When the receiving cluster cannot be reached, the answer is `503` and the sender retries. If the receiving cluster's region stays down, change the **Receiving cluster** in the source's settings to one that is up.
+- **Recently received** is recorded on the cluster that handled the request. The source's page says so when it is opened on another cluster.
+
+## Limits
+
+| Item | Limit |
+|---|---|
+| Request body, one mail | At most 4 MiB. |
+| Reading a mailbox | At most 50 mails at a time; the rest in the next round. |
+| One API request | 100 alerts; `dedup_key` up to 255 characters, `summary` up to 1024 characters. |
+| One alert | 64 labels and 64 annotations. The API refuses more; for other kinds the rest are dropped, and titles and annotations that are too long are cut. |
+| Alerts of a group | 100 are kept. |
+| Extra labels of a source | 32, with no key starting with `alert.` and no `external.kind`. |
+| Recently received | The last 500 requests of each source, for up to 7 days. |
+
+The HMAC signature of Grafana and the signature of PagerDuty are not checked; the token already tells the source. Acknowledging or resolving an incident in MoleSignal is not written back to the sender.
+
+## Alert source API
+
+| Operation | Endpoint |
+|---|---|
+| Send alerts | [`POST /api/v1/intake/alerts`](/en-US/api/alerting/send-alerts) |
+| List sources | [`GET /api/v1/alerts/sources`](/en-US/api/alerting/list-sources) |
+| Create a source | [`POST /api/v1/alerts/sources`](/en-US/api/alerting/create-source) |
+| Update a source | [`PUT /api/v1/alerts/sources/{id}`](/en-US/api/alerting/update-source) |
+| Delete a source | [`DELETE /api/v1/alerts/sources/{id}`](/en-US/api/alerting/delete-source) |
+| Rotate a token | [`POST /api/v1/alerts/sources/{id}/token`](/en-US/api/alerting/rotate-source-token) |
+| Recently received requests | [`GET /api/v1/alerts/sources/{id}/requests`](/en-US/api/alerting/list-source-requests) |
+| The mailbox of an email source | [`/api/v1/alerts/sources/{id}/mailbox`](/en-US/api/alerting/source-mailbox) |
+| Source of an external incident | [`GET /api/v1/alerts/incidents/{id}/source`](/en-US/api/alerting/incident-source) |

@@ -1,0 +1,222 @@
+---
+title: "Remediation"
+description: "Define HTTP and Kubernetes remediation actions, register clusters, and run an action on an incident: every run is approved, then executed and checked."
+"zh-Hans_link": "/zh-Hans/api/alerting/remediation"
+---
+
+A remediation action is a fix defined in advance, such as calling a Jenkins rollback job or restarting a
+Deployment. Running one on an incident always goes through [approval](/en-US/agent#approvals-and-executions):
+L2 needs one approver and L3 needs two, and the requester cannot be an approver. Once approved it runs
+at once, and the outcome and the check after it are recorded on the incident's
+[timeline](/en-US/api/alerting/incident-timeline). How the pages use it is in
+[Remediation](/en-US/alerting/remediation).
+
+| Method and path | What it does | Permission |
+|---|---|---|
+| `GET /api/v1/alerts/remediation/actions` | The organization's remediation actions. | `alerts.remediation.read` |
+| `POST /api/v1/alerts/remediation/actions` | Creates a remediation action. | `alerts.remediation.manage` |
+| `PUT /api/v1/alerts/remediation/actions/{id}` | Replaces a remediation action. | `alerts.remediation.manage` |
+| `DELETE /api/v1/alerts/remediation/actions/{id}` | Deletes a remediation action. | `alerts.remediation.manage` |
+| `GET /api/v1/alerts/remediation/clusters` | The registered Kubernetes clusters. | `alerts.remediation.read` |
+| `POST /api/v1/alerts/remediation/clusters` | Registers a cluster. | `alerts.remediation.manage` |
+| `PUT /api/v1/alerts/remediation/clusters/{id}` | Changes a cluster. | `alerts.remediation.manage` |
+| `DELETE /api/v1/alerts/remediation/clusters/{id}` | Deletes a cluster. | `alerts.remediation.manage` |
+| `POST /api/v1/alerts/remediation/clusters/{id}/test` | Tests the connection; returns `{ "ok": true, "version": "v1.30.2" }`. | `alerts.remediation.manage` |
+| `GET /api/v1/alerts/incidents/{id}/remediations` | The actions that apply to the incident, and its runs. | `alerts.incidents.read` on the incident |
+| `POST /api/v1/alerts/incidents/{id}/remediations` | Requests a run on the incident and submits it for approval. | `alerts.incidents.remediate` on the incident |
+
+Creating, changing, and deleting, and requesting a run, are recorded in the audit log.
+
+## Remediation actions
+
+**Request body**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | string | Yes | 1 to 120 characters. |
+| `description` | string | No | A description. |
+| `target` | object | Yes | How it runs: `kind` is `http` or `kubernetes`; the other fields are below. |
+| `parameters` | array | No | What to fill in when running it, at most 10; see below. |
+| `services` | array | No | The services it applies to. With `team_ids` also empty it applies to every incident; otherwise the incident's services or team has to match. |
+| `team_ids` | array | No | The teams it applies to. |
+| `risk` | string | No | `l2` (default, one approver) or `l3` (two approvers). |
+| `verify_after_secs` | integer | No | How many seconds after a successful run to check it, 0 to 86400. Default `0`: no check. |
+| `verify_by` | string | No | What counts as working: `incident_resolved` (default, the incident is resolved or closed) or `rule_healthy` (the incident's rule is healthy again). |
+| `enabled` | boolean | No | Default `true`. A disabled action cannot be run. |
+
+**`target`: an HTTP request**
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | string | `http`. |
+| `method` | string | `GET`, `POST` (default), `PUT`, or `PATCH`. |
+| `url` | string | The address template, starting with `http://` or `https://`. |
+| `headers` | object | Request headers; the values are templates and stored encrypted. |
+| `body` | string | The body template, JSON, up to 16384 characters; a placeholder without quotes can stand for a number. With every placeholder read as `0` it has to be valid JSON, or the call answers `400`. A body is sent as `application/json`; leave it empty to send none. |
+| `signing_secret` | string | A signing secret, stored encrypted. When set, the request carries `X-MoleSignal-Timestamp` and `X-MoleSignal-Sign`, computed as for the [generic webhook signature](/en-US/notification-channels/webhooks#headers-and-the-signature). |
+
+The request connects only to the IPs the address resolves to, refuses cloud metadata addresses, follows no
+redirects, and times out after 30 seconds; a 2xx response counts as success.
+
+**`target`: Kubernetes**
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | string | `kubernetes`. |
+| `cluster_id` | string | A registered cluster. |
+| `operation` | string | `restart` (a rolling restart, as `kubectl rollout restart`), `scale` (change the replica count), or `rollback` (back to the previous version, as `kubectl rollout undo`). |
+| `workload_kind` | string | `Deployment`, `StatefulSet`, or `DaemonSet`. Only a Deployment can be rolled back, and a DaemonSet cannot be scaled. |
+| `namespace`, `workload_name` | string | The namespace and the workload name; both can be templates. |
+| `replicas` | string | The replica count to scale to; can be a template such as `{{params.replicas}}`. |
+
+**`parameters[]`**
+
+| Field | Type | Notes |
+|---|---|---|
+| `key` | string | Written `{{params.<key>}}` in templates. |
+| `label` | string | The name shown when running the action. |
+| `kind` | string | `text` (default), `number`, or `select`. |
+| `options` | array | The choices of a `select`. |
+| `required` | boolean | Default `false`. |
+| `default` | string | The value used when none is given. |
+
+**Template variables**: `{{incident.id}}`, `{{incident.summary}}`, `{{incident.severity}}`,
+`{{incident.status}}`, `{{incident.service}}` (the `service` label, or else the first affected service),
+`{{incident.url}}` (the incident page), and `{{params.<key>}}`. Values are percent-encoded in the address
+and escaped as JSON strings in a JSON body; unknown variables become empty.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/remediation/actions \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "Roll back checkout",
+    "target": {
+      "kind": "http",
+      "method": "POST",
+      "url": "https://jenkins.example.com/job/rollback/buildWithParameters?service={{incident.service}}",
+      "headers": { "Authorization": "Bearer <jenkins-token>" },
+      "body": "{\"reason\": \"{{params.reason}}\", \"incident\": \"{{incident.url}}\"}"
+    },
+    "parameters": [{ "key": "reason", "label": "Why", "required": true }],
+    "services": ["checkout"],
+    "risk": "l3",
+    "verify_after_secs": 600,
+    "verify_by": "incident_resolved"
+  }'
+```
+</RequestExample>
+
+The response is the saved action. Header values and the signing secret are never returned: the values in
+`headers` are empty, and `secrets_set` lists the secrets that are set, for example
+`["header:Authorization", "signing_secret"]`. On a change, a header left empty and a missing
+`signing_secret` keep their values; an empty `signing_secret` removes the signature.
+
+## Kubernetes clusters
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `name` | string | Yes | A name. |
+| `api_server` | string | Yes | The API server address, starting with `https://`. |
+| `ca_cert` | string | No | A PEM CA certificate; empty uses the system's trusted roots. |
+| `token` | string | When creating | A ServiceAccount token, stored encrypted and never returned; left empty on a change, it keeps its value. |
+
+The token needs `get` and `patch` on the target workloads, and a rollback also needs to list ReplicaSets.
+Connections go only to the IPs the API server address resolves to, refuse cloud metadata addresses, and
+time out after 30 seconds. Deleting a cluster that an action still uses is refused.
+
+## Run an action on an incident
+
+```http
+GET /api/v1/alerts/incidents/{id}/remediations
+```
+
+Returns `{ "actions": [ ... ], "runs": [ ... ] }`: the enabled actions that apply to this incident (secrets
+removed), and the incident's runs. A run whose approval was rejected, expired, or cancelled reads as
+`declined`.
+
+```http
+POST /api/v1/alerts/incidents/{id}/remediations
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `action_id` | string | Yes | The action to run; it has to apply to this incident. |
+| `inputs` | object | No | Parameter values keyed by each parameter's `key`. Required ones must be there, numbers must be numbers, choices must be among the options, and there can be nothing extra; missing ones take their defaults. Each value is at most 500 characters. |
+| `reason` | string | No | The reason written on the approval, up to 2000 characters; made up when left out. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/remediations \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"action_id": "<action-id>", "inputs": {"reason": "pool exhausted after v2026.10.28"}}'
+```
+</RequestExample>
+
+The response is `{ "run": { ... }, "approval": { ... } }`: the run, and the approval submitted for it. The
+approval's risk follows the action's `risk`, and its impact says which address will be called, or what will
+be done to which workload on which cluster. Approvers approve or reject it with
+`POST /api/v1/agent/approvals/{approval_id}/review` and the body `{ "approve": true, "comment": "…" }`,
+which requires `agent.approve`; the run starts as soon as enough approvals are in.
+
+<ResponseExample>
+```json 200
+{
+  "run": {
+    "id": "3KJ0f2R9cWm1Xa8LpV4sNq7TbYe",
+    "org_id": "<organization-id>",
+    "incident_id": "<incident-id>",
+    "action_id": "<action-id>",
+    "action_name": "Roll back checkout",
+    "approval_id": "<approval-id>",
+    "inputs": { "reason": "pool exhausted after v2026.10.28" },
+    "status": "awaiting_approval",
+    "output": "",
+    "verify_at": null,
+    "verification": "",
+    "requested_by": "<user-id>",
+    "executed_by": null,
+    "created_at": 1790000000000000,
+    "updated_at": 1790000000000000
+  },
+  "approval": {
+    "id": "<approval-id>",
+    "org_id": "<organization-id>",
+    "investigation_id": null,
+    "action": "run_remediation_action",
+    "target": "<incident-id>",
+    "parameters": { "action_id": "<action-id>", "action": "Roll back checkout", "inputs": { "reason": "pool exhausted after v2026.10.28" } },
+    "reason": "Run `Roll back checkout` on incident: High error rate · checkout",
+    "impact": "HTTP POST https://jenkins.example.com/job/rollback/buildWithParameters?service={{incident.service}} (reason=pool exhausted after v2026.10.28)",
+    "risk": "l3",
+    "status": "pending",
+    "requested_by": "<user-id>",
+    "required_approvals": 2,
+    "reviews": [],
+    "expires_at": 1790003600000000,
+    "decided_at": null,
+    "created_at": 1790000000000000,
+    "updated_at": 1790000000000000
+  }
+}
+```
+</ResponseExample>
+
+| `status` | Meaning |
+|---|---|
+| `awaiting_approval` | Waiting for approval. |
+| `running` | Running. |
+| `succeeded`, `failed` | The run succeeded or failed; `output` is the start of the response or the error. |
+| `declined` | The approval was rejected, expired, or cancelled, and nothing ran. |
+| `verifying` | The run succeeded and is checked at `verify_at`. |
+| `verified`, `verification_failed` | The check passed or failed; `verification` says what it found. |
+
+**Errors**
+
+| Status | Reason |
+|---|---|
+| `400` | A field is wrong, the cluster is not in this organization, the action does not apply to this incident or is disabled, an input is wrong, or the incident is already resolved. |
+| `403` | A permission is missing, or the incident is out of reach. |
+| `404` | The action, cluster, or incident does not exist. |

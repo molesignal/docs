@@ -85,6 +85,8 @@ Control the mode with the `Prefer` request header:
 | `Prefer: respond-async` | Always creates a search job. |
 | `Prefer: respond-sync` | Runs the query in the request, even for a long range. |
 
+A query of `_audit` always runs in the request, whatever its range or `Prefer` header, and submitting a search job for it answers `400`. See [Audit stream](/en-US/settings/data-security#audit-stream).
+
 Follow a job with these endpoints:
 
 | Endpoint | Purpose |
@@ -102,7 +104,7 @@ A job keeps its result for seven days. Jobs report the states `pending`, `runnin
 
 A job also reports its `kind` (`query` or `backfill`, with the `pipeline_id` of a backfill), the `attempt`, the submitted `request`, and the submitter as `user_id` and `submitted_by`.
 
-A caller reads and changes the jobs that the caller submitted. A caller with `org.settings.manage` reads and changes every job of the organization. A job of another user answers `404`, the same as a job that does not exist. The list and the summary count only the jobs that the caller can read. The **Search jobs** page under **Streams** shows the same jobs. See [Streams](/en-US/streams#search-jobs).
+A caller reads and changes the jobs that the caller submitted. A caller with `org.running_queries.cancel` reads and changes every job of the organization. A job of another user answers `404`, the same as a job that does not exist. The list and the summary count only the jobs that the caller can read. The **Search jobs** page under **Streams** shows the same jobs. See [Streams](/en-US/streams#search-jobs).
 
 ## SQL
 
@@ -111,7 +113,7 @@ A SQL statement names a stream in `FROM`, and the `stream` field of the request 
 ```bash
 NOW=$(date +%s)000000
 curl -X POST http://localhost:5080/api/v1/query \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d "{\"org_id\":\"$MS_ORG\",\"language\":\"sql\",
        \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
@@ -141,12 +143,34 @@ WHERE l.level = 'error'
 | `MATCH(field, 'text')` | Case-insensitive substring match on any field. `%`, `_`, and `*` are literal characters. |
 | `MATCH_TEXT(field, 'query')` | Full-text search on a field with `index_type` set to `full_text`. A field without that index fails with `MATCH_TEXT: field ... has no full-text index configured`. |
 
-`MATCH_TEXT` understands several words as an AND of tokens, `"a b"` as a phrase, `error*` and `*error` as wildcards, `a OR b`, and `-a` to exclude a term. Add the index when creating a stream or editing its schema. See [Streams](/en-US/streams#schema-and-fields).
+In `MATCH_TEXT`, every word separated by spaces must occur, each as a case-insensitive substring anywhere in the value; `"a b"` is a phrase whose text must occur as written; a word with `*` matches the whole value, so `error*` is a value that starts with error and `*error` one that ends with it; `a OR b` and `-a`, which excludes a term, work as well. CJK text needs no word breaks: `登录超时` matches a value with those four characters in a row. Add the index when creating a stream or editing its schema. See [Streams](/en-US/streams#schema-and-fields).
 
 ```sql
 SELECT * FROM app WHERE MATCH(msg, 'timeout');
 SELECT * FROM app WHERE MATCH_TEXT(msg, 'panic "disk full" -debug');
 ```
+
+### IP networks
+
+| Function | Behavior |
+|---|---|
+| `CIDR_MATCH(field, 'network')` | True when the address lies in the network, written as `10.0.0.0/8`, `2001:db8::/32`, or a single address. IPv4 is compared mapped into IPv6, so `10.0.0.0/8` also matches `::ffff:10.1.2.3`. A value that is not an address gives false, and a malformed network fails the query. |
+
+```sql
+SELECT client_ip, count(*) FROM access WHERE CIDR_MATCH(client_ip, '10.0.0.0/8') GROUP BY client_ip
+```
+
+### Conditions that skip files
+
+Conditions joined by `AND` at the top of `WHERE` hold for every row, so MoleSignal uses the indexes of their fields to skip the files that cannot hold such rows; conditions on one column joined by `OR` count as one condition. An `OR` across columns and `NOT` skip no files: the result stays correct, only more files are read.
+
+| Condition | Indexes used |
+|---|---|
+| `=`, `IN` | `exact`, `bloom`, `skip` |
+| `<`, `<=`, `>`, `>=`, `BETWEEN`, `!=`, `NOT IN`, `LIKE 'abc%'` | The minimums and maximums of `exact`, `bloom`, and `skip`, and the value sets of `skip` |
+| Literals of `MATCH`, `MATCH_TEXT`, `LIKE`, and `ILIKE` | `full_text`, `ngram` |
+| `CIDR_MATCH`, `=` on an address | `ip` |
+| `=`, `IN`, `LIKE 'abc%'` on a split field | [Split by field](/en-US/streams#split-by-field): hash for `=` and `IN`, first character for all three |
 
 ### Timestamps in SQL
 
@@ -174,7 +198,7 @@ Only a literal is read as microseconds. To compare `_timestamp` with an expressi
 
 ## PromQL
 
-Set `language` to `promql` to run PromQL over metric streams. A metric selector names a metric, which every metrics stream holding it answers: `metric_name` holds the metric, the `value` column holds the sample, and the other columns are labels. Through this endpoint, MoleSignal evaluates the expression as an instant query at `time_range.end` and returns one row per series, with `value` first and then the labels:
+Set `language` to `promql` to run PromQL over metric streams. A metric selector names a metric, which every metrics stream holding it answers: `metric_name` holds the metric, the `value` column holds the sample, and the other columns are labels. Without `step`, MoleSignal evaluates the expression as an instant query at `time_range.end` and returns one row per series, with `value` first and then the labels. With `step` in microseconds it evaluates a range query from `time_range.start` to `time_range.end` and returns a row per series and step, with `_timestamp` and `value` first; a series has at most 11,000 steps, and `limit` caps the rows by sampling each series evenly:
 
 ```json
 {
@@ -203,7 +227,7 @@ Coverage is broad. It includes the rate family and all `*_over_time` functions, 
 - `GET /api/v1/query/running` and `POST /api/v1/query/{id}/cancel` let organization administrators inspect and cancel active work.
 - `GET /api/v1/query/sql/capabilities` and `GET /api/v1/query/promql/capabilities` list the supported functions for editors.
 
-Standard queries require `streams.query`. Active-query administration requires `org.settings.read` or `org.settings.manage`.
+Standard queries require `streams.query`. Active-query administration requires `org.running_queries.read` or `org.running_queries.cancel`.
 
 ## Federated search
 

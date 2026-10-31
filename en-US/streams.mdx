@@ -20,6 +20,22 @@ Open **Streams** to see what arrives, and to inspect or configure each stream.
 The same stream name may exist for different stream types. Always include `stream_type` in API
 requests and automation.
 
+### Platform streams
+
+MoleSignal writes these streams itself:
+
+| Stream | Content |
+|---|---|
+| `_molesignal` | The telemetry of MoleSignal itself, in the `_sys` organization. See [Self-observability](/en-US/self-observability). |
+| `_synthetic_results` | One row for each run of a synthetic check. See [Synthetic monitoring](/en-US/synthetics#result-stream-and-retention). |
+| `_audit` | The audit events of the workspace. See [Audit stream](/en-US/settings/data-security#audit-stream). |
+| `_agent_model_traces` | The model calls of Mole Agent. See [Usage and budget](/en-US/agent#usage-and-budget). |
+| `_agent_score_traces` | The quality scores of Mole Agent answers. See [Quality](/en-US/quality#scores-in-a-stream). |
+
+They are read like other streams. `_audit` needs `audit.read`: without it, the stream is in neither
+the list nor the runtime figures, and opening, changing, or deleting it answers `403`. Nothing else writes them: a stream with one of these names cannot be created, intake
+into one answers `403`, and no [pipeline](/en-US/pipelines#platform-streams) writes one.
+
 ## The stream list
 
 **Streams** lists every stream of the workspace. Switch the tabs to show **All** streams or one type,
@@ -74,7 +90,7 @@ Select a stream to open it. **Query data** opens it in its explorer, and the men
 | **Fields & indexes** | The fields with their type, index type, and encryption. Edit a field to change its index or its masking. See [Schema and fields](#schema-and-fields). |
 | **Retention** | The retention of the stream, and the downsampling of a metrics stream. See [Retention and deletion](#retention-and-deletion). |
 | **Usage** | What depends on the stream: the intake endpoint that writes it, pipelines, saved queries, and alert rules. Check it before a change or a deletion. |
-| **Settings** | The **Description**, **Queryable**, **Max query range (hours)**, and **Merge small files by day**. |
+| **Settings** | The **Description**, **Queryable**, **Max query range (hours)**, **Merge small files by day**, and **Split by field**. |
 
 Changes on the tabs collect into a draft. **Save and apply** applies them at once, and
 **Discard changes** drops them. Before saving, the page warns about changes that cannot be taken back:
@@ -97,10 +113,12 @@ The index type decides which helper structure MoleSignal builds for a field:
 | Index type | Effect |
 |---|---|
 | `none` | No helper index. This is the default. |
-| `exact` | An exact-match inverted index of whole values plus a Parquet Bloom filter. Use it for identifiers such as `trace_id`. |
-| `full_text` | A tokenized inverted index for text search. |
-| `bloom` | A Parquet Bloom filter only. |
-| `skip` | File-level minimum and maximum values that prune files for comparisons. |
+| `exact` | An exact-match inverted index of whole values and a Parquet Bloom filter, plus the minimum and maximum of each file. `=` and `IN` skip the files without the values before opening them, and read only the pages of the matching rows when there are few. Use it for identifiers such as `trace_id`. |
+| `full_text` | A tokenized inverted index for text search: runs of letters and digits are words, and CJK text is cut into overlapping two-character bigrams. Literals of `MATCH`, `MATCH_TEXT`, `LIKE`, and `ILIKE`, punctuation and CJK text included, skip the files that cannot match. `utf8` fields only. |
+| `bloom` | A Parquet Bloom filter, plus a whole-value filter per file for text fields and the minimum and maximum of each file: `=` and `IN` skip the files that certainly lack the values before opening them. Use it for fields with many values queried by equality only, such as request IDs. |
+| `skip` | The minimum and maximum of each file, and every value of a file that holds at most 32 distinct ones. Comparisons, `IN`, `BETWEEN`, and prefix `LIKE` skip files with them. |
+| `ngram` | The trigrams of each file's values, regardless of case: a literal of `LIKE`, `ILIKE`, or `MATCH` with a trigram that a file lacks skips that file. Use it for URLs, paths, and host names searched by fragment, not for long free text. `utf8` fields only. |
+| `ip` | The range of each file's addresses, IPv4 mapped into IPv6: `CIDR_MATCH(field, '10.0.0.0/8')` and `=` on an address skip files with it. `utf8` fields only. |
 
 A field that first appears in incoming data gets its index type from its name:
 
@@ -111,17 +129,42 @@ A field that first appears in incoming data gets its index type from its name:
 | `traces` | `trace_id`, `span_id`, `parent_span_id`, `service.name` | `exact` |
 | `metrics` | `metric_name` | `exact` |
 
-Every other new field gets `none`. An exact `level` lets the logs histogram count errors from the index instead of reading the files. A changed index type applies to data written after the change; older files are indexed the new way when the compactor merges them.
+Every other new field gets `none`. An exact `level` lets the logs histogram count errors from the index instead of reading the files. A changed index type applies to files written after the change and to files the compactor merges afterwards. A sealed partition (sealed 48 hours after it ends, by default) is never merged again, so its files keep their indexes. When the full-text index format changes, as when CJK text started to be cut into bigrams, the indexes of older files are rebuilt in the new format in the background; until then the old indexes are used as they are, and query results are the same.
 
 To change a field, open **Fields & indexes**, select the edit action of the field, and choose:
 
-- the **Index type**: **Not indexed**, **Full text search**, **Exact match**, **Bloom filter**, or
-  **Skip index**. Full-text search applies to text fields;
+- the **Index type**: **Not indexed**, **Full text search**, **Exact match**, **Bloom filter**,
+  **Skip index**, **N-gram substring**, or **IP address**. Full text search, N-gram substring, and IP
+  address apply to text fields;
 - the **Stream-level policy** of **Result field masking**: **Inherit global rule**, **Custom stream rule**,
   or **Explicitly unmasked for stream**. See [Field masking](/en-US/settings/data-security#field-masking).
   Metrics streams do not take part in masking.
 
 Select **Apply to draft**, then **Save and apply**. The type of a field never changes.
+
+### Split by field
+
+A logs or traces stream can be split by one or two text fields: under **Split by field** on the
+**Settings** tab, select **Add a field**, pick the field, and pick how it splits. Data written
+afterwards is split into shards by the values of the fields, each shard written to its own files.
+
+- **Hash** splits values into 2 to 64 shards by their hash, evenly. A query with an equality
+  condition on the field (`=` or `IN`) reads only the files of the values' shards.
+- **First character** splits values into 37 shards by their first character: one for each digit and
+  each letter (any case), and one for everything else, empty values included. A query with an
+  equality condition on the field, or a `LIKE` that starts with text (such as `'web-%'`), reads only
+  the files of that character's shard; an `ILIKE` also reads the shard of everything else. How even
+  the shards are depends on the data: hexadecimal trace IDs use only 16 of them.
+
+With two fields, files are split by the shards of both, so the shard counts multiply. **Split by
+field** shows the total, at most 256: first character (37 shards) goes with a hash of at most 4
+shards. A query with a condition on either field reads fewer files, and one with conditions on both
+fewer still. Use split fields that nearly every query names, such as a service, namespace, or tenant.
+More shards mean more, smaller files.
+
+The setting applies to data written after the change: existing files stay as they are, a query judges
+each file by the fields it was written with, and the compactor merges only files written with the
+same fields. A split field must be an unencrypted text field, and the two fields must differ.
 
 ### Encrypted fields
 
@@ -184,16 +227,66 @@ action fits the state of the job:
 **Delete** removes a job with its result in any state.
 
 A member sees and manages the jobs that the member submitted. An administrator with
-`org.settings.manage` sees and manages every job of the organization. See
+`org.running_queries.cancel` sees and manages every job of the organization. See
 [Query](/en-US/query#time-ranges-and-asynchronous-jobs) for the job API.
+
+## Intake usage and budgets
+
+Select **Intake usage** in the header of **Streams** to see how much data each source took in over
+the last 24 hours, 7 days, or 30 days. The same figures are divided in three ways, so that their
+totals agree:
+
+| View | A source is |
+|---|---|
+| **Credential** | An API token, a RUM client token, a connector, or a signed-in user. **Platform internal** is the platform's own telemetry. |
+| **Stream** | One stream, by its name and type. |
+| **Service** | The service an event names in `service.name`, else `service` or `service_name`. **No service named** gathers the events that name none. |
+
+Intake counts the decompressed request bytes of what was accepted: a refused event is not counted,
+and a request the sender retries counts once. Spans count when they arrive, before tail sampling.
+Session replays count in the `rum_replay` row of the **Stream** view. When one request holds several
+services or streams, its bytes are shared out by the number of events, so those views are close
+figures rather than exact ones.
+
+A figure that is not known shows `–`, not zero. A figure marked `≥` is a lower bound, because
+metering began inside the window; the line above the list says since when. Figures reach the page
+within about a minute. A node that stops abruptly can lose its last 15 seconds of counts.
+
+Select a row to see the source hour by hour, and what it is made of along the other two views.
+
+### Set a budget
+
+Select **Set budget** on a row, or tick rows and set one budget on all of them.
+
+| Field | Meaning |
+|---|---|
+| **Period** | **Each day** or **Each month**, by the calendar in UTC. |
+| **Limit** | From 1 MiB to 1 PiB. |
+| **Warn at (%)** | People are told once at this share of the limit, and once more when it is used up. `0` tells only when it is used up. Default: 80. |
+| **Who is told** | Members of the organization. Default: the person setting the budget. |
+
+A budget only tells people: intake answers and stores the same when a source is over it, and nothing
+is dropped or slowed down. Each level is told once a period. Raising the limit makes a later pass
+news again.
+
+Notifications go through the built-in notify policies **Intake budget nearly used** and **Intake
+budget exceeded**, and show in the notification center of the top bar. See
+[Notification channels](/en-US/notification-channels) to change who else hears of them and how.
+
+The `_sys` organization has no budgets, because it has no notify policies. A budget cannot be set on
+**Platform internal**, **No service named**, or **Other services**, which are the services past the
+limit in [Platform settings](/en-US/settings/platform#intake-usage).
 
 ## Permissions
 
 | Permission | Capability |
 |---|---|
+| `intake_usage.read` | Open **Intake usage**, which shows the names of tokens and members. Owners and admins have it. |
+| `intake_budgets.manage` | Set and remove budgets. Owners and admins have it. |
 | `streams.read` | List streams and inspect metadata. |
-| `streams.query` | Query stream data, and open **Search jobs**. |
-| `streams.write` | Intake into an existing stream. |
+| `streams.query` | Query stream data with SQL. |
+| `query.jobs.read`, `query.jobs.run` | Open **Search jobs**; submit, cancel, retry, and delete jobs. |
+| `logs.write`, `metrics.write`, `traces.write`, `profiles.write` | Intake into an existing stream of that signal. |
 | `streams.create` | Create a stream. |
 | `streams.configure` | Change schema-facing settings and retention. |
 | `streams.delete` | Delete a stream. |

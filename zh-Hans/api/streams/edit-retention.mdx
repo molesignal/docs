@@ -8,7 +8,7 @@ description: "设置数据流保留数据的时长，并修改它的设置。"
 PUT /api/v1/streams/{id}/settings
 ```
 
-更新数据流的保留期与设置，只发送需要修改的属性。该调用需要 `streams.configure`。对 `_molesignal` 系统数据流需要 `sys.telemetry.manage`，且只能修改保留期、字段索引、提取、遮掩与降采样。
+更新数据流的保留期与设置，只发送需要修改的属性。该调用需要 `streams.configure`；修改 `_audit` 数据流还需要 `audit.read`，没有时返回 `403`。对 `_molesignal` 系统数据流需要 `sys.telemetry.manage`，且只能修改保留期、字段索引、提取、遮掩与降采样。
 
 **请求体**
 
@@ -27,12 +27,13 @@ PUT /api/v1/streams/{id}/settings
 | `max_query_range_hours` | 对该数据流的一次 SQL 或 PromQL 查询最多覆盖的小时数，范围 1 到 87600。时间范围更长的查询返回 `400`。`null` 表示不限制。 |
 | `field_masking` | 数据流级别对全局[字段遮掩](/zh-Hans/settings#数据安全)规则的覆盖。 |
 | `daily_merge` | 仅用于日志与链路。为 `true`（默认）时，一天结束一小时后，这一天的文件加起来不超过 `[compactor].target_size` 就合成一个文件，保留期随之按天生效。为 `false` 时保留按小时的文件。 |
+| `partitions` | 仅用于日志与链路。最多两个分片字段，例如 `[{ "field": "service", "type": "hash", "buckets": 4 }, { "field": "pod", "type": "prefix" }]`：`hash` 按值的哈希分成 `buckets` 片（2 到 64），`prefix` 按值的首字符分成 37 片。之后写入的数据按这些字段分片，各字段的分片数相乘不超过 256，两个字段不能相同。字段在 schema 里时必须是没加密的 `utf8` 字段。空数组（默认）表示不分片。参见[按字段分片](/zh-Hans/streams#按字段分片)。 |
 | `downsample` | 仅用于指标。`{ "after_days": 7, "interval_secs": 300 }` 把早于 `after_days` 天的样本按 `interval_secs` 秒的时间桶聚合：同一 series 在一个桶里的样本合成一个点，数值取平均，增量计数取总和，原始样本随之删除。`after_days` 取 0 到 3650，`0` 表示不降采样（默认）；`interval_secs` 不小于 60 且整除一天。 |
 
 <RequestExample>
 ```bash cURL
 curl -X PUT http://localhost:5080/api/v1/streams/$STREAM_ID/settings \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
     "retention_days": 30,
@@ -43,4 +44,6 @@ curl -X PUT http://localhost:5080/api/v1/streams/$STREAM_ID/settings \
 
 响应是更新后的数据流。保留期与降采样决定 compactor 何时删除或聚合数据，修改只影响之后的清理，不会恢复已经删除的文件或样本。
 
-没有单独设置保留期的数据流使用的平台默认值，用 `GET /api/v1/settings/stream_retention` 读取，用 `PUT` 加同样的请求体 `{ "retention_days": 30 }` 修改，两者都需要系统范围的 `sys.settings.manage`。`retention_days` 是 1 到 3650 的整数。
+没有单独设置保留期的数据流使用的平台默认值，用 `GET /api/v1/settings/stream_retention` 读取，用 `PUT` 加同样的请求体 `{ "retention_days": 30 }` 修改，两者都需要系统范围的 `sys.settings.retention.manage`。`retention_days` 是 1 到 3650 的整数。
+
+`GET /api/v1/settings/stream_retention/preview?retention_days=7` 估算缩短默认值会删除什么，所需权限和范围相同。它只读文件目录，不读数据，所以响应里有 `"estimated": true`。`rows`、`stored_bytes` 和 `earliest_at_micros` 是只因这次修改才会删除的数据的合计，`stream_count` 是涉及的数据流数量，`streams` 列出其中最大的 100 个及它们所属的组织，`unavailable_streams` 是读不出目录信息的数据流数量。设置了自己保留期的数据流和数据集不计入。`retention_days` 不小于当前默认值时，各项都是 0。会话回放和 Profile 归档也按这个设置清理，没有计入。

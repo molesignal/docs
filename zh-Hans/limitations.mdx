@@ -24,25 +24,28 @@ MoleSignal 目前处于 1.0 之前的阶段。本页列出会影响规划和运�
 - **Prometheus remote_write。** 原生直方图与指标元数据会被跳过。
 - **OTLP gRPC 不含 TLS。** 接收端不终止 TLS，流量离开可信网络时，请在前面放置终止 TLS 的代理。
 - **速率限制。** 只有 `router` 角色限制请求。限流按已认证组织的请求计数，并且每个 router 副本各自计数。
-- **保留数据流名称。** `_molesignal` 保留给服务自身的遥测，拒绝公开接入。
+- **平台数据流。** `_molesignal`、`_synthetic_results`、`_audit`、`_agent_model_traces` 和 `_agent_score_traces` 只由 MoleSignal 写入，拒绝公开接入，参见[平台数据流](/zh-Hans/streams#平台数据流)。
 
 ## 查询
 
 - **长时间范围异步运行。** 估算规模达到 `[querier].auto_async_threshold_rows` 的查询会返回 `202` 和一个待跟踪的任务，在默认配置下对应约 13.9 小时的时间范围。发送 `Prefer: respond-sync` 可以在请求内运行，参见[查询](/zh-Hans/query#时间范围与异步任务)。
-- **查询端点上的 PromQL。** `POST /api/v1/query` 把 PromQL 作为 instant 查询，在 `time_range.end` 处求值。
 - **PromQL 子集。** 引擎实现了 PromQL 的一个子集，参见[PromQL 支持矩阵](/zh-Hans/query/promql-subset)。
 - **单次查询的行数。** 读取行数超过 `[querier].max_scan_rows`（默认 1 亿）的查询会被拒绝并返回 `400`，请缩小时间范围或增加过滤条件。PromQL 对每个选择器应用该限制。
-- **分角色集群中的新鲜度。** 查询读取目录列出的文件，因此 intake 节点仍缓冲着的记录要等下一次刷写之后才可见，时间在 `[intake].flush_interval_secs` 之内。`standalone` 节点还会读取自己的缓冲。
+- **分角色集群中的新鲜度。** 查询读取目录列出的文件，因此 intake 节点仍缓冲着的记录要等下一次刷写之后才可见，时间在 `[intake].flush_interval_secs` 之内。`standalone` 节点还会读取自己的缓冲。告警规则默认按 **设置 → 告警评估** 的评估延迟（60 秒）把窗口往回挪，见[评估延迟](/zh-Hans/alerting/rules#评估延迟)。
 
 ## 告警
 
-- **实时规则按 intake 节点计数。** `real_time` 规则统计单个 intake 节点收到的记录，计数保存在内存中。在分角色集群中，每个 intake 节点各自计数，重启后从零开始。语句限定为 `SELECT count(*) FROM <stream> [WHERE <condition>]`。参见[实时规则](/zh-Hans/alerting/rules#实时规则)。
+- **实时规则的计数在内存里。** `real_time` 规则在每个接收写入的节点上计数，负责这条规则的 alert 节点每秒拉一次求和，开事件比记录写入晚最多 1 秒。某个节点重启只丢它那一份计数；拉不到的节点这一秒不算。节点之间拉计数要配集群 bearer，跨联邦的集群不汇总。语句限定为 `SELECT count(*) FROM <stream> [WHERE <condition>]`。参见[实时规则](/zh-Hans/alerting/rules#实时规则)。
 
 ## 安全与身份
 
 - **内部 gRPC 不带认证。** `5082` 端口承载不带认证的节点间流量，请把它放在私有网络内。
-- **没有多因素认证。** 网页界面没有多因素认证和 Passkey。请使用能强制多因素认证的身份提供方，通过 SSO 登录。
+- **Passkey 绑定一个域名。** 它要求 `[http].external_url` 是 HTTPS 域名，从别的主机名打开控制台时不可用。
 - **密码重置依赖邮件。** 重置密码会通过邮件发送链接，因此必须配置 `[notify.smtp]` 与 `[http].external_url`。
+- **不需审批的自助注册依赖邮件。** 注册要先证明邮箱归属。没有配置 `[notify.smtp]` 与 `[http].external_url` 时，新账号一律等待管理员审批。
+- **登录限速按地址计数。** 地址要从[客户端 IP 识别](/zh-Hans/settings/platform#客户端-ip-识别)取对。公网代理或 CDN 没有配置时，所有用户共用一个地址，会互相锁定。私有地址默认不计数，内网部署或代理没有配置时只有账号限速生效。
+- **账号限速不是账号锁定。** 为了不让别人把账号锁在外面，账号限速期间每个账号每天还能被猜约 1400 次。开启多因素认证的账号猜对了也进不来。别人持续占用名额时，没有在这个地址登录成功过的本人可能一直等不到，这时用 Passkey、单点登录或重置密码。
+- **LDAP 目录的锁定策略。** 目录服务自己的锁定策略可能先触发，别人仍能借此锁住目录账号。[登录限速](/zh-Hans/settings/platform#登录限速)的次数要设得比目录的低。
 - **会话。** 账号设置页面只能管理当前浏览器的会话。
 
 ## 报告

@@ -1,0 +1,99 @@
+---
+title: "Import and export policies, schedules, and routing rules"
+description: "Export escalation policies, on-call schedules, and routing rules as bundles that name their references, and import such bundles into an organization."
+"zh-Hans_link": "/zh-Hans/api/alerting/oncall-transfer"
+---
+
+```http
+GET  /api/v1/alerts/escalations/export
+POST /api/v1/alerts/escalations/import
+GET  /api/v1/schedules/export
+POST /api/v1/schedules/import
+GET  /api/v1/alerts/routing/rules/export
+POST /api/v1/alerts/routing/rules/import
+```
+
+| Kind | Export | Import | Format | List key |
+|---|---|---|---|---|
+| Escalation policies | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.escalation-policies/v1` | `policies` |
+| On-call schedules | `schedules.read` | `schedules.create` | `molesignal.schedules/v1` | `schedules` |
+| Routing rules | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.routing-rules/v1` | `rules` |
+
+## Export
+
+The query parameter `ids` takes ids separated by commas; empty exports every item. The response is a
+bundle:
+
+```json
+{
+  "format": "molesignal.escalation-policies/v1",
+  "policies": [
+    {
+      "name": "Payments on-call",
+      "steps": [
+        {"targets": [{"kind": "schedule", "schedule": "Payments primary"}], "ack_timeout_secs": 300, "min_severity": null},
+        {"targets": [{"kind": "user", "user": "lead@example.com"}], "ack_timeout_secs": 600, "min_severity": null}
+      ],
+      "repeat": false,
+      "max_loops": 1,
+      "urgency_rule": {"mode": "by_severity"}
+    }
+  ]
+}
+```
+
+An item keeps its definition but no id or organization. References are names: `user` is the user's
+email; `team`, `schedule`, `policy`, and `calendar` are the names of a team, an on-call schedule, an
+escalation policy, and a holiday calendar; the `members` of a rotation are emails. A schedule leaves out
+its temporary coverage and its times; a routing rule leaves out its position and times.
+
+## Import
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `content` | string | Yes | A bundle of the kind, as JSON or YAML, up to 4 MiB and 500 items. |
+| `dry_run` | boolean | No | `true` by default, which only tries it; `false` writes. |
+| `create_only` | boolean | No | With `true`, existing items with the same name are left as they are. |
+
+Each item is matched by name: a new name is created, a name with one item compared field by field, and a
+name with several items fails, as does a name the file gives twice. Every reference must name something
+in the organization, and each item is checked as saving it checks it. When any item fails, nothing is
+written; otherwise the items are written one after another, a federation change event is sent for each
+synchronized one, and one audit event is recorded: `escalation_policies.imported`, `schedules.imported`,
+or `routing_rules.imported`.
+
+- Importing a schedule that exists keeps its temporary coverage and shift swaps.
+- Imported routing rules go first, in the order of the file; the other rules keep their order after them.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content schedules.yaml '{content: $content, dry_run: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "molesignal.schedules/v1",
+  "items": [
+    {"name": "Payments primary", "action": "update", "changes": ["rotations"], "id": "3KC9..."},
+    {"name": "Payments nights", "action": "create"},
+    {"name": "Search", "action": "error", "error": "no user is named `ann@example.com`"}
+  ],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` is `create`, `update`, `unchanged`, `skip` (an existing item with `create_only`), or `error`;
+`id` is the item created or updated once written. `applied` says whether anything was written.
+
+**Errors**
+
+| Status | Reason |
+|---|---|
+| `400` | The content is not a bundle of the kind, names another format, or is too large or has too many items. |
+| `403` | The token lacks the permission. |

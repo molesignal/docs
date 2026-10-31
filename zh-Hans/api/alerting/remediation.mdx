@@ -1,0 +1,202 @@
+---
+title: "修复动作"
+description: "定义 HTTP 和 Kubernetes 修复动作，登记集群，在事件上发起执行：每次都要审批，批准后执行并验证。"
+"en_link": "/en-US/api/alerting/remediation"
+---
+
+修复动作是预先定义好的一步处置，例如调一次 Jenkins 的回滚任务，或把一个 Deployment 滚动重启。在事件上发起后一律走[审批](/zh-Hans/agent#审批与执行)：L2 要一人批准，L3 要两人批准，发起人不能批准自己发起的；批准后立即执行，结果和验证都记进事件的[时间线](/zh-Hans/api/alerting/incident-timeline)。页面上的用法见[修复动作](/zh-Hans/alerting/remediation)。
+
+| 方法与路径 | 作用 | 权限 |
+|---|---|---|
+| `GET /api/v1/alerts/remediation/actions` | 组织的修复动作。 | `alerts.remediation.read` |
+| `POST /api/v1/alerts/remediation/actions` | 新建修复动作。 | `alerts.remediation.manage` |
+| `PUT /api/v1/alerts/remediation/actions/{id}` | 替换修复动作。 | `alerts.remediation.manage` |
+| `DELETE /api/v1/alerts/remediation/actions/{id}` | 删除修复动作。 | `alerts.remediation.manage` |
+| `GET /api/v1/alerts/remediation/clusters` | 登记的 Kubernetes 集群。 | `alerts.remediation.read` |
+| `POST /api/v1/alerts/remediation/clusters` | 登记集群。 | `alerts.remediation.manage` |
+| `PUT /api/v1/alerts/remediation/clusters/{id}` | 修改集群。 | `alerts.remediation.manage` |
+| `DELETE /api/v1/alerts/remediation/clusters/{id}` | 删除集群。 | `alerts.remediation.manage` |
+| `POST /api/v1/alerts/remediation/clusters/{id}/test` | 测试连接，返回 `{ "ok": true, "version": "v1.30.2" }`。 | `alerts.remediation.manage` |
+| `GET /api/v1/alerts/incidents/{id}/remediations` | 适用于事件的动作，和事件上的执行记录。 | 对事件的 `alerts.incidents.read` |
+| `POST /api/v1/alerts/incidents/{id}/remediations` | 在事件上发起执行，提交审批。 | 对事件的 `alerts.incidents.remediate` |
+
+新建、修改、删除和发起执行都记进审计日志。
+
+## 修复动作
+
+**请求体**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | 1 到 120 个字符。 |
+| `description` | string | 否 | 说明。 |
+| `target` | object | 是 | 怎样执行：`kind` 为 `http` 或 `kubernetes`，其余字段见下文。 |
+| `parameters` | array | 否 | 发起时要填的参数，最多 10 个，见下文。 |
+| `services` | array | 否 | 适用的服务。和 `team_ids` 都空着时所有事件都能用；设了时事件的服务或团队要对得上。 |
+| `team_ids` | array | 否 | 适用的团队。 |
+| `risk` | string | 否 | `l2`（默认，一人批准）或 `l3`（两人批准）。 |
+| `verify_after_secs` | integer | 否 | 执行成功后多少秒验证，0 到 86400；默认 `0`，不验证。 |
+| `verify_by` | string | 否 | 怎样算有效：`incident_resolved`（默认，事件已解决或关闭）或 `rule_healthy`（事件的规则回到健康）。 |
+| `enabled` | boolean | 否 | 默认 `true`。停用的动作不能发起。 |
+
+**`target`：HTTP 请求**
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `kind` | string | `http`。 |
+| `method` | string | `GET`、`POST`（默认）、`PUT` 或 `PATCH`。 |
+| `url` | string | 地址模板，`http://` 或 `https://` 开头。 |
+| `headers` | object | 请求头；值是模板，加密保存。 |
+| `body` | string | 请求体模板，JSON，最长 16384 个字符；占位符可以不带引号当数字用。把每个占位符换成 `0` 后要是合法的 JSON，否则返回 `400`。有请求体时 `Content-Type` 为 `application/json`；空着不带请求体。 |
+| `signing_secret` | string | 签名密钥，加密保存。设了就带 `X-MoleSignal-Timestamp` 与 `X-MoleSignal-Sign`，算法同[通用 Webhook 的签名](/zh-Hans/notification-channels/webhooks#请求头与签名)。 |
+
+请求只连地址解析出的 IP，拒绝云厂商元数据地址，不跟随跳转，30 秒超时；返回 2xx 算成功。
+
+**`target`：Kubernetes**
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `kind` | string | `kubernetes`。 |
+| `cluster_id` | string | 登记的集群。 |
+| `operation` | string | `restart`（滚动重启，同 `kubectl rollout restart`）、`scale`（改副本数）或 `rollback`（回到上一个版本，同 `kubectl rollout undo`）。 |
+| `workload_kind` | string | `Deployment`、`StatefulSet` 或 `DaemonSet`。只有 Deployment 能回滚，DaemonSet 不能扩缩容。 |
+| `namespace`、`workload_name` | string | 命名空间和工作负载名，可以是模板。 |
+| `replicas` | string | 扩缩容的副本数，可以是模板，例如 `{{params.replicas}}`。 |
+
+**`parameters[]`**
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `key` | string | 模板里写 `{{params.<key>}}`。 |
+| `label` | string | 发起时显示的名字。 |
+| `kind` | string | `text`（默认）、`number` 或 `select`。 |
+| `options` | array | `select` 的选项。 |
+| `required` | boolean | 默认 `false`。 |
+| `default` | string | 没填时用的值。 |
+
+**模板变量**：`{{incident.id}}`、`{{incident.summary}}`、`{{incident.severity}}`、`{{incident.status}}`、`{{incident.service}}`（`service` 标签，没有时取第一个受影响的服务）、`{{incident.url}}`（事件页地址），以及 `{{params.<key>}}`。填进地址时按百分号编码，填进 JSON 请求体时按 JSON 字符串转义；没有的变量换成空串。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/remediation/actions \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "Roll back checkout",
+    "target": {
+      "kind": "http",
+      "method": "POST",
+      "url": "https://jenkins.example.com/job/rollback/buildWithParameters?service={{incident.service}}",
+      "headers": { "Authorization": "Bearer <jenkins-token>" },
+      "body": "{\"reason\": \"{{params.reason}}\", \"incident\": \"{{incident.url}}\"}"
+    },
+    "parameters": [{ "key": "reason", "label": "Why", "required": true }],
+    "services": ["checkout"],
+    "risk": "l3",
+    "verify_after_secs": 600,
+    "verify_by": "incident_resolved"
+  }'
+```
+</RequestExample>
+
+响应是保存的动作。请求头的值和签名密钥不再返回：`headers` 里的值为空，`secrets_set` 列出已经设了的秘密，例如 `["header:Authorization", "signing_secret"]`。修改时请求头的值留空、不传 `signing_secret` 的保持原样；`signing_secret` 传空串时去掉签名。
+
+## Kubernetes 集群
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | 名称。 |
+| `api_server` | string | 是 | API Server 地址，`https://` 开头。 |
+| `ca_cert` | string | 否 | PEM 格式的 CA 证书；空着用系统信任的根证书。 |
+| `token` | string | 新建时必填 | ServiceAccount Token，加密保存，不再返回；修改时留空保持原样。 |
+
+Token 需要对目标工作负载有 `get` 和 `patch` 权限，回滚还要能列出 ReplicaSet。连接只连 API Server 地址解析出的 IP，拒绝云厂商元数据地址，30 秒超时。删除还有动作在用的集群会被拒绝。
+
+## 在事件上执行
+
+```http
+GET /api/v1/alerts/incidents/{id}/remediations
+```
+
+返回 `{ "actions": [ ... ], "runs": [ ... ] }`：适用于这个事件、已启用的动作（秘密已去掉），和事件上的执行记录。审批被驳回、过期或撤销的执行在读取时记成 `declined`。
+
+```http
+POST /api/v1/alerts/incidents/{id}/remediations
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `action_id` | string | 是 | 要执行的动作，要适用于这个事件。 |
+| `inputs` | object | 否 | 参数的值，键是参数的 `key`。必填的要有，数字要是数字，选项要在选项里，不能有多余的；没填的用默认值。每个值最长 500 个字符。 |
+| `reason` | string | 否 | 写在审批上的原因，最长 2000 个字符；不填时自动生成。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/remediations \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"action_id": "<action-id>", "inputs": {"reason": "pool exhausted after v2026.10.28"}}'
+```
+</RequestExample>
+
+响应是 `{ "run": { ... }, "approval": { ... } }`：执行记录，和提交的审批（风险按动作的 `risk`，影响写明会调的地址，或在哪个集群上对哪个工作负载做什么）。审批人用 `POST /api/v1/agent/approvals/{approval_id}/review` 批准或驳回，请求体为 `{ "approve": true, "comment": "…" }`，需要 `agent.approve`；批准够人数后立即执行。
+
+<ResponseExample>
+```json 200
+{
+  "run": {
+    "id": "3KJ0f2R9cWm1Xa8LpV4sNq7TbYe",
+    "org_id": "<organization-id>",
+    "incident_id": "<incident-id>",
+    "action_id": "<action-id>",
+    "action_name": "Roll back checkout",
+    "approval_id": "<approval-id>",
+    "inputs": { "reason": "pool exhausted after v2026.10.28" },
+    "status": "awaiting_approval",
+    "output": "",
+    "verify_at": null,
+    "verification": "",
+    "requested_by": "<user-id>",
+    "executed_by": null,
+    "created_at": 1790000000000000,
+    "updated_at": 1790000000000000
+  },
+  "approval": {
+    "id": "<approval-id>",
+    "org_id": "<organization-id>",
+    "investigation_id": null,
+    "action": "run_remediation_action",
+    "target": "<incident-id>",
+    "parameters": { "action_id": "<action-id>", "action": "Roll back checkout", "inputs": { "reason": "pool exhausted after v2026.10.28" } },
+    "reason": "Run `Roll back checkout` on incident: High error rate · checkout",
+    "impact": "HTTP POST https://jenkins.example.com/job/rollback/buildWithParameters?service={{incident.service}} (reason=pool exhausted after v2026.10.28)",
+    "risk": "l3",
+    "status": "pending",
+    "requested_by": "<user-id>",
+    "required_approvals": 2,
+    "reviews": [],
+    "expires_at": 1790003600000000,
+    "decided_at": null,
+    "created_at": 1790000000000000,
+    "updated_at": 1790000000000000
+  }
+}
+```
+</ResponseExample>
+
+| `status` | 含义 |
+|---|---|
+| `awaiting_approval` | 等审批。 |
+| `running` | 执行中。 |
+| `succeeded`、`failed` | 执行成功、失败；`output` 是响应或错误的开头。 |
+| `declined` | 审批被驳回、过期或撤销，没有执行。 |
+| `verifying` | 执行成功，等到 `verify_at` 验证。 |
+| `verified`、`verification_failed` | 验证通过、没通过；`verification` 写明结果。 |
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 字段不对、集群不在本组织、动作不适用于这个事件或已停用、参数不对，或事件已解决。 |
+| `403` | 缺少权限，或无权访问这个事件。 |
+| `404` | 动作、集群或事件不存在。 |

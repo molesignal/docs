@@ -1,0 +1,237 @@
+---
+title: "Gateway API"
+description: "用两个 Gateway 做内网和公网两个入口：内网 HTTPRoute 转发全部路径，公网 HTTPRoute 按路径和方法只匹配外部回调和公开页面。"
+"en_link": "/en-US/public-access/gateway-api"
+---
+
+下面的配置按[公网访问](/zh-Hans/public-access)里推荐的做法：一个 Gateway 挂在内网负载均衡上，一个挂在公网负载均衡上；同一个域名 `molesignal.example.com` 在内网 DNS 和公网 DNS 里分别解析到它们。示例用 Gateway API `v1`，适用于各个实现；IP 白名单、限流、请求体上限和访问日志不在 Gateway API 里，由实现自己的策略提供，见[实现提供的策略](#实现提供的策略)。MoleSignal 的 Service 在命名空间 `molesignal` 里，名字是 `molesignal`、端口 `5080`；分角色部署时换成 router 的 Service。
+
+## 两个 Gateway
+
+`gatewayClassName` 填所用实现的 GatewayClass。内网 Gateway 要落在内网负载均衡上：实现支持 `infrastructure` 时，用它把云厂商的注解带到负载均衡的 Service 上；不支持时按实现的文档配置。
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: molesignal-internal
+  namespace: molesignal
+spec:
+  gatewayClassName: <GatewayClass>
+  infrastructure:
+    annotations:
+      # 按云厂商填写，例如阿里云 ACK：
+      service.beta.kubernetes.io/alibaba-cloud-loadbalancer-address-type: intranet
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: molesignal.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: molesignal-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: molesignal-public
+  namespace: molesignal
+spec:
+  gatewayClassName: <GatewayClass>
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: molesignal.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: molesignal-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+```
+
+## 内网 HTTPRoute
+
+内网 HTTPRoute 转发全部路径。实时查询是流式响应，单独给它放长超时：
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: molesignal-internal
+  namespace: molesignal
+spec:
+  parentRefs:
+    - name: molesignal-internal
+  hostnames: [molesignal.example.com]
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: /api/v1/query/stream }
+      timeouts:
+        request: 600s
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    - matches:
+        - path: { type: PathPrefix, value: / }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+```
+
+## 公网 HTTPRoute
+
+公网 HTTPRoute 只匹配要开放的路径，并限定方法；没有匹配的请求由网关返回 404。只保留实际用到的匹配：
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: molesignal-public
+  namespace: molesignal
+spec:
+  parentRefs:
+    - name: molesignal-public
+  hostnames: [molesignal.example.com]
+  rules:
+    # 外部回调：外部告警、心跳打卡、Jira 的工单 Webhook、值班日历订阅、Teams 里的 Mole Agent、回复短信与电话按键、自动化的 API 触发、推送来源
+    - matches:
+        - { path: { type: Exact, value: /api/v1/intake/alerts }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/intake/heartbeats }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/intake/heartbeats }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/tickets/jira }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/calendar }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/im/teams }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/notify }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/automations }, method: POST }
+        - { path: { type: Exact, value: /api/v1/_kinesis_firehose }, method: POST }
+        - { path: { type: Exact, value: /api/v1/_cloudflare }, method: POST }
+        - { path: { type: Exact, value: /api/v1/_heroku }, method: POST }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    # 用户体验：POST 和浏览器的 CORS 预检
+    - matches:
+        - { path: { type: Exact, value: /api/v1/rum/events }, method: POST }
+        - { path: { type: Exact, value: /api/v1/rum/events }, method: OPTIONS }
+        - { path: { type: Exact, value: /api/v1/rum/replay }, method: POST }
+        - { path: { type: Exact, value: /api/v1/rum/replay }, method: OPTIONS }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    # 拨测 Probe Agent 上传产物
+    - matches:
+        - { path: { type: PathPrefix, value: /api/v1/synthetics/artifacts }, method: PUT }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    # 状态页、资源共享和它们的网页文件
+    - matches:
+        - { path: { type: PathPrefix, value: /status }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/status-pages } }
+        - { path: { type: PathPrefix, value: /s }, method: GET }
+        - { path: { type: Exact, value: /shared }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/share } }
+        - { path: { type: PathPrefix, value: /assets }, method: GET }
+        - { path: { type: Exact, value: /favicon.ico }, method: GET }
+        - { path: { type: Exact, value: /favicon.svg }, method: GET }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+```
+
+`PathPrefix` 按路径段匹配：`/s` 匹配 `/s/<分享 Token>`，不匹配 `/shared`。按方法匹配属于 Gateway API 的扩展功能，大多数实现支持；所用实现不支持时去掉 `method`，由 MoleSignal 对不接受的方法返回 `405` 或 `404`。
+
+## 实现提供的策略
+
+按来源地址放行、限流、请求体上限和识别真实客户端地址都不在 Gateway API 里，由各实现用自己的资源提供，例如：
+
+- **Envoy Gateway**：`SecurityPolicy` 按来源地址放行，`BackendTrafficPolicy` 限流，`ClientTrafficPolicy` 识别真实客户端地址。
+- **Istio**：`AuthorizationPolicy` 按来源地址放行。
+- **NGINX Gateway Fabric**：`ClientSettingsPolicy` 设置请求体上限。
+
+用其他实现时，按它的文档配置同样的限制。例如在 Envoy Gateway 上只允许 Azure 服务标记 `AzureBotService` 里的地址段访问 Teams 的回调：把 Teams 的匹配挪到单独的 HTTPRoute `molesignal-public-teams`，再给它挂一个 `SecurityPolicy`：
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: molesignal-teams-allowlist
+  namespace: molesignal
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: molesignal-public-teams
+  authorization:
+    defaultAction: Deny
+    rules:
+      - action: Allow
+        principal:
+          clientCIDRs:
+            - 203.0.113.0/24
+            - 198.51.100.0/24
+```
+
+## 状态页的自定义域名
+
+状态页绑定了 `status.example.org` 时，给公网 Gateway 加一个这个域名的监听器，再加一条只放行状态页根路径、接口和网页文件的 HTTPRoute：
+
+```yaml
+# 加到 molesignal-public 的 listeners 里
+- name: https-status
+  protocol: HTTPS
+  port: 443
+  hostname: status.example.org
+  tls:
+    mode: Terminate
+    certificateRefs:
+      - name: status-example-org-tls
+  allowedRoutes:
+    namespaces:
+      from: Same
+```
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: molesignal-status-domain
+  namespace: molesignal
+spec:
+  parentRefs:
+    - { name: molesignal-public, sectionName: https-status }
+  hostnames: [status.example.org]
+  rules:
+    - matches:
+        - { path: { type: Exact, value: / }, method: GET }
+        - { path: { type: Exact, value: /history }, method: GET }
+        - { path: { type: Exact, value: /uptime }, method: GET }
+        - { path: { type: PathPrefix, value: /incidents }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/status-pages } }
+        - { path: { type: PathPrefix, value: /assets }, method: GET }
+        - { path: { type: Exact, value: /favicon.ico }, method: GET }
+        - { path: { type: Exact, value: /favicon.svg }, method: GET }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+```
+
+## 检查
+
+确认两个 Gateway 都拿到了地址，HTTPRoute 的状态是 `Accepted` 和 `ResolvedRefs`：
+
+```bash
+kubectl -n molesignal get gateway,httproute
+```
+
+从公网请求登录接口应返回 `404`，不带 Token 请求告警接入应返回 `401`：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://molesignal.example.com/api/v1/auth/signin
+```
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://molesignal.example.com/api/v1/intake/alerts
+```
+
+最后在 `_sys` 组织的 **设置 → 客户端 IP 识别** 里，把公网网关的代理所在的网段列为受信任的代理，见[客户端 IP 识别](/zh-Hans/settings/platform#客户端-ip-识别)。

@@ -1,0 +1,322 @@
+---
+title: "外部告警"
+description: "让 Alertmanager、Grafana、Datadog、PagerDuty、Zabbix、云监控、邮件或自己的系统把告警发进来，开成事件，走升级和通知。"
+"en_link": "/en-US/alerting/sources"
+---
+
+告警来源让别的系统发来的告警也开成[事件](/zh-Hans/alerting/incidents)，和规则开的事件一样按[升级策略](/zh-Hans/alerting/on-call#升级策略)叫人、按[通知策略](/zh-Hans/notification-channels)通知，来源报恢复时自动解决。打开 **告警 → 告警来源**。查看需要 `alerts.sources.read`，新建、修改、删除和轮换 Token 需要 `alerts.sources.manage`。
+
+## 来源类型
+
+每个来源有一个类型，类型决定按哪家的格式读请求体。
+
+| 类型 | 发送方 | 一个事件对应 |
+|---|---|---|
+| **API** | 脚本、CI、自研系统，调用 MoleSignal 的接口 | 一个去重键 |
+| **Alertmanager** | Prometheus Alertmanager 的 webhook 接收器 | 一个通知分组 |
+| **Grafana** | Grafana 告警的 Webhook 联系点 | 一个通知分组 |
+| **Datadog** | Datadog 的 Webhooks 集成 | 一个监控；多告警监控的每个分组各一个 |
+| **PagerDuty** | PagerDuty 的 Webhook（v3）订阅 | 一个 PagerDuty 事件 |
+| **阿里云云监控** | 阈值报警回调、事件订阅的推送渠道 | 一条报警规则下的一个对象，或一条系统事件 |
+| **腾讯云可观测平台** | 通知模板里的接口回调 | 一条策略下一个对象的一个指标或事件，分级别的每级一个 |
+| **Amazon CloudWatch** | 告警发到 SNS 主题，主题的 HTTPS 订阅 | 一个告警 |
+| **Zabbix** | Zabbix 的 Webhook 媒介类型 | 一个问题 |
+| **邮件** | 一个 IMAP 邮箱，或已有的邮件系统转来的原始邮件 | 主题相同的一串邮件 |
+
+兼容 Alertmanager webhook 的系统，例如 Thanos、Cortex、Mimir 的 Alertmanager，按 **Alertmanager** 类型接入。
+
+## 新建来源
+
+1. 打开 **告警 → 告警来源**，点击 **新建告警来源**。
+2. 选择 **类型**，填写 **名称**。
+3. 选择 **升级策略**。默认是 **按路由分派（默认）**，与规则工作台相同：[告警路由](/zh-Hans/alerting/routing)按路由规则、服务的负责团队和 team 标签选出团队和升级策略，都没有时用名为 `default` 的[默认策略](/zh-Hans/alerting/on-call#默认策略)。选某条策略时事件用它，路由只定团队。选 **不升级，只按通知策略通知** 时，事件照常开启和通知，只是不会按升级策略叫人。
+4. 选择 **默认严重度**：告警自己没带严重度时用这一档。
+5. 按需添加 **附加标签**，例如 `team=payments`。它们加在这个来源开的每个事件上，告警自己带了同名标签时以告警的为准。
+6. 点击 **创建**。页面打开来源详情，并弹出这个来源的 Token 和填好 Token 的配置；阿里云云监控只需要接入地址，弹出的是带 Token 的接入地址。
+
+<Warning>
+  Token 只在新建和轮换时显示这一次。关掉弹窗后只能看到 `ms_` 开头的前缀；忘了就点击 **轮换 Token** 换一个，旧 Token 立即失效。
+</Warning>
+
+## 接入地址与 Token
+
+所有来源共用一个接入地址，Token 决定是哪个来源：
+
+```text
+https://<molesignal-host>/api/v1/intake/alerts
+```
+
+Token 形如 `ms_<16 位>_<32 位>`，与 API Token 的样子相同，但只能用来接入告警，API Token 也不能用来接入告警。发送方把它放在请求头里：
+
+```text
+Authorization: Bearer <token>
+```
+
+设不了请求头的发送方（阿里云云监控、腾讯云可观测平台、经 SNS 的 Amazon CloudWatch）把 Token 放在地址上：`https://<molesignal-host>/api/v1/intake/alerts?token=<token>`。
+
+发送方要能访问这个地址。MoleSignal 前面有防火墙时，按发送方所在的站点或地域放行它的出口 IP：Datadog 每个站点的 IP 列表在 `ip-ranges` 的 `webhooks` 一节，PagerDuty 按美国区和欧洲区分别公布，阿里云云监控的推送网段见它的报警回调文档。MoleSignal 部署在内网时，只把这个地址开放到公网的做法见[公网访问](/zh-Hans/public-access)。
+
+## 配置发送方
+
+来源详情的 **接入方式** 分三步给出每种类型的接入地址、Token 和配置，`<TOKEN>` 处填这个来源的 Token。这个来源收到第一条请求后，三步都会打勾。
+
+### API
+
+```bash
+curl -X POST https://<molesignal-host>/api/v1/intake/alerts \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"dedup_key": "disk-full/web-1", "summary": "web-1 磁盘使用率 95%", "severity": "critical", "labels": {"host.name": "web-1"}}'
+```
+
+`action` 为 `trigger`（默认）、`acknowledge` 或 `resolve`。用同一个 `dedup_key` 确认、恢复同一条告警。字段见[接入外部告警](/zh-Hans/api/alerting/send-alerts)。
+
+### Alertmanager
+
+在 `alertmanager.yml` 里加一个接收器，并在路由里把告警交给它：
+
+```yaml
+route:
+  receiver: molesignal
+receivers:
+  - name: molesignal
+    webhook_configs:
+      - url: https://<molesignal-host>/api/v1/intake/alerts
+        send_resolved: true
+        http_config:
+          authorization:
+            credentials: <token>
+```
+
+`send_resolved` 要保持 `true`，否则恢复不会发过来。同一个 Alertmanager 集群的各个副本要配同一个 `--web.external-url`：外部地址是去重键的一部分，几个 region 的 Alertmanager 用同一套路由时，同名的分组也不会并成一个事件。
+
+### Grafana
+
+1. 在 Grafana 中打开 **Alerting → Contact points**，点击 **Add contact point**。
+2. **Integration** 选 **Webhook**，**URL** 填接入地址。
+3. 在 **Optional Webhook settings** 中，**Authentication Header Scheme** 填 `Bearer`，**Authentication Header Credentials** 填 Token。
+4. 不要勾选 **Disable resolved message**，保存后在通知策略里使用这个联系点。
+
+用配置文件管理时：
+
+```yaml
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: molesignal
+    receivers:
+      - uid: molesignal
+        type: webhook
+        settings:
+          url: https://<molesignal-host>/api/v1/intake/alerts
+          httpMethod: POST
+          authorization_scheme: Bearer
+          authorization_credentials: <token>
+```
+
+### Datadog
+
+1. 在 Datadog 中打开 **Integrations → Webhooks**，新建一个 Webhook，名称例如 `molesignal`。
+2. **URL** 填接入地址，**Custom Headers** 填 `{"Authorization": "Bearer <token>"}`，不要勾选 **Encode as form**。
+3. **Payload** 填下面的模板。字段名是 MoleSignal 的，值是 Datadog 的变量；不是这个模板的请求会被拒收。
+
+```json
+{
+  "alert_id": "$ALERT_ID",
+  "alert_cycle_key": "$ALERT_CYCLE_KEY",
+  "transition": "$ALERT_TRANSITION",
+  "alert_type": "$ALERT_TYPE",
+  "priority": "$ALERT_PRIORITY",
+  "title": "$ALERT_TITLE",
+  "event_title": "$EVENT_TITLE",
+  "message": "$TEXT_ONLY_MSG",
+  "scope": "$ALERT_SCOPE",
+  "tags": "$TAGS",
+  "hostname": "$HOSTNAME",
+  "link": "$LINK",
+  "snapshot": "$SNAPSHOT",
+  "query": "$ALERT_QUERY",
+  "org_id": "$ORG_ID",
+  "last_updated": "$LAST_UPDATED"
+}
+```
+
+4. 在监控的通知消息里写 `@webhook-molesignal`。
+
+各个 Datadog 站点（`datadoghq.com`、`datadoghq.eu`、`us3`、`us5`、`ap1` 等）都可以发到同一个来源：站点取自 `$LINK` 的域名，与组织 ID 一起算在去重键里。
+
+### PagerDuty
+
+1. 在 PagerDuty 中打开 **Integrations → Generic Webhooks (v3)**，点击 **New Webhook**。
+2. **Webhook URL** 填接入地址，按需要选择 **Scope Type**（整个账号、某个服务或某个团队）。
+3. **Event Subscription** 勾选 `incident.triggered`、`incident.acknowledged`、`incident.resolved`、`incident.reopened` 和 `incident.priority_updated`。
+4. 添加自定义请求头 `Authorization`，值为 `Bearer <token>`。
+
+美国区和欧洲区的账号都可以发到同一个来源：账号域名（`<子域>.pagerduty.com` 或 `<子域>.eu.pagerduty.com`）算在去重键里，并写进标签 `pagerduty.region`。
+
+### 阿里云云监控
+
+接入地址带上 Token：
+
+```text
+https://<molesignal-host>/api/v1/intake/alerts?token=<token>
+```
+
+- **阈值报警**：在报警规则的 **报警回调** 中填写这个地址。云监控以表单编码 POST 回调，MoleSignal 也认 JSON。
+- **系统事件**：在 **事件中心 → 事件订阅 → 推送渠道** 中新建渠道，**目标类型** 选 **Webhook**，**请求方式** 选 **POST**，**数据格式** 选 **JSON**，地址填上面这个地址，再在订阅策略里使用这个渠道。
+
+云监控的系统事件回调只等 5 秒、失败重试 3 次。MoleSignal 转发到[接收集群](#多个集群)最多等 3 秒，超时回 `503`，让云监控重试。中国站和国际站、各个地域的回调格式相同；地域写进标签 `aliyun.region`，账号 `userId` 算在去重键里。
+
+### 腾讯云可观测平台
+
+在腾讯云可观测平台（原云监控）的 **告警管理 → 通知模板** 编辑或新建模板，把接入地址填进 **接口回调**，再把模板绑到告警策略上。腾讯云的回调设不了请求头，Token 写在地址里，这个地址要当凭证保管：回调没有签名，靠它认来源。指标告警和事件告警都能收，触发和恢复都会推送。
+
+- **去重**：账号、告警策略、指标或事件名和告警对象相同的是同一个告警。分了级别的策略每个级别一个事件，跟腾讯云一样各自恢复。
+- **严重度**：`alarmLevel` 的紧急（`Serious`）为 critical，严重（`Warn`）为 error，提示（`Remind`）为 info；不分级别的策略用来源的默认严重度。
+- **无状态的事件**（`alarmStatus` 为 `5`）开了事件不会等到恢复，要人来解决。
+- **时间**：回调的时间不带时区，按北京时间算。
+
+### Amazon CloudWatch
+
+CloudWatch 告警不直接调外部地址，要经 SNS：
+
+1. 在告警的通知里，把进入 **告警**（`ALARM`）和回到 **正常**（`OK`）都发到同一个 SNS 主题。没有 `OK` 时事件不会自动解决。要收无数据告警，把 **数据不足**（`INSUFFICIENT_DATA`）也发过去。
+2. 给主题加一个 HTTPS 订阅，端点填接入地址，Token 写在地址里：
+
+   ```bash
+   aws sns subscribe \
+     --topic-arn <主题的 ARN> \
+     --protocol https \
+     --notification-endpoint 'https://<molesignal-host>/api/v1/intake/alerts?token=<token>'
+   ```
+
+3. 订阅自动确认：MoleSignal 验过确认消息的签名后访问它的 `SubscribeURL`。
+
+MoleSignal 验每条 SNS 消息的签名，所以 **Raw message delivery** 要关着；开了会被拒收，来源详情的最近收到里写明原因。验签要从 `sns.<region>.amazonaws.com` 取证书，收请求的节点要能访问这个地址。
+
+CloudWatch 的告警没有严重度，事件用来源的默认严重度。告警的 ARN 是去重键，组合告警也一样。告警的说明和状态变化的原因进注解，地域、账号、命名空间、指标和维度进标签，`aws.region` 这样的标签可以用来路由。
+
+### Zabbix
+
+Zabbix 6.0 起都能用。Zabbix 不定请求体，由媒介类型里的脚本发，所以来源详情（和新建时的弹窗）给出一份填好地址和 Token 的媒介类型：
+
+1. 把它存成 YAML，在 **Alerts → Media types → Import** 导入，确认 `token` 参数。
+2. 设好全局宏 `{$ZABBIX.URL}`（Zabbix 前端的地址）。它算在去重键里，一个来源接几台 Zabbix 时不撞，事件上也能链回 Zabbix；没设也能用。
+3. 给一个用户加这个媒介，**发送到** 随便填（脚本不用它）。
+4. 新建一个触发器动作：**操作**、**恢复操作** 和 **更新操作** 都发给这个用户。没有恢复操作，事件不会自动解决。
+
+媒介类型的 **测试** 按钮要填真实的值：宏没展开时（`{EVENT.ID}` 原样发来）MoleSignal 回 `400`，说明要用文档给的媒介类型。
+
+### 邮件
+
+有两种接法，都读成同样的告警。
+
+**读邮箱**（推荐）：MoleSignal 定时读一个 IMAP 邮箱。只要连得出去、有一个邮箱，不用公网地址、MX 记录、25 端口和证书，所以自托管时最省事。把监控系统的告警邮件发到这个邮箱，或用邮件规则转过去。
+
+在来源详情的 **读邮箱** 填 **IMAP 服务器**、**端口**、**加密**、**用户名**、**密码或授权码**、**文件夹**（默认 `INBOX`）和 **多久读一次**（15 到 3600 秒，默认 60），点 **试连**，再点 **保存邮箱**。
+
+- **只读**：用 `EXAMINE` 和 `BODY.PEEK[]`，不改已读状态，也不删邮件。可以给它一个只读的账号。
+- **不吃存量**：第一次连上时记下当时的位置，只读这之后到的邮件。换了主机、账号或文件夹，或服务器重排了邮箱（`UIDVALIDITY` 变了），都重新从当时开始。来源停用期间不读、也不留位置，重新启用后从那时开始。
+- **发件人名单必填**：知道地址的人都能给邮箱发信。在来源设置的 **接受谁发来的** 写完整地址或 `@example.com` 整个域；要谁都接受就写 `*`。名单看的是 `From`，它可以被伪造：邮箱服务商的反垃圾和 DMARC 还要开着。不在名单上的邮件记成 **已拒收**，不开事件。
+- **登录方式**：密码，或邮箱服务给的授权码、应用专用密码。Microsoft 365 不再收密码登录，选 **OAuth 2.0**，填令牌地址 `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token`、客户端 ID、客户端密钥和 Scope `https://outlook.office365.com/.default`，应用要有 `IMAP.AccessAsApp` 权限并被授予这个邮箱。
+- **不加密** 只该用在可信的内网：密码明文过网。
+- 读失败时，来源详情写明原因，下一轮再试。多个告警节点时每个邮箱归一个节点读。开了联邦时，邮箱配在来源的接收集群上，不随联邦同步，密码不出集群。
+
+**把原始邮件发过来**：已有邮件系统（Postfix 的 `pipe`、SES、Mailgun 的 raw MIME）时，把原始邮件 POST 到接入地址：
+
+```bash
+curl -X POST 'https://<molesignal-host>/api/v1/intake/alerts' \
+  -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: message/rfc822' \
+  --data-binary @alert.eml
+```
+
+这种接法要公网（或邮件系统）能访问接入地址，发件人名单可以不写，Token 已经认出了来源；写了也照样看。
+
+没有内置 SMTP 收信：它要开 25 端口、配 MX 记录和 TLS 证书，还要自己挡垃圾邮件，自托管的部署大多过不了这一关。
+
+**一封邮件怎么读**，写在来源设置的 **读邮件的规则** 里：
+
+| 设置 | 说明 |
+|---|---|
+| **什么主题算恢复** | 正则。空着用内置的：`resolved`、`recovered`、`recovery`、`cleared`、`恢复`、`已解决`，以及开头的 `OK`。其余的邮件算触发。 |
+| **从主题取去重键** | 正则，取第一个分组，例如 `host=(\S+)`。空着或没匹配到时用整理过的主题：去掉 `Re:`、`Fwd:`、状态词（`PROBLEM`、`RECOVERY`、`告警`、`恢复` 等）、严重度、日期时间和百分比，大小写不算。所以「CRITICAL: disk full on web-1 (91%)」和「RECOVERY: disk full on web-1 (40%)」是同一个告警，`web-1` 和 `web-2` 不是。发件人的域名也算在去重键里。 |
+| **什么主题不算告警** | 正则。匹配到的邮件直接跳过，记在最近收到里。 |
+
+严重度看主题里的词（`critical`、`fatal`、`disaster`、`P1` 为 critical，`error`、`P2` 为 error，`warning`、`P3` 为 warning，`info`、`notice`、`P4`、`P5` 为 info），没有用来源的默认严重度；`High CPU`、`Low disk` 里的 high、low 不算。正文进注解 `message`（HTML 邮件转成文字，最多 4096 个字符），发件人进标签 `email.from` 和注解 `from`，发信时间是 `Date` 头。自动回复（`Auto-Submitted: auto-replied`）和退信（`multipart/report`）不算告警。GBK、GB2312 等字符集都认。超过 4 MiB 的邮件不取正文，记成 **已拒收**。
+
+## 外部告警怎样变成事件
+
+| 类型 | 去重键 | 触发 | 解决 | 严重度 |
+|---|---|---|---|---|
+| **API** | `dedup_key` | `trigger` | `resolve` | `severity` |
+| **Alertmanager** | 外部地址加 `groupKey` | 分组的 `status` 为 `firing` | 分组的 `status` 为 `resolved`，即组里的告警都恢复了 | 组里正在触发的告警的 `severity` 标签，取最高一档 |
+| **Grafana** | 外部地址、组织加 `groupKey` | 同上 | 同上 | 同上 |
+| **Datadog** | 站点、组织、监控 ID 加 scope | `Recovered` 以外的 transition | `Recovered` | `$ALERT_PRIORITY`；没有时 Warn、No Data 为 warning，其余按 `$ALERT_TYPE` |
+| **PagerDuty** | 账号域名加 PagerDuty 事件 ID | `incident.triggered`、`incident.reopened`；`incident.priority_updated` 调整严重度 | `incident.resolved` | 优先级 P1…P5；没有时紧急度 high 为 error，low 为 warning |
+| **阿里云云监控** | 账号、规则 ID 加 `dimensions`；系统事件为账号加 `dedupId` | `ALERT`、`INSUFFICIENT_DATA`；系统事件 `TRIGGERED` | `OK`；系统事件 `RESOLVED` | `triggerLevel`；系统事件 `severity` |
+| **腾讯云可观测平台** | 账号、策略、指标或事件名、级别和对象 | `alarmStatus` 为 `1` 或 `5` | `alarmStatus` 为 `0` | `alarmLevel` |
+| **Amazon CloudWatch** | `AlarmArn` | `NewStateValue` 为 `ALARM`、`INSUFFICIENT_DATA` | `NewStateValue` 为 `OK` | 没有，用来源的默认严重度 |
+| **Zabbix** | `{$ZABBIX.URL}` 的主机名加 `{EVENT.ID}` | `{EVENT.VALUE}` 为 1；更新操作也算，严重度跟着变 | `{EVENT.VALUE}` 为 0，或更新操作关闭了问题 | `{EVENT.NSEVERITY}`：灾难为 critical，严重为 error，一般严重和警告为 warning，信息为 info |
+| **邮件** | 发件人的域名加主题里取出的部分 | 其余的邮件 | 主题符合恢复的写法 | 主题里的词 |
+
+优先级和紧急度另外读：API 的 `priority`、`urgency`，Datadog 的 `$ALERT_PRIORITY`，PagerDuty 的优先级和紧急度直接成为事件的优先级和紧急度；没给紧急度时按来源的升级策略定，没报严重度的告警按高紧急度，见[紧急度](/zh-Hans/alerting/on-call#紧急度)。
+
+告警自己没带严重度时用来源的 **默认严重度**。各家的严重度词不区分大小写：`critical`、`crit`、`fatal`、`page`、`P1` 为 critical，`error`、`major`、`high`、`P2` 为 error，`warning`、`warn`、`minor`、`medium`、`P3` 为 warning，`info`、`low`、`P4`、`P5` 为 info，认不出的用默认严重度。
+
+- **开事件**：同一个来源、同一个去重键同时最多一个活动事件。事件带标签 `alert.source=external` 和 `external.kind=<类型>`，加上告警自己的标签（Alertmanager 与 Grafana 为分组的 `commonLabels`）和来源的附加标签。标签 `service.name` 或 `service` 进受影响服务，`host.name`、`host` 或 `hostname` 进主机。
+- **标题**：API 用 `summary`；Alertmanager 与 Grafana 用 `summary` 注解，没有就用 `alertname`；Datadog 用 `$ALERT_TITLE`；PagerDuty 用事件标题；阿里云云监控为「报警名 · 实例名」。
+- **链接**：回到发送方的地址写进注解，例如 `alertmanager_url`、`generator_url`、`dashboard_url`、`datadog_url`、`pagerduty_url`，事件详情把它们显示成链接。API 的 `links` 按 `name` 写进注解。
+- **分组里的告警**：Alertmanager 与 Grafana 的事件记着组里的每条告警（最多 100 条）和它们的状态，每收到一次通知更新一次，事件详情的 **外部告警** 一节列出它们，并标出区分它们的标签。
+- **严重度变化**：尚未确认的事件的严重度跟着告警变，经[告警流水线](/zh-Hans/pipelines/alert-events#严重度变化)重新判定；升到更高一档时，升级从第一步重新开始。手动设置过的严重度保持不变。
+- **确认**：API 的 `acknowledge`、PagerDuty 的 `incident.acknowledged` 和 Zabbix 确认问题的更新操作确认事件，停止后续升级和来电。确认人为空。
+- **解决**：来源报恢复时解决事件，已确认的事件也一起解决。解决人为空，时间线显示为已恢复。
+- **晚到的旧消息**：每个去重键记着用过的发送方时间，比它早的消息直接忽略。迟到的触发不会开出僵尸事件，迟到的恢复也不会关掉新事件。API 不带时间，按收到的先后处理。
+- **有人先解决了**：来源还在报这条告警时，下一次重发会开一个新事件，与规则的行为相同。
+- **无数据**：阿里云云监控的 `INSUFFICIENT_DATA`、Datadog 的 No Data 开的事件带 `alert.condition=no_data`，通知标题以 `NO DATA` 开头。
+- **停用与删除**：停用的来源拒收告警（`409`），已开的事件保留。删除来源时，它的 Token 立即失效，它开着的事件都会被解决。
+
+[静默策略](/zh-Hans/alerting/silences)、[语义分组](/zh-Hans/alerting/silences#语义分组)和[通知策略](/zh-Hans/notification-channels)对外部事件照常生效，可以按 `external.kind`、来源的附加标签或告警自己的标签匹配。
+
+## 最近收到
+
+来源详情的顶部写着这个来源的状态：**等待第一条请求**、**正常接收**、**最近一次请求被拒收**、**近 7 天没有请求** 或 **已停用**，旁边是近 24 小时的请求数和告警数，以及这个来源开出、还没关闭的事件数。
+
+收到过请求后，来源详情的 **最近收到** 列出这个来源收到的请求：时间、结果（**已处理**、**已拒收** 或 **已转发**）、HTTP 状态码、告警条数和各条的结果（**开事件**、**更新**、**未变**、**确认**、**恢复** 或 **忽略**）。点击一行展开，查看每条告警的标题、严重度、动作、结果和对应事件；被拒收的请求还显示原因和请求体开头（最多 16 KiB）。每个来源保留最近 500 次请求，最长 7 天。
+
+## 多个集群
+
+开启了[跨集群联邦](/zh-Hans/settings/data-plane#跨集群联邦)时：
+
+- 来源和其他告警配置一样在集群之间同步，Token 一起同步，所以同一个 Token 在每个集群的接入地址上都能用。
+- 一个来源的事件只在它的 **接收集群** 上开，默认是新建它的集群，可以在来源设置中改。别的集群收到这个来源的告警，经集群之间的 gRPC 转给接收集群，再把接收集群的答复回给发送方。所以一条外部告警不管从哪个集群的地址进来，都只对应一个事件。
+- 接收集群连不上时回 `503`，发送方会重试。接收集群所在的地域长时间不可用时，在来源设置中把 **接收集群** 改成可用的集群。
+- **最近收到** 记在处理请求的集群上。来源详情在其他集群上打开时会说明这一点。
+
+## 限制
+
+| 项目 | 限制 |
+|---|---|
+| 请求体、一封邮件 | 最大 4 MiB。 |
+| 读邮箱 | 一次最多处理 50 封，多的下一轮接着读。 |
+| API 一次请求 | 最多 100 条告警；`dedup_key` 最多 255 个字符，`summary` 最多 1024 个字符。 |
+| 一条告警 | 最多 64 个标签、64 个注解；API 超出时拒收，其他类型多出的丢掉，超长的标题和注解截断。 |
+| 分组里的告警 | 最多记 100 条。 |
+| 来源的附加标签 | 最多 32 个，不能用 `alert.` 开头的键和 `external.kind`。 |
+| 最近收到 | 每个来源最近 500 次请求，最长 7 天。 |
+
+不校验 Grafana 的 HMAC 签名和 PagerDuty 的签名，Token 已经认出了来源。在 MoleSignal 里确认、解决事件不会回写到发送方。
+
+## 告警来源 API
+
+| 操作 | 端点 |
+|---|---|
+| 接入外部告警 | [`POST /api/v1/intake/alerts`](/zh-Hans/api/alerting/send-alerts) |
+| 列出来源 | [`GET /api/v1/alerts/sources`](/zh-Hans/api/alerting/list-sources) |
+| 新建来源 | [`POST /api/v1/alerts/sources`](/zh-Hans/api/alerting/create-source) |
+| 修改来源 | [`PUT /api/v1/alerts/sources/{id}`](/zh-Hans/api/alerting/update-source) |
+| 删除来源 | [`DELETE /api/v1/alerts/sources/{id}`](/zh-Hans/api/alerting/delete-source) |
+| 轮换 Token | [`POST /api/v1/alerts/sources/{id}/token`](/zh-Hans/api/alerting/rotate-source-token) |
+| 最近收到的请求 | [`GET /api/v1/alerts/sources/{id}/requests`](/zh-Hans/api/alerting/list-source-requests) |
+| 邮件来源读的邮箱 | [`/api/v1/alerts/sources/{id}/mailbox`](/zh-Hans/api/alerting/source-mailbox) |
+| 外部事件的来源 | [`GET /api/v1/alerts/incidents/{id}/source`](/zh-Hans/api/alerting/incident-source) |

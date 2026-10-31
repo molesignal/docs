@@ -1,0 +1,72 @@
+---
+title: "公网访问"
+description: "MoleSignal 部署在内网时，只把外部回调和公开页面开放到公网：要开放的路径、两种入口做法和加固清单。"
+"en_link": "/en-US/public-access"
+---
+
+MoleSignal 通常部署在内网，员工从公司网络或 VPN 访问。少数功能要由外部系统或公网上的人直接访问，例如 Datadog、PagerDuty 发来的告警，Microsoft Teams 的消息回调，访客打开的状态页。MoleSignal 本身不区分请求来自内网还是公网，这件事交给网络入口：内网入口照常转发全部请求，公网入口只转发[下表](#需要公网访问的路径)里用到的路径，其他路径一律返回 404。
+
+开放到公网的每条路径都有自己的鉴权：告警来源的 Token、推送 Token、分享链接，或平台签发的令牌。网络层的限制是第二道防线，让公网上的扫描和撞库碰不到登录接口和管理接口。
+
+## 需要公网访问的路径
+
+只开放实际用到的功能，各行互不依赖。
+
+| 功能 | 路径 | 方法 | 调用方 | 鉴权 |
+|---|---|---|---|---|
+| [外部告警](/zh-Hans/alerting/sources) | `/api/v1/intake/alerts` | `POST` | Datadog、PagerDuty、阿里云云监控、腾讯云可观测平台、Amazon SNS，以及公网上的 Alertmanager、Grafana、Zabbix 和邮件系统 | 告警来源的 Token，放在请求头或 `?token=` 里 |
+| [心跳打卡](/zh-Hans/alerting/rules#心跳规则) | `/api/v1/intake/heartbeats/` 开头 | `GET`、`POST` | 公网上的定时任务、备份脚本 | 地址里的打卡 Token |
+| [Jira 的工单 Webhook](/zh-Hans/alerting/tickets#状态同步) | `/api/v1/public/tickets/jira/<连接器 ID>` | `POST` | Jira Cloud | 连接器的 Webhook 密钥签的 `X-Hub-Signature` |
+| [值班日历订阅](/zh-Hans/alerting/on-call#订阅日历) | `/api/v1/public/calendar/<Token>.ics` | `GET` | Google 日历、Outlook 等在线日历服务 | 地址里的订阅 Token，每次读取按订阅人重新核对权限 |
+| [Teams 里的 Mole Agent](/zh-Hans/im#teams-的安全措施) | `/api/v1/public/im/teams/` 开头 | `POST` | Microsoft Bot Framework | Bot Framework 签发的令牌 |
+| [回复短信与电话按键](/zh-Hans/notification-channels#回复短信与电话按键) | `/api/v1/public/notify/<连接器 ID>/replies`、`/api/v1/public/notify/<连接器 ID>/keypress` | `POST` | Twilio、Amazon SNS，阿里云、腾讯云和华为云的短信与语音，自建短信网关（华为云的地址后面还有一段回调 Token） | Twilio 或 SNS 的签名，或地址里的回调 Token |
+| [自动化的 API 触发](/zh-Hans/automations) | `/api/v1/public/automations/<自动化 ID>/trigger` | `POST` | CI 流水线等外部系统 | 自动化自己的 Token |
+| [推送来源](/zh-Hans/connectors) | `/api/v1/_kinesis_firehose`、`/api/v1/_cloudflare`、`/api/v1/_heroku` | `POST` | Amazon Data Firehose、Cloudflare Logpush、Heroku 日志 Drain | 连接器的推送 Token |
+| [用户体验](/zh-Hans/rum) | `/api/v1/rum/events`、`/api/v1/rum/replay` | `POST`、`OPTIONS` | 公网用户的浏览器和 App | 应用的 Client Token |
+| [状态页](/zh-Hans/status-pages) | `/status/`、`/api/v1/public/status-pages/` 和[网页文件](#网页文件) | `GET`、`POST` | 状态页的访客和订阅者 | 公开状态页无需登录，私有状态页凭访问链接 |
+| [资源共享](/zh-Hans/resource-sharing) | `/s/`、`/shared`、`/api/v1/public/share` 和[网页文件](#网页文件) | `GET`、`POST` | 拿到分享链接的人 | 分享链接换来的短期会话 |
+| [拨测的 Probe Agent](/zh-Hans/synthetics#地点与-probe-agent) | `/api/v1/synthetics/artifacts/` | `PUT` | 外部地点的 Probe Agent，上传截图等产物 | 任务的租约 Token |
+
+Probe Agent 上传的产物由 MoleSignal 校验租约 Token、大小和内容哈希后写进对象存储，Probe Agent 拿不到对象存储的凭据，对象存储不用开放到公网。Probe Agent 还要连 `5084`（注册）和 `5085`（控制流）两个 gRPC 端口。这两个端口由 MoleSignal 自己终止 TLS，只能在四层（TCP）直通，不能交给 HTTP 代理；外部地点的 Probe Agent 从公网连进来时，把它们单独映射出去，并把 `probe.register_endpoint` 和 `probe.control_endpoint` 设为对外地址，见[配置](/zh-Hans/configuration)。
+
+### 网页文件
+
+状态页和分享页是网页，公网入口还要放行它们的静态文件：`/assets/` 开头的文件、`/favicon.ico` 和 `/favicon.svg`。只放行 `/status/`、`/shared` 这些页面路径和静态文件时，登录页和其他页面在公网入口上仍是 404。
+
+### 状态页的自定义域名
+
+状态页绑定自己的域名后，这个域名也指向公网入口。域名上的页面在根路径：`/`、`/history`、`/uptime` 和 `/incidents/` 开头的路径，数据来自 `/api/v1/public/status-pages/` 开头的接口。对这个域名只放行这些路径和网页文件。证书可以在公网入口上管理，也可以交给 MoleSignal 自动签发，见[自定义域名与 TLS](/zh-Hans/status-pages#自定义域名与-tls)。
+
+## 两种入口做法
+
+### 内外网解析到不同入口
+
+推荐的做法。内网 DNS 把 `molesignal.example.com` 解析到内网入口，公网 DNS 把同一个域名解析到公网入口。内网入口转发全部路径，公网入口只转发上表的路径。`http.external_url` 设为这个域名：页面上显示的接入地址、发给发送方的回调地址、IM 和邮件里的链接，在内网和公网都能用，员工从内网访问完全不受影响。
+
+### 同一个入口按来源地址区分
+
+只有一个入口时，上表的路径对所有来源开放，其他路径只允许公司网络和 VPN 的地址段访问。这种做法要求入口看得到真实的客户端地址：入口前面还有负载均衡时，用 PROXY 协议或 `X-Forwarded-For` 把原始地址传进来。
+
+## 加固清单
+
+- **只用 HTTPS。** 公网入口只监听 443，证书由公共 CA 签发。Teams 只往 https 地址投递。
+- **按接口设请求体上限。** 外部告警 4 MiB，心跳打卡 64 KiB，Jira 的工单 Webhook 1 MiB，用户体验的事件 5 MiB、会话回放 8 MiB，Probe Agent 的产物 10 MiB，其他接入接口 2 MiB。超过上限时 MoleSignal 返回 `413`，入口上的上限不要比这些小。
+- **在公网入口限流。** 按来源地址限制每秒请求数。`standalone` 节点不对接入限流，见[速率与大小限制](/zh-Hans/security#速率与大小限制)。
+- **访问日志不记查询串。** 阿里云云监控只能把 Token 放在地址的 `token` 参数里，公网入口的访问日志只记路径。心跳打卡和值班日历订阅的 Token 在路径里，这两类路径只记前缀，[配置示例](#配置示例)里用 `map` 把 Token 换掉了。MoleSignal 自己的链路只记路由，不记查询串。
+- **让 MoleSignal 看到真实地址。** 在 `_sys` 组织的 **设置 → 客户端 IP 识别** 里选择转发链，并把公网入口的地址列为受信任的代理，见[客户端 IP 识别](/zh-Hans/settings/platform#客户端-ip-识别)。用户体验的地理信息和[登录限速](/zh-Hans/settings/platform#登录限速)都依赖它：不配置时所有用户都算成入口的地址，私有地址不计数，公网地址上的用户会互相锁定。
+- **可选：按来源地址收紧。** 发送方公布了出口地址的，可以只放行这些地址：Datadog 按站点在 `ip-ranges.<站点域名>` 的 `webhooks` 一节公布，PagerDuty 分美区和欧区，阿里云云监控在报警回调文档里列出，Teams 用 Azure 服务标记 `AzureBotService`。这些地址会变，要跟着更新，Token 仍是主要防线。
+- **上线前验证。** 从公网请求 `/` 和 `/api/v1/auth/signin` 应返回 `404`；不带 Token 请求 `POST /api/v1/intake/alerts` 应返回 `401`，说明请求到了 MoleSignal。从内网打开 `/` 应看到登录页。
+
+## 配置示例
+
+<CardGroup cols={3}>
+  <Card title="nginx" icon="server" href="/zh-Hans/public-access/nginx">
+    两个 server：内网转发全部，公网只转发回调和公开页面。
+  </Card>
+  <Card title="Kubernetes Ingress" icon="network-wired" href="/zh-Hans/public-access/ingress">
+    两个 ingress-nginx 控制器，公网那个只列出要开放的路径。
+  </Card>
+  <Card title="Gateway API" icon="route" href="/zh-Hans/public-access/gateway-api">
+    两个 Gateway，公网那个的 HTTPRoute 按路径和方法匹配。
+  </Card>
+</CardGroup>

@@ -8,7 +8,7 @@ description: "为事件定义有序的通知步骤。"
 POST /api/v1/alerts/escalations
 ```
 
-创建一条升级策略。策略由有序的步骤组成，每一步通知自己的目标并等待确认。该调用需要 `alerts.manage`。
+创建一条升级策略。策略由有序的步骤组成，每一步通知自己的目标并等待确认。该调用需要 `alerts.escalations.manage`。
 
 ## 升级如何工作
 
@@ -17,6 +17,7 @@ POST /api/v1/alerts/escalations
 3. 当前步骤的每个目标都会收到一条通知事件。消息如何投递由[通知渠道](/zh-Hans/notification-channels)决定。
 4. `ack_timeout_secs` 过后仍未确认时，开始下一个适用的步骤。
 5. 最后一个适用步骤超时后，`repeat` 为 `true` 的策略会从第一步重新开始，直到完成 `max_loops` 轮。
+6. 设了 `ack_retrigger_secs` 时，`acknowledged` 的事件在确认后过了这么久仍未解决，会退回 `open`：有负责人时通知负责人，否则重新通知当前步骤，`escalation.reason` 都是 `ack_timeout`；当前步骤重新计算确认超时，之后照常升级。暂缓中的事件不看这个时间。
 
 规则通过 `escalation_policy_id` 选择策略。没有指定时规则使用 `default`，它是组织内名称为 `default` 的策略的别名，比较时不区分大小写。升级开始时，事件会保存该策略的真实 id，因此之后给策略改名不会让已开启的事件换到别的策略。组织里没有名为 `default` 的策略时，这类规则的事件不会升级，但触发事件仍会发送给通知策略。请创建一个名为 `default` 的策略，或者把规则指向某个策略 id。
 
@@ -28,6 +29,9 @@ POST /api/v1/alerts/escalations
 | `steps` | array | 否 | 默认为空。没有步骤的策略不会通知任何人。 |
 | `repeat` | boolean | 否 | 默认 `false`。最后一步之后重新开始。 |
 | `max_loops` | integer | 否 | 默认 `1`。`repeat` 为 `true` 时遍历步骤的总轮数。小于 1 的值按 1 处理。 |
+| `ack_retrigger_secs` | integer | 否 | 确认后多久仍未解决就重新通知，300 到 86400 秒。默认 `null`：不重新通知。 |
+| `urgency_rule` | object | 否 | 事件没指定紧急度时怎样定，默认 `{"mode": "by_severity"}`：每个严重度落到组织给它定的那一档（没改过时严重、错误为高，警告、提示为低）。也可以是 `{"mode": "always", "urgency": "high"}`，或 `{"mode": "support_hours", "hours": {"timezone": "Asia/Shanghai", "ranges": [{"weekday_mask": 62, "start": "09:00", "end": "18:00"}], "calendar": {"calendar_id": "<id>", "holidays": "exclude"}}, "inside": "high", "outside": "low", "raise_at_start": true}`：支持时段内用 `inside`、时段外用 `outside`，默认是 `high` 和 `low`；`raise_at_start` 时，支持时段开始那一刻还没确认、比 `inside` 不急的事件升到 `inside`，从第一级重新通知。紧急度写组织[档位](/zh-Hans/alerting/on-call#紧急度与优先级档位)的键。`weekday_mask` 的第 0 位是星期日；`calendar` 可选，`holidays` 为 `exclude` 或 `only`（见[节假日日历](/zh-Hans/alerting/on-call#节假日日历)）。见[紧急度](/zh-Hans/alerting/on-call#紧急度)。 |
+| `escalate_low_urgency` | boolean | 否 | 默认 `false`：不逐级升级的那几档只通知第一级，不往下升也不整轮重复。`true` 时在这条策略下照常升级。 |
 
 步骤包含以下字段：
 
@@ -50,7 +54,7 @@ POST /api/v1/alerts/escalations
 <RequestExample>
 ```bash cURL
 curl -X POST http://localhost:5080/api/v1/alerts/escalations \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
     "name": "Primary operations",
@@ -62,7 +66,8 @@ curl -X POST http://localhost:5080/api/v1/alerts/escalations \
         "min_severity": "critical" }
     ],
     "repeat": true,
-    "max_loops": 2
+    "max_loops": 2,
+    "ack_retrigger_secs": 3600
   }'
 ```
 </RequestExample>
@@ -86,7 +91,8 @@ curl -X POST http://localhost:5080/api/v1/alerts/escalations \
     }
   ],
   "repeat": true,
-  "max_loops": 2
+  "max_loops": 2,
+  "ack_retrigger_secs": 3600
 }
 ```
 </ResponseExample>
@@ -95,17 +101,17 @@ curl -X POST http://localhost:5080/api/v1/alerts/escalations \
 
 | 状态码 | 原因 |
 |---|---|
-| `400` | `name` 为空。 |
-| `403` | Token 缺少 `alerts.manage`。 |
+| `400` | `name` 为空，或 `ack_retrigger_secs` 不在 300 到 86400 之间。 |
+| `403` | Token 缺少 `alerts.escalations.manage`。 |
 | `422` | 字段缺失或无效，例如目标的 `kind` 不是 `user`、`team` 或 `schedule`，或 `min_severity` 未知。响应为纯文本。 |
 
 ## 其他策略路由
 
 | 操作 | 端点 | 权限 |
 |---|---|---|
-| 列出 | `GET /api/v1/alerts/escalations` | `alerts.read` |
-| 读取 | `GET /api/v1/alerts/escalations/{id}` | `alerts.read` |
-| 替换 | `PUT /api/v1/alerts/escalations/{id}` | `alerts.manage` |
-| 删除 | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.manage` |
+| 列出 | `GET /api/v1/alerts/escalations` | `alerts.escalations.read` |
+| 读取 | `GET /api/v1/alerts/escalations/{id}` | `alerts.escalations.read` |
+| 替换 | `PUT /api/v1/alerts/escalations/{id}` | `alerts.escalations.manage` |
+| 删除 | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.escalations.delete` |
 
 `PUT` 的请求体与创建调用相同，并替换整条策略。`DELETE` 返回纯文本 `deleted`，`id` 不存在时返回 `404`。删除策略时不会检查引用它的规则，这些规则会停止升级。

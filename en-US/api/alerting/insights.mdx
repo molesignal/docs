@@ -1,6 +1,6 @@
 ---
 title: "Incident insights"
-description: "Summarize incident volume, resolution time, and noise over a time window."
+description: "Summarize incident volume, resolution time, noise, and how people responded over a time window."
 "zh-Hans_link": "/zh-Hans/api/alerting/insights"
 ---
 
@@ -8,7 +8,10 @@ description: "Summarize incident volume, resolution time, and noise over a time 
 GET /api/v1/alerts/insights
 ```
 
-Aggregates the incidents that were created within a window. The call requires `alerts.read`.
+Aggregates the incidents that were created within a window, and how people responded to them: how soon
+someone took them, how soon they recovered and how many escalated, against a period of the same length
+before. Incidents merged into another are left out. The call requires `alerts.incidents.read`. Each person's on-call
+load is in [On-call load](/en-US/api/alerting/oncall-load).
 
 **Query parameters**
 
@@ -19,7 +22,7 @@ Aggregates the incidents that were created within a window. The call requires `a
 <RequestExample>
 ```bash cURL
 curl "http://localhost:5080/api/v1/alerts/insights?window_secs=86400" \
-  -H "authorization: Bearer $MS_JWT"
+  -H "authorization: Bearer $MS_TOKEN"
 ```
 </RequestExample>
 
@@ -38,7 +41,35 @@ curl "http://localhost:5080/api/v1/alerts/insights?window_secs=86400" \
   "top_rules": [
     { "key": "3KEDBLvTYO6DnWi8H9S9MNLpPT7", "count": 3 },
     { "key": "3KEDviJWhe5wIf6gnQyS8kucGhJ", "count": 2 }
-  ]
+  ],
+  "response": {
+    "current": {
+      "incidents": 5,
+      "responded": 4,
+      "mtta": { "mean_secs": 312.5, "p50_secs": 240.0, "p90_secs": 610.0 },
+      "mttr": { "mean_secs": 59.34, "p50_secs": 42.0, "p90_secs": 118.0 },
+      "escalation_rate": 0.4,
+      "steps": [
+        { "step": 0, "reached": 2, "acknowledged": 1 },
+        { "step": 1, "reached": 1, "acknowledged": 1 }
+      ],
+      "ack_via": { "im": 1, "web": 3 }
+    },
+    "previous": {
+      "incidents": 3,
+      "responded": 3,
+      "mtta": { "mean_secs": 420.0, "p50_secs": 380.0, "p90_secs": 700.0 },
+      "mttr": { "mean_secs": 96.0, "p50_secs": 80.0, "p90_secs": 150.0 },
+      "escalation_rate": 0.33,
+      "steps": [{ "step": 0, "reached": 1, "acknowledged": 0 }, { "step": 1, "reached": 1, "acknowledged": 1 }],
+      "ack_via": { "web": 3 }
+    },
+    "breakdown": {
+      "teams": [{ "key": "<team-id>", "incidents": 3, "mtta_secs": 280.0, "mttr_secs": 51.0, "escalation_rate": 0.33 }],
+      "services": [{ "key": "checkout", "incidents": 3, "mtta_secs": 300.0, "mttr_secs": 55.0, "escalation_rate": 0.33 }],
+      "people": [{ "key": "<user-id>", "incidents": 2, "mtta_secs": 190.0, "mttr_secs": 40.0, "escalation_rate": 0.0 }]
+    }
+  }
 }
 ```
 </ResponseExample>
@@ -56,3 +87,17 @@ curl "http://localhost:5080/api/v1/alerts/insights?window_secs=86400" \
 | `by_hour` | 24 counts of incidents by the UTC hour of creation. |
 | `by_severity` | The count per severity. Severities without incidents are absent. |
 | `top_services`, `top_rules` | Up to 8 entries of `key` and `count`, highest first. The key is a service name or a rule identifier. |
+| `response.current`, `response.previous` | How people responded in the window and in the period of the same length before it; the fields are below. |
+| `response.breakdown` | The window split by team (`teams`, keyed by team ID), service (`services`) and person (`people`, keyed by the first person to take the incident), at most 20 rows each, most incidents first. An incident with several services counts once for each. Each row has `incidents`, the mean seconds to take `mtta_secs`, the mean seconds to recover `mttr_secs` and the escalation rate `escalation_rate`. |
+
+**`response.current` and `response.previous`**
+
+| Field | Notes |
+|---|---|
+| `incidents` | The incidents created in the period. |
+| `responded` | The incidents someone took. Taking one is the first acknowledgement; one resolved by a person without being acknowledged counts at the moment it was resolved. Incidents whose rule recovered on its own do not count. |
+| `mtta` | Seconds from the trigger to the first time someone took the incident: the mean `mean_secs`, the median `p50_secs` and `p90_secs`. All `0` when no one took any. |
+| `mttr` | Seconds from the trigger to recovery over the recovered incidents, with the same mean, P50 and P90. |
+| `escalation_rate` | The share from 0 to 1 of incidents that escalated: those that reached the second step or were [escalated now](/en-US/api/alerting/escalate-incident). |
+| `steps` | How each step did, `step` counting from 0: the incidents that reached it, `reached`, and the ones acknowledged at it, `acknowledged`. Only incidents with escalations on their timeline count; empty when the period has none. |
+| `ack_via` | Where the incidents were first taken: `web`, `api`, `im`, `sms`, `phone` or `agent`, with a count each. |

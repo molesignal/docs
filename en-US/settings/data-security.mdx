@@ -6,7 +6,7 @@ description: "Manage the data keys of encrypted fields, redact sensitive text wi
 
 The **Data security** group of **Settings** holds **Cipher keys**, **Regex patterns**,
 **Field masking**, **Domain management**, and **Audit**. Reading the first four requires
-`org.settings.read`, and changing them requires `org.settings.manage`. **Audit** requires
+`org.field_masking.read`, and changing them requires `org.field_masking.manage`. **Audit** requires
 `audit.read`. The retention of audit records is a [platform setting](/en-US/settings/platform#audit-retention).
 
 ## Cipher keys
@@ -101,3 +101,62 @@ how long records are kept; **Change retention** opens the platform setting in `_
 
 Credentials, model keys, sensitive webhook headers, and signing material never appear in audit
 records. See [Audit](/en-US/security#audit).
+
+### Audit stream
+
+Every audit event is also written as a row of the workspace's `_audit` logs stream, so it can be
+searched in **Logs** and delivered elsewhere, such as to a SIEM, with a
+[scheduled pipeline](/en-US/pipelines#platform-streams). The row is cleaned the same way as the record
+on this page, and its time is the time of the event.
+
+| Field | Content |
+|---|---|
+| `audit_id` | The ID of the event, as **Copy id** gives it. |
+| `actor_kind`, `actor_id` | Who acted. |
+| `action` | The action key. |
+| `target_kind`, `target_id` | The changed resource, when the event has one. |
+| `ip`, `user_agent` | Where the request came from, when the event records it. |
+| `payload` | The details of the event, when it has any. |
+
+This page and the [audit API](/en-US/api/admin/audit) read the authoritative records. Each node writes
+the rows in the background, in batches, and holds at most 4,096 events waiting; when that queue is
+full, the row is left out of the stream and the record stays. The rows follow the retention of the
+stream, like the rows of any stream.
+
+Reading `_audit` needs `audit.read`, like this page:
+
+- Without it, the stream is not in the list of streams and cannot be opened, changed, or deleted, and
+  a query of it answers `403`. This holds for queries in the product, the query API with its NDJSON
+  streaming, Flight SQL, and federated search, where the remote cluster checks the `audit.read` of the
+  caller's token.
+- A query of `_audit` always runs in the request: it never becomes a search job, even with
+  `Prefer: respond-async`, and submitting a search job for it answers `400`.
+- What runs in the background without a person cannot read it, whoever saved it. An alert rule that
+  reads `_audit`, through its stream or anywhere in its statement, and a scheduled log inspection of it
+  cannot be saved: the call answers `400`, for the owner too. Reports cannot read it either.
+- Mole Agent tools and [Inbound MCP](/en-US/inbound-mcp) cannot read it with any credential: neither
+  its rows nor its fields.
+
+A [scheduled pipeline](/en-US/pipelines#platform-streams) reads `_audit` with the access of one person:
+whoever last saved it. Pausing and resuming do not count as saving. The head of the pipeline's page
+shows that person as **Reads \_audit as**, and so does the source in the editor, which tells someone
+else who holds `audit.read` and can save: **After you save, it reads with your access.**
+
+- Saving a change needs `audit.read`. A service account token answers `403`, because its
+  access cannot be checked again when the pipeline runs. A personal token counts as the person it was
+  issued to.
+- Before each read, the run checks that the person can still sign in, is still in the organization, and
+  still holds `audit.read`. Otherwise the read fails and the run says who and why, for example
+  `` `_audit` is read with the access of admin@example.com, who no longer holds audit.read ``. The
+  pipeline stays on and its read position stays where it is, so no event is skipped.
+- The pipeline goes on from there once the person holds `audit.read` again, or once someone who holds
+  it saves the pipeline, even without changing anything. Saving it unchanged without `audit.read`, or
+  with a service account token, changes nothing and reports no error.
+- Pausing and resuming need only `pipelines.pause`, and do not change whose access the pipeline reads
+  with. Resuming [starts over](/en-US/pipelines#schedule-and-read-positions) like any pipeline, so leave
+  the pipeline on to keep its read position.
+- A backfill reads with the access of whoever submits it. That person needs `audit.read` when
+  submitting, and the job checks them again when it runs.
+
+The rows that a pipeline copies are ordinary rows of its destinations, readable by whoever can read
+those.

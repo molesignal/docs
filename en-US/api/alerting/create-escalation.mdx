@@ -8,7 +8,7 @@ description: "Define ordered notification steps for incidents."
 POST /api/v1/alerts/escalations
 ```
 
-Creates an escalation policy. A policy lists ordered steps. Each step notifies its targets and waits for an acknowledgement. The call requires `alerts.manage`.
+Creates an escalation policy. A policy lists ordered steps. Each step notifies its targets and waits for an acknowledgement. The call requires `alerts.escalations.manage`.
 
 ## How escalation works
 
@@ -17,6 +17,7 @@ Creates an escalation policy. A policy lists ordered steps. Each step notifies i
 3. Every target of the current step receives a notification event. [Notification channels](/en-US/notification-channels) decide how the message is delivered. The `assignees` of the incident become the users that the step names directly: its `user` targets and the on-call user of each `schedule` target. A step that targets only teams keeps the earlier assignees.
 4. When `ack_timeout_secs` passes without an acknowledgement, the next applicable step starts.
 5. After the last applicable step times out, a policy with `repeat` set to `true` starts again at the first step until `max_loops` passes are complete.
+6. With `ack_retrigger_secs` set, an `acknowledged` incident still unresolved that long after its acknowledgement goes back to `open`: its assignees are notified, or the current step again when it has none, with `escalation.reason` set to `ack_timeout`; the current step starts its ack timeout again, and escalation goes on as usual. A snoozed incident is not timed this way.
 
 A rule picks a policy with `escalation_policy_id`. A rule without one uses `default`, an alias for the policy of the organization whose name is `default`, compared without regard to case. When escalation starts, the incident stores the real id of that policy, so renaming the policy later does not move an open incident to another policy. When the organization has no policy named `default`, the incidents of such a rule never escalate, although the triggered event still reaches notification policies. Create a policy named `default`, or point the rule at a policy id.
 
@@ -28,6 +29,9 @@ A rule picks a policy with `escalation_policy_id`. A rule without one uses `defa
 | `steps` | array | No | Default empty. A policy without steps notifies nobody. |
 | `repeat` | boolean | No | Default `false`. Start again after the last step. |
 | `max_loops` | integer | No | Default `1`. The total number of passes through the steps when `repeat` is `true`. A value below 1 becomes 1. |
+| `ack_retrigger_secs` | integer | No | How long an acknowledged incident may stay unresolved before it is notified again, 300 to 86400 seconds. Default `null`: never again. |
+| `urgency_rule` | object | No | How the urgency of an incident that does not come with one is set; `{"mode": "by_severity"}` by default, which puts each severity in the level the organization gave it (critical and error high, warning and info low unless changed). Also `{"mode": "always", "urgency": "high"}`, or `{"mode": "support_hours", "hours": {"timezone": "Asia/Shanghai", "ranges": [{"weekday_mask": 62, "start": "09:00", "end": "18:00"}], "calendar": {"calendar_id": "<id>", "holidays": "exclude"}}, "inside": "high", "outside": "low", "raise_at_start": true}`: `inside` within support hours and `outside` beyond them, `high` and `low` by default; with `raise_at_start`, incidents nobody acknowledged that are less urgent than `inside` are raised to it when support hours begin and are notified again from the first step. An urgency is the key of one of the organization's [levels](/en-US/alerting/on-call#urgency-and-priority-levels). Bit 0 of `weekday_mask` is Sunday; `calendar` is optional, with `holidays` `exclude` or `only` (see [Holiday calendars](/en-US/alerting/on-call#holiday-calendars)). See [Urgency](/en-US/alerting/on-call#urgency). |
+| `escalate_low_urgency` | boolean | No | `false` by default: incidents of a level that does not climb the steps notify the first step only, never further, and never repeat. With `true` they escalate as usual under this policy. |
 
 A step has these fields:
 
@@ -50,7 +54,7 @@ The call does not check that the referenced user, team, or schedule exists.
 <RequestExample>
 ```bash cURL
 curl -X POST http://localhost:5080/api/v1/alerts/escalations \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
     "name": "Primary operations",
@@ -62,7 +66,8 @@ curl -X POST http://localhost:5080/api/v1/alerts/escalations \
         "min_severity": "critical" }
     ],
     "repeat": true,
-    "max_loops": 2
+    "max_loops": 2,
+    "ack_retrigger_secs": 3600
   }'
 ```
 </RequestExample>
@@ -86,7 +91,8 @@ curl -X POST http://localhost:5080/api/v1/alerts/escalations \
     }
   ],
   "repeat": true,
-  "max_loops": 2
+  "max_loops": 2,
+  "ack_retrigger_secs": 3600
 }
 ```
 </ResponseExample>
@@ -95,17 +101,17 @@ curl -X POST http://localhost:5080/api/v1/alerts/escalations \
 
 | Status | Cause |
 |---|---|
-| `400` | `name` is empty. |
-| `403` | The token lacks `alerts.manage`. |
+| `400` | `name` is empty, or `ack_retrigger_secs` is outside 300 to 86400. |
+| `403` | The token lacks `alerts.escalations.manage`. |
 | `422` | A field is missing or invalid, for example a target `kind` other than `user`, `team`, or `schedule`, or an unknown `min_severity`. The response is plain text. |
 
 ## Other policy routes
 
 | Operation | Endpoint | Permission |
 |---|---|---|
-| List | `GET /api/v1/alerts/escalations` | `alerts.read` |
-| Get | `GET /api/v1/alerts/escalations/{id}` | `alerts.read` |
-| Replace | `PUT /api/v1/alerts/escalations/{id}` | `alerts.manage` |
-| Delete | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.manage` |
+| List | `GET /api/v1/alerts/escalations` | `alerts.escalations.read` |
+| Get | `GET /api/v1/alerts/escalations/{id}` | `alerts.escalations.read` |
+| Replace | `PUT /api/v1/alerts/escalations/{id}` | `alerts.escalations.manage` |
+| Delete | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.escalations.delete` |
 
 `PUT` takes the body of the create call and replaces the policy. `DELETE` answers the plain text `deleted`, and an unknown id answers `404`. Deleting a policy does not check the rules that reference it. Those rules stop escalating.

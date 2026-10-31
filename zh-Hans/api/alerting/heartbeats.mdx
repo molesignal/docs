@@ -1,0 +1,78 @@
+---
+title: "心跳打卡"
+description: "定时任务向心跳规则的打卡地址报到，查看最后一次打卡，以及重置打卡地址。"
+"en_link": "/en-US/api/alerting/heartbeats"
+---
+
+[心跳规则](/zh-Hans/api/alerting/create-rule#心跳规则)等作业每次跑完来打卡；过了周期加宽限还没打卡，或打卡报了失败，规则就触发。
+
+| 方法与路径 | 作用 | 权限 |
+|---|---|---|
+| `GET`、`POST /api/v1/intake/heartbeats/{token}` | 打卡，不用登录。 | 地址里的 Token |
+| `GET /api/v1/alerts/rules/{id}/heartbeat` | 最后一次打卡和下一次最晚的时间。 | 对规则的 `alerts.rules.read` |
+| `POST /api/v1/alerts/rules/{id}/heartbeat-token` | 重置打卡地址。 | 对规则的 `alerts.rules.manage` |
+
+## 打卡
+
+```http
+GET /api/v1/intake/heartbeats/{token}
+POST /api/v1/intake/heartbeats/{token}
+```
+
+地址在心跳规则第一次保存时给出，见[创建规则](/zh-Hans/api/alerting/create-rule#心跳规则)。作业成功时请求它；失败时加上 `?status=fail`，规则马上触发，不等周期。`POST` 的请求体开头（最多 1000 字）记成这次打卡带的话，会出现在事件的注解 `heartbeat_message` 里；请求体最大 64 KiB，超过时返回 `413`。打卡后规则立即判定一轮：报了失败就触发，报成功时开着的事件按恢复条件恢复。
+
+<RequestExample>
+```bash cURL
+# 备份成功
+curl -fsS https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN
+
+# 备份失败，带上最后几行输出
+tail -n 20 backup.log | curl -fsS -X POST --data-binary @- \
+  "https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN?status=fail"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "ok": true, "status": "fail" }
+```
+</ResponseExample>
+
+`status` 只有 `fail` 算失败，别的值和不带都算成功。Token 不对、规则已删除或已重置时返回 `404`。
+
+## 查看打卡状态
+
+```http
+GET /api/v1/alerts/rules/{id}/heartbeat
+```
+
+<ResponseExample>
+```json 200
+{
+  "last_checkin_at": 1790000000000000,
+  "last_status": "ok",
+  "last_message": "",
+  "due_at": 1790003900000000,
+  "alarming": false,
+  "issued_at": 1789900000000000
+}
+```
+</ResponseExample>
+
+| 字段 | 说明 |
+|---|---|
+| `last_checkin_at` | 最后一次打卡，Unix 微秒；还没打过卡时为 `null`。 |
+| `last_status`、`last_message` | 最后一次打卡报的 `ok` 或 `fail`，以及带的话。 |
+| `due_at` | 最晚下一次打卡的时间：最后一次打卡（没打过时从发出地址起）加周期和宽限。 |
+| `alarming` | 现在该不该响：最后一次报了失败，或已过 `due_at`。 |
+| `issued_at` | 当前地址发出或重置的时间。 |
+
+规则不是心跳规则，或还没有地址时返回 `404`。
+
+## 重置打卡地址
+
+```http
+POST /api/v1/alerts/rules/{id}/heartbeat-token
+```
+
+换一个新地址，旧地址马上失效，打卡记录保留。返回 `{ "path": "...", "url": "..." }`，地址只在这时给出一次；没有设外部地址时 `url` 为 `null`。重置记进审计日志。规则不是心跳规则时返回 `400`。

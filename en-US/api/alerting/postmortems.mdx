@@ -1,0 +1,118 @@
+---
+title: "Incident postmortems"
+description: "Write an internal postmortem for an incident: a Markdown body, a status, an owner and reviewers, and action items with owners and due dates, each of which can become a ticket."
+"zh-Hans_link": "/zh-Hans/api/alerting/postmortems"
+---
+
+An incident has at most one internal postmortem, written in Markdown. It is kept apart from the
+[status page's postmortems](/en-US/status-pages#postmortems); the pages can copy its summary across. How
+the pages use it is in [Major incidents and postmortems](/en-US/alerting/major-incidents#postmortems).
+
+| Method and path | What it does | Permission |
+|---|---|---|
+| `GET /api/v1/alerts/postmortems` | The organization's postmortems, newest first, with counts of their action items. | `postmortems.read` |
+| `GET /api/v1/alerts/incidents/{id}/postmortem` | The incident's postmortem and action items. | `alerts.incidents.read` on the incident, and `postmortems.read` |
+| `POST /api/v1/alerts/incidents/{id}/postmortem` | Starts a postmortem for the incident. | `alerts.incidents.read` on the incident, and `postmortems.manage` |
+| `PUT /api/v1/alerts/postmortems/{id}` | Changes a postmortem: its title, body, status, owner, and reviewers. | `postmortems.manage` |
+| `POST /api/v1/alerts/postmortems/{id}/actions` | Adds an action item. | `postmortems.manage` |
+| `PUT /api/v1/alerts/postmortems/{id}/actions/{action_id}` | Changes an action item. | `postmortems.manage` |
+| `DELETE /api/v1/alerts/postmortems/{id}/actions/{action_id}` | Deletes an action item. | `postmortems.manage` |
+| `POST /api/v1/alerts/postmortems/{id}/actions/{action_id}/ticket` | Creates a ticket for an action item. | `postmortems.manage` |
+
+## Start and change a postmortem
+
+```http
+POST /api/v1/alerts/incidents/{id}/postmortem
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `title` | string | Yes | 1 to 200 characters. |
+| `body` | string | No | The Markdown body, up to 100000 characters. |
+
+An incident that already has a postmortem answers `409`. The pages first draft the body from a template
+(summary, impact, timeline, root cause, what went well, what went badly, action items) and then call this;
+the creation is recorded in the audit log. A change sends only the fields to change: `title`, `body`,
+`status`, `owner_id` (`null` clears it), and `reviewer_ids`.
+
+<RequestExample>
+```bash cURL
+curl -X PUT http://localhost:5080/api/v1/alerts/postmortems/$POSTMORTEM_ID \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"status": "in_review", "reviewer_ids": ["<user-id>"]}'
+```
+</RequestExample>
+
+Reading, starting, and changing return `{ "postmortem": { ... }, "actions": [ ... ] }`; `postmortem` is
+`null` when the incident has none.
+
+<ResponseExample>
+```json 200
+{
+  "postmortem": {
+    "id": "3KJbX2p8Lr0Ws4Nf6Qa1Hd9TcVe",
+    "org_id": "<organization-id>",
+    "incident_id": "<incident-id>",
+    "title": "Checkout errors after the payments deploy",
+    "status": "in_review",
+    "body": "# Checkout errors after the payments deploy\n\n## Summary\n…",
+    "owner_id": "<user-id>",
+    "reviewer_ids": ["<user-id>"],
+    "created_by": "<user-id>",
+    "created_at": 1790000000000000,
+    "updated_at": 1790003600000000,
+    "published_at": null
+  },
+  "actions": [
+    {
+      "id": "3KJbZ7m1Qe5Rt9Va2Xc8Lw0NdHf",
+      "org_id": "<organization-id>",
+      "postmortem_id": "3KJbX2p8Lr0Ws4Nf6Qa1Hd9TcVe",
+      "incident_id": "<incident-id>",
+      "title": "Alert on payments pool saturation",
+      "owner_id": "<user-id>",
+      "due_at": 1790600000000000,
+      "status": "open",
+      "ticket_id": "<ticket-id>",
+      "ticket_key": "OPS-57",
+      "ticket_url": "https://example.atlassian.net/browse/OPS-57",
+      "created_at": 1790003600000000,
+      "updated_at": 1790003600000000
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Field | Notes |
+|---|---|
+| `status` | `draft`, `in_review`, or `published`. The first change to `published` records `published_at`. |
+
+Each row of the list has the postmortem's fields plus the incident summary `incident_summary`, the action
+items still open `open_actions`, and those past their due date and still open `overdue_actions`.
+
+## Action items
+
+Adding one takes `{ "title": "…", "owner_id": "<user-id>", "due_at": 1790600000000000 }`, with a title of 1
+to 300 characters, at most 50 per postmortem, and `due_at` in Unix microseconds. A change sends only the
+fields to change: `title`, `owner_id` and `due_at` (`null` clears either), and `status` (`open` or `done`).
+Adding and changing return the action item, and deleting returns `{ "deleted": true }`.
+
+```http
+POST /api/v1/alerts/postmortems/{id}/actions/{action_id}/ticket
+```
+
+The body is `{ "connector_id": "<connector-id>" }`: creates a ticket for the action item with that
+[ticket connector](/en-US/api/alerting/tickets) and returns the action item with `ticket_key` and
+`ticket_url`; one that already has a ticket is returned as it is. The ticket gets no comments or
+transitions from the incident, and does not resolve the incident when it is done.
+
+**Errors**
+
+| Status | Reason |
+|---|---|
+| `400` | A field is beyond its limits, or the ticket connector is disabled. |
+| `403` | A permission is missing, or the incident is out of reach. |
+| `404` | The incident, postmortem, action item, or ticket connector does not exist. |
+| `409` | The incident already has a postmortem. |

@@ -20,7 +20,8 @@ GET  /api/v1/query
 | `statement` | string | 是 | 查询语句。 |
 | `time_range` | object | 是 | `{ "start": <微秒>, "end": <微秒> }`。 |
 | `stream` | object | SQL 必填 | `{ "name": "app", "stream_type": "logs" }` 指明主表，两个字段都必填，类型为 `logs`、`metrics`、`traces`、`profiles` 或 `extend`。 |
-| `limit` | integer | 否 | 行数上限。 |
+| `limit` | integer | 否 | 行数上限。PromQL range 查询在上限内为每条序列均匀取点。 |
+| `step` | integer | 否 | 仅 PromQL。range 查询的步长，单位微秒。带 `step` 时 PromQL 从 `start` 到 `end` 每一步返回一个值；不带时返回 `end` 时刻的值。每条序列至多 11,000 步，步长更小时返回 `400`。 |
 
 **GET 的查询字符串**
 
@@ -33,12 +34,13 @@ GET  /api/v1/query
 | `start`、`end` | 是 | 以微秒表示的时间范围。 |
 | `stream`、`stream_type` | SQL 必填 | 主表及其类型，需要同时给出。 |
 | `limit` | 否 | 行数上限。 |
+| `step` | 否 | PromQL range 查询的步长，单位微秒。 |
 
 **请求头与查询字符串**
 
 | 名称 | 效果 |
 |---|---|
-| `Prefer: respond-async` | 总是创建搜索任务并返回 `202`。 |
+| `Prefer: respond-async` | 创建搜索任务并返回 `202`。查询 `_audit` 时仍在请求内执行。 |
 | `Prefer: respond-sync` | 在请求内运行，即使时间范围很长。 |
 | `Accept: application/x-ndjson` | 逐行流式返回 JSON 对象，最后附带一条 `{"__meta__": ...}` 记录。 |
 | `?clusters=local,remote` | 在联邦搜索中包含远程集群。 |
@@ -48,7 +50,7 @@ GET  /api/v1/query
 NOW=$(date +%s)000000
 
 curl -X POST http://localhost:5080/api/v1/query \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d "{\"org_id\":\"$MS_ORG\",\"language\":\"sql\",
        \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
@@ -60,11 +62,12 @@ curl -X POST http://localhost:5080/api/v1/query \
 NOW=$(date +%s)000000
 
 curl -G http://localhost:5080/api/v1/query \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   --data-urlencode 'language=promql' \
   --data-urlencode 'statement=sum(rate(http_requests_total[5m]))' \
   --data-urlencode "start=$((NOW-3600000000))" \
-  --data-urlencode "end=$NOW"
+  --data-urlencode "end=$NOW" \
+  --data-urlencode 'step=60000000'
 ```
 </RequestExample>
 
@@ -78,6 +81,17 @@ curl -G http://localhost:5080/api/v1/query \
 }
 ```
 </ResponseExample>
+
+PromQL 的结果每个值一行。range 查询返回 `_timestamp`（微秒）、`value` 和每个标签一列，每条序列的每一步一行；不带 `step` 的查询返回 `value` 和标签列，每条序列一行。
+
+```json
+{
+  "columns": ["_timestamp", "value", "service.name"],
+  "rows": [[1761638400000000, 0.42, "checkout"], [1761638460000000, 0.40, "checkout"]],
+  "scanned_rows": 2,
+  "took_ms": 6
+}
+```
 
 估算规模达到 `[querier].auto_async_threshold_rows` 的查询会返回 `202`：
 
@@ -95,7 +109,7 @@ curl -G http://localhost:5080/api/v1/query \
 
 | 状态码 | 原因 |
 |---|---|
-| `400` | 语句无法规划，SQL 缺少 `stream` 提示（`query.stream hint is required`），或查询读取的行数超过 `[querier].max_scan_rows` 的限制。`GET` 缺少必填参数，或给了 `stream` 而没有 `stream_type` 时，也返回 `400`。 |
+| `400` | 语句无法规划，SQL 缺少 `stream` 提示（`query.stream hint is required`），PromQL 的 `step` 不是正数或使一条序列超过 11,000 步，或查询读取的行数超过 `[querier].max_scan_rows` 的限制。`GET` 缺少必填参数，或给了 `stream` 而没有 `stream_type` 时，也返回 `400`。 |
 | `503` | 在分角色集群中，没有存活的 `querier` 节点（`no querier node is available`）。 |
-| `403` | 组织中不存在该数据流（`stream not found: <name>`），或 Token 缺少 `streams.query`。 |
+| `403` | 组织中不存在该数据流（`stream not found: <name>`）、Token 缺少 `streams.query`，或查询读取 `_audit` 而 Token 缺少 `audit.read`。 |
 | `422` | 请求体字段缺失或类型错误，例如 `org_id` 或 `stream_type`，响应为纯文本。 |

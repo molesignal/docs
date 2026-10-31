@@ -1,0 +1,72 @@
+---
+title: "Send alerts"
+description: "Send alerts in from an outside system: trigger, acknowledge, resolve."
+"zh-Hans_link": "/zh-Hans/api/alerting/send-alerts"
+---
+
+```http
+POST /api/v1/intake/alerts
+```
+
+An outside system calls with the token of an [alert source](/en-US/alerting/sources): the header `Authorization: Bearer <token>`, or `?token=<token>` in the address when it cannot set headers. Every source shares this address; the token tells which source an alert belongs to, and the source's kind decides whose format the body is read in. [Set up the sender](/en-US/alerting/sources#set-up-the-sender) covers each sender's format (an email source reads a raw mail with `Content-Type: message/rfc822`); this page describes the body of the **API** kind. The body is at most 4 MiB.
+
+The body is one alert object, or an array of up to 100. Unknown fields are refused.
+
+| Field | Type | Description |
+|---|---|---|
+| `action` | string | `trigger` (the default), `acknowledge` or `resolve`. |
+| `dedup_key` | string | The dedup key within the source, up to 255 characters; one key has at most one active incident at a time. Required for `acknowledge` and `resolve`. A `trigger` without one gets a key computed from `summary` and `labels`, returned in the response. |
+| `summary` | string | The incident title, required for `trigger`, up to 1024 characters. |
+| `severity` | string | `critical`, `error`, `warning` or `info`. Without it, the source's default severity applies. |
+| `priority` | string | The incident's priority, `P1` to `P9` (`1` to `9` too); one beyond the organization's levels falls to the lowest. Without it, none. |
+| `urgency` | string | The incident's urgency, the key of one of the organization's levels such as `high` or `low`; an unknown key is ignored. Without it, the source's escalation policy decides, and an alert without `severity` is `high`. |
+| `labels` | object | Up to 64 labels. A key cannot start with `alert.` or `__molesignal`, or be `external.kind`. |
+| `annotations` | object | Annotations; with the links, up to 64. |
+| `links` | array | Up to 10 `{"name": "…", "url": "https://…"}`, written to annotations by `name`; one without a `name` is called `link`. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/alerts \
+  -H "authorization: Bearer $SOURCE_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"dedup_key": "disk-full/web-1", "summary": "Disk almost full on web-1", "severity": "critical", "labels": {"host.name": "web-1"}, "links": [{"name": "Runbook", "url": "https://wiki.example.com/disk"}]}'
+```
+</RequestExample>
+
+The response gives the result of each alert, in order. `message` says why nothing was to be done when the body was read but held no alert to handle, such as a PagerDuty test event.
+
+<ResponseExample>
+```json 200
+{
+  "alerts": [
+    {
+      "dedup_key": "disk-full/web-1",
+      "outcome": "opened",
+      "incident_id": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+      "reason": null
+    }
+  ],
+  "message": null
+}
+```
+</ResponseExample>
+
+| `outcome` | Meaning |
+|---|---|
+| `opened` | A new incident was opened. |
+| `updated` | The severity of the active incident, or the alerts of its notification group, changed. |
+| `unchanged` | The active incident already stood so, or a person had acknowledged it. |
+| `acknowledged` | The incident was acknowledged. |
+| `resolved` | The incident was resolved, acknowledged ones included. |
+| `ignored` | Nothing changed; `reason` says why, such as no active incident, or a message older than the last one. |
+
+**Errors**
+
+| Status | Cause |
+|---|---|
+| `400` | The body cannot be read; `message` says why. |
+| `401` | The token is missing or wrong, or the source does not exist. |
+| `403` | The organization is disabled. |
+| `409` | The source is turned off. |
+| `413` | The body is larger than 4 MiB. |
+| `503` | The receiving cluster of the source cannot be reached, or the request could not be handled in full. Retry; a retry does not open an incident twice. |

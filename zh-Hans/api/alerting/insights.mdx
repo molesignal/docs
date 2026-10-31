@@ -1,6 +1,6 @@
 ---
 title: "事件洞察"
-description: "汇总时间窗口内的事件数量、解决时长和噪声。"
+description: "汇总时间窗口内的事件数量、解决时长、噪声和人的响应。"
 "en_link": "/en-US/api/alerting/insights"
 ---
 
@@ -8,7 +8,7 @@ description: "汇总时间窗口内的事件数量、解决时长和噪声。"
 GET /api/v1/alerts/insights
 ```
 
-汇总窗口内创建的事件。该调用需要 `alerts.read`。
+汇总窗口内创建的事件，以及人的响应：多久有人接手、多久恢复、升级了多少，和前一段同样长的时间相比。并入别处的事件不算。该调用需要 `alerts.incidents.read`。每个人的值班负担见[值班负担](/zh-Hans/api/alerting/oncall-load)。
 
 **查询参数**
 
@@ -19,7 +19,7 @@ GET /api/v1/alerts/insights
 <RequestExample>
 ```bash cURL
 curl "http://localhost:5080/api/v1/alerts/insights?window_secs=86400" \
-  -H "authorization: Bearer $MS_JWT"
+  -H "authorization: Bearer $MS_TOKEN"
 ```
 </RequestExample>
 
@@ -38,7 +38,35 @@ curl "http://localhost:5080/api/v1/alerts/insights?window_secs=86400" \
   "top_rules": [
     { "key": "3KEDBLvTYO6DnWi8H9S9MNLpPT7", "count": 3 },
     { "key": "3KEDviJWhe5wIf6gnQyS8kucGhJ", "count": 2 }
-  ]
+  ],
+  "response": {
+    "current": {
+      "incidents": 5,
+      "responded": 4,
+      "mtta": { "mean_secs": 312.5, "p50_secs": 240.0, "p90_secs": 610.0 },
+      "mttr": { "mean_secs": 59.34, "p50_secs": 42.0, "p90_secs": 118.0 },
+      "escalation_rate": 0.4,
+      "steps": [
+        { "step": 0, "reached": 2, "acknowledged": 1 },
+        { "step": 1, "reached": 1, "acknowledged": 1 }
+      ],
+      "ack_via": { "im": 1, "web": 3 }
+    },
+    "previous": {
+      "incidents": 3,
+      "responded": 3,
+      "mtta": { "mean_secs": 420.0, "p50_secs": 380.0, "p90_secs": 700.0 },
+      "mttr": { "mean_secs": 96.0, "p50_secs": 80.0, "p90_secs": 150.0 },
+      "escalation_rate": 0.33,
+      "steps": [{ "step": 0, "reached": 1, "acknowledged": 0 }, { "step": 1, "reached": 1, "acknowledged": 1 }],
+      "ack_via": { "web": 3 }
+    },
+    "breakdown": {
+      "teams": [{ "key": "<team-id>", "incidents": 3, "mtta_secs": 280.0, "mttr_secs": 51.0, "escalation_rate": 0.33 }],
+      "services": [{ "key": "checkout", "incidents": 3, "mtta_secs": 300.0, "mttr_secs": 55.0, "escalation_rate": 0.33 }],
+      "people": [{ "key": "<user-id>", "incidents": 2, "mtta_secs": 190.0, "mttr_secs": 40.0, "escalation_rate": 0.0 }]
+    }
+  }
 }
 ```
 </ResponseExample>
@@ -56,3 +84,17 @@ curl "http://localhost:5080/api/v1/alerts/insights?window_secs=86400" \
 | `by_hour` | 按创建时刻的 UTC 小时统计的 24 个事件数量。 |
 | `by_severity` | 各严重程度的数量。没有事件的严重程度不会出现。 |
 | `top_services`、`top_rules` | 最多 8 个 `key` 与 `count` 条目，数量高者在前。键是服务名称或规则标识符。 |
+| `response.current`、`response.previous` | 窗口内和它之前同样长的一段时间里人的响应，字段见下表。 |
+| `response.breakdown` | 窗口内按团队（`teams`，键是团队 ID）、服务（`services`）和个人（`people`，键是第一个接手的人）拆开，每个维度最多 20 行，事件多的在前。一个事件涉及几个服务时，每个服务各算一次。每行有 `incidents`、平均接手秒数 `mtta_secs`、平均恢复秒数 `mttr_secs` 和升级率 `escalation_rate`。 |
+
+**`response.current` 与 `response.previous`**
+
+| 字段 | 说明 |
+|---|---|
+| `incidents` | 这段时间创建的事件数。 |
+| `responded` | 有人接手过的事件数。第一次接手是第一次确认；没人确认就被人解决的，算在解决的那一刻。规则自行恢复的不算。 |
+| `mtta` | 从触发到第一次接手的秒数：均值 `mean_secs`、中位数 `p50_secs` 和 `p90_secs`。没有人接手过时都是 `0`。 |
+| `mttr` | 已恢复事件从触发到恢复的秒数，同样给出均值、P50 和 P90。 |
+| `escalation_rate` | 升级过的事件所占比例，范围 0 到 1。到过第 2 级或被[立即升级](/zh-Hans/api/alerting/escalate-incident)的算升级过。 |
+| `steps` | 各级的确认情况，`step` 从 0 起：到过这一级的事件数 `reached`，和在这一级被确认的 `acknowledged`。只算时间线上有升级记录的事件；这段时间没有时为空。 |
+| `ack_via` | 第一次接手在哪里做的：`web`、`api`、`im`、`sms`、`phone` 或 `agent`，各多少个。 |

@@ -1,18 +1,20 @@
 ---
 title: "连接器"
 sidebarTitle: "连接器"
-description: "从 CloudWatch Logs、Amazon Data Firehose、Cloudflare Logpush、Heroku 接入日志，并把流水线产出投递到 S3、Kafka 或 HTTP 端点。"
+description: "从 CloudWatch Logs、Kafka 主题、S3 对象、Amazon Data Firehose、Cloudflare Logpush、Heroku 接入日志，并把流水线产出投递到 S3、Kafka 或 HTTP 端点。"
 "en_link": "/en-US/connectors"
 ---
 
 **连接器**是与外部平台的托管集成，分两个方向：
 
-- **来源**从其他服务接入日志并写入数据流。CloudWatch Logs 由 MoleSignal 定时拉取；Amazon Data Firehose、Cloudflare Logpush、Heroku 把日志推送给 MoleSignal。
+- **来源**从其他服务接入日志并写入数据流。CloudWatch Logs、Kafka 主题和 S3 对象由 MoleSignal 定时拉取；Amazon Data Firehose、Cloudflare Logpush、Heroku 把日志推送给 MoleSignal。
 - **目标**接收[定时流水线](/zh-Hans/pipelines#目标与连接器出口)的产出：Amazon S3 及 S3 兼容存储、Apache Kafka，以及任意 HTTP 端点。
 
 | Kind | 连接器 | 方向 | 认证 |
 |---|---|---|---|
 | `aws_cloudwatch_logs` | AWS CloudWatch Logs | 来源，每 30 秒拉取一次 | [AWS 凭据](#aws-认证) |
+| `kafka_source` | Kafka 主题 | 来源，每 30 秒拉取一次 | 无、SASL 或客户端证书 |
+| `s3_source` | S3 对象 | 来源，每 30 秒拉取一次 | AWS 凭据 |
 | `aws_kinesis_firehose` | Amazon Data Firehose | 来源，推送 | [推送 Token](#推送来源) |
 | `cloudflare_logpush` | Cloudflare Logpush | 来源，推送 | 推送 Token |
 | `heroku_drain` | Heroku 日志 Drain | 来源，推送 | 推送 Token |
@@ -41,7 +43,7 @@ description: "从 CloudWatch Logs、Amazon Data Firehose、Cloudflare Logpush、
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/connectors \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
         "name": "archive",
@@ -145,7 +147,7 @@ CloudWatch Logs 是**拉取**来源：MoleSignal 每 30 秒调用一次 `FilterL
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/connectors \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
         "name": "cw-prod",
@@ -166,6 +168,80 @@ curl -X POST http://localhost:5080/api/v1/connectors \
 | `target_stream` | 写入的数据流，默认 `default`。 |
 
 同一时刻只有一个节点轮询某个连接器。`alert` 节点之间按连接器分工，节点先认领连接器再轮询，参见 [alert 节点之间的分工](/zh-Hans/deployment/role-based#alert-节点之间的分工)。每条事件成为一条带 `message`、`log_stream`、`log_group` 的日志。已停用的连接器不会被轮询。
+
+### Kafka 主题
+
+`kafka_source` 连接器每 30 秒读取一个主题，从上一次写入成功的地方接着读。它按指定分区读取，不加入消费者组，读取位点保存在 MoleSignal 里，所以只需要这个主题的读权限，集群上也不会多出消费者组。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "orders",
+        "kind": "kafka_source",
+        "config_json": {
+          "brokers": "b-1.example.com:9096,b-2.example.com:9096",
+          "topic": "orders",
+          "tls": true,
+          "auth": "sasl_scram_sha_512",
+          "sasl_username": "molesignal",
+          "sasl_password": "<password>",
+          "target_stream": "orders",
+          "start_from": "latest"
+        }
+      }'
+```
+
+| 字段 | 说明 |
+|---|---|
+| `brokers`、`topic`、`tls`、`tls_ca_cert`、`auth` 及其键 | 同 [Kafka 目标](#apache-kafka)。 |
+| `target_stream` | 写入的数据流，默认 `default`。 |
+| `start_from` | 第一次从哪里读：`latest`（默认）从现在起到达的消息，`earliest` Broker 保存的全部消息。之后新增的分区从头读。界面：**从哪里开始**。 |
+
+- 值是 JSON 对象的消息，对象的字段就是日志的字段；其他值成为 `message`。每条日志还带 `kafka_topic`、`kafka_partition`、`kafka_offset`、`source`，消息有 key 时带 `kafka_key`。日志时间取消息的时间戳。
+- 一次读取最多 10,000 条消息或 32 MiB，还有更多时马上接着读，一次拉取最多持续 2 分钟。
+- 日志写入成功后读取位点才前进。读取或写入失败时，30 秒后从同一位置重试，所以消息可能写入两次，但不会丢。位点对应的消息已被 Broker 清理时，从 Broker 保存的最早消息接着读。
+- 改 `topic` 会按 `start_from` 重新开始，因为位点属于主题。
+
+### S3 对象
+
+`s3_source` 连接器每 30 秒列举一次存储桶，按从旧到新读取还没读过的对象，支持 AWS S3 和 S3 兼容存储。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "elb-logs",
+        "kind": "s3_source",
+        "config_json": {
+          "bucket": "acme-logs",
+          "region": "us-east-1",
+          "prefix": "AWSLogs/123456789012/",
+          "auth": "node_role",
+          "target_stream": "elb",
+          "start_from": "latest"
+        }
+      }'
+```
+
+| 字段 | 说明 |
+|---|---|
+| `bucket`、`region`、`endpoint`、`virtual_hosted_style`、`auth` 及其键 | 同 [S3 目标](#amazon-s3)。凭据需要存储桶的 `s3:ListBucket` 和对象的 `s3:GetObject` 权限。 |
+| `prefix` | 只读这个前缀下的对象。每次拉取都要完整列举它，所以请给来源一个专用的前缀。 |
+| `target_stream` | 写入的数据流，默认 `default`。 |
+| `start_from` | 第一次从哪里读：`latest`（默认）从现在起出现的对象，`earliest` 前缀下的全部对象。界面：**从哪里开始**。 |
+
+- 对象按行读取。JSON 对象的一行就是一条日志的字段；只含 `Records` 的一行（CloudTrail 的写法）每条记录一条日志；其他行成为 `message`。`.gz` 和 `.zst` 对象按文件名解压。每条日志还带 `s3_bucket`、`s3_key` 和 `source`。日志时间取对象的最后修改时间。
+- 一次拉取最多读 100 个对象或读到 50,000 条日志，还有更多时马上接着读，最多持续 2 分钟。
+- 日志写入成功后读取状态才前进。取不到的对象让这次拉取停在那里，30 秒后重试，所以日志可能写入两次，但不会丢。
+- 读不了的对象会被跳过，并在连接器上写明，因为反复重试会挡住后面的所有对象。这包括损坏、超过 256 MiB、解压后超过 512 MiB、超过一百万条日志，或有一行超过 64 MiB 的对象。
+- 对象按键和修改时间识别，留 5 分钟余量。这个余量内用同一个键重新写入的对象不会再读一次；修改时间比已读到的最新对象早 5 分钟以上的对象不会被读取。S3 把分段上传的时间记为开始上传的时间，所以比这更慢的上传读不到。
+
+### 拉取的状况
+
+连接器页面显示来源最近一次收到数据的时间。上次读取失败的来源旁边有一个警告，原因写在提示和连接器设置里，最近跳过的内容也写在那里。通过 API 读取时，`read_state` 包含 `last_error`、`last_warning`（各有 `at_micros` 和 `text`）以及读到哪里的 `position`。保存连接器不会改变读取位置。
 
 ## 目标
 
@@ -227,7 +303,7 @@ TLS 与 SASL 可以组合：基于 TLS 的 SCRAM 以 `SASL_SSL` 连接。
 | `header` | **自定义请求头** | `header_name`、`header_value` | 把值放在指定的请求头中，例如 `X-API-Key` 或 `DD-API-KEY`。 |
 | `hmac` | **HMAC 签名** | `hmac_secret` | 对请求体签名，共享密钥至少 16 个字符。 |
 
-自定义请求头不能是投递本身设置的请求头：`Host`、`Content-Type`、`Content-Length`、`Content-Encoding`、`Transfer-Encoding`、`Connection`、`X-MoleSignal-Timestamp`、`X-MoleSignal-Signature`。
+自定义请求头不能是投递本身设置的请求头：`Host`、`Content-Type`、`Content-Length`、`Content-Encoding`、`Transfer-Encoding`、`Connection`、`X-MoleSignal-Timestamp`、`X-MoleSignal-Sign`。
 
 投递遵循以下规则：
 
@@ -243,7 +319,7 @@ TLS 与 SASL 可以组合：基于 TLS 的 SCRAM 以 `SASL_SSL` 连接。
 | 请求头 | 内容 |
 |---|---|
 | `X-MoleSignal-Timestamp` | 请求时间，Unix 秒。 |
-| `X-MoleSignal-Signature` | `sha256=<十六进制>`，用共享密钥对 `<timestamp>.<body>` 计算的 HMAC-SHA256。 |
+| `X-MoleSignal-Sign` | `sha256=<十六进制>`，用共享密钥对 `<timestamp>.<body>` 计算的 HMAC-SHA256。 |
 
 校验请求时，用同一密钥对时间戳、一个 `.` 和原始请求体字节计算 HMAC-SHA256，再与签名做常量时间比较。拒绝超过几分钟的时间戳，使截获的请求无法在之后重放。
 
@@ -321,12 +397,14 @@ Token 在连接器 `region` 所在区域的 STS 端点兑换；节点环境设�
 | `kafka` | 向 Broker 读取主题元数据，以此验证连接、TLS 与认证，并确认主题存在。不写入消息。 |
 | `http` | 发送一条标记为测试的事件：`"message": "MoleSignal connection test"`、`"molesignal_connection_test": true`。 |
 | `aws_cloudwatch_logs` | 读取日志组最近一分钟内至多一条事件。不写入数据流，读取位点保持不变。 |
+| `kafka_source` | 向 Broker 读取主题元数据，同 `kafka`。不读取消息，读取位点保持不变。 |
+| `s3_source` | 列举前缀下的一个对象，以此验证凭据和 `s3:ListBucket`。什么都不读，读取位点保持不变。 |
 
 测试在 25 秒后放弃。通过 API 测试时，`POST /api/v1/connectors/test` 接收要试用的 `kind` 与 `config_json`。带上同一 kind 的已保存连接器的 `id` 时，`***` 代表该连接器保存的密钥。无法生效的设置与保存时一样返回 `400`。
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/connectors/test \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
         "id": "<connector id>",
@@ -372,7 +450,7 @@ curl -X POST http://localhost:5080/api/v1/connectors/test \
 | `POST /api/v1/connectors/test` | `pipelines.edit` | 在保存前测试设置。 |
 | `GET /api/v1/connectors/aws-external-id` | `pipelines.read` | 以 `external_id` 返回组织的外部 ID。 |
 
-连接器的读取结果包含 `id`、`name`、`kind`、密钥已掩码的 `config_json`、`secret_keys`、`enabled`、`last_run_at_micros`、`created_at_micros` 与 `updated_at_micros`。
+连接器的读取结果包含 `id`、`name`、`kind`、密钥已掩码的 `config_json`、`secret_keys`、`enabled`、`last_run_at_micros`、`read_state`、`created_at_micros` 与 `updated_at_micros`。
 
 ## 权限
 

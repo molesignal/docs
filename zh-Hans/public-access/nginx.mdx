@@ -1,0 +1,286 @@
+---
+title: "nginx"
+description: "用 nginx 做两个入口：内网入口转发全部请求，公网入口只转发外部回调和公开页面，其他路径返回 404。"
+"en_link": "/en-US/public-access/nginx"
+---
+
+下面的配置按[公网访问](/zh-Hans/public-access)里推荐的做法：同一个域名 `molesignal.example.com`，内网 DNS 解析到 nginx 的内网地址 `10.0.0.10`，公网 DNS 解析到公网地址 `203.0.113.10`。两个 `server` 用同一张证书，按监听地址区分。只保留实际用到的 `location`。
+
+## 公共部分
+
+把上游、公网日志格式和限流区放在 `http` 块里，例如 `/etc/nginx/conf.d/molesignal.conf` 的开头：
+
+```nginx
+upstream molesignal {
+    # standalone 节点，或分角色部署时的 router
+    server 10.0.1.20:5080;
+    keepalive 16;
+}
+
+# 公网入口的访问日志只记路径，不记查询串；心跳打卡和日历订阅的路径里有 Token，只记前缀。
+map $uri $molesignal_log_uri {
+    ~^(/api/v1/(?:intake/heartbeats|public/calendar)/)  $1<token>;
+    default                                             $uri;
+}
+
+log_format molesignal_public '$remote_addr [$time_local] "$request_method $molesignal_log_uri $server_protocol" '
+                             '$status $body_bytes_sent "$http_user_agent" $request_time';
+
+limit_req_zone $binary_remote_addr zone=molesignal_public:10m rate=20r/s;
+```
+
+每个转发位置都用同一组代理设置，放进 `/etc/nginx/snippets/molesignal-proxy.conf`：
+
+```nginx
+proxy_pass http://molesignal;
+proxy_http_version 1.1;
+proxy_set_header Connection "";
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+```
+
+## 内网入口
+
+内网入口转发全部路径，与没有公网入口时一样。实时查询是流式响应，不能缓冲：
+
+```nginx
+server {
+    listen 10.0.0.10:443 ssl;
+    server_name molesignal.example.com;
+    ssl_certificate     /etc/nginx/tls/molesignal.crt;
+    ssl_certificate_key /etc/nginx/tls/molesignal.key;
+
+    client_max_body_size 10m;
+
+    location /api/v1/query/stream {
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+    location / {
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+## 公网入口
+
+公网入口只列出要开放的路径，每个路径只收它用到的方法，最后的 `location /` 对其他一切返回 404：
+
+```nginx
+server {
+    listen 203.0.113.10:443 ssl;
+    server_name molesignal.example.com;
+    ssl_certificate     /etc/nginx/tls/molesignal.crt;
+    ssl_certificate_key /etc/nginx/tls/molesignal.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    access_log /var/log/nginx/molesignal-public.log molesignal_public;
+    client_max_body_size 2m;
+    limit_req zone=molesignal_public burst=40 nodelay;
+    limit_req_status 429;
+
+    # 外部告警
+    location = /api/v1/intake/alerts {
+        limit_except POST { deny all; }
+        client_max_body_size 4m;
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # 心跳打卡
+    location ^~ /api/v1/intake/heartbeats/ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Jira 的工单 Webhook
+    location ~ ^/api/v1/public/tickets/jira/[^/]+$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # 值班日历订阅
+    location ^~ /api/v1/public/calendar/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Teams 里的 Mole Agent
+    location ^~ /api/v1/public/im/teams/ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # 回复短信与电话按键
+    location ~ ^/api/v1/public/notify/[^/]+/(replies|keypress)$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # 自动化的 API 触发
+    location ~ ^/api/v1/public/automations/[^/]+/trigger$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # 推送来源
+    location ~ ^/api/v1/(_kinesis_firehose|_cloudflare|_heroku)$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # 用户体验：浏览器先发 CORS 预检
+    location ~ ^/api/v1/rum/(events|replay)$ {
+        limit_except POST OPTIONS { deny all; }
+        client_max_body_size 8m;
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # 拨测 Probe Agent 上传产物
+    location ^~ /api/v1/synthetics/artifacts/ {
+        limit_except PUT { deny all; }
+        client_max_body_size 10m;
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # 状态页
+    location ^~ /status/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/status-pages/ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # 资源共享
+    location ^~ /s/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location = /shared {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/share {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # 状态页和分享页的网页文件
+    location ^~ /assets/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ~ ^/favicon\.(ico|svg)$ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # 其他路径在公网上不存在
+    location / {
+        return 404;
+    }
+}
+```
+
+`limit_except GET` 同时放行 `HEAD`。要按来源地址收紧某条路径，在它的 `location` 里加 `allow` 和 `deny all;`，例如只允许 Azure 服务标记 `AzureBotService` 里的地址段访问 Teams 的回调。
+
+## 状态页的自定义域名
+
+状态页绑定了 `status.example.org` 时，为它加一个公网 `server`，只放行状态页的根路径、接口和网页文件：
+
+```nginx
+server {
+    listen 203.0.113.10:443 ssl;
+    server_name status.example.org;
+    ssl_certificate     /etc/nginx/tls/status.example.org.crt;
+    ssl_certificate_key /etc/nginx/tls/status.example.org.key;
+
+    access_log /var/log/nginx/molesignal-public.log molesignal_public;
+    limit_req zone=molesignal_public burst=40 nodelay;
+    limit_req_status 429;
+
+    location ~ ^/(history|uptime)?$ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /incidents/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/status-pages/ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /assets/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ~ ^/favicon\.(ico|svg)$ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location / {
+        return 404;
+    }
+}
+```
+
+由 MoleSignal 自动签发自定义域名的证书时，TLS 在 MoleSignal 上终止，nginx 只能用 `stream` 模块按 SNI 直通，看不到路径，也就不能只放行状态页。要在入口上限制路径，就把证书放在 nginx 上管理。
+
+## 只有一个入口时
+
+nginx 只有一个监听地址时，用来源地址区分：公网 `server` 里的开放路径保持不变，把最后的 `location /` 换成只允许公司网络和 VPN 的地址段，再补上实时查询的流式设置：
+
+```nginx
+location /api/v1/query/stream {
+    allow 10.0.0.0/8;
+    allow 192.168.0.0/16;
+    deny all;
+    include /etc/nginx/snippets/molesignal-proxy.conf;
+    proxy_buffering off;
+    proxy_read_timeout 600s;
+    proxy_send_timeout 600s;
+}
+
+location / {
+    allow 10.0.0.0/8;
+    allow 192.168.0.0/16;
+    deny all;
+    include /etc/nginx/snippets/molesignal-proxy.conf;
+}
+```
+
+这时内网请求也走同一个 `server`，`client_max_body_size` 要放宽到 `10m`，访问日志也会记下内网请求的路径。nginx 前面还有负载均衡时，用 `set_real_ip_from` 和 `real_ip_header` 取到原始地址，否则 `allow` 看到的都是负载均衡的地址。
+
+## 检查
+
+检查配置并重新加载：
+
+```bash
+nginx -t
+```
+
+```bash
+nginx -s reload
+```
+
+从公网请求登录接口，应返回 `404`：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://molesignal.example.com/api/v1/auth/signin
+```
+
+从公网不带 Token 请求告警接入，应返回 `401`，说明请求到了 MoleSignal：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://molesignal.example.com/api/v1/intake/alerts
+```
+
+最后在 `_sys` 组织的 **设置 → 客户端 IP 识别** 里，把 nginx 的地址列为受信任的代理，见[客户端 IP 识别](/zh-Hans/settings/platform#客户端-ip-识别)。

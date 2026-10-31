@@ -7,12 +7,12 @@ description: "列出、查看、编辑、运行、暂停与删除流水线。"
 | 操作 | 端点 | 权限 |
 |---|---|---|
 | 列出 | `GET /api/v1/scheduled_pipelines` | `pipelines.read` |
-| 创建 | `POST /api/v1/scheduled_pipelines` | `pipelines.create` |
+| 创建 | `POST /api/v1/scheduled_pipelines` | `pipelines.create`，读取 `_audit` 时还需要 `audit.read` |
 | 查看 | `GET /api/v1/scheduled_pipelines/{id}` | `pipelines.read` |
-| 更新 | `PUT /api/v1/scheduled_pipelines/{id}` | `pipelines.edit`，修改 `enabled` 时还需要 `pipelines.pause` |
+| 更新 | `PUT /api/v1/scheduled_pipelines/{id}` | 修改配置需要 `pipelines.edit`，读取 `_audit` 时还需要 `audit.read`；修改 `enabled` 需要 `pipelines.pause` |
 | 删除 | `DELETE /api/v1/scheduled_pipelines/{id}` | `pipelines.delete` |
 | 运行历史 | `GET /api/v1/scheduled_pipelines/{id}/runs` | `pipelines.read` |
-| 回填 | `POST /api/v1/scheduled_pipelines/{id}/backfill` | `pipelines.run` |
+| 回填 | `POST /api/v1/scheduled_pipelines/{id}/backfill` | `pipelines.run`，读取 `_audit` 时还需要 `audit.read` |
 
 ## 列出
 
@@ -33,6 +33,9 @@ description: "列出、查看、编辑、运行、暂停与删除流水线。"
     "last_run_at_micros": 1790000000000000,
     "read_until_micros": { "app_raw": 1789999940000000, "nginx_raw": 1789999940000000 },
     "retry": null,
+    "alert_record": null,
+    "audit_reader_id": null,
+    "audit_reader": null,
     "created_at_micros": 1789900000000000,
     "updated_at_micros": 1789900000000000,
     "last_run_state": "succeeded",
@@ -77,6 +80,9 @@ GET /api/v1/scheduled_pipelines/{id}
     "next_at_micros": 1790000030000000,
     "error": "read: <reason>"
   },
+  "alert_record": null,
+  "audit_reader_id": null,
+  "audit_reader": null,
   "created_at_micros": 1789900000000000,
   "updated_at_micros": 1789900000000000
 }
@@ -87,12 +93,23 @@ GET /api/v1/scheduled_pipelines/{id}
 |---|---|
 | `read_until_micros` | 每个来源的读取位点，单位微秒。该来源在这个时间之前的事件都已处理。还没有读取过的来源不出现在这里。 |
 | `retry` | 最早一次已计划的失败窗口重试，没有时为 `null`。`source` 是来源，`attempt` 是这次重试将是第几次尝试，`next_at_micros` 是重试的时间，`error` 是上一次尝试失败的原因。 |
+| `alert_record` | 告警流水线最近一个处理过事件的 UTC 日的计数：`day`（`YYYY-MM-DD`）、`processed`、`dropped`、`failed`，以及当天最近一次丢弃和出错 `last_dropped`、`last_failed`，各带 `at_micros`、`rule`（告警规则、告警来源或拨测检查）和 `reason`。缺少的计数为 0。其他流水线和还没有处理过事件的告警流水线为 `null`，参见[当天的计数](/zh-Hans/pipelines/alert-events#当天的计数)。 |
+| `audit_reader_id` | 流水线读取 `_audit` 时用谁的权限，即最后保存它的人；不读取 `_audit` 的流水线为 `null`，参见[审计数据流](/zh-Hans/settings/data-security#审计数据流)。 |
+| `audit_reader` | 这个人的 `id`、`display_name` 和 `email`，有 `pipelines.read` 就能看到。用户已不存在或读取失败时为 `null`，这时只有 `audit_reader_id`。 |
 
 参见[定时与读取位点](/zh-Hans/pipelines#定时与读取位点)和[重试与死信](/zh-Hans/pipelines#重试与死信)。
 
 ## 更新与删除
 
-`PUT` 的请求体与[创建流水线](/zh-Hans/api/intake/create-pipeline)相同，并替换整个配置。只修改 `enabled` 需要 `pipelines.pause`，其他修改需要 `pipelines.edit`。把 `enabled` 从 `false` 改为 `true` 会重置读取位点，每个来源重新往回读 `lookback_secs`。`DELETE` 返回 `{"deleted": true}`。
+`PUT` 的请求体与[创建流水线](/zh-Hans/api/intake/create-pipeline)相同，并替换整个配置。只修改 `enabled` 需要 `pipelines.pause`，其他 `PUT`（包括什么都没改的）需要 `pipelines.edit`。把 `enabled` 从 `false` 改为 `true` 会重置读取位点，每个来源重新往回读 `lookback_secs`。`DELETE` 返回 `{"deleted": true}`。
+
+对读取 `_audit` 的流水线，`PUT` 还决定流水线用谁的权限读取，参见[审计数据流](/zh-Hans/settings/data-security#审计数据流)。
+
+| `PUT` | 还需要 | 流水线用谁的权限读取 `_audit` |
+|---|---|---|
+| 改了配置 | `audit.read`，且 Token 不能属于服务账号 | 此后用调用者的权限。 |
+| 什么都没改 | 无 | 调用者持有 `audit.read` 且 Token 不属于服务账号时，此后用调用者的权限；否则不变，也不报错。 |
+| 只改 `enabled` | 无 | 不变。 |
 
 ## 运行历史
 
@@ -100,7 +117,7 @@ GET /api/v1/scheduled_pipelines/{id}
 GET /api/v1/scheduled_pipelines/{id}/runs?limit=50&before_micros=<cursor>
 ```
 
-按时间倒序返回定时流水线的运行记录。实时流水线不产生运行记录。
+按时间倒序返回定时流水线的运行记录。实时流水线和告警流水线不产生运行记录。
 
 <ResponseExample>
 ```json 200
@@ -151,7 +168,7 @@ POST /api/v1/scheduled_pipelines/{id}/backfill
 <RequestExample>
 ```bash cURL
 curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backfill \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"start_micros": 1790000000000000, "end_micros": 1790086400000000}'
 ```
@@ -178,4 +195,4 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backf
 
 回填为每个来源各提交一个搜索任务。每个任务在窗口内读取它的来源、应用各步骤，并像定时运行一样写入、投递和保存死信。流水线的读取位点不变。用每个任务的 `monitor` 路径跟踪它，参见[查询](/zh-Hans/query#时间范围与异步任务)。
 
-实时流水线会返回 `400`（`realtime pipelines do not support backfill`）。
+实时流水线和告警流水线会返回 `400`（`realtime and alert pipelines do not support backfill`）。读取 `_audit` 的流水线在 Token 缺少 `audit.read` 或属于服务账号时返回 `403`。任务真正执行时会再核对一次提交人，提交人已不再持有 `audit.read` 时任务失败。

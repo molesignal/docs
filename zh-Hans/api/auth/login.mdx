@@ -1,6 +1,6 @@
 ---
 title: "登录"
-description: "用邮箱和密码换取 JWT。"
+description: "用邮箱和密码开始一次浏览器会话。"
 "en_link": "/en-US/api/auth/login"
 ---
 
@@ -8,18 +8,19 @@ description: "用邮箱和密码换取 JWT。"
 POST /api/v1/auth/signin
 ```
 
-用邮箱 + 密码换取 JWT。该路由**免认证**。
+开始一次 Web 界面的会话。该路由**免认证**。响应写下会话 Cookie，并在 `login` 中返回登录的是谁，响应体中没有 Token。开启了多因素认证的账号见[第二步](#第二步)。
 
 **请求体**
 
-| 字段 | 类型 | 必填 |
-|---|---|---|
-| `email` | string | ✅ |
-| `password` | string | ✅ |
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `email` | string | 是 | |
+| `password` | string | 是 | |
+| `remember` | boolean | 否 | 关闭浏览器后仍保持会话，默认 `false`。 |
 
 <RequestExample>
 ```bash cURL
-curl -X POST http://localhost:5080/api/v1/auth/signin \
+curl -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
   -H 'content-type: application/json' \
   -d '{"email":"admin@example.com","password":"admin"}'
 ```
@@ -28,23 +29,108 @@ curl -X POST http://localhost:5080/api/v1/auth/signin \
 <ResponseExample>
 ```json 200
 {
-  "token": "eyJhbGciOi...",
-  "user_id": "<user-id>",
-  "email": "admin@example.com",
-  "display_name": "root",
-  "org_id": "<organization-id>",
-  "org_name": "default",
-  "display_role": "Owner",
-  "roles": [
-    {
-      "id": "<role-id>",
-      "key": "owner",
-      "name": "Owner",
-      "builtin": true
-    }
-  ]
+  "login": {
+    "user_id": "<user-id>",
+    "email": "admin@example.com",
+    "display_name": "root",
+    "org_id": "<organization-id>",
+    "org_name": "default",
+    "display_role": "Owner",
+    "roles": [
+      {
+        "id": "<role-id>",
+        "key": "owner",
+        "name": "Owner",
+        "builtin": true
+      }
+    ],
+    "scope": "organization"
+  }
 }
 ```
 </ResponseExample>
 
-后续请求使用 `Authorization: Bearer <token>`。登录会选择用户的第一个组织成员关系；无人值守的集成应使用 API token。
+登录会选择用户第一个放行这次登录的组织成员关系。程序在 `Authorization` 请求头中发送 API Token，该请求头不接受会话 Token，参见[签发 API Token](/zh-Hans/api/auth/issue-token)。
+
+## 尝试次数太多
+
+密码输错太多次后返回 `429`，`Retry-After` 响应头给出要等的秒数，错误码是 `signin_limited`，账号存在和不存在时内容相同。这时不核对密码。密码错误或账号不存在返回 `401`；密码正确但账号已停用或待审批时返回 `403` 和原因。参见[登录限速](/zh-Hans/settings/platform#登录限速)。
+
+```json
+{
+  "error": "resource_exhausted",
+  "code": "signin_limited",
+  "message": "too many failed password attempts; try again in 14 minutes"
+}
+```
+
+## 第二步
+
+账号开启了[多因素认证](/zh-Hans/identity/mfa)时，只有密码不会写 Cookie。响应里没有 `login`，而是 `mfa`，说明账号可以用什么完成：
+
+```json
+{
+  "mfa": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp", "recovery_code"],
+    "expires_at_micros": 1790000000000000
+  }
+}
+```
+
+| 端点 | 用途 |
+|---|---|
+| `POST /api/v1/auth/signin/verify` | 完成登录。带 `challenge`，以及 `method`（`totp` 或 `recovery_code`）和 `code`，或者 `method` 为 `passkey` 和 `ceremony`、`credential`。返回 `{"login": …}` 并写会话 Cookie；用恢复码时还带 `recovery_codes_left`。 |
+| `POST /api/v1/auth/signin/verify/passkey` | 带 `challenge`，返回一次 Passkey 验证的 `ceremony` 和 `options`。`options` 交给 `navigator.credentials.get()`；`ceremony` 和结果一起带回来，只能用一次。 |
+
+## 现场开启第二因素
+
+组织[要求多因素认证](/zh-Hans/identity/sso#登录要求)、账号还没有第二因素时，响应里没有 `login`，而是 `enroll`：
+
+```json
+{
+  "enroll": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp"],
+    "organization_name": "default",
+    "expires_at_micros": 1790000000000000
+  }
+}
+```
+
+| 端点 | 用途 |
+|---|---|
+| `POST /api/v1/auth/signin/enroll/totp` | 带 `challenge`，返回 `setup`、`secret`、`otpauth_url`、`qr_svg` 和 `expires_at_micros`。 |
+| `POST /api/v1/auth/signin/enroll/totp/confirm` | 带 `challenge`、`setup` 和 `code`。返回 `{"login": …, "recovery_codes": […]}` 并写会话 Cookie。 |
+| `POST /api/v1/auth/signin/enroll/passkey/options` | 带 `challenge`，返回 `navigator.credentials.create()` 用的 `ceremony` 和 `options`。 |
+| `POST /api/v1/auth/signin/enroll/passkey` | 带 `challenge`、`ceremony`、`credential`，可选 `name`。返回 `{"login": …, "recovery_codes": […]}` 并写会话 Cookie。 |
+
+组织[只允许单点登录](/zh-Hans/identity/sso#登录要求)时，密码登录返回 `403`。账号属于多个组织时，进入第一个放行的组织。
+
+## Passkey 登录
+
+[Passkey](/zh-Hans/identity/mfa#用-passkey-免密码登录) 不用密码，也不用第二步。
+
+| 端点 | 用途 |
+|---|---|
+| `POST /api/v1/auth/signin/passkey/options` | 返回 `ceremony` 和 `options`。实例的 `[http].external_url` 不能做 Passkey 的[依赖方](/zh-Hans/identity/mfa#实例的要求)时返回 `400`。 |
+| `POST /api/v1/auth/signin/passkey` | 带 `ceremony`、`credential`，可选 `remember`。返回 `{"login": …}` 并写会话 Cookie。 |
+
+## 会话 Cookie
+
+| Cookie | Path | 内容 | 有效期 |
+|---|---|---|---|
+| `accessToken` | `/api` | Access Token，随每个 API 请求发送。 | 15 分钟，通过 `POST /api/v1/auth/refresh` 续期。 |
+| `refreshToken` | `/api/v1/auth` | Refresh Token，只用来续期 Access Token。 | 到会话结束为止，即登录后 `[auth].session_ttl_secs`，默认 24 小时。 |
+
+两个 Cookie 都是 `HttpOnly` 和 `SameSite=Strict`，浏览器经 HTTPS 访问 MoleSignal 时还带 `Secure`。没有选 `remember` 时，浏览器关闭即丢弃它们。两个 Token 都是签名的 JWT，服务端不保存，只按签名、用途和过期时间校验。停用或删除用户后，会话在下一个请求时结束。
+
+## 会话端点
+
+| 端点 | 用途 |
+|---|---|
+| `POST /api/v1/auth/refresh` | 用 Refresh Token 签发新的 Access Token，返回 `204` 和新的 `accessToken` Cookie，会话结束时间不变。会话已过期、用户已停用或缺少 Cookie 时返回 `401`，并清除两个 Cookie。 |
+| `GET /api/v1/auth/session` | 返回当前会话的身份，结构与登录响应中的 `login` 相同。 |
+| `POST /api/v1/auth/signout` | 清除两个 Cookie，返回 `204`。 |
+
+用会话 Cookie 修改数据的请求必须来自 MoleSignal 的页面。浏览器标明 `Sec-Fetch-Site` 不是 `same-origin` 的请求会收到 `403`。

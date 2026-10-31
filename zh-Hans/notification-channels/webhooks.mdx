@@ -14,7 +14,7 @@ MoleSignal 当前提供三种 Webhook 连接器：Slack Webhook、飞书 Webhook
 |---|---|---|---|
 | `slack_webhook` | `{ "text": "..." }` | 凭证包含在 Webhook URL 中 | `fixed_group`、`webhook` |
 | `lark_webhook` | 飞书 `msg_type: text` | URL 凭证和可选签名 | `fixed_group`、`webhook` |
-| `webhook` | MoleSignal 目标与消息 Envelope | 自定义 JSON Header | 所有目标类型 |
+| `webhook` | MoleSignal 事件 JSON，或通知模板正文 | 自定义 JSON Header，可选签名 | 所有目标类型 |
 
 `fixed_group` 使用连接器中配置的 URL。`webhook` 要求目标值为绝对 URL，并用目标值覆盖本次投递的已配置 URL。
 
@@ -83,40 +83,153 @@ MoleSignal 会拼接消息标题与 Markdown 正文，并发送：
 
 ## 通用 Webhook
 
-配置默认地址、方法、Header 和超时：
+配置默认地址、方法、请求体、签名密钥、Header 和超时：
 
 ```json
 {
   "url": "https://notify.example.com/molesignal",
   "method": "post",
+  "body": "event",
+  "signing_secret": "<at-least-16-characters>",
   "headers": {
-    "Authorization": "Bearer <token>",
     "X-Environment": "production"
   },
   "timeout_secs": 10
 }
 ```
 
-方法可以是 `post`、`put` 或 `patch`。Header 名称和值必须符合 HTTP 语法。MoleSignal 发送以下 Envelope：
+方法可以是 `post`、`put` 或 `patch`。Header 名称和值必须符合 HTTP 语法，不能用 `Content-Type` 和下面几个 `X-MoleSignal-*` 的名字。
+
+### 请求体
+
+`body` 是 `event`（默认，界面上是**MoleSignal 事件**）时，请求体是写给机器读的 JSON：
 
 ```json
 {
-  "target": {
-    "type": "fixed_group",
-    "value": "platform-oncall",
-    "metadata": {}
+  "version": 1,
+  "event": {
+    "id": "alert.triggered:3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "type": "alert.triggered",
+    "occurred_at": "2026-10-28T08:00:00Z",
+    "organization_id": "<organization-id>"
   },
+  "alert": {
+    "id": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "status": "open",
+    "severity": "critical",
+    "title": "High error rate · checkout",
+    "url": "https://molesignal.example.com/alerts/incidents/3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "started_at": "2026-10-28T08:00:00Z",
+    "acknowledged_at": null,
+    "resolved_at": null,
+    "acknowledged_by": null,
+    "resolved_by": null,
+    "assignees": ["<user-id>"],
+    "team_id": "<team-id>",
+    "service": "checkout",
+    "environment": "production",
+    "affected_services": ["checkout"],
+    "labels": { "service": "checkout", "env": "production" },
+    "annotations": { "runbook_url": "https://runbooks.example.com/checkout" },
+    "value": 120.0,
+    "threshold": 50.0
+  },
+  "rule": { "id": "<rule-id>", "name": "High error rate", "description": "Share of 5xx answers." },
+  "target": { "type": "fixed_group", "value": "platform-oncall", "metadata": {} },
   "message": {
-    "title": "Checkout error rate is high",
+    "title": "[CRITICAL] High error rate · checkout",
     "text": "The error rate exceeded 5%.",
     "markdown": "**Checkout** error rate exceeded 5%.",
     "html": null,
-    "metadata": {}
+    "metadata": { "event_type": "alert.triggered", "alert_id": "3KEDNEyqouYJeBDTLTMTBui7XHW" }
   }
 }
 ```
 
-任意 2xx 响应都表示成功。响应包含 `X-Request-ID` 时，MoleSignal 会把 Header 值记录为服务商消息 ID。
+| 字段 | 内容 |
+|---|---|
+| `version` | 请求体结构的版本，现在是 `1`。字段只增不改，有不兼容的改动时才加一。 |
+| `event` | 通知的 `id`、`type`（例如 `alert.triggered`、`alert.escalated`、`oncall.shift.starting`）、`occurred_at` 和 `organization_id`。 |
+| `alert` | 告警类通知才有：状态、严重度、标题、事件地址（要配置 `http.external_url`）、开始、确认、解决的时间、负责人、团队、服务、环境、标签、注解、触发值和阈值。时间是 RFC 3339（UTC），人员和团队写 ID。 |
+| `rule` | 告警的规则：`id`、`name`、`description`。 |
+| `escalation` | 升级通知才有：`step`、`loop`、`reason`（为什么发，见[处理事件](/zh-Hans/alerting/incidents#处理事件)）和 `target`（`kind` 与 `id`）。 |
+| `data` | 值班交接、无人覆盖这类不是告警的通知，原样带上它的事件属性。 |
+| `target` | 这次投递的目标：`type`、`value`、`metadata`。 |
+| `message` | 渲染好的消息：`title`、`text`、`markdown`、`html`、`metadata`。 |
+
+`body` 是 `template`（**通知模板正文**）时，请求体是通知策略给 Webhook 渠道选的模板正文，原样发出：JSON 格式的模板按 `application/json` 发，变量的值按 JSON 字符串转义；其余格式按 `text/plain; charset=utf-8` 发。策略没给 Webhook 渠道选模板时，发通用模板或事件默认消息的正文。模板写法见[条件](/zh-Hans/notification-channels#条件)。
+
+### 请求头与签名
+
+| Header | 内容 |
+|---|---|
+| `Content-Type` | `application/json`；模板正文不是 JSON 格式时是 `text/plain; charset=utf-8`。 |
+| `X-MoleSignal-Event` | 通知类型，与 `event.type` 相同。 |
+| `X-MoleSignal-Delivery` | 这次投递的 ID，接收方可以用它去掉重复的请求。 |
+| `X-MoleSignal-Timestamp` | 填了签名密钥才有：发送时刻的 Unix 秒。 |
+| `X-MoleSignal-Sign` | 填了签名密钥才有：`sha256=<hex>`，用签名密钥对 `<timestamp>.<请求体>` 算的 HMAC-SHA256。 |
+
+接收方用同一个密钥对收到的原始请求体重新计算，与 `X-MoleSignal-Sign` 做常量时间比较，再拒绝时间戳离当前时间太远（例如超过 5 分钟）的请求。要用原始字节计算，不能先把 JSON 解析再序列化：
+
+<CodeGroup>
+```python Python
+import hashlib, hmac, time
+
+def verify(secret: str, headers, body: bytes, tolerance: int = 300) -> bool:
+    timestamp = headers.get("X-MoleSignal-Timestamp", "")
+    signature = headers.get("X-MoleSignal-Sign", "")
+    if not timestamp.isdigit() or abs(time.time() - int(timestamp)) > tolerance:
+        return False
+    mac = hmac.new(secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256)
+    return hmac.compare_digest("sha256=" + mac.hexdigest(), signature)
+```
+
+```javascript Node.js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+export function verify(secret, headers, body, toleranceSecs = 300) {
+  const timestamp = headers['x-molesignal-timestamp'] ?? '';
+  const signature = Buffer.from(headers['x-molesignal-sign'] ?? '');
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > toleranceSecs) return false;
+  const expected = Buffer.from(
+    'sha256=' + createHmac('sha256', secret).update(`${timestamp}.`).update(body).digest('hex'),
+  );
+  return expected.length === signature.length && timingSafeEqual(expected, signature);
+}
+```
+
+```go Go
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+func verify(secret string, r *http.Request, body []byte, tolerance time.Duration) bool {
+	timestamp := r.Header.Get("X-MoleSignal-Timestamp")
+	seconds, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil || time.Since(time.Unix(seconds, 0)).Abs() > tolerance {
+		return false
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp + "."))
+	mac.Write(body)
+	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(expected), []byte(r.Header.Get("X-MoleSignal-Sign")))
+}
+```
+</CodeGroup>
+
+签名密钥至少 16 个字符，例如 `openssl rand -hex 32` 生成的；连接器的 HTTP 目标用的是同一套签名，见[连接器](/zh-Hans/connectors)。
+
+### 响应与出站
+
+任意 2xx 响应都表示成功。响应包含 `X-Request-ID` 时，MoleSignal 会把 Header 值记录为服务商消息 ID。MoleSignal 只连接地址解析出的 IP，拒绝云元数据地址，不跟随跳转。Webhook 通知不参与[合并通知](/zh-Hans/notification-channels#合并通知)。
 
 ## 通过 API 创建和测试
 
@@ -124,7 +237,7 @@ MoleSignal 会拼接消息标题与 Markdown 正文，并发送：
 
 ```bash
 curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors" \
-  -H "Authorization: Bearer $MS_JWT" \
+  -H "Authorization: Bearer $MS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "platform webhook",
@@ -133,6 +246,8 @@ curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors" \
     "config": {
       "url": "https://notify.example.com/molesignal",
       "method": "post",
+      "body": "event",
+      "signing_secret": "<at-least-16-characters>",
       "headers": {"Authorization": "Bearer <token>"},
       "timeout_secs": 10
     }
@@ -143,7 +258,7 @@ curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors" \
 
 ```bash
 curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors/$CONNECTOR_ID/test" \
-  -H "Authorization: Bearer $MS_JWT" \
+  -H "Authorization: Bearer $MS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "target_type": "fixed_group",
@@ -160,12 +275,12 @@ curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors/$CONNECTOR_ID/test" \
 ## 安全与限制
 
 - MoleSignal 会加密保存完整连接器配置；
-- API 响应会掩码 `url`、`webhook_url`、`headers`、`secret`、Token 和密码；
+- API 响应会掩码 `url`、`webhook_url`、`headers`、`secret`、`signing_secret`、Token 和密码；
 - 即使没有单独配置密钥，也要把 Webhook URL 当作凭证；
 - 优先使用 `https`，只在可信网络内使用 `http`；
 - 将 MoleSignal 的出向访问限制到连接器确实需要的目标；
 - 已停用的连接器不能发送测试或通知。
 
-<Warning>
-  当前连接器注册表没有原生钉钉或企业微信 Adapter。只有对端能接收 MoleSignal Envelope 时，才能直接使用通用 Webhook；否则请在服务商端点前增加转换 Relay。
-</Warning>
+<Note>
+  钉钉、企业微信、Teams、Google Chat 有各自的连接器，见[配置各服务商](/zh-Hans/notification-channels#配置各服务商)。对端要别的 JSON 格式时，用 JSON 格式的 Webhook 模板写成它要的样子，请求体选**通知模板正文**，不必再加转换服务。
+</Note>

@@ -1,0 +1,85 @@
+---
+title: "Shift swaps"
+description: "Ask another person on the schedule to take a stretch of a shift: request, accept or decline, withdraw, and approve or reject as a manager."
+"zh-Hans_link": "/zh-Hans/api/alerting/schedule-swaps"
+---
+
+A shift swap asks another person on the schedule to cover a stretch for the requester. Once the person asked accepts,
+the schedule gets an [override](/en-US/alerting/on-call#temporary-coverage) and the swap takes effect; when the
+schedule has **Swaps need approval** on (`swap_needs_approval`), someone who can manage the schedule must
+also approve it. A swap still undecided when its stretch ends expires. Every step notifies the people
+involved, through the built-in policy
+[Shift swap: notify the people involved](/en-US/notification-channels#built-in-policies), and is recorded in
+the audit log.
+
+| Method and path | What it does | Permission |
+|---|---|---|
+| `GET /api/v1/schedules/swaps` | The swaps the current user asked for or was asked to take, across schedules. | `schedules.read` |
+| `GET /api/v1/schedules/{id}/swaps` | A schedule's swaps, newest first. | `schedules.read` on the schedule |
+| `POST /api/v1/schedules/{id}/swaps` | Asks for a swap. | `schedules.swaps.request` on the schedule |
+| `POST /api/v1/schedules/{id}/swaps/{swap_id}/accept` | Accepts. Only the person asked can. | `schedules.swaps.request` on the schedule |
+| `POST /api/v1/schedules/{id}/swaps/{swap_id}/decline` | Declines. Only the person asked can. | `schedules.swaps.request` on the schedule |
+| `POST /api/v1/schedules/{id}/swaps/{swap_id}/cancel` | Withdraws. Only the requester can, any time before it is settled. | `schedules.swaps.request` on the schedule |
+| `POST /api/v1/schedules/{id}/swaps/{swap_id}/approve` | Approves an accepted swap; the override takes effect at once. | `schedules.swaps.approve` on the schedule |
+| `POST /api/v1/schedules/{id}/swaps/{swap_id}/reject` | Rejects an accepted swap. | `schedules.swaps.approve` on the schedule |
+
+## Ask for a swap
+
+**Request body**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `target_id` | string | Yes | Who takes the shift: a member of this schedule other than the requester. |
+| `start_at_micros`, `end_at_micros` | integer | Yes | The stretch to swap, in Unix microseconds. It must be ahead, and end after it starts. |
+| `note` | string | No | A note of up to 500 characters. |
+
+The requester must be the only person on call on the schedule for the whole stretch, and a stretch that
+overlaps an undecided swap on the same schedule cannot be asked for.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/$SCHEDULE_ID/swaps \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"target_id": "<user-id>", "start_at_micros": 1790060400000000, "end_at_micros": 1790146800000000, "note": "Travelling on Friday"}'
+```
+</RequestExample>
+
+Each call returns the swap; the lists return `{ "swaps": [ ... ] }`.
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KHq2nB7yZ0d4kVwXc1sPa9LmQe",
+  "org_id": "<organization-id>",
+  "schedule_id": "<schedule-id>",
+  "schedule_name": "Payments primary",
+  "requester_id": "<user-id>",
+  "target_id": "<another-user-id>",
+  "start_at": 1790060400000000,
+  "end_at": 1790146800000000,
+  "note": "Travelling on Friday",
+  "status": "pending",
+  "override_id": null,
+  "decided_by": null,
+  "decided_at": null,
+  "created_at": 1790000000000000,
+  "updated_at": 1790000000000000
+}
+```
+</ResponseExample>
+
+| Field | Notes |
+|---|---|
+| `status` | `pending` (waiting for an answer), `awaiting_approval` (accepted, waiting for approval), `accepted` (in effect), `declined`, `rejected` (by a manager), `cancelled` (withdrawn) or `expired`. |
+| `override_id` | The override added when it took effect. |
+| `decided_by`, `decided_at` | Who answered, approved, rejected or withdrew it last, and when. |
+
+**Errors**
+
+| Status | Reason |
+|---|---|
+| `400` | The stretch is wrong, the person asked is not on the schedule, someone besides the requester is on call in the stretch, or it overlaps an undecided swap. |
+| `403` | A permission is missing, or the caller is not the one who can take this step. |
+| `404` | The schedule or swap does not exist. |
+| `409` | The swap is past this step (for example accepted or expired), or someone changed it meanwhile; read it again and retry. |

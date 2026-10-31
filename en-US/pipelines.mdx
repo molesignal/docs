@@ -1,19 +1,21 @@
 ---
 title: "Pipelines"
 sidebarTitle: "Pipelines"
-description: "Transform and route events as they arrive, or on a schedule over data that is already stored."
+description: "Transform and route events as they arrive, on a schedule over data that is already stored, or as alert events before their incidents open."
 "zh-Hans_link": "/zh-Hans/pipelines"
 ---
 
-A **pipeline** transforms events with an ordered chain of steps and writes the result to target streams. A step is a [VRL](/en-US/functions) transform or the built-in routing step. A pipeline runs in one of two modes:
+A **pipeline** transforms events with an ordered chain of steps. A step is a [VRL](/en-US/functions) transform or the built-in routing step. A pipeline runs in one of three modes:
 
-| | Realtime | Scheduled |
-|---|---|---|
-| When it runs | During intake, before an event is stored. | On an interval, over stored data. Each run continues where the previous one stopped. |
-| Signals | Logs. | Logs, metrics, and traces. |
-| Source and sink | One source stream and one stream sink. | Up to 8 source streams, up to 8 target streams, and optional connectors. |
-| Typical use | Normalize, redact, and route logs into streams as they arrive. | Enrich, filter, sample, or copy stored data, and backfill history. |
-| Backfill and run history | Not available. | Available. |
+| | Realtime | Scheduled | Alert events |
+|---|---|---|---|
+| When it runs | During intake, before an event is stored. | On an interval, over stored data. Each run continues where the previous one stopped. | Before an incident opens, or before a notification policy sends. |
+| Signals | Logs, metrics, traces, and the metadata of profiles. | Logs, metrics, and traces. | Alert events. |
+| Source and sink | One source stream. Logs go to one stream sink; metrics, traces, profile metadata, and RUM events stay in their stream. | Up to 8 source streams, up to 8 target streams, and optional connectors and extend tables. | The alert events of rules, external sources, and synthetic checks. The result goes back into the incident. |
+| Typical use | Normalize, redact, and route logs as they arrive, and trim the labels of metrics and the attributes of spans. | Enrich, filter, sample, or copy stored data, fill extend tables, and backfill history. | Enrich, re-grade, or drop alert events, and add a model's summary. |
+| Backfill and run history | Not available. | Available. | Not available. The pipeline counts what it did today. |
+
+This page covers realtime and scheduled pipelines. [Alert pipelines](/en-US/pipelines/alert-events) have a page of their own.
 
 <Frame caption="Scheduled pipeline">
   <img src="/images/architecture/pipeline_en_light.svg" alt="Scheduled pipeline" className="block dark:hidden" />
@@ -25,7 +27,8 @@ A **pipeline** transforms events with an ordered chain of steps and writes the r
 Open **Pipelines** and select **New pipeline**. The editor has three parts.
 
 **Settings.** Name the pipeline, choose the signal type, and set the **Execution mode** to
-**Realtime** or **Scheduled**. A scheduled pipeline also takes **Run every**, the interval between
+**Realtime** or **Scheduled**. **Alert events** makes an [alert pipeline](/en-US/pipelines/alert-events).
+A scheduled pipeline also takes **Run every**, the interval between
 runs, **First run reads back**, how far back the first run reads, and **Wait for late events**, how
 long the latest events are left to arrive before a run reads them. The row below them holds
 **Retry a failed run**, **Retry a failed delivery**, **Dead letter stream**, and **Dedupe by field**.
@@ -38,7 +41,7 @@ See [Schedule and read positions](#schedule-and-read-positions) and
 |---|---|
 | **Source** | The streams that the pipeline reads. In a scheduled pipeline, **Add source** adds one. |
 | **Processing** | The steps, in the order in which they run. **Add step** adds one. |
-| **Destinations** | The streams that the pipeline writes through standard intake, and optional external connectors. In a scheduled pipeline, **Add destination** adds a **Stream** or a **Connector**. |
+| **Destinations** | The streams that the pipeline writes through standard intake, and optional external connectors and extend tables. In a scheduled pipeline, **Add destination** adds a **Stream**, a **Connector**, or an **Extend table**. |
 
 Select a node to edit it. The head of the flow shows **Valid**, the number of entries that are left
 to fill in, or the issues that block a save: a missing source or destination, a step without a name
@@ -65,10 +68,15 @@ backfill, and deletion.
 | Kind | Steps |
 |---|---|
 | Parse | **Parse JSON**, **Parse key=value**, and **Extract with regex**. |
-| Fields | **Rename field**, **Remove fields**, **Set field**, **Mask field**, **Change case**, and **Convert type**. |
+| Fields | **Rename field**, **Rename by pattern**, **Remove fields**, **Keep only these fields**, **Set field**, **Mask field**, **Change case**, **Convert type**, and **Look up an extend table**. See [Look up an extend table](#look-up-an-extend-table). |
 | Events | **Filter events** and **Sample**. See [Filter and sample](#filter-and-sample). |
 | Routing | **Route to stream**. See [Routing](#routing). |
 | Code | **Custom VRL**. |
+
+An alert pipeline offers **AI summary**, **Call an API**, and **Add query results** in place of **Route to stream**, and no **Sample**. See
+[Steps of alert pipelines](/en-US/pipelines/alert-events#steps).
+
+**Rename by pattern** and **Keep only these fields** go through the keys of one object, named under **In**: the top of the event when it is left empty, `labels` to begin with in an alert pipeline. **Rename by pattern** renames every key that a regular expression matches, where `$1` in **Replace with** is the first group of the pattern, and leaves the others. **Keep only these fields** removes every key that is not listed. At the top of an event, `_timestamp` always stays. A field that is missing or is not an object is left as it was.
 
 A parse, field, or event step is filled in as a form and runs as VRL. **Show generated VRL**
 displays the script, and **Edit as VRL** turns the step into a **Custom VRL** step.
@@ -122,30 +130,35 @@ In a scheduled pipeline, a step reads the stream that the event was read from as
 The built-in routing step chooses the target stream of each event. Both modes support it. A route is one of:
 
 - a **Fixed stream**;
-- **Route by field**, which writes to the stream named by a field of the event. An optional **Stream prefix** is prepended, and the **Fallback stream** receives events whose field is missing, not a string, or not a valid stream name.
+- **Route by field**, which writes to the stream named by a field of the event. An optional **Stream prefix** is prepended, and the **Fallback stream** receives events whose field is missing, not a string, or does not name a stream that a pipeline can write.
 
-The route reads the fields as they are when the step runs, and later steps do not change a decision that was already made. When several routing steps run, the last result wins. A stream name has 1 to 255 characters from ASCII letters, digits, `_`, `-`, and `.`. Names such as `.` and `..`, and the protected `_molesignal`, are rejected. Missing streams are created on the first write.
+The route reads the fields as they are when the step runs, and later steps do not change a decision that was already made. When several routing steps run, the last result wins. A stream name has 1 to 255 characters from ASCII letters, digits, `_`, `-`, and `.`. Names such as `.` and `..`, the [platform streams](#platform-streams), and the [RUM streams](#rum-streams) are rejected. Missing streams are created on the first write.
 
 In a scheduled pipeline, the route replaces only the first target stream. Every further target stream takes every event, whatever the route picks. A route cannot lead back into a stream that the pipeline reads: a **Fixed stream** or a **Fallback stream** that is a source is rejected on save with `400`, and an event whose field names a source counts as failed and goes to the dead letter stream.
 
-### Extend tables
+### Look up an extend table
 
-An **extend table** is a key-to-record lookup table available to a transform. Open **Extend tables**, create a table, add rows (a key plus named fields), and perform the lookup from VRL:
+An [extend table](/en-US/extend-tables) maps a key to a record. **Look up an extend table** copies
+values from the row whose key is the value of a field of the event:
 
-```ruby
-# enrich each event with the service's owning team
-.team = lookup("service_meta", .service).team
-```
+| Field | Meaning |
+|---|---|
+| **Extend table** | The table of the workspace to look in. |
+| **Key field** | The field of the event whose value is the key of the row, such as `host`. A dotted name such as `labels.host` reads a field with that literal name first, then the nested path. |
+| **Values to copy** | Pairs of a **Value of the row** and the **Field of the event** that it goes into. **Add a value** adds a pair. |
 
-Lookups happen in memory and add no query cost to the run.
+When the table has no row for the key, the step changes nothing. In a **Custom VRL** step, the
+`lookup` function returns the whole row. See
+[Look up tables and IP addresses](/en-US/functions#look-up-tables-and-ip-addresses). A scheduled
+pipeline can also write rows into a table: see [Write to an extend table](#write-to-an-extend-table).
 
 ## Realtime pipelines
 
-A realtime pipeline processes each log event during intake, before the event is stored. Create it in the editor by setting **Execution mode** to **Realtime**, or through the API:
+A realtime pipeline processes logs, metric samples, spans, or the metadata of profiles during intake, before they are stored. Create it in the editor by setting **Execution mode** to **Realtime** and choosing the **Signal type**, or through the API. A logs pipeline can route events to other streams:
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/scheduled_pipelines \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
     "name": "route-app-logs",
@@ -174,14 +187,73 @@ An event with `appname` set to `checkout` reaches the stream `app_checkout`. An 
 
 Behavior to plan for:
 
-- Each event runs through the steps in order. A step that fails, or a result that is not an object, rejects that event. The intake response lists it, for example `{"index":1,"reason":"realtime transform `needs-level` failed"}`, and the other events of the batch are accepted.
-- **Also retain in source stream** keeps the original event in the source stream next to the transformed copy. It is off by default. When the source and the target are the same stream, only the transformed event is written.
+- Each event runs through the steps in order. A step that fails, or a result that is not an object, rejects that event. The intake response lists it, for example `{"index":1,"reason":"realtime transform `needs-level` failed"}`, and the other events of the batch are accepted. Spans sent over OTLP are the exception: see [Where realtime pipelines run](#where-realtime-pipelines-run).
+- For logs, **Also retain in source stream** keeps the original event in the source stream next to the transformed copy. It is off by default. When the source and the target are the same stream, only the transformed event is written.
 - A step that runs `abort` drops the event on purpose. Nothing is routed, and the intake response counts the event as accepted without an error. When the source and the target differ, **Also retain in source stream** still keeps the original event.
-- Only one realtime pipeline can be enabled per source stream. A second one fails with `409`. The pipeline supports logs only.
-- A change of configuration applies to later batches. A batch that has already started keeps the configuration it read.
+- Only one realtime pipeline can be enabled per kind of data and source stream, so a logs stream and a metrics stream of the same name can each have one. A second one on the same stream fails with `409`.
+- A change of configuration applies to later batches, on every node within 10 seconds. A batch that has already started keeps the configuration it read.
 - The output of a pipeline does not trigger another pipeline.
 - Writes to several target streams are not atomic. A retry of the whole batch can duplicate events in streams that already succeeded, so the pipeline does not promise exactly-once delivery.
 - A realtime pipeline records no runs and cannot be backfilled. In the list, the status **Ready for intake** means that the configuration is enabled, not that data has arrived.
+
+### Metrics and traces
+
+A realtime pipeline on metrics or traces changes the samples or spans in place: they stay in the stream that they arrive in. The flow ends in **Back into the stream**, **Add step** offers no **Route to stream**, and **Also retain in source stream** does not apply. Through the API, a `target_stream` other than the `source_stream`, a routing step, or `retain_source` set to `true` answers `400`. A realtime pipeline on a RUM stream works in place too; see [RUM streams](#rum-streams).
+
+The pipeline keeps the fields that a sample or a span rests on as they arrive:
+
+| Signal | Fields kept as they arrive |
+|---|---|
+| Metrics | `metric_name`, `value`, `_timestamp`, the metric metadata (`metric_kind`, `metric_description`, `metric_unit`, `metric_temporality`, `metric_monotonic`, and `metric_start_time_unix_nano`), the exemplars, the `count`, `sum`, `min`, and `max` that OTLP histograms and summaries store as fields, and the labels `le` and `quantile`, which name the bucket of a histogram and the quantile of a summary. A label named `count`, `sum`, `min`, or `max` is kept too. |
+| Traces | `trace_id`, `span_id`, `parent_span_id`, `service.name`, `start_time_unix_nano`, `end_time_unix_nano`, and `duration_ns`. |
+
+A logs pipeline keeps no field. A metrics pipeline can remove, rename, or add other labels, for example to cut the cardinality of a metric: a sample whose labels change belongs to another series. A traces pipeline can drop spans, remove attributes, and rewrite the span name:
+
+```ruby
+# metrics: drop the pod label of every sample
+del(.pod)
+```
+
+```ruby
+# traces: remove the SQL text and fold IDs out of the span name
+del(."db.statement")
+.name = replace(string!(.name), r'/\d+', "/{id}")
+```
+
+The kept fields are checked in three places:
+
+| Where | Check |
+|---|---|
+| Editor | A form step that writes a kept field is an issue that blocks the save, and **Run test** marks a step that changes one as failed. |
+| Save | Each VRL step runs once on a sample that has every kept field. A step that changes one there is refused with `400`, and the message names the step and the field. A change made only under a condition that the sample does not meet passes. |
+| Intake | After every step, the kept fields are compared with the ones that arrived. A step that changed, removed, or added one fails the sample or the span. |
+
+### Where realtime pipelines run
+
+| Signal | Intake | When the steps run | An event that fails |
+|---|---|---|---|
+| Logs | Every log intake. | As a batch arrives, before it is stored. | Listed in the `errors` of the intake response. |
+| Metrics | [`/api/v1/intake/metrics/{stream}`](/en-US/api/intake/native-json), [OTLP](/en-US/api/intake/otlp) metrics, and [Prometheus remote write](/en-US/api/intake/prometheus). | As a batch arrives, before it is stored. | Listed in the `errors` of the intake response. |
+| RUM | [RUM intake](/en-US/rum/events) from the SDKs. | As a batch arrives, before it is stored. | Listed in the `rejected` of the RUM intake [answer](/en-US/rum/events#the-answer). |
+| Traces | [OTLP](/en-US/api/intake/otlp) over HTTP and gRPC. | After [tail sampling](/en-US/configuration#trace-capture-and-tail-sampling), before the spans are written. | Not written. The sender already has its response, so the node logs a warning. |
+| Traces | [`/api/v1/intake/traces/{stream}`](/en-US/api/intake/native-json). | Before the spans are written. | Listed in the `errors` of the intake response. |
+| Profiles | Every [profile intake](/en-US/profiles), over HTTP and OTLP. | After the profile is stored as an object, before its metadata row is written. | Listed in the `errors` of the intake response, and the row is not written. |
+
+### Traces
+
+A step sees one span at a time, with its attributes as fields such as `http.method`. A step that changes or removes such a field changes or removes it in the `attributes` and `resource` of the span too, and a field that a step adds goes into `attributes`.
+
+- A span dropped from the middle of a trace leaves its children without a parent. To keep or drop whole traces, use **Sample** with **Sample by field (optional)** set to `trace_id`.
+- The trace list summarizes the spans that are written: the span count, the error count, and the start and end of each trace. A trace whose spans are all dropped has no summary.
+- The trace list and the [service map](/en-US/apm/service-map) count only the spans that are written. [APM](/en-US/apm) figures are derived before tail sampling, so they still count the spans that a pipeline drops.
+
+### Profiles
+
+A realtime pipeline on **Profiles** works on the metadata row of each profile: its service, type, time, labels, and where its object is. The profile itself is an object that no step touches. Profiles of an organization all arrive in the `default` stream, so that is the pipeline's one source, and the rows stay there. A scheduled pipeline does not read profiles.
+
+Steps can rename the `service`, add or change `labels` and other fields, and drop rows, for example to tag every profile with its environment or to leave out one noisy service. A row that is dropped takes the profile out of the [Profiles](/en-US/profiles) pages; its object stays until the retention period of the stream ends.
+
+These fields are kept as they arrive, as for [metrics and traces](#metrics-and-traces): `id`, `object_key`, `archived_bytes`, `_timestamp`, `profile_type`, `duration_nanos`, `sample_count`, `total_value`, `unsymbolized`, `trace_id`, and `span_id`. The flame graphs and downloads find and merge the objects by them.
 
 ## Scheduled pipelines
 
@@ -189,11 +261,12 @@ A scheduled pipeline reads its source streams on an interval, applies the chain,
 
 ### Sinks and connector egress
 
-A scheduled pipeline writes up to 8 **target streams** through standard intake, where the events are queryable, and delivers to external **connectors**:
+A scheduled pipeline writes up to 8 **target streams** through standard intake, where the events are queryable, delivers to external **connectors**, and writes rows into **extend tables**:
 
 - Every event goes to the first target stream, the `target_stream`, unless a routing step picks another stream.
 - Every further target stream takes every event that comes through the steps.
 - Every connector that is turned on receives every event that comes through the steps.
+- Every extend table takes a row for every event that comes through the steps. See [Write to an extend table](#write-to-an-extend-table).
 
 | Connector | Payload |
 |---|---|
@@ -204,6 +277,16 @@ A scheduled pipeline writes up to 8 **target streams** through standard intake, 
 Add connectors under **Pipelines → Connectors**, then add them to the **Destinations** of the flow with **Add destination → Connector**. A pipeline writes its streams and delivers to its connectors in the same run. A pipeline cannot write a stream that it reads: a target stream that is also a source is rejected with `409`.
 
 A target stream does not have to exist beforehand. The first write creates it with a schema inferred from the output, and later runs add new fields the way any other stream does. An event whose field type conflicts with the schema of an existing target stream is rejected on its own: it counts as failed and goes to the dead letter stream, and the other events of the run are still written. When a target stream rejects every event of a run and the pipeline has no dead letter stream, the run fails and the reason appears in its `error`. A backfill writes the same way.
+
+### Write to an extend table
+
+**Add destination → Extend table** makes a scheduled pipeline keep an [extend table](/en-US/extend-tables) of the workspace current, for example a table of the team that owns each host, which `lookup` then reads in other pipelines. A pipeline writes up to 8 extend tables.
+
+- Each event becomes a row under the value of the **Lookup key** field of the table. A dotted key field such as `kubernetes.pod_name` reads a field with that literal name first, then the nested path. Text is the key as it is, and a number or a boolean as it is written.
+- A table with **Value fields** takes those fields of the event by name, and leaves out the ones that the event lacks or holds as `null`. A table without value fields takes the whole event.
+- A row replaces the row with the same key. When several events of a run share a key, the one with the latest `_timestamp` wins.
+- An event whose key field is missing, empty, `null`, an object, or a list is not written to that table. It counts as failed and goes to the dead letter stream with `dead_letter_destination` set to `table:<table>`. So does every event for a table that does not exist.
+- When storage cannot take the rows, the window is tried again like a failed write to a stream. See [Retries and dead letters](#retries-and-dead-letters). Rows are written by key, so writing them again changes nothing.
 
 ### Hide the source stream from queries
 
@@ -257,10 +340,10 @@ The dead letter stream is a logs stream whatever the signal of the pipeline, so 
 | Field | Content |
 |---|---|
 | `dead_letter_pipeline` | The name of the pipeline. |
-| `dead_letter_stage` | `transform` when a step failed on the event or routed it into a source, `write` when a target stream rejected it, and `deliver` when a connector did not take it. |
+| `dead_letter_stage` | `transform` when a step failed on the event or routed it into a source, `write` when a target stream or an extend table did not take it, and `deliver` when a connector did not take it. |
 | `dead_letter_reason` | What went wrong. |
 | `dead_letter_source` | The stream that the event was read from. |
-| `dead_letter_destination` | The stream or the connector that did not take the event. Set for `write` and `deliver`. |
+| `dead_letter_destination` | The stream, the connector, or the extend table (`table:<table>`) that did not take the event. Set for `write` and `deliver`. |
 
 A `transform` dead letter keeps the event as it was read. A `write` or `deliver` dead letter keeps the event as it was sent. Without a dead letter stream, these events count as failed and are not kept.
 
@@ -291,7 +374,7 @@ To process a historical window on demand, open **More → Backfill** in the edit
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backfill \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"start_micros": 1790000000000000, "end_micros": 1790086400000000}'
 ```
@@ -299,6 +382,27 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backf
 The window must not exceed 31 days. The request returns `202` with one job per source, each with a `job_id` and a `monitor` path. Each job runs through the asynchronous [search job](/en-US/deployment/role-based#asynchronous-search-jobs) worker: it reads its source over the window, applies the same chain, and writes, delivers, and keeps dead letters the way a run does.
 
 A backfill leaves the read positions where they are, so the scheduled runs read what they would have read without it. A backfill window that overlaps time that runs already processed writes those events again.
+
+## RUM streams
+
+Only RUM intake writes the [RUM streams](/en-US/rum/events#where-the-events-are-stored), such as `rum_views` and `rum_errors`, because the RUM pages read their rows in a fixed shape. A scheduled pipeline can read them, for example to copy errors into a stream of its own or to a connector. A RUM stream cannot be a target stream, a stream that a route picks, or the dead letter stream: the editor does not offer it as a destination or a dead letter stream and marks a name typed by hand before saving, and the API answers `400`.
+
+A realtime pipeline on `rum_views`, `rum_actions`, `rum_errors`, `rum_resources`, `rum_long_tasks`, or `rum_vitals` changes the events in place, like a pipeline on [metrics or traces](#metrics-and-traces): set the **Signal type** to **Logs** and choose the RUM stream as the source. `rum_sessions` takes no pipeline, because MoleSignal builds it from the views as they arrive.
+
+- Only `context`, `usr.extra`, `feature_flags`, and `extra` can change, with everything inside them, such as `.context.plan`. Every other column is what the RUM pages read: a step that changes, removes, or adds one fails the event.
+- Actions, errors, resources, and long tasks can be dropped. Views and vitals never are: a step that drops one fails the event, and a step that can drop, such as a VRL step with `abort`, **Filter events**, or **Sample**, cannot be saved on `rum_views` or `rum_vitals`.
+- When the pipeline is saved, each VRL step runs once on a sample that has every column, and a step that changes another column there is refused with `400`.
+
+```ruby
+# remove an email address that the application put into its custom context
+del(.context.email)
+```
+
+## Platform streams
+
+Only MoleSignal writes the [platform streams](/en-US/streams#platform-streams), such as `_audit` and `_synthetic_results`. No pipeline writes them: a platform stream cannot be a target stream, a stream that a route picks, a dead letter stream, or the source of a realtime pipeline. The editor does not offer it as a destination, a dead letter stream, or a realtime source, and marks a name typed by hand before saving. The API answers `400`.
+
+A scheduled pipeline can read every platform stream except `_molesignal`, for example to deliver the audit events of `_audit` to a SIEM through a connector. Saving a pipeline that reads `_audit`, or submitting a backfill of it, needs `audit.read`, and a service account token answers `403`. The pipeline reads `_audit` with the access of whoever last saved it, pausing and resuming aside: when that person loses `audit.read`, it stops at its read position, and goes on from there once they hold it again or someone who holds it saves the pipeline. The head of the pipeline's page and the **Source** node of the editor show that person as **Reads \_audit as**. See [Audit stream](/en-US/settings/data-security#audit-stream).
 
 ## Permissions
 
@@ -308,6 +412,8 @@ A backfill leaves the read positions where they are, so the scheduled runs read 
 - `pipelines.pause` enables or pauses a pipeline.
 - `pipelines.run` submits a backfill.
 - `pipelines.delete` deletes a pipeline.
+
+Creating, changing, or backfilling a pipeline that reads `_audit` also needs `audit.read`. Pausing or resuming it does not.
 
 <Card title="Pipeline API" icon="code" href="/en-US/api/intake/scheduled-pipelines">
   Create, update, list, and backfill pipelines over the HTTP API.

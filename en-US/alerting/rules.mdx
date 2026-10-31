@@ -1,18 +1,22 @@
 ---
 title: "Alert rules"
-description: "Create threshold and anomaly rules in the rule workbench, test them on real data, split them by host or service, and decide how incidents recover."
+description: "Create threshold, forecast, outlier, composite, heartbeat, and anomaly rules in the rule workbench, test them on real data, split them by host or service, and decide how incidents recover."
 "zh-Hans_link": "/zh-Hans/alerting/rules"
 ---
 
 A rule says what must not happen. MoleSignal evaluates it on an interval, and opens an
 [incident](/en-US/alerting/incidents) when the condition holds. Open **Alerts → Rules**. Reading rules
-requires `alerts.read`, and creating or changing them requires `alerts.manage`.
+requires `alerts.rules.read`, and creating or changing them requires `alerts.rules.manage`.
 
 ## Rule types
 
 | Type | Evaluates | Created in |
 |---|---|---|
 | **Threshold rule** | A SQL or PromQL query, an [APM figure](/en-US/apm#alert-on-apm-figures), or a [RUM figure](/en-US/rum/alerts), against fixed thresholds, on an interval. | The rule workbench. |
+| **Forecast rule** | The trend of a query, an APM figure, or a RUM figure; fires when it is expected to cross a threshold within the lead time. See [Forecast rules](#forecast-rules). | **How it fires** in the rule workbench. |
+| **Outlier rule** | A query split by columns whose groups are compared with each other; a group that stands apart fires. See [Outlier rules](#outlier-rules). | **How it fires** in the rule workbench. |
+| **Composite rule** | Whether other rules have open incidents, combined with and, or, and not. See [Composite rules](#composite-rules). | **How it fires** in the rule workbench. |
+| **Heartbeat rule** | Whether a job such as a cron task or a backup script checked in on time. See [Heartbeat rules](#heartbeat-rules). | **How it fires** in the rule workbench. |
 | **Anomaly detection** | A query, an APM figure, or a RUM figure against a baseline learned from its history. | The anomaly editor. |
 | **Real-time rule** | Records counted as they arrive on the intake path. | The API only. See [Real-time rules](#real-time-rules). |
 
@@ -28,6 +32,7 @@ evaluation. Search by rule, service, or source, and switch between **All**, **En
 | **Healthy** | The last evaluation did not meet the condition. |
 | **Waiting duration** | The condition holds, but not yet for the required duration. |
 | **Firing** | The rule has an open incident. |
+| **Dropped by pipeline** | The rule fires, but an [alert pipeline](/en-US/pipelines/alert-events#what-becomes-of-an-event) dropped the incident that it would open. |
 | **Disabled** | The rule is saved as a draft and does not run. |
 
 Select a rule, or **Edit** in its row, to open it.
@@ -48,11 +53,18 @@ Select **New rule → Threshold rule** to open the rule workbench.
     The **Rule name** titles the incidents, for example `api_high_error_rate`. **Service** ties the rule
     to a service for ownership and cross-signal context. **Description** says what the rule protects.
   </Step>
+  <Step title="Choose how it fires">
+    At the top of **Query and trigger condition**, choose **How it fires**: **Threshold** (default),
+    [**Forecast**](#forecast-rules), [**Outlier**](#outlier-rules), [**Composite**](#composite-rules), or
+    [**Heartbeat**](#heartbeat-rules). Composite and heartbeat rules have no query; the query, test, and
+    thresholds below give way to their own settings.
+  </Step>
   <Step title="Write the query">
     Set the **Target stream**, the **Evaluation interval** (every 1, 5, or 10 minutes), the
     **Query language** (**PromQL** for metrics, **SQL** otherwise), and the **Query**. The query must
     return a number: the evaluator reads the first column of the first row. Optionally fill in
-    [**Split by**](#split-a-rule-by-columns).
+    [**Split by**](#split-a-rule-by-columns). A rule cannot read the
+    [`_audit` stream](/en-US/settings/data-security#audit-stream): saving one answers `400`.
   </Step>
   <Step title="Set the trigger conditions">
     Each row is a severity: **When result** is compared with the **Threshold** by an operator, **And
@@ -77,8 +89,9 @@ Select **New rule → Threshold rule** to open the rule workbench.
   </Step>
 </Steps>
 
-A rule created in the workbench uses the escalation policy named `default`. An organization without
-one opens incidents that escalate to nobody: create it first. See
+A rule created in the workbench names no escalation policy: [alert routing](/en-US/alerting/routing)
+places its incidents, and the policy named `default` takes those routing cannot place. An organization
+without one opens such incidents with nobody to escalate to: create it first. See
 [The default policy](/en-US/alerting/on-call#the-default-policy).
 
 ## Split a rule by columns
@@ -103,7 +116,7 @@ GROUP BY host
 ORDER BY errors DESC
 ```
 
-In PromQL the labels of a series are its columns, so `sum by (instance) (rate(http_requests_total{status=~"5.."}[5m]))` splits by `instance`. When the result has rows but no column of that name, the round fails and nothing changes. Testing a query in the rule workbench checks the columns. APM, RUM, real-time, and anomaly rules are not split.
+In PromQL the labels of a series are its columns, so `sum by (instance) (rate(http_requests_total{status=~"5.."}[5m]))` splits by `instance`. When the result has rows but no column of that name, the round fails and nothing changes. Testing a query in the rule workbench checks the columns. APM, RUM, real-time, and anomaly rules are not split; [outlier rules](#outlier-rules) have to be.
 
 ## Recovery and missing data
 
@@ -140,9 +153,94 @@ threshold. Select **New rule → Anomaly detection rule**.
 | | **Trigger after (intervals)** | Consecutive anomalous evaluations before an incident opens. |
 | | **Weekly seasonality** | Compares only with the same weekday, which avoids alarms between weekdays and weekends. Needs a lookback of at least 7 days; 28 or more works best. |
 
+## Forecast rules
+
+A forecast rule carries a figure's trend forward and fires when the figure is expected to cross the
+threshold within the lead time. It suits figures that creep toward a limit, such as disk use, quotas, or
+connections. Choose **Forecast** under **How it fires**, write the query as for a threshold rule, and set:
+
+| Setting | Notes |
+|---|---|
+| **Expected to be** | The operator and threshold, for example expected `> 90`. |
+| **Lead time** | How far ahead a crossing fires the rule: 1, 6, or 12 hours, or 1, 2, 3, or 7 days. Default 1 day. |
+| **Looking back** | How many past days of the trend to project from: 1, 3, 7, 14, or 30. Default 7. |
+| **Model** | **Linear trend**; or **Daily pattern** or **Weekly pattern**: the value one day or one week earlier at the same moment plus the trend, for figures that rise and fall by the day or week. The weekly pattern needs at least 7 days of lookback. |
+
+Each round adds the current value to a series; a new rule, or one whose query changed, first queries some
+past moments to fill in history. With too few points (fewer than 6, or less than a full period for the
+daily and weekly patterns) the round reaches no verdict. The incident says when the crossing is expected
+and the value expected then. A forecast rule has one severity and a duration, no recovery threshold, and
+can set [When there is no data](#recovery-and-missing-data).
+
+## Outlier rules
+
+An outlier rule compares the groups of a split query with each other instead of with a fixed threshold.
+Split error counts by host, for example, and a host with far more errors than the others fires, while all
+hosts rising together does not. Choose **Outlier** under **How it fires**, write the query, fill in
+[**Split by**](#split-a-rule-by-columns), and set:
+
+| Setting | Notes |
+|---|---|
+| **Tolerance** | How many scaled deviations away counts as an outlier, 0.5 to 10. Default 3. Smaller is more sensitive. |
+| **Which side** | **Higher or lower**, **Higher only**, or **Lower only**. |
+
+The deviation is measured from the groups' median and median absolute deviation (MAD), in a way that does
+not turn a small wobble into an outlier when the groups are nearly the same. Each outlier group opens its
+own incident, which gives how far it stands apart; with fewer than 3 groups that have a value, the round
+makes no judgement. Outlier rules take no APM or RUM figures and have one severity and a duration.
+
+## Composite rules
+
+A composite rule looks at several rules together: a combined rule counts while it has an open incident,
+and an expression combines them. `A && B`, for example, notifies only when error rate and latency both
+alert, and `A && !B` counts an upstream problem only while the downstream is fine. Choose **Composite**
+under **How it fires**:
+
+| Setting | Notes |
+|---|---|
+| **Rules** | Up to 10 rules, named A, B, C, and so on. |
+| **Expression** | Letters combined with `&&` (and), `\|\|` (or), `!` (not), and brackets, for example `A && (B \|\| C)`. |
+| **Merge these rules' incidents under the composite incident** | Once the composite rule opens an incident, the open incidents of the combined rules are [merged](/en-US/alerting/incidents#merge-incidents) into it and stop notifying on their own; later ones are merged too. |
+
+A composite rule runs no query, cannot be tested, and has no
+[When there is no data](#recovery-and-missing-data). A combined rule cannot be a composite rule, and a
+composite rule cannot be combined into another; a combined rule that is deleted counts as false. The
+incident says which letters were true.
+
+## Heartbeat rules
+
+A heartbeat rule turns things around and waits for a job to report in: a cron task, a backup script, or a
+batch job requests a check-in address each time it runs, and the rule fires when no check-in arrives within
+the period plus the grace, or when a check-in reports a failure. Choose **Heartbeat** under
+**How it fires**:
+
+| Setting | Notes |
+|---|---|
+| **Check-in period** | How often the job runs, 1 minute to 7 days. Default 60 minutes. |
+| **Grace** | How much longer to wait after the period before a check-in counts as missed, up to 1 day. Default 5 minutes. |
+
+After saving, a dialog shows the check-in address and a `curl` example; the address is shown only that
+once. Have the job request it (`GET` or `POST`) when it succeeds, and add `?status=fail` when it fails to
+fire the rule at once. The start of a `POST` body is kept on the incident as the check-in's message, which
+suits the last lines of a log.
+
+```bash
+if ./backup.sh; then
+  curl -fsS "$HEARTBEAT_URL"
+else
+  curl -fsS "$HEARTBEAT_URL?status=fail"
+fi
+```
+
+Editing a heartbeat rule shows the last check-in and when the next one is due at the latest.
+**Reset check-in address** issues a new address, and the old one stops working at once. The check-in
+address needs no sign-in, only the token in it; see [Public access](/en-US/public-access) and
+[Heartbeat check-ins](/en-US/api/alerting/heartbeats). A heartbeat rule runs no query, cannot be tested,
+and has no [When there is no data](#recovery-and-missing-data).
+
 ## Real-time rules
 
-A real-time rule runs on the intake path instead of on a timer. Every record that an intake node accepts is checked against the real-time rules of its stream, and the matches go into a sliding window of `period_secs` seconds. The rule fires as soon as the number of matches in the window meets the trigger, and an incident resolves when the count no longer meets it.
+A real-time rule runs on the intake path instead of on a timer. Every record that an intake node accepts is checked against the real-time rules of its stream, and the matches go into a sliding window of `period_secs` seconds. Every second, the alert node in charge of the rule reads the matches in the window from every node that takes writes and adds them up; an incident opens when the sum meets the trigger and resolves when it no longer does, at most a second after the records were written.
 
 | Part | Behavior |
 |---|---|
@@ -151,7 +249,58 @@ A real-time rule runs on the intake path instead of on a timer. Every record tha
 | Trigger | `operator` is `gt` or `gte`, and `for_periods` is `0` or `1`. Tiers in `thresholds` set the severity by count. |
 | Incident | The incident follows the usual lifecycle: one active incident per rule, the `silence_secs` cool-down, escalation, and notification. |
 
-[Create a rule](/en-US/api/alerting/create-rule) rejects a real-time rule outside these limits with `400`. Counting happens in memory on each intake node and starts at zero after a restart. In a role-split cluster, every intake node counts the records it receives, so size the threshold for one node.
+[Create a rule](/en-US/api/alerting/create-rule) rejects a real-time rule outside these limits with `400`. Counts are kept in memory on each node that takes writes, and every 5 seconds each node saves a snapshot of its windows in the metadata database. A node that restarts reads its snapshot back and loses at most the last 5 seconds. While a node is down or does not answer, the alert node in charge uses the node's last snapshot in its place, until those counts leave the window. When another alert node takes the rule over nothing is lost; it picks up the firing state from the open incident. Nodes read each other's counts with the cluster bearer (`MS_SELF_TELEMETRY_CLUSTER_TOKEN`, shared with role-split deployments); without it the other nodes are known only by their snapshots.
+
+### Real-time rules in a federation
+
+In a [cross-cluster federation](/en-US/settings/data-plane#cluster-federation), every cluster counts the records written to it, and by default each cluster decides by its own count. To add the clusters up, set the cluster that decides: `query.home_cluster` in the API, or **Decided in** when the rule is opened in the rule workbench, which offers this cluster and the enabled remote clusters. Only that cluster opens and resolves the rule's incidents. Every second, its alert node in charge of the rule asks each cluster the organization is mapped to for its count, with the organization's per-org token, and adds the counts to its own; the other clusters only count. A cluster that does not answer within 800 milliseconds counts with the last count it gave, for up to 30 seconds, and as 0 after that, so a missed second does not resolve an incident; the metric `realtime_federated_counts_failed_total{cluster}` counts the misses. The rule follows the federation with the same id, so every cluster counts it.
+
+## Evaluation delay
+
+In a role-split cluster, queries read only what intake has flushed, and records in an intake buffer show up only after up to `[intake].flush_interval_secs` (30 seconds by default), so the latest window counts low. **Evaluation delay** under **Advanced** in the rule workbench moves each round's window back: with 5 minutes and a 5-minute period, the round at 07:00 reads the data from 06:50 to 06:55.
+
+| Value | Effect |
+|---|---|
+| **Auto** (default) | None on a single process that runs every role; in a role-split cluster, the **Evaluation delay** in **Settings → Alert evaluation**, 60 seconds by default. |
+| **No delay** | Reads up to now. |
+| 30 seconds to 1 hour | The rule's own delay. The API takes 0 to 3600 seconds (`query.delay_secs`). |
+
+The no-data check, recovery conditions, anomaly baselines, forecast series, split rules, and outliers all move back by the same delay. When the window moved, the incident keeps the range it read in the annotation `evaluated_window`. Real-time rules run no query and have no evaluation delay.
+
+## Priority and urgency
+
+**Priority** and **Urgency** under **Notify and response** in the rule workbench set what the rule's incidents open with:
+
+- **Priority**: one of the organization's [priority levels](/en-US/alerting/on-call#urgency-and-priority-levels), P1 to P5 by default, P1 the heaviest. Unset, the incident has no priority ([alert pipelines](/en-US/pipelines) may still set one). Priority is never derived from severity.
+- **Urgency**: **By escalation policy** (default) follows the [urgency of the incident's escalation policy](/en-US/alerting/on-call#urgency); high or low holds for every incident.
+
+## Discovery rules
+
+What [discovery](/en-US/alerting/discovery) finds is only listed. To be told, select **New discovery rule** in **Alerts → Discovery**, or **Alert on findings like this** on a finding, and choose the kinds of findings, the services or applications, the environments, and the minimum severity, with an escalation policy and an urgency. Each finding the rule takes opens its own incident, as severe as the finding and low urgency unless set; when the finding ends, the incident recovers. The rule list shows **Discovery** as the source of such a rule, and opening it goes back to the discovery page.
+
+## Import and export
+
+**Import/export** on the rule list saves rules as a file or brings them in from one:
+
+- **Export all rules**, or **Export these N rules** after filtering, downloads a JSON rule bundle (`"format": "molesignal.alert-rules/v1"`). A rule keeps its whole definition but no id, organization, evaluation state, or times; escalation policies and the rules of composite rules are named, so a bundle moves to another workspace or cluster. The check-in address of a heartbeat rule is not in the bundle; reset it on the rule after importing.
+- **Import rules…** takes a bundle, or a Prometheus alerting rule file (Prometheus Operator's `PrometheusRule` too), pasted or chosen. Select **Try** to see whether each rule would be created, updated (with the fields that change), stay the same, or fail, then **Import N**. Rules are matched by name: a new name is created, a name with one rule is updated, and a name with several rules fails, as does a name the file gives twice (rename rules that share a name before you import an export of them). With **Only create; leave those with a name that exists as they are**, existing rules are skipped. When any rule fails, nothing is written; otherwise the whole import is written at once, all or nothing.
+
+A Prometheus rule becomes a MoleSignal rule this way:
+
+| Prometheus | MoleSignal |
+|---|---|
+| `alert` | The rule's name. An alert name in several groups takes its group's name after the first. |
+| `expr` | A PromQL rule with the statement `count(<expr>)` and the condition `>= 1`: the alert fires when the expression returns series. When annotations or labels use `{{ $labels.x }}`, the statement is `count by (x) (<expr>)` and the rule is [split](#split-a-rule-by-columns) by `x`, one incident per group. The stream is the first metric name of the expression. |
+| The group's `interval` | The period; 60 seconds without one. |
+| `for` | The periods in a row, rounded up. |
+| The label `severity` | The severity: `critical` and `page` are critical, `error` and `high` error, `warning` and `warn` warning, `info`, `low`, and `none` info; other labels are kept. |
+| `annotations` | Kept; the description is the `description` or `summary` annotation. |
+| `record` | Recording rules are not imported; they are listed under the result. |
+| `keep_firing_for` | Not supported; listed under the result. |
+
+Imported rules use the default escalation policy; set `escalation_policy` in a bundle before importing it when needed. Alertmanager's own configuration (the routes and receivers in `alertmanager.yml`) is not rules and cannot be imported this way; use [alert routing](/en-US/alerting/routing) and [notification policies](/en-US/notification-channels) instead.
+
+In CI, the [CLI](/en-US/cli) runs `molesignal alerts rules export` and `molesignal alerts rules apply -f rules.json [--dry-run]`: the result is printed as a table, and the command exits with 1 when any rule fails.
 
 ## Change, pause, or delete a rule
 

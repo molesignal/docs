@@ -1,6 +1,6 @@
 ---
 title: "Functions"
-description: "Create and test reusable VRL and JavaScript transforms for use in pipelines."
+description: "Create and test reusable VRL and JavaScript transforms, and look up extend tables and IP locations from VRL."
 "zh-Hans_link": "/zh-Hans/functions"
 ---
 
@@ -14,7 +14,7 @@ of the list narrow it, each with its count:
 
 | View | Content |
 |---|---|
-| **All** | Every function that a pipeline can call. |
+| **All** | Every function of the organization, and the presets. |
 | **Yours** | The functions that the organization wrote. |
 | **Presets** | The read-only functions that ship with MoleSignal. |
 
@@ -36,9 +36,11 @@ function.
 
 The Functions workbench exposes VRL and JavaScript. LLM functions are an advanced API
 workflow: the function source is the system instruction, the event is the model input, and
-`params_schema.output_field` selects the output field (default `_llm_eval`). Every matching event
-triggers a model call, so the setting `[functions].llm_eval_enabled` stays `false` by default. See
-[Configuration](/en-US/configuration#features-and-integrations).
+`params_schema.output_field` selects the output field (default `_llm_eval`). Each run calls the
+model, so the setting `[functions].llm_eval_enabled` stays `false` by default. See
+[Configuration](/en-US/configuration#features-and-integrations). To have a model summarize alert
+events, use the **AI summary** step of an [alert pipeline](/en-US/pipelines/alert-events#ai-summary),
+which does not depend on this setting.
 
 ## Built-in presets
 
@@ -81,7 +83,7 @@ returns the transformed event:
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/functions/run \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"language":"vrl","source":".service = downcase!(string!(.service))","input":{"service":"Checkout"}}'
 ```
@@ -99,6 +101,52 @@ if exists(.customer_id) {
   .customer = lookup("customers", .customer_id)
 }
 ```
+
+## Look up tables and IP addresses
+
+Two VRL functions read data that MoleSignal keeps. They work in a sample run and in every VRL step
+of a pipeline, alert pipelines included.
+
+| Function | Returns |
+|---|---|
+| `lookup("<table>", key)` | The row of the [extend table](/en-US/extend-tables) `<table>` whose key is `key`, as an object, or `null`. |
+| `geoip_lookup(ip)` | Where an IPv4 or IPv6 address is, as an object, or `null`. |
+
+```vrl
+# the team that owns the host, from the extend table host_owner
+.team = lookup("host_owner", .host).team
+
+# where the client is
+place = geoip_lookup(.client_ip)
+if is_object(place) {
+  .country = place.country
+  .city = place.city
+}
+```
+
+- Neither function fails. A table or a row that does not exist, a key that is not text, a number, or
+  a boolean, and an address that does not parse or that the database does not know all give `null`.
+  A path such as `.team` on `null` is `null` as well.
+- The table name of `lookup` is written out as a string. A name taken from a field or a variable
+  does not compile. A number or a boolean key is looked up as its text: `42` finds the row with the
+  key `42`.
+- `lookup` reads the extend tables of the workspace. See
+  [Extend tables](/en-US/extend-tables#look-up-a-key-in-a-pipeline) for how soon a change to the
+  rows reaches it.
+- `geoip_lookup` reads the [DB-IP](https://db-ip.com) City Lite database that
+  [`[mmdb].db_path`](/en-US/configuration#features-and-integrations) names, and gives `null` without
+  it. Private addresses are not in the database. The object holds those of these fields that the
+  database knows:
+
+| Field | Content |
+|---|---|
+| `country` | The ISO 3166 code of the country, such as `DE`. |
+| `country_name` | The English name of the country. |
+| `continent_code` | The code of the continent, such as `EU`. |
+| `continent` | The English name of the continent. |
+| `region` | The English name of the first-level region, such as a state or a province. |
+| `city` | The English name of the city. |
+| `latitude`, `longitude` | The coordinates, in degrees. |
 
 ## JavaScript functions
 
@@ -127,11 +175,9 @@ A JavaScript function runs in an isolated engine with these limits:
 
 ## Use a function
 
-Add the function as a transform node in a pipeline. The pipeline stores the ordered steps and
-passes the event through each function.
-
-Deleting or changing a function can affect every referencing pipeline. Review usage before a
-breaking edit.
+Pipeline steps run VRL. In a **Custom VRL** step, **Start from a saved function** copies the source
+of a VRL function or a preset into the step, where it stays editable. The step keeps its copy: a
+later change to the function, or its deletion, leaves the pipeline as it is.
 
 ## Permissions
 

@@ -20,7 +20,8 @@ Runs a query and returns the rows, or starts an asynchronous search job for a la
 | `statement` | string | Yes | The query text. |
 | `time_range` | object | Yes | `{ "start": <microseconds>, "end": <microseconds> }`. |
 | `stream` | object | For SQL | `{ "name": "app", "stream_type": "logs" }` names the primary table. Both fields are required, and the type is `logs`, `metrics`, `traces`, `profiles`, or `extend`. |
-| `limit` | integer | No | Row cap. |
+| `limit` | integer | No | Row cap. A PromQL range answer samples each series evenly to fit it. |
+| `step` | integer | No | PromQL only. The step of a range query in microseconds. With `step`, PromQL answers a series per step from `start` to `end`; without it, the value at `end`. A series has at most 11,000 steps: a finer step answers `400`. |
 
 **Query string of a GET**
 
@@ -36,12 +37,13 @@ server may refuse a request line longer than 8 KB.
 | `start`, `end` | Yes | The time range in microseconds. |
 | `stream`, `stream_type` | For SQL | The primary table and its type, given together. |
 | `limit` | No | Row cap. |
+| `step` | No | PromQL range step in microseconds. |
 
 **Headers and query string**
 
 | Name | Effect |
 |---|---|
-| `Prefer: respond-async` | Always creates a search job and answers `202`. |
+| `Prefer: respond-async` | Creates a search job and answers `202`. A query of `_audit` runs in the request all the same. |
 | `Prefer: respond-sync` | Runs in the request even for a long range. |
 | `Accept: application/x-ndjson` | Streams one JSON object per row, then a `{"__meta__": ...}` record. |
 | `?clusters=local,remote` | Includes remote clusters in a federated search. |
@@ -51,7 +53,7 @@ server may refuse a request line longer than 8 KB.
 NOW=$(date +%s)000000
 
 curl -X POST http://localhost:5080/api/v1/query \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d "{\"org_id\":\"$MS_ORG\",\"language\":\"sql\",
        \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
@@ -63,11 +65,12 @@ curl -X POST http://localhost:5080/api/v1/query \
 NOW=$(date +%s)000000
 
 curl -G http://localhost:5080/api/v1/query \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   --data-urlencode 'language=promql' \
   --data-urlencode 'statement=sum(rate(http_requests_total[5m]))' \
   --data-urlencode "start=$((NOW-3600000000))" \
-  --data-urlencode "end=$NOW"
+  --data-urlencode "end=$NOW" \
+  --data-urlencode 'step=60000000'
 ```
 </RequestExample>
 
@@ -81,6 +84,17 @@ curl -G http://localhost:5080/api/v1/query \
 }
 ```
 </ResponseExample>
+
+A PromQL answer has a row per value. A range query answers the columns `_timestamp` (microseconds), `value`, and one column per label, a row per series and step. A query without `step` answers `value` and the label columns, a row per series.
+
+```json
+{
+  "columns": ["_timestamp", "value", "service.name"],
+  "rows": [[1761638400000000, 0.42, "checkout"], [1761638460000000, 0.40, "checkout"]],
+  "scanned_rows": 2,
+  "took_ms": 6
+}
+```
 
 A query whose estimated size reaches `[querier].auto_async_threshold_rows` answers `202`:
 
@@ -98,7 +112,7 @@ See [Query](/en-US/query#time-ranges-and-asynchronous-jobs) for the thresholds a
 
 | Status | Cause |
 |---|---|
-| `400` | The statement cannot be planned, the `stream` hint is missing for SQL (`query.stream hint is required`), or the query would read more rows than `[querier].max_scan_rows` allows. A `GET` also answers `400` when a required parameter is missing or `stream` comes without `stream_type`. |
+| `400` | The statement cannot be planned, the `stream` hint is missing for SQL (`query.stream hint is required`), a PromQL `step` is not positive or gives a series more than 11,000 steps, or the query would read more rows than `[querier].max_scan_rows` allows. A `GET` also answers `400` when a required parameter is missing or `stream` comes without `stream_type`. |
 | `503` | In a role-split cluster, no `querier` node is alive (`no querier node is available`). |
-| `403` | The stream does not exist in the organization (`stream not found: <name>`), or the token lacks `streams.query`. |
+| `403` | The stream does not exist in the organization (`stream not found: <name>`), the token lacks `streams.query`, or the query reads `_audit` and the token lacks `audit.read`. |
 | `422` | A body field is missing or has the wrong type, for example `org_id` or `stream_type`. The response is plain text. |

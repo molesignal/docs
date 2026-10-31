@@ -1,6 +1,6 @@
 ---
 title: "函数"
-description: "创建可复用的 VRL 与 JavaScript 转换，用样例事件进行测试，并在流水线中使用。"
+description: "创建可复用的 VRL 与 JavaScript 转换并用样例事件测试，以及在 VRL 中查扩展表和 IP 位置。"
 "en_link": "/en-US/functions"
 ---
 
@@ -12,7 +12,7 @@ description: "创建可复用的 VRL 与 JavaScript 转换，用样例事件进�
 
 | 视图 | 内容 |
 |---|---|
-| **全部** | 流水线可以调用的全部函数。 |
+| **全部** | 组织的全部函数和内置预设。 |
 | **自建** | 组织自己编写的函数。 |
 | **内置预设** | 随 MoleSignal 提供的只读函数。 |
 
@@ -30,7 +30,7 @@ VRL 与 JavaScript 都运行在 MoleSignal 二进制内部，不需要配置项�
 
 保存函数时，MoleSignal 会验证并编译源代码。无效代码不会成为当前生效版本。
 
-函数工作台提供 VRL 与 JavaScript。LLM 函数属于高级 API 工作流：函数源码是系统指令，事件是模型输入，`params_schema.output_field` 决定输出字段（默认 `_llm_eval`）。每个命中的事件都会触发一次模型调用，因此配置项 `[functions].llm_eval_enabled` 默认保持为 `false`，参见[配置](/zh-Hans/configuration#功能与集成)。
+函数工作台提供 VRL 与 JavaScript。LLM 函数属于高级 API 工作流：函数源码是系统指令，事件是模型输入，`params_schema.output_field` 决定输出字段（默认 `_llm_eval`）。每次运行都会调用一次模型，因此配置项 `[functions].llm_eval_enabled` 默认保持为 `false`，参见[配置](/zh-Hans/configuration#功能与集成)。要让模型为告警事件写摘要，请用[告警流水线](/zh-Hans/pipelines/alert-events#ai-摘要)的 **AI 摘要** 步骤，它不受这个配置项影响。
 
 ## 内置预设
 
@@ -64,7 +64,7 @@ VRL 与 JavaScript 都运行在 MoleSignal 二进制内部，不需要配置项�
 
 ```bash
 curl -X POST http://localhost:5080/api/v1/functions/run \
-  -H "authorization: Bearer $MS_JWT" \
+  -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"language":"vrl","source":".service = downcase!(string!(.service))","input":{"service":"Checkout"}}'
 ```
@@ -82,6 +82,42 @@ if exists(.customer_id) {
   .customer = lookup("customers", .customer_id)
 }
 ```
+
+## 查扩展表与 IP 地址
+
+有两个 VRL 函数读取 MoleSignal 保存的数据。样例运行和流水线的每个 VRL 步骤（包括告警流水线）都可以使用。
+
+| 函数 | 返回 |
+|---|---|
+| `lookup("<表名>", key)` | [扩展表](/zh-Hans/extend-tables) `<表名>` 中键为 `key` 的那一行，类型为对象；没有时为 `null`。 |
+| `geoip_lookup(ip)` | IPv4 或 IPv6 地址所在的位置，类型为对象；查不到时为 `null`。 |
+
+```vrl
+# 从扩展表 host_owner 查出主机所属的团队
+.team = lookup("host_owner", .host).team
+
+# 客户端所在的位置
+place = geoip_lookup(.client_ip)
+if is_object(place) {
+  .country = place.country
+  .city = place.city
+}
+```
+
+- 两个函数都不会出错。表或行不存在、键不是文本、数字或布尔值、地址无法解析或库里没有，结果都是 `null`；对 `null` 取 `.team` 这样的路径，结果也是 `null`。
+- `lookup` 的表名要直接写成字符串，从字段或变量取表名无法编译。数字或布尔值的键按文本查找：`42` 找到键为 `42` 的行。
+- `lookup` 读取工作区的扩展表。行的改动多久后能被查到，参见[扩展表](/zh-Hans/extend-tables#在流水线中查找)。
+- `geoip_lookup` 读取 [`[mmdb].db_path`](/zh-Hans/configuration#功能与集成) 指定的 [DB-IP](https://db-ip.com) City Lite 库，没有这个文件时返回 `null`。库里没有私有地址。返回的对象包含以下字段中库里有值的那些：
+
+| 字段 | 内容 |
+|---|---|
+| `country` | 国家的 ISO 3166 代码，例如 `DE`。 |
+| `country_name` | 国家的英文名称。 |
+| `continent_code` | 洲的代码，例如 `EU`。 |
+| `continent` | 洲的英文名称。 |
+| `region` | 一级行政区（例如州或省）的英文名称。 |
+| `city` | 城市的英文名称。 |
+| `latitude`、`longitude` | 经纬度，单位为度。 |
 
 ## JavaScript 函数
 
@@ -110,9 +146,7 @@ JavaScript 函数运行在隔离的引擎中，有以下限制：
 
 ## 使用函数
 
-在流水线中将函数添加为转换节点。流水线保存有序步骤，并依次将事件传给每个函数。
-
-删除或修改函数可能影响所有引用该函数的流水线。进行不兼容变更前，请先检查使用情况。
+流水线的步骤运行 VRL。在 **自定义 VRL** 步骤中，**从已保存的函数开始** 把一个 VRL 函数或预设的源码复制到步骤里，之后仍可编辑。步骤保存的是自己的副本：之后修改或删除该函数，都不会改变流水线。
 
 ## 权限
 

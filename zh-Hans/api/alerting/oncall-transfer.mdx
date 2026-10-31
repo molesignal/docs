@@ -1,0 +1,89 @@
+---
+title: "导入导出升级策略、排班和路由规则"
+description: "把升级策略、值班排班和路由规则导出成按名字引用的包，再把这样的包导入组织。"
+"en_link": "/en-US/api/alerting/oncall-transfer"
+---
+
+```http
+GET  /api/v1/alerts/escalations/export
+POST /api/v1/alerts/escalations/import
+GET  /api/v1/schedules/export
+POST /api/v1/schedules/import
+GET  /api/v1/alerts/routing/rules/export
+POST /api/v1/alerts/routing/rules/import
+```
+
+| 种类 | 导出 | 导入 | 格式 | 列表的键 |
+|---|---|---|---|---|
+| 升级策略 | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.escalation-policies/v1` | `policies` |
+| 值班排班 | `schedules.read` | `schedules.create` | `molesignal.schedules/v1` | `schedules` |
+| 路由规则 | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.routing-rules/v1` | `rules` |
+
+## 导出
+
+查询参数 `ids` 写用逗号分开的 id，不写时导出全部。响应是一个包：
+
+```json
+{
+  "format": "molesignal.escalation-policies/v1",
+  "policies": [
+    {
+      "name": "支付值班",
+      "steps": [
+        {"targets": [{"kind": "schedule", "schedule": "支付主值班"}], "ack_timeout_secs": 300, "min_severity": null},
+        {"targets": [{"kind": "user", "user": "lead@example.com"}], "ack_timeout_secs": 600, "min_severity": null}
+      ],
+      "repeat": false,
+      "max_loops": 1,
+      "urgency_rule": {"mode": "by_severity"}
+    }
+  ]
+}
+```
+
+每项保留完整的定义，但不带 id 和组织。引用都写成名字：`user` 是用户的邮箱；`team`、`schedule`、`policy` 和 `calendar` 分别是团队、值班排班、升级策略和节假日日历的名称；轮值的 `members` 是邮箱。排班不带临时替班和时间戳；路由规则不带位置和时间戳。
+
+## 导入
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `content` | string | 是 | 这一种的包，JSON 或 YAML，最大 4 MiB、500 项。 |
+| `dry_run` | boolean | 否 | 默认 `true`，只预演；`false` 才写入。 |
+| `create_only` | boolean | 否 | 为 `true` 时，已有的同名项保持不动。 |
+
+每项按名称对上：没有同名的就新建，正好一项就逐个字段比较，同名的有几项时报错，文件里同一个名称出现两次也报错。引用的东西必须在组织里，每项按保存时的规则检查。有一项出错时什么都不写；没出错时逐项写入，会同步的每项各发一个联邦变更事件，并记一条审计事件：`escalation_policies.imported`、`schedules.imported` 或 `routing_rules.imported`。
+
+- 导入已有的排班时保留它的临时替班和换班。
+- 导入的路由规则按文件的先后排在最前面，其余的规则保持原来的先后排在后面。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content schedules.yaml '{content: $content, dry_run: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "molesignal.schedules/v1",
+  "items": [
+    {"name": "支付主值班", "action": "update", "changes": ["rotations"], "id": "3KC9..."},
+    {"name": "支付夜班", "action": "create"},
+    {"name": "搜索", "action": "error", "error": "no user is named `ann@example.com`"}
+  ],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` 是 `create`、`update`、`unchanged`、`skip`（`create_only` 时已有的项）或 `error`；写入后 `id` 是新建或更新的那一项。`applied` 表示有没有写入。
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | 内容不是这一种的包、写的是别的格式，或太大、项数太多。 |
+| `403` | Token 缺少相应权限。 |

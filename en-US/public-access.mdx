@@ -1,0 +1,72 @@
+---
+title: "Public access"
+description: "Keep MoleSignal on the internal network and open only external callbacks and public pages to the internet: the paths to open, two ways to build the entry points, and a hardening checklist."
+"zh-Hans_link": "/zh-Hans/public-access"
+---
+
+MoleSignal usually runs on an internal network, reached from the office network or a VPN. A few features must be reached directly by external systems or by people on the internet, such as alerts sent by Datadog or PagerDuty, message callbacks from Microsoft Teams, and visitors of a status page. MoleSignal itself does not tell internal requests from public ones; the network entry points do. The internal entry point forwards every request as before. The public entry point forwards only the paths in [the table below](#paths-that-need-public-access) that are in use, and answers 404 for every other path.
+
+Every path open to the internet has its own authentication: the token of an alert source, a push token, a share link, or a token signed by a platform. The network restriction is the second line of defense: scans and credential stuffing on the internet never reach the sign-in and management endpoints.
+
+## Paths that need public access
+
+Open only the features in use. The rows do not depend on each other.
+
+| Feature | Path | Methods | Caller | Authentication |
+|---|---|---|---|---|
+| [External alerts](/en-US/alerting/sources) | `/api/v1/intake/alerts` | `POST` | Datadog, PagerDuty, Alibaba Cloud CloudMonitor, Tencent Cloud Observability Platform, Amazon SNS, and Alertmanager, Grafana, Zabbix or a mail system on the internet | The alert source's token, in a header or in `?token=` |
+| [Heartbeat check-ins](/en-US/alerting/rules#heartbeat-rules) | Starting with `/api/v1/intake/heartbeats/` | `GET`, `POST` | Cron jobs and backup scripts on the internet | The check-in token in the URL |
+| [Jira ticket webhook](/en-US/alerting/tickets#status-sync) | `/api/v1/public/tickets/jira/<connector ID>` | `POST` | Jira Cloud | `X-Hub-Signature`, signed with the connector's webhook secret |
+| [On-call calendar subscriptions](/en-US/alerting/on-call#calendar-subscriptions) | `/api/v1/public/calendar/<token>.ics` | `GET` | Online calendar services such as Google Calendar and Outlook | The subscription token in the URL; each read checks the subscriber's permissions again |
+| [Mole Agent in Teams](/en-US/im#security-for-teams) | Starting with `/api/v1/public/im/teams/` | `POST` | Microsoft Bot Framework | A token signed by Bot Framework |
+| [Replies to texts and calls](/en-US/notification-channels#replies-to-texts-and-calls) | `/api/v1/public/notify/<connector ID>/replies`, `/api/v1/public/notify/<connector ID>/keypress` | `POST` | Twilio, Amazon SNS, SMS and voice from Alibaba Cloud, Tencent Cloud and Huawei Cloud, an SMS gateway of one's own (Huawei Cloud's address ends with the callback token) | The Twilio or SNS signature, or the callback token in the URL |
+| [Automation API triggers](/en-US/automations) | `/api/v1/public/automations/<automation ID>/trigger` | `POST` | External systems such as CI pipelines | The automation's own token |
+| [Push sources](/en-US/connectors) | `/api/v1/_kinesis_firehose`, `/api/v1/_cloudflare`, `/api/v1/_heroku` | `POST` | Amazon Data Firehose, Cloudflare Logpush, Heroku log drains | The connector's push token |
+| [RUM](/en-US/rum) | `/api/v1/rum/events`, `/api/v1/rum/replay` | `POST`, `OPTIONS` | Browsers and apps of users on the internet | The application's Client Token |
+| [Status pages](/en-US/status-pages) | `/status/`, `/api/v1/public/status-pages/` and the [web files](#web-files) | `GET`, `POST` | Visitors and subscribers of the status page | None for a public page; the access link for a private page |
+| [Resource sharing](/en-US/resource-sharing) | `/s/`, `/shared`, `/api/v1/public/share` and the [web files](#web-files) | `GET`, `POST` | Anyone holding a share link | A short-lived session exchanged for the share link |
+| [Synthetics Probe Agents](/en-US/synthetics#locations-and-probe-agents) | `/api/v1/synthetics/artifacts/` | `PUT` | Probe Agents in external locations, uploading screenshots and other artifacts | The task's lease token |
+
+MoleSignal checks the lease token, the size and the content hash of an uploaded artifact before it writes the artifact to the object store. Probe Agents never get object store credentials, so the object store stays off the internet. Probe Agents also connect to two gRPC ports, `5084` for registration and `5085` for the control stream. MoleSignal terminates TLS on these ports itself, so they pass through at layer 4 (TCP) and cannot go through an HTTP proxy. When Probe Agents in external locations connect over the internet, map the two ports separately and set `probe.register_endpoint` and `probe.control_endpoint` to the public addresses, see [Configuration](/en-US/configuration).
+
+### Web files
+
+Status pages and shared resources are web pages, so the public entry point also forwards their static files: files under `/assets/`, `/favicon.ico` and `/favicon.svg`. With only the page paths `/status/` and `/shared` and the static files open, the sign-in page and every other page stay 404 on the public entry point.
+
+### Custom domains of status pages
+
+A status page with its own domain points that domain at the public entry point too. Its pages sit at the root of the domain: `/`, `/history`, `/uptime`, and paths starting with `/incidents/`; their data comes from endpoints starting with `/api/v1/public/status-pages/`. Open only these paths and the web files for that domain. Manage its certificate on the public entry point, or let MoleSignal issue it, see [Custom domain and TLS](/en-US/status-pages#custom-domain-and-tls).
+
+## Two ways to build the entry points
+
+### Split DNS to separate entry points
+
+The recommended way. The internal DNS resolves `molesignal.example.com` to the internal entry point, and the public DNS resolves the same name to the public entry point. The internal entry point forwards every path; the public entry point forwards only the paths in the table. Set `http.external_url` to this name: the intake addresses shown on pages, the callback addresses given to senders, and the links in IM and email work from both networks, and access from the internal network does not change at all.
+
+### One entry point that tells sources apart
+
+With a single entry point, the paths in the table are open to every source, and every other path is limited to the address ranges of the office network and the VPN. The entry point must see the real client address: when a load balancer stands in front of it, pass the original address with the PROXY protocol or `X-Forwarded-For`.
+
+## Hardening checklist
+
+- **HTTPS only.** The public entry point listens on 443 only, with a certificate from a public CA. Teams delivers to https addresses only.
+- **Body limits per endpoint.** External alerts 4 MiB, heartbeat check-ins 64 KiB, the Jira ticket webhook 1 MiB, RUM events 5 MiB and session replay 8 MiB, Probe Agent artifacts 10 MiB, other intake endpoints 2 MiB. MoleSignal answers `413` above these limits; keep the entry point's limits no lower.
+- **Rate limits on the public entry point.** Limit requests per second by source address. A `standalone` node applies no intake rate limits, see [Rate and size limits](/en-US/security#rate-and-size-limits).
+- **No query strings in access logs.** Alibaba Cloud CloudMonitor can only carry the token in the `token` parameter of the address, so the public entry point logs paths only. Heartbeat check-ins and on-call calendar subscriptions carry their token in the path, so log only the prefix of those paths; the [configuration examples](#configuration-examples) replace the token with a `map`. MoleSignal's own traces record routes, never query strings.
+- **Real client addresses for MoleSignal.** In the `_sys` organization, open **Settings → Client IP recognition**, choose the forwarded chain and list the public entry point's addresses as trusted proxies, see [Client IP recognition](/en-US/settings/platform#client-ip-recognition). RUM geolocation and [sign-in limits](/en-US/settings/platform#sign-in-limits) depend on it: without it every user counts as the entry point's address, which does not count when private and locks users out of each other when public.
+- **Optional: tighten by source address.** Where a sender publishes its egress addresses, allow only those: Datadog per site in the `webhooks` section of `ip-ranges.<site domain>`, PagerDuty per US or EU service region, Alibaba Cloud CloudMonitor in its alarm callback documentation, and Teams with the Azure service tag `AzureBotService`. These addresses change and must be kept up to date; the tokens remain the main defense.
+- **Check before going live.** From the internet, `/` and `/api/v1/auth/signin` answer `404`, and `POST /api/v1/intake/alerts` without a token answers `401`, which shows that the request reached MoleSignal. From the internal network, `/` opens the sign-in page.
+
+## Configuration examples
+
+<CardGroup cols={3}>
+  <Card title="nginx" icon="server" href="/en-US/public-access/nginx">
+    Two servers: the internal one forwards everything, the public one only callbacks and public pages.
+  </Card>
+  <Card title="Kubernetes Ingress" icon="network-wired" href="/en-US/public-access/ingress">
+    Two ingress-nginx controllers; the public one lists only the paths to open.
+  </Card>
+  <Card title="Gateway API" icon="route" href="/en-US/public-access/gateway-api">
+    Two Gateways; the public one's HTTPRoute matches paths and methods.
+  </Card>
+</CardGroup>
