@@ -79,7 +79,57 @@ docker pull ghcr.io/molesignal/molesignal:26.1.0.0
 
     该 unit 使用 `/var/lib/molesignal` 作为状态目录，并授予 `CAP_NET_BIND_SERVICE`，使内置 TLS 监听器可以绑定 `80` 与 `443` 端口。
   </Tab>
-  <Tab title="Kubernetes">
+  <Tab title="Helm">
+    官方 Chart 在 Kubernetes 1.27 及以上版本部署 MoleSignal，需要 Helm 3.8 及以上版本和 MoleSignal 26.2.0.0 及以上版本。Chart 仓库是 `https://charts.molesignal.com`，同一个 Chart 也发布为 `oci://ghcr.io/molesignal/charts/molesignal`。
+
+    默认情况下，Chart 运行一个承载全部角色的进程，外加单实例的 PostgreSQL 17 和 RustFS。这两个服务没有备份，也没有故障切换，所以默认配置只用于体验。
+
+    ```bash
+    helm repo add molesignal https://charts.molesignal.com
+    helm repo update
+    helm install molesignal molesignal/molesignal --namespace molesignal --create-namespace
+    ```
+
+    通过端口转发打开 Web 界面，然后访问 `http://127.0.0.1:5080`：
+
+    ```bash
+    kubectl --namespace molesignal port-forward svc/molesignal 5080:5080
+    ```
+
+    生产环境把各角色拆成独立的工作负载，关闭内置服务，并让 Chart 使用外部的 PostgreSQL 和对象存储。先创建两个 Secret：`molesignal-db` 包含键 `database-dsn`，`molesignal-s3` 包含 `access-key` 和 `secret-key`。
+
+    ```yaml
+    mode: distributed
+
+    postgresql:
+      enabled: false
+    externalDatabase:
+      existingSecret: molesignal-db
+
+    rustfs:
+      enabled: false
+    objectStore:
+      bucket: example-telemetry
+      region: eu-west-1
+      existingSecret: molesignal-s3
+    ```
+
+    [`examples/production.yaml`](https://github.com/molesignal/molesignal-helm/blob/main/examples/production.yaml) 还加上了 TLS、自动扩缩容和中断预算。全部配置项见 [Chart README](https://github.com/molesignal/molesignal-helm/tree/main/charts/molesignal)。
+
+    | 主题 | 说明 |
+    |---|---|
+    | Cipher key | Chart 在首次安装时生成这个密钥，升级和 `helm uninstall` 时都会保留。务必备份：没有它就无法读取加密字段。使用 Argo CD 等通过 `helm template` 渲染的工具时，设置 `secrets.cipherKey` 和 `secrets.clusterToken`，或把 `secrets.existingSecret` 指向一个 Secret。 |
+    | 镜像 | 除 PostgreSQL 外，所有镜像都跟随 `latest`，每次启动 Pod 时都会拉取。生产环境固定 `image.tag`，并把 `image.pullPolicy` 设为 `IfNotPresent`。 |
+    | Ingress | 设置 `ingress.enabled`。在 Ingress 后面运行时，在[客户端 IP 识别](/zh-Hans/settings/platform#客户端-ip-识别)里把控制器 Pod 所在的网段列为受信任的代理。 |
+    | 应用配置 | 写在 `config` 下，结构与 `conf/config.toml` 相同。 |
+
+    读取默认安装的 cipher key：
+
+    ```bash
+    kubectl --namespace molesignal get secret molesignal-secret -o jsonpath='{.data.cipher-key}' | base64 --decode
+    ```
+  </Tab>
+  <Tab title="Kubernetes 清单">
     [`deploy/k8s/`](https://github.com/molesignal/molesignal/tree/main/deploy/k8s) 中的清单所有角色共用一个镜像，并引用占位镜像 `molesignal:dev`。请在每个工作负载中把它替换为 `ghcr.io/molesignal/molesignal:<version>`。
 
     清单不包含 PostgreSQL 与对象存储：请在服务名 `postgresql` 下提供 PostgreSQL 17（或修改 ConfigMap 中的 `meta_database.dsn`），并提供任意兼容 S3 的对象存储（修改 ConfigMap 中的 `object_store`）。
