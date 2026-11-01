@@ -38,7 +38,7 @@ Use one term per concept, in both languages. UI labels follow the product.
 | escalation policy | 升级策略 | UI label. |
 | silence | 静默 | |
 | service account | 服务账号 | |
-| API token, intake token | API Token, 接入 Token | Keep `Token`. 令牌桶 is the only place for 令牌. |
+| API Token, intake token | API Token, 接入 Token | Capital T in both languages; a UI label stays as the product writes it, such as **API tokens** in a menu path. Keep `Token`. 令牌桶 is the only place for 令牌. |
 | provider (SSO, notification, model) | 服务商 | Identity provider (IdP) is 身份提供方. |
 | intake (verb and noun) | 接入 | 采集器 for a collector. |
 | datasource | 数据源 | The **Datasource** page. |
