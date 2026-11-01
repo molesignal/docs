@@ -1,0 +1,217 @@
+---
+title: "Migrate schedules from Opsgenie or PagerDuty"
+description: "Bring on-call schedules over from the Opsgenie or PagerDuty REST API, compare them with what the source renders before anything is written, and see what comes over and what does not."
+"zh-Hans_link": "/zh-Hans/alerting/schedule-migration"
+---
+
+**Import schedules…** reads schedules as the Opsgenie and PagerDuty REST APIs return them, so a team that moves over does not rebuild its rotations by hand. A script fetches them into a file with the source's API key. The file then goes through the same import as a [bundle](/en-US/alerting/on-call#import-and-export): tried first, then written all at once. MoleSignal does not keep the key and does not call the source. Importing requires `schedules.create`.
+
+One rule decides what comes over: who is on call at any moment stays the same from now on. What a schedule here cannot express and would change the result stops the import; what does not affect the result from now on is left out and named in the result.
+
+## Steps
+
+<Steps>
+  <Step title="Add the people">
+    Add everyone on the rotations to the workspace with the same email as in the source; see [Members](/en-US/identity/members). Members are matched by email, without regard to case.
+  </Step>
+  <Step title="Fetch the schedules">
+    Run the script for [Opsgenie](#opsgenie) or [PagerDuty](#pagerduty) on a machine with `curl` and `jq`. It writes one file.
+  </Step>
+  <Step title="Try the import">
+    Open **Alerts → On-call schedules**, select **Import/export → Import schedules…**, select **Choose a file**, and select **Try**. Each schedule is listed with what would happen to it; see [Read the result](#read-the-result).
+  </Step>
+  <Step title="Fix what stops it">
+    Change the source and fetch again, or edit the file. Nothing is written while any schedule has an error.
+  </Step>
+  <Step title="Import">
+    Select **Import**, then open an imported schedule and check who is on call. Point an [escalation policy](/en-US/alerting/on-call#escalation-policies) at it to start paging through it.
+  </Step>
+</Steps>
+
+## Opsgenie
+
+Set an API key that can read schedules, then run the script. Accounts in the EU use `api.eu.opsgenie.com`.
+
+```bash
+export OPSGENIE_API_KEY=<api key>
+```
+
+```bash
+API=https://api.opsgenie.com   # EU accounts: https://api.eu.opsgenie.com
+DAYS=200
+
+get() { curl -fsS -H "Authorization: GenieKey $OPSGENIE_API_KEY" "$API$1"; }
+
+get /v2/schedules | jq -r '.data[].id' | while read -r id; do
+  get "/v2/schedules/$id"
+  get "/v2/schedules/$id/timeline?expand=base&interval=$DAYS&intervalUnit=days"
+done | jq -s '{
+  data: map(.data | select(has("rotations"))),
+  timelines: map(.data | select(has("baseTimeline"))
+    | {_parent, startDate, endDate, baseTimeline}
+    | .baseTimeline.rotations[].periods |= map({startDate, endDate, type, recipient}))
+}' > opsgenie-schedules.json
+```
+
+The file holds each schedule from `GET /v2/schedules/{id}` under `data`, and its `GET /v2/schedules/{id}/timeline` under `timelines`. `DAYS` sets how far ahead the timeline reaches.
+
+| In Opsgenie | Here |
+|---|---|
+| Name, description, timezone, enabled | The same. |
+| Owner team | The team of the same name, when there is one; otherwise the schedule has no team, and the result says so. |
+| Rotation `type` and `length` | **Daily** and **Weekly** for a length of 1; otherwise a custom period, such as 6 hours for `hourly` with a length of 6. |
+| `startDate`, `endDate` | The start and the end of the rotation. A rotation that has ended is left out. |
+| `timeRestriction` | Weekly ranges in the timezone of the schedule, including ranges that span several days. |
+| Several rotations that do not overlap | Several rotations, such as one for business hours and one for off hours. |
+| User participants | Members, in the same order, by the `username`, which is the email. |
+
+These stop the import while the rotation is running:
+
+| In Opsgenie | Why |
+|---|---|
+| A team or an escalation as a participant | A rotation here takes people. |
+| A **No-One** participant | A rotation here cannot leave a turn open. |
+| Rotations that overlap | Opsgenie puts the people of all overlapping rotations on call at once; a schedule here has one person at a time. Move the rotations into separate schedules in the file, with different names, and name both schedules in one step of an escalation policy. |
+
+Overrides, forwarding rules, escalations, and routing are not imported.
+
+## PagerDuty
+
+Set an API key that can read schedules and users, then run the script. Accounts in the EU use `api.eu.pagerduty.com`.
+
+```bash
+export PAGERDUTY_API_KEY=<api key>
+```
+
+```bash
+API=https://api.pagerduty.com   # EU accounts: https://api.eu.pagerduty.com
+DAYS=200
+since=$(jq -rn 'now | todate')
+until=$(jq -rn "now + $DAYS * 86400 | todate")
+
+get() {
+  curl -fsSg -H "Authorization: Token token=$PAGERDUTY_API_KEY" \
+    -H 'Accept: application/vnd.pagerduty+json;version=2' "$API$1"
+}
+pages() {
+  offset=0
+  while page=$(get "$1?limit=100&offset=$offset"); do
+    printf '%s\n' "$page"
+    [ "$(printf '%s' "$page" | jq .more)" = true ] || break
+    offset=$((offset + 100))
+  done
+}
+shift_based=$(pages /v3/schedules)
+
+{
+  pages /users
+  printf '%s\n' "$shift_based"
+  printf '%s\n' "$shift_based" | jq -r '.schedules[].id' | while read -r id; do
+    get "/v3/schedules/$id?since=$since&until=$until&include[]=final_schedule"
+  done
+  pages /schedules | jq -r '.schedules[].id' | while read -r id; do
+    get "/schedules/$id?since=$since&until=$until&include[]=final_schedule&include[]=overrides_subschedule"
+  done
+} | jq -s --arg since "$since" --arg until "$until" '{
+  since: $since,
+  until: $until,
+  users: (map(.users // []) | add // [] | map({id, email})),
+  shift_based_schedules: (map(.schedules // []) | add // [] | map({id, type, summary})),
+  schedules: map(.schedule // empty
+    | del(.users, .escalation_policies)
+    | if .type == "schedule_v3" then
+        .final_schedule.computed_shift_assignments[]? |= {start_time, end_time, member, source: {type: .source.type}}
+      else
+        del(.schedule_layers[].rendered_schedule_entries)
+        | .final_schedule.rendered_schedule_entries |= map({start, end, user: (.user | select(.) | {id})})
+        | .overrides_subschedule.rendered_schedule_entries |= map({start, end})
+      end)
+}' > pagerduty-schedules.json
+```
+
+The file holds each schedule from `GET /schedules/{id}` and `GET /v3/schedules/{id}` under `schedules`, the emails from `GET /users` under `users`, because a schedule names people without their email, and the list from `GET /v3/schedules` under `shift_based_schedules`. `since` and `until` give the stretch PagerDuty renders, and `DAYS` sets how far ahead it reaches.
+
+Fetch schedules one by one, without `time_zone`. `GET /schedules` renders restrictions in the timezone of the caller instead of the schedule; the import recognizes a schedule rendered in another timezone and refuses it.
+
+### Layered schedules
+
+| In PagerDuty | Here |
+|---|---|
+| Name, description, timezone | The same. A paused schedule that is updated stays paused. |
+| Teams | The first team with a team of the same name here; the others are named in the result. |
+| Layers | Rotations in the same order of priority: the latest layer goes first and decides, and the layers below take over outside its restrictions. |
+| `rotation_turn_length_seconds` | **Daily** and **Weekly** for exactly 24 hours and 7 days; otherwise a custom period. |
+| `rotation_virtual_start` | The start of the rotation, which sets the handoff time and whose turn it is. |
+| `start` | When the layer takes effect. A start that has passed needs nothing more. A start still to come moves the rotation there, with the person due at that moment first. |
+| `end` | The end of the rotation. A layer that has ended is left out, as earlier versions of an edited layer are. |
+| `restrictions` | Weekly ranges in the timezone of the schedule, for both `daily_restriction` and `weekly_restriction`. |
+| `users` | Members, in the same order, by the email in `users`. |
+
+### Shift-based schedules
+
+A schedule that PagerDuty's V3 API returns is made of events. Events have no priority: when they overlap, the people of all of them are on call at once.
+
+| In PagerDuty | Here |
+|---|---|
+| Name, description, teams | As for a layered schedule. |
+| The timezone of the events | The timezone of the schedule, because handoffs keep the local time of the event. When the schedule's own `time_zone` is another one, the result says so. |
+| Each event | One rotation with the name of the event. Events that do not overlap, such as one for business hours and one for off hours, can come in any order. |
+| `start_time`, `end_time`, `recurrence` | The first shift and how it repeats, as in the next table. |
+| `shifts_per_member` | How long a turn is. It counts the repeats from `start_time`, with each day of `BYDAY` as one. |
+| `effective_since` | When the event takes effect. One that has passed needs nothing more and does not decide whose turn it is. One still to come moves the rotation there, with the person due at that moment first. |
+| `effective_until` | The end of the rotation. An event that has ended is left out. |
+| `members` | Members, in the same order, by the email in `users`. |
+
+| `recurrence` | First shift | Here |
+|---|---|---|
+| `RRULE:FREQ=WEEKLY` | 7 days | Always active, **Weekly** with a `shifts_per_member` of 1, otherwise a custom period. |
+| `RRULE:FREQ=DAILY` | 24 hours | Always active, **Daily** with a `shifts_per_member` of 1, **Weekly** with 7, otherwise a custom period. |
+| `FREQ=WEEKLY`, `FREQ=DAILY` or `FREQ=HOURLY` with an `INTERVAL` | As long as the interval | Always active, with a custom period such as 12 hours for `RRULE:FREQ=HOURLY;INTERVAL=12`. |
+| `RRULE:FREQ=DAILY` | Part of a day | Weekly ranges for every day. |
+| `RRULE:FREQ=WEEKLY`, or with one day in `BYDAY` | Part of a week | One weekly range, which can span several days. |
+| `RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` | Part of a day | Weekly ranges for those days. A `shifts_per_member` of 5 is one week per person and 10 is two. |
+
+These stop the import while the event is running:
+
+| In PagerDuty | Why |
+|---|---|
+| `every_member_assignment_strategy` with several members | All of them are on call at once; a schedule here has one person at a time. Give each person a schedule in the file, with different names, and name them all in one step of an escalation policy. |
+| `empty_member` among other members | A rotation here cannot leave a turn open. |
+| Events that overlap | Their people are on call at once. Move them into separate schedules, as for Opsgenie. |
+| `EXDATE` or `RDATE` | A rotation here cannot leave out or add one occurrence, and PagerDuty does not document whether they count towards `shifts_per_member`. |
+| Any other rule, such as `FREQ=MONTHLY`, `COUNT`, `UNTIL`, or an `INTERVAL` with a shift shorter than the interval | Its turns or its coverage do not repeat in the same place every week. |
+| `BYDAY` with several members and a `shifts_per_member` that is not a multiple of the days | Handoffs do not fall on a fixed period: the shift after Friday is on Monday. |
+| A custom shift that is still to come | A rotation here cannot express a one-off shift. Import after it has passed, or remove it from `final_schedule` in the file and add an override after importing. |
+| Events in different timezones | A schedule here has one timezone. |
+
+A shift-based schedule the file only names under `shift_based_schedules` is left out and named in the result, such as one the script could not fetch. Run the script again to bring it over. The rest of the file still imports.
+
+Overrides, escalation policies, and services are not imported.
+
+## Read the result
+
+| Word | Meaning |
+|---|---|
+| **Create**, **Update**, **Same** | Matched by name, as for a bundle. **Update** names the fields that change. |
+| **Skip** | Left out: a PagerDuty shift-based schedule the file only names, or an existing schedule with **Only create; leave those with a name that exists as they are**. |
+| **Error** | Stops the import of the whole file. Each reason has its own line, and every email without a member is listed. |
+
+The other lines under a schedule say what was left out, and how it compares with the source.
+
+### The comparison with the source
+
+The file holds what the source itself renders: PagerDuty's `final_schedule` and Opsgenie's timeline. The try works out who is on call for that stretch and compares the two, from now on. A difference is an error that gives the times and both people, and nothing is written.
+
+- Overrides are not imported, so the stretches they hold are not compared.
+- A shift-based schedule that has several people on call at once in `final_schedule` stops the import, even if its events do not overlap.
+- A schedule disabled in Opsgenie comes over paused and is not compared.
+- When the comparison does not reach a clock change in a timezone with daylight saving, the result says so. Handoffs stay at the same local time here; raise `DAYS` to compare them across the next change.
+- When the file has no rendered schedule, the result says it was not compared, and the import goes on. Removing `final_schedule` or `timelines` from the file is how to import a schedule that differs on purpose.
+
+### Limits
+
+A file holds up to 4 MiB and 500 schedules, and a schedule up to 60 running rotations. Lower `DAYS` when a file is too large.
+
+## Import again
+
+Schedules are matched by name, so running the import again updates the rotations of those that changed in the source and leaves the rest as they are. Overrides and shift swaps made here stay, and so do settings the file does not have, such as the team or **Swaps need approval**.

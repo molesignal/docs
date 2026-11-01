@@ -1,0 +1,217 @@
+---
+title: "从 Opsgenie 或 PagerDuty 迁移排班"
+description: "把值班排班从 Opsgenie 或 PagerDuty 的 REST API 带过来，写入之前和来源自己排出来的值班表对照，并看清哪些内容能带过来，哪些不能。"
+"en_link": "/en-US/alerting/schedule-migration"
+---
+
+**导入排班…** 能读 Opsgenie 和 PagerDuty REST API 返回的排班，迁过来的团队不用手工重建轮值。脚本用来源的 API Key 把排班取到一个文件里，这个文件再走和[包](/zh-Hans/alerting/on-call#导入导出)一样的导入流程：先预演，再一次写入。MoleSignal 不保存这个 Key，也不向来源发请求。导入需要 `schedules.create`。
+
+能带过来什么由一条规则决定：从现在起，任何时刻谁值班都不变。这里的排班表达不了、又会改变结果的内容会挡住导入；不影响现在往后值班结果的内容会跳过，并在结果里说明。
+
+## 步骤
+
+<Steps>
+  <Step title="加人">
+    把轮值上的人都加进工作区，邮箱和来源里一样，见[成员](/zh-Hans/identity/members)。成员按邮箱对上，不分大小写。
+  </Step>
+  <Step title="取排班">
+    在装有 `curl` 和 `jq` 的机器上运行 [Opsgenie](#opsgenie) 或 [PagerDuty](#pagerduty) 的脚本，它写出一个文件。
+  </Step>
+  <Step title="预演">
+    打开 **告警 → 值班排班**，选择 **导入导出 → 导入排班…**，再选择 **选择文件** 和 **预演**。每个排班会列出将发生什么，见[读懂结果](#读懂结果)。
+  </Step>
+  <Step title="解决挡住导入的问题">
+    改来源后重新取，或者编辑文件。有排班出错时什么都不写。
+  </Step>
+  <Step title="导入">
+    选择 **导入**，打开导入的排班核对谁在值班。把[升级策略](/zh-Hans/alerting/on-call#升级策略)指向它，通知就开始走这个排班。
+  </Step>
+</Steps>
+
+## Opsgenie
+
+设置一个能读排班的 API Key，再运行脚本。EU 账号用 `api.eu.opsgenie.com`。
+
+```bash
+export OPSGENIE_API_KEY=<api key>
+```
+
+```bash
+API=https://api.opsgenie.com   # EU accounts: https://api.eu.opsgenie.com
+DAYS=200
+
+get() { curl -fsS -H "Authorization: GenieKey $OPSGENIE_API_KEY" "$API$1"; }
+
+get /v2/schedules | jq -r '.data[].id' | while read -r id; do
+  get "/v2/schedules/$id"
+  get "/v2/schedules/$id/timeline?expand=base&interval=$DAYS&intervalUnit=days"
+done | jq -s '{
+  data: map(.data | select(has("rotations"))),
+  timelines: map(.data | select(has("baseTimeline"))
+    | {_parent, startDate, endDate, baseTimeline}
+    | .baseTimeline.rotations[].periods |= map({startDate, endDate, type, recipient}))
+}' > opsgenie-schedules.json
+```
+
+文件的 `data` 里是每个排班的 `GET /v2/schedules/{id}`，`timelines` 里是它的 `GET /v2/schedules/{id}/timeline`。`DAYS` 决定时间线往后取多久。
+
+| Opsgenie 里 | 这里 |
+|---|---|
+| 名称、说明、时区、是否启用 | 不变。 |
+| 所属团队 | 有同名团队时用它；没有时排班不设团队，结果里会说明。 |
+| 轮换的 `type` 和 `length` | 长度为 1 时是 **每日** 和 **每周**；其余是自定义周期，例如 `hourly` 长度 6 是 6 小时。 |
+| `startDate`、`endDate` | 轮值的开始和结束。已结束的轮换跳过。 |
+| `timeRestriction` | 按排班时区的每周时段，跨几天的也能写。 |
+| 互不重叠的多条轮换 | 多条轮值，例如工作时间一条、下班时间一条。 |
+| 用户参与者 | 成员，顺序不变，按 `username` 对上，它就是邮箱。 |
+
+下面这些内容在轮换还生效时会挡住导入：
+
+| Opsgenie 里 | 原因 |
+|---|---|
+| 团队或升级策略作参与者 | 这里的轮值只能排人。 |
+| **No-One** 参与者 | 这里的轮值不能空出一班。 |
+| 互相重叠的轮换 | Opsgenie 让重叠的所有轮换上的人同时值班；这里一个排班同一时刻只有一个人。在文件里把这些轮换拆到不同名称的排班中，再在升级策略的同一级里同时指定这几个排班。 |
+
+临时替班、转发规则、升级策略和路由不导入。
+
+## PagerDuty
+
+设置一个能读排班和用户的 API Key，再运行脚本。EU 账号用 `api.eu.pagerduty.com`。
+
+```bash
+export PAGERDUTY_API_KEY=<api key>
+```
+
+```bash
+API=https://api.pagerduty.com   # EU accounts: https://api.eu.pagerduty.com
+DAYS=200
+since=$(jq -rn 'now | todate')
+until=$(jq -rn "now + $DAYS * 86400 | todate")
+
+get() {
+  curl -fsSg -H "Authorization: Token token=$PAGERDUTY_API_KEY" \
+    -H 'Accept: application/vnd.pagerduty+json;version=2' "$API$1"
+}
+pages() {
+  offset=0
+  while page=$(get "$1?limit=100&offset=$offset"); do
+    printf '%s\n' "$page"
+    [ "$(printf '%s' "$page" | jq .more)" = true ] || break
+    offset=$((offset + 100))
+  done
+}
+shift_based=$(pages /v3/schedules)
+
+{
+  pages /users
+  printf '%s\n' "$shift_based"
+  printf '%s\n' "$shift_based" | jq -r '.schedules[].id' | while read -r id; do
+    get "/v3/schedules/$id?since=$since&until=$until&include[]=final_schedule"
+  done
+  pages /schedules | jq -r '.schedules[].id' | while read -r id; do
+    get "/schedules/$id?since=$since&until=$until&include[]=final_schedule&include[]=overrides_subschedule"
+  done
+} | jq -s --arg since "$since" --arg until "$until" '{
+  since: $since,
+  until: $until,
+  users: (map(.users // []) | add // [] | map({id, email})),
+  shift_based_schedules: (map(.schedules // []) | add // [] | map({id, type, summary})),
+  schedules: map(.schedule // empty
+    | del(.users, .escalation_policies)
+    | if .type == "schedule_v3" then
+        .final_schedule.computed_shift_assignments[]? |= {start_time, end_time, member, source: {type: .source.type}}
+      else
+        del(.schedule_layers[].rendered_schedule_entries)
+        | .final_schedule.rendered_schedule_entries |= map({start, end, user: (.user | select(.) | {id})})
+        | .overrides_subschedule.rendered_schedule_entries |= map({start, end})
+      end)
+}' > pagerduty-schedules.json
+```
+
+文件的 `schedules` 里是每个排班的 `GET /schedules/{id}` 和 `GET /v3/schedules/{id}`，`users` 里是 `GET /users` 的邮箱（排班里的人不带邮箱），`shift_based_schedules` 里是 `GET /v3/schedules` 的列表。`since` 和 `until` 是 PagerDuty 渲染的范围，`DAYS` 决定往后取多久。
+
+排班要逐个取，不传 `time_zone`。`GET /schedules` 按调用者的时区渲染时段限制，而不是排班的时区；导入认得出按别的时区渲染的排班，会拒绝它。
+
+### 分层排班
+
+| PagerDuty 里 | 这里 |
+|---|---|
+| 名称、说明、时区 | 不变。已暂停的排班更新后仍是暂停。 |
+| 团队 | 这里有同名团队的第一个；其余的在结果里说明。 |
+| 层 | 优先级相同的多条轮值：最新的层排在最前面并优先，它的时段限制之外由后面的层接着。 |
+| `rotation_turn_length_seconds` | 正好 24 小时和 7 天时是 **每日** 和 **每周**；其余是自定义周期。 |
+| `rotation_virtual_start` | 轮值的开始，决定交接时间和轮到谁。 |
+| `start` | 这一层何时生效。已经过去时不用再处理；还没到时轮值的开始挪到那一刻，那一刻该值班的人排在最前面。 |
+| `end` | 轮值的结束。已结束的层跳过，修改过的层的旧版本就属于这一类。 |
+| `restrictions` | 按排班时区的每周时段，`daily_restriction` 和 `weekly_restriction` 都支持。 |
+| `users` | 成员，顺序不变，按 `users` 里的邮箱对上。 |
+
+### shift-based 排班
+
+PagerDuty 的 V3 API 返回的排班由事件组成。事件之间没有优先级：时间上重叠时，这些事件里的人同时值班。
+
+| PagerDuty 里 | 这里 |
+|---|---|
+| 名称、说明、团队 | 和分层排班一样。 |
+| 事件的时区 | 作为排班的时区，因为交接保持事件的本地时间。排班自己的 `time_zone` 不是这个时区时，结果会说明。 |
+| 每个事件 | 一条轮值，名称就是事件的名称。不重叠的事件（例如工作时间一个、下班时间一个）顺序无所谓。 |
+| `start_time`、`end_time`、`recurrence` | 第一班和它怎么重复，见下一张表。 |
+| `shifts_per_member` | 一人一班多长。从 `start_time` 数重复的次数，`BYDAY` 的每一天算一次。 |
+| `effective_since` | 事件何时生效。已经过去时不用再处理，也不决定轮到谁；还没到时轮值的开始挪到那一刻，那一刻该值班的人排在最前面。 |
+| `effective_until` | 轮值的结束。已结束的事件跳过。 |
+| `members` | 成员，顺序不变，按 `users` 里的邮箱对上。 |
+
+| `recurrence` | 第一班 | 这里 |
+|---|---|---|
+| `RRULE:FREQ=WEEKLY` | 7 天 | 一直生效，`shifts_per_member` 是 1 时是 **每周**，其余是自定义周期。 |
+| `RRULE:FREQ=DAILY` | 24 小时 | 一直生效，`shifts_per_member` 是 1 时是 **每日**，是 7 时是 **每周**，其余是自定义周期。 |
+| 带 `INTERVAL` 的 `FREQ=WEEKLY`、`FREQ=DAILY` 或 `FREQ=HOURLY` | 和间隔一样长 | 一直生效，自定义周期，例如 `RRULE:FREQ=HOURLY;INTERVAL=12` 是 12 小时。 |
+| `RRULE:FREQ=DAILY` | 一天中的一段 | 每天的每周时段。 |
+| `RRULE:FREQ=WEEKLY`，或 `BYDAY` 里只有一天 | 一周中的一段 | 一段每周时段，可以跨几天。 |
+| `RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` | 一天中的一段 | 这几天的每周时段。`shifts_per_member` 是 5 时每人一周，是 10 时每人两周。 |
+
+事件还在生效时，下面这些会挡住导入：
+
+| PagerDuty 里 | 原因 |
+|---|---|
+| 不止一个成员的 `every_member_assignment_strategy` | 所有成员同时值班，这里一个排班同一时刻只有一个人。在文件里给每个人一个排班，名称各不相同，再把它们都放进升级策略的同一步。 |
+| 和其他成员排在一起的 `empty_member` | 这里的轮值不能空出一班。 |
+| 重叠的事件 | 这些事件里的人同时值班。和 Opsgenie 一样，拆到不同的排班里。 |
+| `EXDATE` 或 `RDATE` | 这里的轮值不能去掉或加上某一次，PagerDuty 的文档也没说它们算不算进 `shifts_per_member`。 |
+| 其他规则，例如 `FREQ=MONTHLY`、`COUNT`、`UNTIL`，或第一班比 `INTERVAL` 的间隔短 | 它的交接或有人值班的时段不是每周落在同一个位置。 |
+| 不止一个成员、`shifts_per_member` 不是天数倍数的 `BYDAY` | 交接不在固定的周期上：周五的下一班在周一。 |
+| 还没过去的自定义班次 | 这里的轮值表达不了一次性的班次。等它过去再导入，或者从文件的 `final_schedule` 里删掉它，导入后用临时替班补上。 |
+| 用不同时区的事件 | 这里一个排班只有一个时区。 |
+
+文件里只在 `shift_based_schedules` 下有名字的 shift-based 排班（例如脚本没取到的）会被跳过，并列在结果里。重新运行脚本就能带过来。文件里其余的排班照常导入。
+
+临时替班、升级策略和服务不导入。
+
+## 读懂结果
+
+| 词 | 含义 |
+|---|---|
+| **新建**、**更新**、**不变** | 和包一样按名称对上。**更新** 会列出变化的字段。 |
+| **跳过** | 不写入：文件里只有名字的 PagerDuty shift-based 排班，或勾选 **只新建，已有的同名项不动** 时已有的排班。 |
+| **出错** | 挡住整个文件的导入。每个原因占一行，没有对应成员的邮箱会逐个列出。 |
+
+排班下面的其他几行说明跳过了什么，以及和来源对照的结果。
+
+### 和来源对照
+
+文件里带着来源自己排出来的值班表：PagerDuty 的 `final_schedule` 和 Opsgenie 的时间线。预演算出这段时间谁值班，从现在起和它比。有不同就报错，写明时间和两边的人，什么都不写。
+
+- 临时替班不导入，它占的时段不比。
+- shift-based 排班的 `final_schedule` 里同一时刻有几个人值班时，即使事件之间不重叠，也会挡住导入。
+- Opsgenie 里已停用的排班带过来也是暂停的，不做对照。
+- 对照范围没跨过有夏令时的时区的切换时，结果会说明。这里的交接保持本地时间不变；调大 `DAYS` 可以把下一次切换也比上。
+- 文件里没有渲染结果时，结果会说明没有对照，导入继续。从文件里去掉 `final_schedule` 或 `timelines`，就能导入有意不一样的排班。
+
+### 限制
+
+一个文件最多 4 MiB、500 个排班，一个排班最多 60 条还在生效的轮值。文件太大时调小 `DAYS`。
+
+## 再次导入
+
+排班按名称对上，再次导入会更新来源里变过的轮值，其余保持不变。这里做的临时替班和换班会保留，文件里没有的设置也保留，例如团队和 **换班需要批准**。

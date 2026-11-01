@@ -7,7 +7,7 @@
 - Mintlify pairs pages across languages only when the folder is named after a language code it knows, and `en-US` is not one. A page without a link to its counterpart leaves the other language greyed out in the language switcher. Every page therefore carries a frontmatter link to its counterpart: `"zh-Hans_link": "/zh-Hans/<path>"` in `en-US/` pages and `"en_link": "/en-US/<path>"` in `zh-Hans/` pages. Drop the `.mdx` extension and a trailing `/index`. Add both links when adding a page pair, and open the switcher in `mint dev` to check them.
 - Navigation, branding, and the 404 page live in `docs.json`.
 - `changelog.js` renders the Changelog page from GitHub releases. `style.css` and `sidebar-toggle.js` hold the site customizations.
-- Diagrams are rendered SVG files in `images/architecture/` with light and dark variants for each language.
+- Diagrams are drawn with Excalidraw. `scripts/diagrams/build.mjs` holds one layout per diagram with the text of both languages, and `node scripts/diagrams/build.mjs [key ...]` renders it to SVG files in `images/architecture/` with light and dark variants for each language, and to editable scenes in `diagrams/`. Do not use Mermaid, ASCII art, or hand-written SVG for a diagram. Give each image an `alt` in the language of its page that says what the diagram shows.
 - For Mintlify product knowledge (components, configuration, writing standards), use the Mintlify skill (`npx skills add https://mintlify.com/docs`) or the Mintlify docs MCP server at `https://www.mintlify.com/docs/mcp`.
 
 ## Keep the facts verified
