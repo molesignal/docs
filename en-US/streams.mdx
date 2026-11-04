@@ -113,12 +113,17 @@ The index type decides which helper structure MoleSignal builds for a field:
 | Index type | Effect |
 |---|---|
 | `none` | No helper index. This is the default. |
-| `exact` | An exact-match inverted index of whole values and a Parquet Bloom filter, plus the minimum and maximum of each file. `=` and `IN` skip the files without the values before opening them, and read only the pages of the matching rows when there are few. Use it for identifiers such as `trace_id`. |
+| `exact` | An exact-match inverted index of whole values and a Parquet Bloom filter, plus the minimum and maximum of each file. `=` and `IN` skip the files without the values before opening them, and read only the pages of the matching rows when there are few. A `LIKE` or `ILIKE` on a field with up to 65,536 values per file skips the files where no value holds the text. Use it for identifiers such as `trace_id`. |
 | `full_text` | A tokenized inverted index for text search: runs of letters and digits are words, and CJK text is cut into overlapping two-character bigrams. Literals of `MATCH`, `MATCH_TEXT`, `LIKE`, and `ILIKE`, punctuation and CJK text included, skip the files that cannot match. `utf8` fields only. |
-| `bloom` | A Parquet Bloom filter, plus a whole-value filter per file for text fields and the minimum and maximum of each file: `=` and `IN` skip the files that certainly lack the values before opening them. Use it for fields with many values queried by equality only, such as request IDs. |
+| `bloom` | A Parquet Bloom filter, plus a whole-value filter per file for text and `int64` fields and the minimum and maximum of each file: `=` and `IN` skip the files that certainly lack the values before opening them. Use it for fields with many values queried by equality only, such as request IDs. |
 | `skip` | The minimum and maximum of each file, and every value of a file that holds at most 32 distinct ones. Comparisons, `IN`, `BETWEEN`, and prefix `LIKE` skip files with them. |
 | `ngram` | The trigrams of each file's values, regardless of case: a literal of `LIKE`, `ILIKE`, or `MATCH` with a trigram that a file lacks skips that file. Use it for URLs, paths, and host names searched by fragment, not for long free text. `utf8` fields only. |
 | `ip` | The range of each file's addresses, IPv4 mapped into IPv6: `CIDR_MATCH(field, '10.0.0.0/8')` and `=` on an address skip files with it. `utf8` fields only. |
+| `key_value` | The first-level keys of a JSON object and their values: `json_text(field, 'key') = 'value'`, `IN`, and `IS NOT NULL` skip the files without the key or value, and read only the pages of the matching rows when there are few. A value is matched as `json_text` returns it: text as it is, numbers and booleans as their JSON. `json` fields only. |
+
+Every indexed field also records, for each file, how many of its rows leave the field empty. `IS NULL` skips the files where the field always has a value, and any other condition on the field, including ones that ask whether it has a value such as `IS NOT NULL` and `!= ''`, skips the files where it never has one.
+
+Conditions joined with `OR` skip a file too when every branch is ruled out in it, each branch by whichever index answers it: `level = 'error' OR status >= 500` skips a file whose `level` index lacks `error` and whose `status` never reaches 500.
 
 A field that first appears in incoming data gets its index type from its name:
 
@@ -129,18 +134,31 @@ A field that first appears in incoming data gets its index type from its name:
 | `traces` | `trace_id`, `span_id`, `parent_span_id`, `service.name` | `exact` |
 | `metrics` | `metric_name` | `exact` |
 
-Every other new field gets `none`. An exact `level` lets the logs histogram count errors from the index instead of reading the files. A changed index type applies to files written after the change and to files the compactor merges afterwards. A sealed partition (sealed 48 hours after it ends, by default) is never merged again, so its files keep their indexes. When the full-text index format changes, as when CJK text started to be cut into bigrams, the indexes of older files are rebuilt in the new format in the background; until then the old indexes are used as they are, and query results are the same.
+Every other new field gets `none`, unless the stream's own rules say otherwise: see [Index of new fields](#index-of-new-fields). An exact `level` lets the logs histogram count errors from the index instead of reading the files. RUM streams index the keys of `context`, `feature_flags`, and `usr.extra` with `key_value`.
+
+A changed index type applies at once to the data written afterwards. The data written before is indexed again in the background under the new settings: each sealed partition (sealed 48 hours after it ends, by default) is rebuilt from its files, and newer files once they are sealed or merged. Until then a file keeps the index it was written with, which never changes query results, only how many files a query reads. **Indexed field coverage** on the **Overview** shows how many files are left. When the full-text index format changes, as when CJK text started to be cut into bigrams, the indexes of older files are rebuilt in the new format in the background in the same way.
 
 To change a field, open **Fields & indexes**, select the edit action of the field, and choose:
 
 - the **Index type**: **Not indexed**, **Full text search**, **Exact match**, **Bloom filter**,
-  **Skip index**, **N-gram substring**, or **IP address**. Full text search, N-gram substring, and IP
-  address apply to text fields;
+  **Skip index**, **N-gram substring**, **IP address**, or **JSON keys**. Full text search, N-gram
+  substring, and IP address apply to text fields, JSON keys to JSON fields;
 - the **Stream-level policy** of **Result field masking**: **Inherit global rule**, **Custom stream rule**,
   or **Explicitly unmasked for stream**. See [Field masking](/en-US/settings/data-security#field-masking).
   Metrics streams do not take part in masking.
 
 Select **Apply to draft**, then **Save and apply**. The type of a field never changes.
+
+### Index of new fields
+
+Under **Field indexes** on the **Settings** tab, rules give fields that first appear in the stream
+an index by their name. Select **Add a rule**, enter a field name pattern, and pick an index type:
+`*` stands for any run of text and `?` for one character, so `*_id` matches `user_id` and
+`order_id`, and `http.*` matches every field under `http`. The first rule in order whose pattern
+matches the name and whose index type suits the field's data type applies; an index set for a field
+by name under **Fields & indexes** comes first, and a field no rule matches gets the default above.
+The rules affect only fields that appear from now on: change existing fields under **Fields &
+indexes**. A stream holds at most 32 rules.
 
 ### Split by field
 

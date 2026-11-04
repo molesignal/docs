@@ -12,7 +12,7 @@ A **pipeline** transforms events with an ordered chain of steps. A step is a [VR
 | When it runs | During intake, before an event is stored. | On an interval, over stored data. Each run continues where the previous one stopped. | Before an incident opens, or before a notification policy sends. |
 | Signals | Logs, metrics, traces, and the metadata of profiles. | Logs, metrics, and traces. | Alert events. |
 | Source and sink | One source stream. Logs go to one stream sink; metrics, traces, profile metadata, and RUM events stay in their stream. | Up to 8 source streams, up to 8 target streams, and optional connectors and extend tables. | The alert events of rules, external sources, and synthetic checks. The result goes back into the incident. |
-| Typical use | Normalize, redact, and route logs as they arrive, and trim the labels of metrics and the attributes of spans. | Enrich, filter, sample, or copy stored data, fill extend tables, and backfill history. | Enrich, re-grade, or drop alert events, and add a model's summary. |
+| Typical use | Normalize, redact, and route logs as they arrive, trim the labels of metrics and the attributes of spans, make metrics of logs and spans, and hold logs to a daily quota or a rate. | Enrich, filter, sample, or copy stored data, fill extend tables, and backfill history. | Enrich, re-grade, or drop alert events, and add a model's summary. |
 | Backfill and run history | Not available. | Available. | Not available. The pipeline counts what it did today. |
 
 This page covers realtime and scheduled pipelines. [Alert pipelines](/en-US/pipelines/alert-events) have a page of their own.
@@ -46,8 +46,8 @@ See [Schedule and read positions](#schedule-and-read-positions) and
 Select a node to edit it. The head of the flow shows **Valid**, the number of entries that are left
 to fill in, or the issues that block a save: a missing source or destination, a step without a name
 or a script, and a destination that is also a source. The first source and the first destination
-stream are saved as the `source_stream` and the `target_stream` of the pipeline, and the full lists
-as `sources` and `sinks` in `function_steps`.
+stream are saved as the `sourceStream` and the `targetStream` of the pipeline, and the full lists
+as `sources` and `sinks` in `functionSteps`.
 
 **Test.** Run one sample event through every step before saving. Nothing is stored. Edit the
 **Sample event**, or take a recent event from a source stream, then select **Run test**. With
@@ -70,6 +70,7 @@ backfill, and deletion.
 | Parse | **Parse JSON**, **Parse key=value**, and **Extract with regex**. |
 | Fields | **Rename field**, **Rename by pattern**, **Remove fields**, **Keep only these fields**, **Set field**, **Mask field**, **Change case**, **Convert type**, and **Look up an extend table**. See [Look up an extend table](#look-up-an-extend-table). |
 | Events | **Filter events** and **Sample**. See [Filter and sample](#filter-and-sample). |
+| Count and limit | **Generate metric**, **Quota**, and **Throttle**, in a realtime pipeline. See [Count and limit](#count-and-limit). |
 | Routing | **Route to stream**. See [Routing](#routing). |
 | Code | **Custom VRL**. |
 
@@ -162,21 +163,21 @@ curl -X POST http://localhost:5080/api/v1/scheduled_pipelines \
   -H 'content-type: application/json' \
   -d '{
     "name": "route-app-logs",
-    "source_stream": "default",
-    "target_stream": "default",
+    "sourceStream": "default",
+    "targetStream": "default",
     "cron": "",
-    "lookback_secs": 300,
+    "lookbackSecs": 300,
     "enabled": true,
-    "function_steps": {
+    "functionSteps": {
       "mode": "realtime",
-      "signal_type": "logs",
+      "signalType": "logs",
       "sources": ["default"],
       "sinks": ["default"],
-      "retain_source": false,
+      "retainSource": false,
       "steps": [
-        { "transform_name": "lowercase-level", "kind": "vrl",
+        { "transformName": "lowercase-level", "kind": "vrl",
           "script": ".level = downcase!(string!(.level))" },
-        { "transform_name": "route-by-app", "kind": "builtin", "operation": "route",
+        { "transformName": "route-by-app", "kind": "builtin", "operation": "route",
           "routing": { "kind": "field", "field": "appname", "prefix": "app_", "fallback": "default" } }
       ]
     }
@@ -198,7 +199,7 @@ Behavior to plan for:
 
 ### Metrics and traces
 
-A realtime pipeline on metrics or traces changes the samples or spans in place: they stay in the stream that they arrive in. The flow ends in **Back into the stream**, **Add step** offers no **Route to stream**, and **Also retain in source stream** does not apply. Through the API, a `target_stream` other than the `source_stream`, a routing step, or `retain_source` set to `true` answers `400`. A realtime pipeline on a RUM stream works in place too; see [RUM streams](#rum-streams).
+A realtime pipeline on metrics or traces changes the samples or spans in place: they stay in the stream that they arrive in. The flow ends in **Back into the stream**, **Add step** offers no **Route to stream**, and **Also retain in source stream** does not apply. Through the API, a `targetStream` other than the `sourceStream`, a routing step, or `retainSource` set to `true` answers `400`. A realtime pipeline on a RUM stream works in place too; see [RUM streams](#rum-streams).
 
 The pipeline keeps the fields that a sample or a span rests on as they arrive:
 
@@ -255,6 +256,104 @@ Steps can rename the `service`, add or change `labels` and other fields, and dro
 
 These fields are kept as they arrive, as for [metrics and traces](#metrics-and-traces): `id`, `object_key`, `archived_bytes`, `_timestamp`, `profile_type`, `duration_nanos`, `sample_count`, `total_value`, `unsymbolized`, `trace_id`, and `span_id`. The flame graphs and downloads find and merge the objects by them.
 
+### Count and limit
+
+A realtime pipeline can count what goes through it. **Add step** offers these steps under **Count and limit**; a scheduled or an alert pipeline does not take them:
+
+| Step | What it does | Data |
+|---|---|---|
+| **Generate metric** | Makes a metric of the events that it picks and writes it into a metrics stream. | Logs, RUM events, and spans. |
+| **Quota** | Lets a set amount through per UTC day. | Logs, and the RUM events that a step may drop. |
+| **Throttle** | Lets a set number through per window. | Logs, and the RUM events that a step may drop. |
+
+None of these steps changes a field of an event. Each applies to the events that **Applies to** picks: tests on fields that must all hold, the same tests as **Filter events**. Without a test, a step applies to every event. An event that the step does not pick goes past it untouched. The counts of a step are kept under its name, so these steps need names that differ within a pipeline, and a quota that is renamed starts the day's count over.
+
+A quota or a throttle holds back data only in a pipeline that someone put it into. Nothing else in MoleSignal drops or slows down data because of a limit: an [intake budget](/en-US/streams#intake-usage-and-budgets) only notifies.
+
+#### Generate metric
+
+| Setting | Notes |
+|---|---|
+| **Metric name** | The name that PromQL selects the metric by: letters, digits, `_`, and `:`, not starting with a digit. |
+| **Type** | **Count** adds 1 per event, or the number in **Add up field** when one is named. **Gauge** keeps the number in **Numeric field** of the latest event of the interval. **Histogram** sorts the number in **Numeric field** into **Upper bounds**, ascending, with `+Inf` always there. |
+| **Group by** | Up to 10 fields. Each becomes a label: one series per combination of values. |
+| **Metrics stream** | Where the samples go. A name that does not exist yet creates the stream. The editor starts with the name of the source stream. |
+| **Interval** | 10 seconds, 30 seconds, 1 minute (the default), or 5 minutes. |
+
+The samples are stored the way every metric is: `metric_name` and the labels as fields. PromQL, dashboards, and alert rules read them like any other metric. A histogram writes `<name>_bucket` with `le`, `<name>_count`, and `<name>_sum`. A count and a histogram are delta samples, `metric_temporality` set to `delta`: each sample counts one interval, so read them with `increase` or `rate`. The editor shows the query under **Query**:
+
+```promql
+sum by (service) (increase(app_errors_total[5m]))
+histogram_quantile(0.99, sum by (le) (rate(request_duration_ms_bucket[5m])))
+```
+
+Count first, then drop: a **Generate metric** step followed by **Filter events** or **Sample** keeps the metric of every event while only some of the events are stored.
+
+Behavior to plan for:
+
+- An event counts in the interval of its own timestamp, not of its arrival. An interval is written 5 to 10 seconds after it ends. An event that arrives later is written as another sample of its interval, with a timestamp of its own in the last half second of the interval, so `increase` adds both up.
+- An event with a timestamp more than 24 hours in the past, or more than 5 minutes ahead of the clock of the node, is not counted. Neither is an event without a number in the field that a gauge, a histogram, or an **Add up field** reads.
+- A label takes the value of its field: text as it is, a number or a boolean as written, an object or a list as JSON, cut to 256 bytes. An event without the field gets no such label. Label values are text, so a metrics stream that already stores a field of that name as a number refuses those samples, and the node logs a warning. Write generated metrics into a stream of their own.
+- A step keeps up to 1,000 series per interval on each node. The events of further combinations go into one series whose grouped labels all read `__other__`.
+- A batch of logs counts once it is written: a batch that fails and is sent again is not counted twice. An event that a later step drops or fails on is still counted.
+- The node that runs the pipeline adds the metric up and writes it every few seconds. A node that stops writes what it holds first. A crash loses what was not written yet: at most the open interval and about 10 seconds.
+- Intake routes the batches of a stream of an organization to one intake node, by rendezvous hashing of the organization and the stream, so a series normally has one writer. While a node joins or leaves, the old and the new node each write a part of the same intervals, each part with a timestamp of its own, and `increase` adds them up.
+- Spans are counted where they are written, after tail sampling: a span that sampling drops is not counted. [APM](/en-US/apm) figures count before sampling.
+
+#### Quota
+
+| Setting | Notes |
+|---|---|
+| **Counts** | **Events**, or **Bytes**: the size of an event as it arrived, measured the way intake usage measures it. The editor takes bytes in MiB. |
+| **Daily limit** | What the quota lets through per UTC day. The count starts over at 00:00 UTC. |
+| **Split by** | Up to 5 fields. Each combination of their values is a bucket with its own count and the daily limit. A quota keeps up to 1,000 buckets a day; the events of further combinations share one bucket, `*`. |
+| **Buckets with a limit of their own** | Up to 100 buckets, each named by a value of every field that the quota is split by, with a limit of its own. They are always kept apart. |
+| **Past the limit** | **Drop**, **Let through**, or **Send to another stream**: the event leaves the pipeline at this step, as the step sees it, for the logs stream named under **Stream past the limit**, for example one with a shorter retention. The steps after the quota do not run on it. |
+
+Behavior to plan for:
+
+- An event goes through while its bucket is below the limit, so the last event that goes through can take the bucket a little past the limit. With **Let through**, the events past the limit go on and are counted as past the limit.
+- The counts are stored. Every node adds what it counted every 5 seconds and reads back what all nodes counted, so a restart goes on with the count of the day. Between two of these syncs a node does not see what the other nodes counted, so a quota that several nodes count can let a little more than its limit through. With rendezvous routing that happens mostly while a node joins or leaves. A crash loses up to 5 seconds of counts, which can let that much more through.
+- When the metadata database cannot be read, a quota counts from zero until the next sync reads it: events are not held back because the database does not answer.
+- A quota counts an event as the step decides on it. A batch that fails to be written and is sent again counts again.
+- With **Also retain in source stream** on, the source stream keeps every event as it arrived, past the quota or not.
+
+#### Throttle
+
+| Setting | Notes |
+|---|---|
+| **Events per window** | 1 to 1,000,000. |
+| **Window (seconds)** | 1 to 86,400. |
+| **Per group of** | Up to 5 fields. Each combination of their values is throttled on its own. A node keeps up to 10,000 groups of a step; the events of further groups share one. |
+| **Past the limit** | **Drop** or **Send to another stream**. |
+
+- After a quiet window, a group lets **Events per window** through at once, then one every window divided by the limit: on average, the limit per window. This is the generic cell rate algorithm that the router's [rate limit](/en-US/configuration#cluster-and-rate-limits) uses too.
+- Each node throttles the events that it receives, counted by arrival, and starts full after a restart. Intake routes a stream to one node, so a stream is normally throttled in one place. While a node joins or leaves, two nodes can each let the limit through.
+
+#### Limits today
+
+The page of a realtime pipeline with a quota or a throttle shows **Limits today**: what each step let through and held back since 00:00 UTC, for every node together, a few seconds behind. A quota shows one row per bucket with its limit. The counts are kept for 8 days and are also returned by [`GET /api/v1/scheduled_pipelines/{id}/limits`](/en-US/api/intake/scheduled-pipelines#limits-today).
+
+**Run test** shows what these steps would do with the sample event: the series and the amount that a metric adds, and the bucket, the limit, and what happens past it for a quota or a throttle. A test counts nothing and never goes past a limit.
+
+Through the API, the steps carry their settings beside `transformName` and `kind`:
+
+```json
+"steps": [
+  { "transformName": "errors", "kind": "generate_metric",
+    "conditions": [{ "field": "level", "test": "equals", "value": "error" }],
+    "metric": { "name": "app_errors_total", "type": "count", "groupBy": ["service"],
+                "stream": "app_metrics", "intervalSecs": 60 } },
+  { "transformName": "daily", "kind": "quota",
+    "quota": { "unit": "bytes", "limit": 10737418240, "partitionBy": ["service"],
+               "action": "route", "target": "app_logs_cold" } },
+  { "transformName": "per-host", "kind": "throttle",
+    "throttle": { "limit": 1000, "windowSecs": 60, "groupBy": ["host"], "action": "drop" } }
+]
+```
+
+See [Create a pipeline](/en-US/api/intake/create-pipeline) for every field.
+
 ## Scheduled pipelines
 
 A scheduled pipeline reads its source streams on an interval, applies the chain, and writes the output to its target streams. It can also deliver the same events to connectors.
@@ -263,7 +362,7 @@ A scheduled pipeline reads its source streams on an interval, applies the chain,
 
 A scheduled pipeline writes up to 8 **target streams** through standard intake, where the events are queryable, delivers to external **connectors**, and writes rows into **extend tables**:
 
-- Every event goes to the first target stream, the `target_stream`, unless a routing step picks another stream.
+- Every event goes to the first target stream, the `targetStream`, unless a routing step picks another stream.
 - Every further target stream takes every event that comes through the steps.
 - Every connector that is turned on receives every event that comes through the steps.
 - Every extend table takes a row for every event that comes through the steps. See [Write to an extend table](#write-to-an-extend-table).
@@ -299,7 +398,7 @@ A non-queryable stream still accepts and retains data and feeds the pipeline. It
 | Field | Editor | Notes |
 |---|---|---|
 | `cron` | **Run every** | Interval shorthand: `every:30s`, `every:5m`, or `every:1h`. |
-| `lookback_secs` | **First run reads back** | How far back the first run of a source reads. The default is 300. |
+| `lookbackSecs` | **First run reads back** | How far back the first run of a source reads. The default is 300. |
 | `function_steps.delay_secs` | **Wait for late events** | Seconds that the latest stretch of time is left for late events before a run reads it. 0 to 3600, default 60. |
 | `enabled` | **Run on schedule** | Pauses or resumes the schedule without deleting the pipeline. |
 
@@ -307,9 +406,9 @@ The runner does not parse standard cron expressions. A schedule outside the `eve
 
 The pipeline keeps a read position for each source: the time before which the events of that source have been handled. Each run reads every source from its read position up to the time of the run minus the wait for late events, applies the chain, and writes the output. The read position then moves to where the run stopped reading, and the next run starts there. An event that arrives within the wait is read once. An event that arrives later, with a timestamp that a run has already passed, is not read, so raise **Wait for late events** for a source that receives late data.
 
-- The first run of a source reads back `lookback_secs`. A source that is added later starts the same way.
-- A run reads at most the longest of the interval, `lookback_secs`, and one hour of each source. A source that is further behind runs again at the next check, a stretch at a time, until it catches up.
-- Enabling a paused pipeline starts over: the first run reads back `lookback_secs` from the time of the run, whatever was read before the pause. Submit a [backfill](#backfill) to process the time outside that window.
+- The first run of a source reads back `lookbackSecs`. A source that is added later starts the same way.
+- A run reads at most the longest of the interval, `lookbackSecs`, and one hour of each source. A source that is further behind runs again at the next check, a stretch at a time, until it catches up.
+- Enabling a paused pipeline starts over: the first run reads back `lookbackSecs` from the time of the run, whatever was read before the pause. Submit a [backfill](#backfill) to process the time outside that window.
 
 The runner checks for due pipelines every 15 seconds, so very short intervals run at that granularity.
 
@@ -376,10 +475,10 @@ To process a historical window on demand, open **More → Backfill** in the edit
 curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backfill \
   -H "authorization: Bearer $MS_TOKEN" \
   -H 'content-type: application/json' \
-  -d '{"start_micros": 1790000000000000, "end_micros": 1790086400000000}'
+  -d '{"startTime": 1790000000000000, "endTime": 1790086400000000}'
 ```
 
-The window must not exceed 31 days. The request returns `202` with one job per source, each with a `job_id` and a `monitor` path. Each job runs through the asynchronous [search job](/en-US/deployment/role-based#asynchronous-search-jobs) worker: it reads its source over the window, applies the same chain, and writes, delivers, and keeps dead letters the way a run does.
+The window must not exceed 31 days. The request returns `202` with one job per source, each with a `jobId` and a `monitor` path. Each job runs through the asynchronous [search job](/en-US/deployment/role-based#asynchronous-search-jobs) worker: it reads its source over the window, applies the same chain, and writes, delivers, and keeps dead letters the way a run does.
 
 A backfill leaves the read positions where they are, so the scheduled runs read what they would have read without it. A backfill window that overlaps time that runs already processed writes those events again.
 
@@ -406,7 +505,7 @@ A scheduled pipeline can read every platform stream except `_molesignal`, for ex
 
 ## Permissions
 
-- `pipelines.read` lists pipelines and reads run history.
+- `pipelines.read` lists pipelines and reads run history and the counts of quotas and throttles.
 - `pipelines.create` creates a pipeline.
 - `pipelines.edit` changes the flow, the steps, the schedule, or the lookback.
 - `pipelines.pause` enables or pauses a pipeline.
