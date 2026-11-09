@@ -1,3 +1,7 @@
+---
+noindex: true
+---
+
 # Documentation project instructions
 
 ## About this project
