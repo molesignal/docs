@@ -46,9 +46,19 @@ same `MS_SELF_TELEMETRY_CLUSTER_TOKEN` on every role.
 MoleSignal instruments HTTP, gRPC, Flight SQL, database, object storage, intake, query,
 background workers, and Agent stages.
 
+The spans follow OpenTelemetry Semantic Conventions 1.43.0. Standard attributes keep their standard
+names, and the attributes that MoleSignal adds start with `molesignal.`. Each span records the
+version in `semantic_conventions_version`.
+
 Inbound W3C context is validated or replaced. External baggage does not authorize an organization.
 Sensitive request bodies, SQL values, credentials, prompts, model output, and tool arguments are
 excluded from spans.
+
+A SQL span can carry `molesignal.db.query.fingerprint`, a keyed fingerprint of the statement with its
+values replaced by `?`, and an object storage span `molesignal.object.key_fingerprint`, a keyed
+fingerprint of the object key. Spans of one statement or one object can then be grouped without
+storing either. The fingerprints are written only while
+[`MS_TRACE_FINGERPRINT_KEY`](/en-US/configuration#environment-variables) holds at least 16 bytes.
 
 The tail sampler retains traces in this order:
 
@@ -71,18 +81,23 @@ The diagnostic listener is disabled by default:
 [profiling]
 enabled = true
 bind = "127.0.0.1"
-port = 5084
+port = 5086
 allow_remote = false
 ```
+
+The same keys can be set with `MS_PROFILING_ENABLED`, `MS_PROFILING_BIND`, `MS_PROFILING_PORT`, and
+`MS_PROFILING_ALLOW_REMOTE`. `bind` takes an IP address, not a host name such as `localhost`. The port
+must differ from the ports of the other enabled listeners, including listeners of roles that the node
+does not run; otherwise the process stops at startup. See [pprof](/en-US/configuration#pprof).
 
 Capture profiles:
 
 ```bash
 curl --fail --output cpu.pb.gz \
-  'http://127.0.0.1:5084/debug/pprof/profile?seconds=30'
+  'http://127.0.0.1:5086/debug/pprof/profile?seconds=30'
 
 curl --fail --output heap.pb.gz \
-  'http://127.0.0.1:5084/debug/pprof/heap'
+  'http://127.0.0.1:5086/debug/pprof/heap'
 ```
 
 Keep the listener on loopback and use an SSH tunnel. Remote exposure requires
@@ -98,6 +113,61 @@ bearer credential.
 
 For a new distributed-tracing rollout, start with `telemetry.trace.force_disabled = true`, validate
 system resources and privacy, enable a canary, then expand the persisted runtime policy.
+
+## Component metrics
+
+Every node exposes the metrics below on `/metrics`. Their labels take values from fixed lists and
+never name an organization, a trace, a route, or an object key. In the `_sys` organization, the
+built-in dashboards **MoleSignal Self Telemetry & Runtime** and **MoleSignal Tracing & APM** chart
+them.
+
+### Self-telemetry and metadata database
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `self_telemetry_accepted_total` | `signal` | Records taken in for the `_molesignal` streams. |
+| `self_telemetry_dropped_total` | `signal`, `reason` | Records dropped on their way to the `_molesignal` streams. `reason` is `queue_full`, `queue_closed`, `trace_candidate_queue`, `delivery_failed`, `flush_timeout`, or `persistence_failed`; for a scheduled profile that was not captured, `capture_busy`, `unavailable`, `invalid_duration`, or `capture_failed`. |
+| `self_telemetry_batches_total` | `signal`, `outcome` | Batches sent, with the `outcome` `success` or `error`. |
+| `self_telemetry_retries_total` | `signal`, `reason` | Retries of a batch that a node without the `intake` role forwards to an intake node: `no_intake`, `connect`, or `push`. |
+| `self_telemetry_queue_depth`, `self_telemetry_queue_capacity` | `signal` | Spans waiting in the trace queue, and its size, `queue_capacity`. Only `traces` has a queue. |
+| `self_telemetry_last_success_unixtime` | `signal` | When the last batch succeeded, in seconds since the Unix epoch. |
+| `self_telemetry_profile_available` | `kind` | `1` when the build can capture the `cpu` or `heap` profile on this platform, else `0`. |
+| `db_pool_connections` | `pool`, `state` | Connections of the metadata database pool, `pool="meta"`: `total`, `idle`, `checked_out`, and the configured `min` and `max`. |
+| `db_pool_acquire_duration_seconds` | `pool` | Time spent waiting for a connection of the pool, without the time that the statement then runs. |
+
+`signal` is `metrics`, `traces`, or `profiles`. Drops never hold up the process; they leave gaps in
+the `_molesignal` streams.
+
+### APM projection
+
+The projection runs on the nodes that own trace candidates, and its rollup on the `alert` role. See
+[APM](/en-US/configuration#apm).
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `molesignal_apm_facts_total` | `result` | Spans that reached the projection, by result: `accepted`, `duplicate_skip`, `late_kept`, `late_dropped`, `queue_full`, `stopped`, `cardinality_rejected`, `extract_failed`, or `flush_failed`. `flush_failed` counts failed writes, not spans. |
+| `molesignal_apm_cardinality_total` | `reason` | Spans that went past a [cardinality limit](/en-US/apm/settings#cardinality-limits), by limit, such as `service_rejected` or `transaction_overflow`. A span of a rejected service is not counted at all; past the other limits, its name counts as **Other** or loses its detail. |
+| `molesignal_apm_queue` | `resource` | Spans waiting in the projection queue (`depth`) and its size (`capacity`, `[apm].queue_capacity`). |
+| `molesignal_apm_flushes_total` | `result` | Writes of the aggregates to PostgreSQL, `success` or `failure`. |
+| `molesignal_apm_flush_duration_seconds` | | Time of one write. |
+| `molesignal_apm_rollups_total` | `result` | Runs of the rollup of minute aggregates into hourly ones, `success` or `failure`. |
+| `molesignal_apm_rollup_rows_total` | `kind` | Rows that the rollup read (`source`), wrote (`rollup`), and deleted past their retention (`deleted`). |
+| `molesignal_apm_lag_seconds` | `stage` | For `projection`, the age of the last span that the projection took. For `rollup`, the time that late data is still accepted, `[apm].late_grace_secs`. |
+| `molesignal_apm_health` | `component` | `1` while the `projector`, the `repository`, or the `rollup` is healthy, `0` while it is degraded. |
+| `molesignal_apm_api_duration_seconds` | `endpoint` | Time to answer an APM API request, by endpoint, such as `overview` or `services`. |
+
+Alert when:
+
+- `molesignal_apm_queue{resource="depth"}` stays above 80% of `capacity`;
+- `molesignal_apm_facts_total` grows with the `result` `queue_full`, `cardinality_rejected`, or
+  `flush_failed`, which leave gaps that the [data-quality notices](/en-US/apm#read-data-quality-notices)
+  report as partial data;
+- `molesignal_apm_lag_seconds{stage="projection"}` stays above 120, two minute buckets;
+- `molesignal_apm_health` is `0`;
+- the P95 of `molesignal_apm_api_duration_seconds{endpoint="overview"}` stays above 0.5 seconds.
+
+A degraded APM never fails `/api/v1/healthz` or `/api/v1/readyz`. `GET /api/v1/apm/health` shows the
+state of the projection for one organization; see [APM API](/en-US/api/apm).
 
 <Card title="Configuration" icon="sliders" href="/en-US/configuration">
   Review every telemetry, tracing, exporter, and profiling setting.

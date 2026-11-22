@@ -1,0 +1,79 @@
+---
+title: "查询 Exemplar"
+description: "按 Prometheus HTTP API 的响应格式读取随 Prometheus remote write 样本保存的 Exemplar。"
+"en_link": "/en-US/api/query/exemplars"
+---
+
+```http
+GET  /api/v1/prometheus/api/v1/query_exemplars
+POST /api/v1/prometheus/api/v1/query_exemplars
+```
+
+返回 PromQL 表达式所选序列的 Exemplar，响应格式与 Prometheus HTTP API 的 `query_exemplars` 端点相同。**指标** 页面从这个端点读取图表上的 Exemplar。该调用需要 `metrics.read`，系统范围下需要 `sys.telemetry.read`。
+
+Exemplar 来自 [Prometheus remote write](/zh-Hans/intake#prometheus-remote_write)，与样本一起保存。OTLP 指标保存时不带 Exemplar。
+
+`GET` 通过查询字符串传参，`POST` 以表单（`application/x-www-form-urlencoded`）传参：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `query` | 是 | PromQL 表达式，其中每个选择器都必须写明指标名。 |
+| `start` | 是 | 自 Unix 纪元起的秒数（可带小数）或 RFC 3339 时间。 |
+| `end` | 是 | 格式同上，不能早于 `start`。 |
+
+只有表达式中的选择器起作用：每个选择器选出其指标中与标签匹配器相符的序列，函数、运算符和范围时长都不影响结果。重复发送的 Exemplar（例如 remote write 重试）只返回一次。结果最多 10,000 个 Exemplar，达到上限时停止并附带警告。请求与查询一样要等待[准入控制](/zh-Hans/configuration#准入控制)的空位，结果从不缓存。
+
+[字段遮掩](/zh-Hans/settings/data-security#字段遮掩)作用于序列标签和 Exemplar 标签。遮掩规则覆盖 `value` 或 `_timestamp` 时请求会失败，因为 Prometheus 的格式无法表示遮掩后的值。
+
+<RequestExample>
+```bash cURL
+curl -G http://localhost:5080/api/v1/prometheus/api/v1/query_exemplars \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'query=histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{service="checkout"}[5m]))' \
+  --data-urlencode "start=$(( $(date +%s) - 3600 ))" \
+  --data-urlencode "end=$(date +%s)"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "status": "success",
+  "data": [
+    {
+      "seriesLabels": {
+        "__name__": "http_request_duration_seconds_bucket",
+        "le": "0.5",
+        "service": "checkout"
+      },
+      "exemplars": [
+        {
+          "labels": { "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7" },
+          "value": 0.43,
+          "timestamp": 1790000000.123
+        }
+      ]
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| 字段 | 说明 |
+|---|---|
+| `data[].seriesLabels` | 序列的标签，指标名在 `__name__` 中。 |
+| `data[].exemplars[]` | 该序列在时间范围内的 Exemplar，最早的在前。 |
+| `labels` | Exemplar 的标签，例如 `trace_id` 和 `span_id`。 |
+| `value` | Exemplar 记录的观测值。 |
+| `timestamp` | 自 Unix 纪元起的秒数，可带小数。 |
+| `warnings` | 仅在结果达到 10,000 个 Exemplar 上限时出现。 |
+
+**错误**
+
+| 状态码 | 原因 |
+|---|---|
+| `400` | `query` 为空或不是有效的 PromQL、有选择器没写指标名、时间不是这两种格式之一，或 `end` 早于 `start`。 |
+| `403` | Token 缺少 `metrics.read`，或有遮掩规则覆盖 `value` 或 `_timestamp`。 |
+| `429` | [准入控制](/zh-Hans/configuration#准入控制)拒绝了请求。 |
+
+这些错误使用与其他端点相同的[错误响应体](/zh-Hans/api-reference#响应与错误)，而不是 Prometheus 的格式。

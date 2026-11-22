@@ -46,6 +46,7 @@ These variables are read separately from the settings:
 | `MS_CIPHER_KEY` | Root key for the secrets that MoleSignal encrypts in PostgreSQL. Provide 32 random bytes encoded as base64. Without it, the process falls back to an all-zero development key and logs a warning. Never change the key without running `rewrap-kek`. See [Production checklist](/en-US/deployment/production-checklist). |
 | `MS_AUTH_JWT_SECRET_OVERRIDE` | Pins the JWT signing secret instead of the one generated in PostgreSQL on first start. |
 | `MS_SELF_TELEMETRY_CLUSTER_TOKEN` | Shared secret that authenticates the trace candidates and self-telemetry that role-split nodes forward to each other. Set the same value on every role-split node while [trace capture](#trace-capture-and-tail-sampling) (on by default) or `[telemetry.self_collect]` is enabled. A node without the `intake` role refuses to start without it. |
+| `MS_TRACE_FINGERPRINT_KEY` | Key of the HMAC-SHA-256 fingerprints that stand in for values that are never stored: SQL statement shapes and object keys in [MoleSignal's own spans](/en-US/self-observability#backend-distributed-tracing), and database names in [APM dependencies](/en-US/apm#dependencies). Use at least 16 bytes; a shorter value is ignored. Set the same value on every node, since a different key gives different fingerprints. Without the key, no fingerprint is written, and no unkeyed hash replaces it. The key is read only from the environment and never appears in API responses, logs, or spans. |
 | `MS_AGENT_OPENAI_API_KEY`, `MS_AGENT_ANTHROPIC_API_KEY`, `MS_AGENT_COMPATIBLE_API_KEY` | Development fallback API keys for Mole Agent model providers. Each has a matching `_BASE_URL` variable. Configure production providers in the product instead. |
 | `RELEASE_CHANNEL` | Labels the deployment maturity: `alpha`, `beta`, `rc`, or `stable`. |
 | `RUST_LOG` | Overrides `[telemetry].log_level` when set. |
@@ -172,7 +173,7 @@ Also set `MS_CIPHER_KEY` in the environment. See the [Production checklist](/en-
 |---|---|---|
 | `enabled` | `false` | Starts the listener. |
 | `bind` | `127.0.0.1` | Listen address. Must be a loopback address unless `allow_remote` is `true`. |
-| `port` | `5084` | Port. Change it when the Probe Agent registration port uses the same value on the same host. |
+| `port` | `5086` | Port. Must differ from the ports of the other enabled listeners, including listeners of roles that the node does not run. |
 | `allow_remote` | `false` | Allows a non-loopback `bind`. Remote exposure can leak runtime information. |
 
 ## Storage
@@ -293,7 +294,7 @@ The limits per organization and per metric are a platform setting: **Settings â†
 | Key | Default | Description |
 |---|---|---|
 | `interval_secs` | `300` | Time between compaction rounds. |
-| `target_size` | `512` | Largest total size, in MiB, of the files one merge combines, from `1` to `65536`. A merged file is about this size or smaller. A merge reads its inputs a part at a time and uploads its output in parts, so its memory does not grow with this size. One merge reads at most 64 files; the rest are merged with its result in a later round. |
+| `target_size` | `512` | Largest total size, in MiB, of the files one merge combines, from `1` to `65536`. A merged file is about this size or smaller. A merge reads its inputs a part at a time and uploads its output in parts, so its memory does not grow with this size. One merge reads at most 128 files; the rest are merged with its result in a later round. A file larger than the other files of a merge together is left out of it and merged once the new files add up to its size, so a large file is not rewritten for a little new data. |
 | `max_concurrent_groups` | `4` | Streams that one node processes at the same time in one round. |
 
 How long a stream without a retention of its own is kept is a platform setting: **Settings â†’ Data retention** in the `_sys` organization, 30 days by default. Downsampling is set for each metrics stream on its **Retention** tab. See [Streams](/en-US/streams).
@@ -331,7 +332,7 @@ The `[storage.*]` sections control background maintenance of the file catalog an
 
 | Key | Default | Description |
 |---|---|---|
-| `[querier].concurrency` | `0` | Query engine parallelism. `0` uses the number of CPUs. |
+| `[querier].concurrency` | `0` | Parallelism of SQL queries. `0` uses the number of CPUs. It also caps how many data files one query reads at once. |
 | `[querier].max_scan_rows` | `100000000` | Largest number of rows that one query may read: the rows of the files that the query has to read plus the rows in memory buffers. A larger query is rejected with `400` before it reads data. A PromQL query applies the limit to each selector and counts the rows it reads of the selector's metrics, stopping once it is over. `0` removes the limit. |
 | `[querier].auto_async_threshold_rows` | `50000000` | Queries whose estimated rows exceed the value become asynchronous search jobs. `0` disables the conversion. |
 | `[querier].estimate_throughput_per_sec` | `1000` | Conservative rows-per-second figure that the size estimate uses. |
@@ -342,17 +343,20 @@ The `[storage.*]` sections control background maintenance of the file catalog an
 
 ### Admission control
 
-`[search.admission]` limits concurrent queries per workgroup. All values default to `0` or empty, which means no limit. The section is absent from the sample file.
+`[search.admission]` limits how many queries of a workgroup run at once on a node. A query that finds its workgroup full waits in line, and queries start in the order they arrived. A query that waits longer than `max_wait_secs` gets `429`. Queries answered from the result cache do not wait. The limit applies to queries sent through the query API and Flight SQL, to the explorer's charts and field statistics, to public shares, and to search jobs. Alert evaluation and other background work do not wait in line. The section is absent from the sample file.
 
-| Key | Description |
-|---|---|
-| `default_max_concurrent` | Per-node limit for workgroups without an entry in `groups`. |
-| `groups` | Table that maps a workgroup name to its per-node limit. |
-| `role_map` | Table that maps a role (`owner`, `admin`, `editor`, `viewer`) to a workgroup. Unmapped roles use `default`. |
-| `cluster_default_max_concurrent` | Soft cluster-wide limit for workgroups without an entry in `cluster_groups`. |
-| `cluster_groups` | Table that maps a workgroup name to its cluster-wide soft limit. |
-| `cluster_sync_interval_secs` | Interval for publishing node load. `0` uses 5. |
-| `cluster_stale_secs` | Nodes silent for longer drop out of the cluster view. `0` uses 30. |
+| Key | Default | Description |
+|---|---|---|
+| `default_max_concurrent` | Twice the CPU count | Per-node limit for workgroups without an entry in `groups`. `0` means no limit. |
+| `groups` | Empty | Table that maps a workgroup name to its per-node limit. |
+| `role_map` | Empty | Table that maps a role (`owner`, `admin`, `editor`, `viewer`) to a workgroup. Unmapped roles use `default`. |
+| `max_wait_secs` | `60` | How long a query waits for a free slot before `429`. `0` answers `429` as soon as the workgroup is full. |
+| `cluster_default_max_concurrent` | `0` | Soft cluster-wide limit for workgroups without an entry in `cluster_groups`. A query that finds it full gets `429` at once. `0` means no limit. |
+| `cluster_groups` | Empty | Table that maps a workgroup name to its cluster-wide soft limit. |
+| `cluster_sync_interval_secs` | `0` | Interval for publishing node load. `0` uses 5. |
+| `cluster_stale_secs` | `0` | Nodes silent for longer drop out of the cluster view. `0` uses 30. |
+
+`/metrics` shows each workgroup's line as `query_admission_running`, `query_admission_waiting`, `query_admission_wait_seconds`, and `query_admission_refusals_total`.
 
 ### Caches
 
@@ -439,7 +443,7 @@ The rate limit applies to the `router` role only, and each router replica counts
 
 MoleSignal creates the root account on the first start, when the database holds no users and both values are set. Changing `root_password` later does not change the password of an existing account. Change it in the web UI instead. At every start, the account with `root_email` becomes the platform administrator, so `root_email` must belong to an existing user.
 
-The JWT signing secret is generated on first start and stored in PostgreSQL. The `[auth].jwt_secret` key from older releases is ignored. Use `MS_AUTH_JWT_SECRET_OVERRIDE` to pin a secret, and `POST /api/v1/auth/jwt/rotate` to rotate it.
+The JWT signing secret is generated on first start and stored in PostgreSQL. Use `MS_AUTH_JWT_SECRET_OVERRIDE` to pin a secret, and `POST /api/v1/auth/jwt/rotate` to rotate it.
 
 ## Self-observability
 

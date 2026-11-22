@@ -17,11 +17,13 @@ upstream molesignal {
     keepalive 16;
 }
 
-# The public entry point logs paths, never query strings; heartbeat and calendar paths carry a token,
-# so only their prefix is logged.
+# The public entry point logs paths, never query strings; heartbeat, calendar, action link and Huawei
+# Cloud callback paths carry a token, so only their prefix is logged.
 map $uri $molesignal_log_uri {
-    ~^(/api/v1/(?:intake/heartbeats|public/calendar)/)  $1<token>;
-    default                                             $uri;
+    ~^(/api/v1/(?:intake/heartbeats|public/calendar|public/notify/actions)/)  $1<token>;
+    ~^(/notify/actions/)                                                      $1<token>;
+    ~^(/api/v1/public/notify/[^/]+/(?:replies|keypress)/)                     $1<token>;
+    default                                                                   $uri;
 }
 
 log_format molesignal_public '$remote_addr [$time_local] "$request_method $molesignal_log_uri $server_protocol" '
@@ -53,7 +55,7 @@ server {
     ssl_certificate     /etc/nginx/tls/molesignal.crt;
     ssl_certificate_key /etc/nginx/tls/molesignal.key;
 
-    client_max_body_size 10m;
+    client_max_body_size 16m;
 
     location /api/v1/query/stream {
         include /etc/nginx/snippets/molesignal-proxy.conf;
@@ -117,9 +119,31 @@ server {
         include /etc/nginx/snippets/molesignal-proxy.conf;
     }
 
-    # Replies to texts and calls
-    location ~ ^/api/v1/public/notify/[^/]+/(replies|keypress)$ {
+    # Replies to texts and calls; Huawei Cloud's address ends with the callback token
+    location ~ ^/api/v1/public/notify/[^/]+/(replies|keypress)(/[^/]+)?$ {
         limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Buttons from a WeCom app: WeCom checks the address with a GET first
+    location ~ ^/api/v1/public/notify/[^/]+/wecom$ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Buttons from a Mattermost bot
+    location ~ ^/api/v1/public/notify/[^/]+/mattermost$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # One-time action links: the confirm page and its API
+    location ^~ /notify/actions/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/notify/actions/ {
+        limit_except GET POST { deny all; }
         include /etc/nginx/snippets/molesignal-proxy.conf;
     }
 
@@ -173,7 +197,7 @@ server {
         include /etc/nginx/snippets/molesignal-proxy.conf;
     }
 
-    # Web files of status pages and shared resources
+    # Web files of status pages, shared resources and action link pages
     location ^~ /assets/ {
         limit_except GET { deny all; }
         include /etc/nginx/snippets/molesignal-proxy.conf;
@@ -258,7 +282,7 @@ location / {
 }
 ```
 
-Internal requests then pass the same `server`: raise `client_max_body_size` to `10m`, and expect the access log to record the paths of internal requests too. When a load balancer stands in front of nginx, take the original address with `set_real_ip_from` and `real_ip_header`; otherwise `allow` sees only the load balancer's address.
+Internal requests then pass the same `server`: raise `client_max_body_size` to `16m`, and expect the access log to record the paths of internal requests too. When a load balancer stands in front of nginx, take the original address with `set_real_ip_from` and `real_ip_header`; otherwise `allow` sees only the load balancer's address.
 
 ## Check
 

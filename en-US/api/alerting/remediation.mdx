@@ -1,13 +1,14 @@
 ---
 title: "Remediation API"
 sidebarTitle: "Remediation"
-description: "Define HTTP and Kubernetes remediation actions, register clusters, and run an action on an incident: every run is approved, then executed and checked."
+description: "Define HTTP and Kubernetes remediation actions, register clusters, and run an action on an incident: each run is approved or pre-approved, then executed and checked."
 "zh-Hans_link": "/zh-Hans/api/alerting/remediation"
 ---
 
 A remediation action is a fix defined in advance, such as calling a Jenkins rollback job or restarting a
-Deployment. Running one on an incident always goes through [approval](/en-US/agent#approvals-and-executions):
-L2 needs one approver and L3 needs two, and the requester cannot be an approver. Once approved it runs
+Deployment. Running one on an incident goes through [approval](/en-US/agent#approvals-and-executions):
+L2 needs one approver and L3 needs two, and the requester cannot be an approver. When the organization
+turns [pre-approval](#pre-approval) on, the same number of approvals can be given in advance. Once approved it runs
 at once, and the outcome and the check after it are recorded on the incident's
 [timeline](/en-US/api/alerting/incident-timeline). How the pages use it is in
 [Remediation](/en-US/alerting/remediation).
@@ -25,8 +26,13 @@ at once, and the outcome and the check after it are recorded on the incident's
 | `POST /api/v1/alerts/remediation/clusters/{id}/test` | Tests the connection; returns `{ "ok": true, "version": "v1.30.2" }`. | `alerts.remediation.manage` |
 | `GET /api/v1/alerts/incidents/{id}/remediations` | The actions that apply to the incident, and its runs. | `alerts.incidents.read` on the incident |
 | `POST /api/v1/alerts/incidents/{id}/remediations` | Requests a run on the incident and submits it for approval. | `alerts.incidents.remediate` on the incident |
+| `GET /api/v1/alerts/remediation/preapproval` | The organization's pre-approval switch, and for each action with a pre-approval how many runs it had in its window and where it stands. | `alerts.remediation.read` |
+| `PUT /api/v1/alerts/remediation/preapproval` | Turns pre-approval on or off for the organization, body `{ "enabled": true }`. | `alerts.remediation.preapprove` |
+| `PUT /api/v1/alerts/remediation/actions/{id}/preapproval` | Sets or replaces an action's pre-approval. | `alerts.remediation.preapprove` and `agent.approve` |
+| `DELETE /api/v1/alerts/remediation/actions/{id}/preapproval` | Removes an action's pre-approval. | `alerts.remediation.preapprove` |
+| `POST /api/v1/alerts/remediation/actions/{id}/preapproval/confirm` | A second person confirms the pre-approval of an L3 action. | `alerts.remediation.preapprove` and `agent.approve` |
 
-Creating, changing, and deleting, and requesting a run, are recorded in the audit log.
+Creating, changing, and deleting, and requesting a run, are recorded in the audit log; so are turning pre-approval on or off and setting, confirming, or removing a pre-approval.
 
 ## Remediation actions
 
@@ -127,6 +133,26 @@ The token needs `get` and `patch` on the target workloads, and a rollback also n
 Connections go only to the IPs the API server address resolves to, refuse cloud metadata addresses, and
 time out after 30 seconds. Deleting a cluster that an action still uses is refused.
 
+## Pre-approval
+
+Once the organization turns pre-approval on (it is off by default), an action can be pre-approved: for the services listed, it may run up to a number of times within a window without waiting for approval each time. An L2 action's pre-approval applies as soon as it is set; an L3 action's applies only after a second person confirms it with `confirm`. A pre-approval moves approval earlier; it never lowers how many people approve. Setting and confirming take a person signed in, not an API Token.
+
+**Request body** (`PUT /api/v1/alerts/remediation/actions/{id}/preapproval`)
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `services` | array | Yes | The services it covers, at most 20, each within the action's own scope. |
+| `maxRuns` | integer | Yes | The most runs within the window, 1 to 20. |
+| `windowSecs` | integer | Yes | The length of the window, 300 to 604800 seconds. |
+| `expiresAt` | integer | No | When it expires, in microseconds since the epoch; it does not expire when left out. |
+| `channels` | array | No | Where to send a notice after a run, at most 5: `connectorId`, `targetType`, and `target`, as in a notification policy's targets. |
+
+The response is `{ "preapproval": { ... } }`, which adds `approvers` (`[{ "userId", "at" }]`), `setBy`, and `setAt` to the body. The person who sets it is its first approver; replacing it leaves that person as the only approver. When the action's target, parameters, services or teams, or risk change, its approvers are cleared and it has to be confirmed again.
+
+`GET /api/v1/alerts/remediation/preapproval` returns `{ "enabled": true, "actions": { "<action-id>": { "used": 1, "state": "active" } } }`. `state` is `off` (the organization has it off), `expired`, `awaiting_approver` (an L3 action still needs its second person), `used_up` (the window's runs are spent), or `active`.
+
+When a pre-approval applies, requesting the action on an incident of a covered service records the approval as approved by the people who set and confirmed the pre-approval, and the run starts at once; the requester still needs `alerts.incidents.remediate`. A pre-approval the requester gave does not count for them: when too few other people pre-approved, the request waits for approval as usual, and the requester is never among the recorded reviews. When the runs are spent, the pre-approval has expired, or the organization has it off, the request goes to approval as usual. After the run, successful or not, a notice goes to the `channels`.
+
 ## Run an action on an incident
 
 ```http
@@ -160,7 +186,9 @@ The response is `{ "run": { ... }, "approval": { ... } }`: the run, and the appr
 approval's risk follows the action's `risk`, and its impact says which address will be called, or what will
 be done to which workload on which cluster. Approvers approve or reject it with
 `POST /api/v1/agent/approvals/{approvalId}/review` and the body `{ "approve": true, "comment": "…" }`,
-which requires `agent.approve`; the run starts as soon as enough approvals are in.
+which requires `agent.approve`; the run starts as soon as enough approvals are in. When the action's
+[pre-approval](#pre-approval) applies, the run has finished before the response, which also carries
+`"preapproved": true` and `execution`, and the run's `preapproved` is `true`.
 
 <ResponseExample>
 ```json 200

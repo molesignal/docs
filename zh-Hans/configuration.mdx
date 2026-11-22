@@ -46,6 +46,7 @@ molesignal --config /etc/molesignal/config.toml
 | `MS_CIPHER_KEY` | MoleSignal 加密保存在 PostgreSQL 中的密文所用的根密钥。取 32 个随机字节并以 base64 编码。缺少它时，进程回退到全零的开发密钥并记录警告。更换密钥前必须执行 `rewrap-kek`，参见[生产检查清单](/zh-Hans/deployment/production-checklist)。 |
 | `MS_AUTH_JWT_SECRET_OVERRIDE` | 固定 JWT 签名密钥，取代首次启动时在 PostgreSQL 中生成的密钥。 |
 | `MS_SELF_TELEMETRY_CLUSTER_TOKEN` | 为分角色节点之间转发的链路候选与自遥测做认证的共享密钥。启用[链路捕获](#链路捕获与尾部采样)（默认启用）或 `[telemetry.self_collect]` 时，每个分角色节点都要设置相同的值，没有 `intake` 角色的节点缺少它会拒绝启动。 |
+| `MS_TRACE_FINGERPRINT_KEY` | HMAC-SHA-256 指纹的密钥，指纹代替从不保存的原值：[MoleSignal 自身 Span](/zh-Hans/self-observability#后端分布式链路追踪) 中 SQL 语句的形状和对象键，以及 [APM 依赖](/zh-Hans/apm#依赖)中的数据库名。至少 16 个字节，更短的值会被忽略。每个节点都要设置相同的值，密钥不同，指纹也不同。没有密钥时不写指纹，也不会改用不带密钥的哈希。密钥只从环境变量读取，不会出现在 API 响应、日志或 Span 中。 |
 | `MS_AGENT_OPENAI_API_KEY`、`MS_AGENT_ANTHROPIC_API_KEY`、`MS_AGENT_COMPATIBLE_API_KEY` | Mole Agent 模型服务商的开发用回退 API Key，各自有对应的 `_BASE_URL` 变量。生产环境请在产品中配置服务商。 |
 | `RELEASE_CHANNEL` | 标记部署成熟度：`alpha`、`beta`、`rc` 或 `stable`。 |
 | `RUST_LOG` | 设置后覆盖 `[telemetry].log_level`。 |
@@ -172,7 +173,7 @@ root_password = "<初始密码>"
 |---|---|---|
 | `enabled` | `false` | 启动监听器。 |
 | `bind` | `127.0.0.1` | 监听地址。除非 `allow_remote` 为 `true`，否则必须是回环地址。 |
-| `port` | `5084` | 端口。同一台主机上 Probe Agent 注册端口使用相同值时，需要修改其中一个。 |
+| `port` | `5086` | 端口。必须与其它已启用监听器的端口不同，未在本节点运行的角色也算在内。 |
 | `allow_remote` | `false` | 允许非回环的 `bind`。对外暴露可能泄露运行时信息。 |
 
 ## 存储
@@ -293,7 +294,7 @@ S3 与 Azure 客户端从下列来源中第一个同时提供 access key 与 sec
 | 键 | 默认值 | 说明 |
 |---|---|---|
 | `interval_secs` | `300` | 两轮合并之间的间隔。 |
-| `target_size` | `512` | 一次合并的输入文件总大小上限，单位 MiB，取值 `1`–`65536`。合并出的文件大致等于或小于它。合并分段读取输入、分片上传输出，内存不随它增长。一次合并最多读 64 个文件，其余的在下一轮与合并结果再合并。 |
+| `target_size` | `512` | 一次合并的输入文件总大小上限，单位 MiB，取值 `1`–`65536`。合并出的文件大致等于或小于它。合并分段读取输入、分片上传输出，内存不随它增长。一次合并最多读 128 个文件，其余的在下一轮与合并结果再合并。某个文件比同一次合并的其余文件加起来还大时，这次不合它，等新文件加起来和它一样大时再一起合并，免得为一点新数据反复重写大文件。 |
 | `max_concurrent_groups` | `4` | 每个节点在一轮内同时处理的数据流数。 |
 
 没有单独设置保留期的数据流保留多久是平台设置：在 `_sys` 组织的 **设置 → 数据保留** 中修改，默认 30 天。降采样在每个指标数据流的 **保留策略** 页签中设置，见[数据流](/zh-Hans/streams)。
@@ -331,7 +332,7 @@ S3 与 Azure 客户端从下列来源中第一个同时提供 access key 与 sec
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
-| `[querier].concurrency` | `0` | 查询引擎的并行度。`0` 表示使用 CPU 数。 |
+| `[querier].concurrency` | `0` | SQL 查询的并行度。`0` 表示使用 CPU 数。一个查询同时读取的数据文件数也以它为上限。 |
 | `[querier].max_scan_rows` | `100000000` | 单个查询最多可读取的行数：查询需要读取的文件所含行数，加上内存缓冲中的行数。更大的查询在读取数据之前就会被拒绝并返回 `400`。PromQL 对每个选择器应用该限制，统计它读到的该选择器指标的行数，超出时停止。`0` 表示不限制。 |
 | `[querier].auto_async_threshold_rows` | `50000000` | 估算行数超过该值的查询会转为异步搜索任务。`0` 表示关闭自动转换。 |
 | `[querier].estimate_throughput_per_sec` | `1000` | 规模估算使用的保守每秒行数。 |
@@ -342,17 +343,20 @@ S3 与 Azure 客户端从下列来源中第一个同时提供 access key 与 sec
 
 ### 准入控制
 
-`[search.admission]` 按工作组限制并发查询数。所有值默认为 `0` 或空，表示不限制。示例文件中没有该配置段。
+`[search.admission]` 限制每个工作组在一个节点上同时执行的查询数。工作组已满时，新来的查询排队等候，按到达顺序开始执行；等候超过 `max_wait_secs` 的查询返回 `429`。命中结果缓存的查询不用排队。该限制作用于经查询 API 和 Flight SQL 发起的查询、explorer 的图表与字段统计、公开分享以及搜索任务；告警评估等后台工作不排队。示例文件中没有该配置段。
 
-| 键 | 说明 |
-|---|---|
-| `default_max_concurrent` | 未在 `groups` 中配置的工作组的节点并发上限。 |
-| `groups` | 工作组名称到节点并发上限的映射表。 |
-| `role_map` | 角色（`owner`、`admin`、`editor`、`viewer`）到工作组的映射表。未映射的角色使用 `default`。 |
-| `cluster_default_max_concurrent` | 未在 `cluster_groups` 中配置的工作组的集群级软上限。 |
-| `cluster_groups` | 工作组名称到集群级软上限的映射表。 |
-| `cluster_sync_interval_secs` | 发布节点负载的间隔。`0` 表示使用 5。 |
-| `cluster_stale_secs` | 超过该时长没有更新的节点会退出集群视图。`0` 表示使用 30。 |
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `default_max_concurrent` | CPU 数的 2 倍 | 未在 `groups` 中配置的工作组的节点并发上限。`0` 表示不限制。 |
+| `groups` | 空 | 工作组名称到节点并发上限的映射表。 |
+| `role_map` | 空 | 角色（`owner`、`admin`、`editor`、`viewer`）到工作组的映射表。未映射的角色使用 `default`。 |
+| `max_wait_secs` | `60` | 查询等候空闲槽位的最长时间，超时返回 `429`。`0` 表示工作组一满就返回 `429`。 |
+| `cluster_default_max_concurrent` | `0` | 未在 `cluster_groups` 中配置的工作组的集群级软上限。已满时查询立即返回 `429`。`0` 表示不限制。 |
+| `cluster_groups` | 空 | 工作组名称到集群级软上限的映射表。 |
+| `cluster_sync_interval_secs` | `0` | 发布节点负载的间隔。`0` 表示使用 5。 |
+| `cluster_stale_secs` | `0` | 超过该时长没有更新的节点会退出集群视图。`0` 表示使用 30。 |
+
+`/metrics` 按工作组提供排队情况：`query_admission_running`、`query_admission_waiting`、`query_admission_wait_seconds` 和 `query_admission_refusals_total`。
 
 ### 缓存
 
@@ -439,7 +443,7 @@ S3 与 Azure 客户端从下列来源中第一个同时提供 access key 与 sec
 
 数据库中没有任何用户且两个值都已设置时，MoleSignal 会在首次启动时创建 root 账号。之后再修改 `root_password` 不会改变已有账号的密码，请在网页界面中修改。每次启动时，邮箱为 `root_email` 的账号会成为平台管理员，因此 `root_email` 必须属于一个已存在的用户。
 
-JWT 签名密钥在首次启动时生成并保存在 PostgreSQL 中。旧版本的 `[auth].jwt_secret` 会被忽略。用 `MS_AUTH_JWT_SECRET_OVERRIDE` 固定密钥，用 `POST /api/v1/auth/jwt/rotate` 轮换密钥。
+JWT 签名密钥在首次启动时生成并保存在 PostgreSQL 中。用 `MS_AUTH_JWT_SECRET_OVERRIDE` 固定密钥，用 `POST /api/v1/auth/jwt/rotate` 轮换密钥。
 
 ## 自身可观测性
 

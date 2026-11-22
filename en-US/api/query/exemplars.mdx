@@ -1,0 +1,79 @@
+---
+title: "Query exemplars"
+description: "Read the exemplars kept with Prometheus remote write samples, in the response shape of the Prometheus HTTP API."
+"zh-Hans_link": "/zh-Hans/api/query/exemplars"
+---
+
+```http
+GET  /api/v1/prometheus/api/v1/query_exemplars
+POST /api/v1/prometheus/api/v1/query_exemplars
+```
+
+Returns the exemplars of the series that a PromQL expression selects, in the response shape of the `query_exemplars` endpoint of the Prometheus HTTP API. The **Metrics** page draws its exemplars from it. The call requires `metrics.read`, or `sys.telemetry.read` in the system scope.
+
+Exemplars come from [Prometheus remote write](/en-US/intake#prometheus-remote_write), which keeps them beside the samples. OTLP metrics are stored without their exemplars.
+
+`GET` takes the parameters in the query string, and `POST` takes them as a form (`application/x-www-form-urlencoded`):
+
+| Param | Required | Notes |
+|---|---|---|
+| `query` | Yes | A PromQL expression. Each selector in it must name its metric. |
+| `start` | Yes | Seconds since the Unix epoch, fractions allowed, or an RFC 3339 time. |
+| `end` | Yes | The same forms. Not before `start`. |
+
+Only the selectors of the expression count: each picks the series of its metric that match its label matchers, and functions, operators, and range durations do not change the answer. An exemplar sent twice, for example by a retried remote write, is returned once. The answer stops at 10,000 exemplars and then carries a warning. A request waits for a slot of [admission control](/en-US/configuration#admission-control) like a query, and its answer is never cached.
+
+[Field masking](/en-US/settings/data-security#field-masking) applies to the series labels and the exemplar labels. A masking rule on `value` or `_timestamp` makes the request fail, since the Prometheus shape cannot carry a masked value.
+
+<RequestExample>
+```bash cURL
+curl -G http://localhost:5080/api/v1/prometheus/api/v1/query_exemplars \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'query=histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{service="checkout"}[5m]))' \
+  --data-urlencode "start=$(( $(date +%s) - 3600 ))" \
+  --data-urlencode "end=$(date +%s)"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "status": "success",
+  "data": [
+    {
+      "seriesLabels": {
+        "__name__": "http_request_duration_seconds_bucket",
+        "le": "0.5",
+        "service": "checkout"
+      },
+      "exemplars": [
+        {
+          "labels": { "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7" },
+          "value": 0.43,
+          "timestamp": 1790000000.123
+        }
+      ]
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Field | Notes |
+|---|---|
+| `data[].seriesLabels` | The labels of the series, with its metric name as `__name__`. |
+| `data[].exemplars[]` | The exemplars of the series in the range, oldest first. |
+| `labels` | The labels of the exemplar, such as `trace_id` and `span_id`. |
+| `value` | The value that the exemplar observed. |
+| `timestamp` | Seconds since the Unix epoch, with fractions. |
+| `warnings` | Present only when the answer stopped at 10,000 exemplars. |
+
+**Errors**
+
+| Status | Cause |
+|---|---|
+| `400` | `query` is empty or not valid PromQL, a selector names no metric, a time is in neither form, or `end` is before `start`. |
+| `403` | The token lacks `metrics.read`, or a masking rule covers `value` or `_timestamp`. |
+| `429` | [Admission control](/en-US/configuration#admission-control) turned the request away. |
+
+These errors use the [error body](/en-US/api-reference#responses-and-errors) of the other endpoints, not the one of Prometheus.

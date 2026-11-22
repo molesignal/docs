@@ -40,7 +40,11 @@ profile_duration_secs = 10
 
 MoleSignal 会为 HTTP、gRPC、Flight SQL、数据库、对象存储、采集、查询、后台 Worker 与 Agent 阶段创建链路。
 
+这些 Span 遵循 OpenTelemetry 语义约定 1.43.0：标准属性沿用标准名称，MoleSignal 自己添加的属性以 `molesignal.` 开头。每个 Span 都在 `semantic_conventions_version` 中记录这个版本。
+
 入站 W3C 上下文会被验证，无效上下文会被替换。外部 Baggage 不能授权组织。Span 不会记录敏感请求体、SQL 值、凭据、提示词、模型输出和工具参数。
+
+SQL 的 Span 可以带有 `molesignal.db.query.fingerprint`，即值替换为 `?` 之后的语句的带密钥指纹；对象存储的 Span 可以带有 `molesignal.object.key_fingerprint`，即对象键的带密钥指纹。这样不保存语句和对象键，也能把同一语句或同一对象的 Span 归在一起。只有 [`MS_TRACE_FINGERPRINT_KEY`](/zh-Hans/configuration#环境变量) 至少有 16 个字节时才会写入这些指纹。
 
 尾采样器按以下顺序保留链路：
 
@@ -61,18 +65,20 @@ MoleSignal 会为 HTTP、gRPC、Flight SQL、数据库、对象存储、采集�
 [profiling]
 enabled = true
 bind = "127.0.0.1"
-port = 5084
+port = 5086
 allow_remote = false
 ```
+
+同样的键也可以用 `MS_PROFILING_ENABLED`、`MS_PROFILING_BIND`、`MS_PROFILING_PORT` 和 `MS_PROFILING_ALLOW_REMOTE` 设置。`bind` 只接受 IP 地址，不接受 `localhost` 这样的主机名。端口必须与其它已启用监听器的端口不同，本节点不运行的角色的监听器也算在内，否则进程在启动时退出。参见 [pprof](/zh-Hans/configuration#pprof)。
 
 采集性能剖析：
 
 ```bash
 curl --fail --output cpu.pb.gz \
-  'http://127.0.0.1:5084/debug/pprof/profile?seconds=30'
+  'http://127.0.0.1:5086/debug/pprof/profile?seconds=30'
 
 curl --fail --output heap.pb.gz \
-  'http://127.0.0.1:5084/debug/pprof/heap'
+  'http://127.0.0.1:5086/debug/pprof/heap'
 ```
 
 请将监听器保留在回环地址，并通过 SSH 隧道访问。远程暴露要求 `allow_remote = true`、网络控制、监听器前置 TLS，以及管理 Bearer 凭据。
@@ -85,6 +91,53 @@ curl --fail --output heap.pb.gz \
 - `X-Request-Id` 和 `X-Trace-Id` 用于将请求关联到已保留链路。
 
 首次上线分布式链路追踪时，先设置 `telemetry.trace.force_disabled = true`，验证系统资源与隐私，然后启用灰度节点，最后逐步扩大持久化运行策略。
+
+## 组件指标
+
+每个节点都在 `/metrics` 上暴露下列指标。标签只取固定列表中的值，不会出现组织、链路、路由或对象键。在 `_sys` 组织中，内置仪表盘 **MoleSignal Self Telemetry & Runtime** 和 **MoleSignal Tracing & APM** 绘制了这些指标。
+
+### 自身遥测与元数据库
+
+| 指标 | 标签 | 含义 |
+|---|---|---|
+| `self_telemetry_accepted_total` | `signal` | 为 `_molesignal` 数据流接收的记录数。 |
+| `self_telemetry_dropped_total` | `signal`、`reason` | 写入 `_molesignal` 数据流途中丢弃的记录数。`reason` 为 `queue_full`、`queue_closed`、`trace_candidate_queue`、`delivery_failed`、`flush_timeout` 或 `persistence_failed`；定时性能剖析没有采集到时为 `capture_busy`、`unavailable`、`invalid_duration` 或 `capture_failed`。 |
+| `self_telemetry_batches_total` | `signal`、`outcome` | 发送的批次数，`outcome` 为 `success` 或 `error`。 |
+| `self_telemetry_retries_total` | `signal`、`reason` | 没有 `intake` 角色的节点把批次转发给 intake 节点时的重试次数，`reason` 为 `no_intake`、`connect` 或 `push`。 |
+| `self_telemetry_queue_depth`、`self_telemetry_queue_capacity` | `signal` | 链路队列中等待的 Span 数，以及队列容量 `queue_capacity`。只有 `traces` 有队列。 |
+| `self_telemetry_last_success_unixtime` | `signal` | 最近一次批次成功的时间，为自 Unix 纪元起的秒数。 |
+| `self_telemetry_profile_available` | `kind` | 当前构建能在本平台采集 `cpu` 或 `heap` 剖析时为 `1`，否则为 `0`。 |
+| `db_pool_connections` | `pool`、`state` | 元数据库连接池（`pool="meta"`）的连接数：`total`、`idle`、`checked_out`，以及配置的 `min` 和 `max`。 |
+| `db_pool_acquire_duration_seconds` | `pool` | 从连接池取得连接的等待时间，不含随后执行语句的时间。 |
+
+`signal` 为 `metrics`、`traces` 或 `profiles`。丢弃不会阻塞进程，只会让 `_molesignal` 数据流缺少数据。
+
+### APM 投影
+
+投影运行在持有链路候选的节点上，汇总运行在 `alert` 角色上，参见 [APM](/zh-Hans/configuration#apm)。
+
+| 指标 | 标签 | 含义 |
+|---|---|---|
+| `molesignal_apm_facts_total` | `result` | 进入投影的 Span 按结果计数：`accepted`、`duplicate_skip`、`late_kept`、`late_dropped`、`queue_full`、`stopped`、`cardinality_rejected`、`extract_failed` 或 `flush_failed`。`flush_failed` 按写入失败的次数计，不按 Span 计。 |
+| `molesignal_apm_cardinality_total` | `reason` | 超过[基数上限](/zh-Hans/apm/settings#基数上限)的 Span 数，按上限区分，例如 `service_rejected` 或 `transaction_overflow`。被拒绝的服务的 Span 完全不计入；超过其他上限时，名称计入**其他**，或不再保留明细。 |
+| `molesignal_apm_queue` | `resource` | 投影队列中等待的 Span 数（`depth`）和队列容量（`capacity`，即 `[apm].queue_capacity`）。 |
+| `molesignal_apm_flushes_total` | `result` | 把聚合写入 PostgreSQL 的次数，`success` 或 `failure`。 |
+| `molesignal_apm_flush_duration_seconds` | | 一次写入的耗时。 |
+| `molesignal_apm_rollups_total` | `result` | 把分钟聚合汇总为小时聚合的运行次数，`success` 或 `failure`。 |
+| `molesignal_apm_rollup_rows_total` | `kind` | 汇总读取（`source`）、写入（`rollup`）以及因超过保留期而删除（`deleted`）的行数。 |
+| `molesignal_apm_lag_seconds` | `stage` | `projection` 为投影最近处理的 Span 距今的时间；`rollup` 为仍接受迟到数据的时间 `[apm].late_grace_secs`。 |
+| `molesignal_apm_health` | `component` | `projector`、`repository` 或 `rollup` 正常时为 `1`，降级时为 `0`。 |
+| `molesignal_apm_api_duration_seconds` | `endpoint` | 响应 APM API 请求的耗时，按端点区分，例如 `overview` 或 `services`。 |
+
+出现以下情况时告警：
+
+- `molesignal_apm_queue{resource="depth"}` 持续高于 `capacity` 的 80%；
+- `molesignal_apm_facts_total` 中 `result` 为 `queue_full`、`cardinality_rejected` 或 `flush_failed` 的计数在增长，这些都会留下数据缺口，[数据质量提示](/zh-Hans/apm#阅读数据质量提示)会显示为部分数据；
+- `molesignal_apm_lag_seconds{stage="projection"}` 持续高于 120，即两个分钟桶；
+- `molesignal_apm_health` 为 `0`；
+- `molesignal_apm_api_duration_seconds{endpoint="overview"}` 的 P95 持续高于 0.5 秒。
+
+APM 降级不会让 `/api/v1/healthz` 或 `/api/v1/readyz` 失败。`GET /api/v1/apm/health` 显示单个组织的投影状态，参见 [APM API](/zh-Hans/api/apm)。
 
 <Card title="配置" icon="sliders" href="/zh-Hans/configuration">
   查看全部遥测、链路追踪、导出器与性能剖析设置。

@@ -19,7 +19,8 @@ Check the process log first. It prints the cause of a start-up failure, and the 
 | `MS_SELF_TELEMETRY_CLUSTER_TOKEN must be set when split-role self intake is enabled` | A role-split node without the `intake` role starts without the shared token while trace capture or self-collection is on. | Set the same token on every node. Disabling `[telemetry.self_collect]` alone is not enough, because trace capture is on by default. |
 | `open Probe CA key` | `MS_CIPHER_KEY` differs from the key that encrypted the database. | Restore the original key. See [Production checklist](/en-US/deployment/production-checklist). |
 | `migration ... was previously applied but is missing in the resolved migrations` or `... has been modified` | The binary and the database come from incompatible versions. | Run the matching version, or restore a backup. See [Upgrade](/en-US/upgrade). |
-| `address already in use` | Another process uses a configured port. | Change the port. `[profiling].port` and `[probe].register_port` both default to `5084`. |
+| `address already in use` | Another process uses a configured port. | Change the port. |
+| `profiling.port and ... are both ...` | The pprof listener shares a port with another listener. | Set `[profiling].port` to a port that no other listener uses. |
 | A setting from an environment variable has no effect | The variable name contains a dot, a double underscore, or a typo. | Join the path with single underscores, as in `MS_META_DATABASE_DSN`. |
 
 ## Sign-in
@@ -37,7 +38,7 @@ Check the process log first. It prints the cause of a start-up failure, and the 
 |---|---|---|
 | `401` | The token is missing or invalid, or the header carries a sign-in session token. | Send `Authorization: Bearer <token>` with a default intake token or a service account token. |
 | `403` | The token lacks the write permission of the signal, such as `logs.write`, for example a RUM client token sent to an intake path. | Use a token with the write permission of the signal. |
-| `413` | The request body exceeds 2 MiB. | Send smaller batches. Raise the limit of the proxy to at least 2 MiB. |
+| `413` | The request body exceeds the limit of the endpoint: 16 MiB for native JSON intake, 2 MiB for the others. | Send smaller batches. Raise the limit of the proxy to at least the limit of the endpoint. |
 | `400` from an OTLP over HTTP endpoint | The sender compressed the body. | Set `compression: none` on the OpenTelemetry Collector exporter. |
 | `404` from an OTLP over HTTP endpoint | The exporter endpoint omits the `/api` base path, so requests go to `/v1/logs`. | Use `http://host:5080/api` as the OTLP endpoint. |
 | `429` with `Retry-After` | The `router` role rate limit for the organization applies. | Slow down, or raise `[router.rate_limit]`. |
@@ -66,11 +67,12 @@ Check the process log first. It prints the cause of a start-up failure, and the 
 |---|---|---|
 | `GET /api/v1/healthz` returns `503` | The WAL is replaying, or the object store is unreachable. The body carries a `reason`. | Wait for the replay, or fix the object store connection. |
 | The WAL directory grows | Flushes fail, usually because the object store is unreachable. | Fix the object store. Intake flushes the backlog afterwards. |
-| Intake answers `429` with `intake buffer memory limit exceeded` | The buffers of the process hold more than `[intake].max_buffer_memory_size`, usually because flushes keep failing. | Find the cause in the `intake flush failed` log lines, and fix the object store or the database. Rows that can never be published stop counting against the limit (see the next two rows). |
+| Intake answers `429` with `intake buffer memory limit exceeded` | The buffers of the process hold more than `[intake].max_buffer_memory_size`, usually because flushes keep failing. | Find the cause in the `intake flush failed` log lines, and fix the object store or the database. Rows that can never be published stop counting against the limit (see the next two rows). Native JSON intake sends `Retry-After` with this answer; retry after that delay. |
 | The log shows `dataset no longer exists; buffered rows discarded` | A stream was deleted, or deleted and created again, while rows of it were still buffered. Those rows have nowhere to go, so intake drops them and returns their memory. The counter `intake_flush_errors_total` records each discard under the step `stream_gone` or `dataset_gone`. | Nothing to fix. Send the data again if it matters. |
 | Writes answer `503` with `fenced by a newer writer epoch` | Another process publishes the same dataset under the same `[node].id`. The fenced process cannot publish its data, drops the rows it holds in memory, and refuses writes to that dataset. Its WAL stays on disk. The counter `intake_flush_errors_total` records the fencing under the step `writer_fenced`. | Give every process a unique `[node].id` and restart the fenced one. See [Role-based deployment](/en-US/deployment/role-based). |
 | Scheduled PDF or PNG reports fail | Chrome is missing, or `[scheduled_reports.renderer].base_url` does not reach the web UI. | Use the release image, which includes Chromium, and set `base_url` to the web UI address that the node can reach. |
 | Onboarding snippets show the wrong host | `http.external_url` is empty behind a proxy. | Set `[http].external_url` to the public address and restart. |
 | Queries answer `503` with `no querier node is available` | No node with the `querier` role has a recent heartbeat. | Start a `querier` node and check that its `advertise_addr` is reachable from the router. See [Role-based deployment](/en-US/deployment/role-based#cluster-membership). |
 | Writes through the router answer `503` with `no intake node is available` | No node with the `intake` role has a recent heartbeat. | Start an `intake` node and check its `advertise_addr` and WAL replay. See [Role-based deployment](/en-US/deployment/role-based#cluster-membership). |
+| Requests answer `503` with `no metadata database connection` | The node waited 10 seconds for a PostgreSQL connection and got none: PostgreSQL is overloaded or unreachable, or all `[meta_database].max_connections` connections are in use. | Retry the request. If it keeps happening, check the load and reachability of PostgreSQL first. If PostgreSQL is idle, raise `[meta_database].max_connections` to suit the load, within the `max_connections` of PostgreSQL. |
 | The OTLP gRPC port is unreachable from the host | The Compose file does not publish port `4317`. | Add a `4317:4317` mapping. |
