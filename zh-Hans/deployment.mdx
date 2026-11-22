@@ -13,7 +13,7 @@ MoleSignal 以一个二进制文件和一个容器镜像交付。配置决定进
 | PostgreSQL | 存放元数据、身份、文件目录与产品资源。PostgreSQL 是唯一受支持的元数据库。Compose 沙箱与 Kubernetes 清单使用 PostgreSQL 17。 |
 | 对象存储 | 存放 Parquet 文件、检索索引与 Profile 数据块。使用 `s3`（AWS S3，或 RustFS、Cloudflare R2、阿里云 OSS 等兼容 S3 的服务）、`azure` 或 `gcs`。`local` 后端仅用于单节点与开发。 |
 | 计算资源 | 容器镜像支持 x86-64 与 arm64 的 Linux（`linux/amd64`、`linux/arm64`）。沙箱需要约 2 GB 内存。 |
-| Intake 磁盘 | 运行 `intake` 角色的每个节点都需要一块持久化的本地卷，用于预写日志（WAL）。 |
+| 本地磁盘 | 只存放可以重建的缓存。写入的预写日志（WAL）对象写进对象存储后才确认，所以节点都不需要持久化卷，参见[持久性与接管](/zh-Hans/architecture#持久性与接管)。 |
 
 内存与磁盘用量取决于接入量、活跃数据流数量以及[配置](/zh-Hans/configuration)中的缓存设置。请根据实际用量规划容量：[接入用量](/zh-Hans/streams#接入用量与预算)显示各来源的接入量，进程也在 `/metrics` 暴露 Prometheus 指标。参见[生产检查清单](/zh-Hans/deployment/production-checklist)。
 
@@ -134,12 +134,12 @@ docker pull ghcr.io/molesignal/molesignal:26.1.0.0
 
     清单不包含 PostgreSQL 与对象存储：请在服务名 `postgresql` 下提供 PostgreSQL 17（或修改 ConfigMap 中的 `meta_database.dsn`），并提供任意兼容 S3 的对象存储（修改 ConfigMap 中的 `object_store`）。
 
-    这些清单部署的是分角色拓扑：`router` 工作负载提供网页界面与 HTTP API，其余工作负载运行数据角色与后台角色。要改为运行一个承担全部角色的进程，请以 `40-intake.yaml`（带 WAL 持久卷的 StatefulSet）为起点，把 `MS_NODE_ROLES` 设为 `["standalone"]`，加上 Service 的 `5080` 端口，并用 `/api/v1/healthz` 做探针。
+    这些清单部署的是分角色拓扑：`router` 工作负载提供网页界面与 HTTP API，其余工作负载运行数据角色与后台角色。要改为运行一个承担全部角色的进程，请以 `40-intake.yaml`（不带持久卷的 Deployment）为起点，把 `MS_NODE_ROLES` 设为 `["standalone"]`，加上 Service 的 `5080` 端口，并用 `/api/v1/healthz` 做探针。
 
     | 工作负载 | 类型 | 副本数 | 角色 |
     |---|---|---|---|
     | `router` | Deployment | 2 | `router`：网页界面、HTTP API 与 OTLP gRPC |
-    | `intake` | StatefulSet | 2 | `intake`，每个副本一块 20 Gi 持久卷用于 WAL |
+    | `intake` | Deployment | 2 | `intake`，不需要持久卷；滚动更新先启动新 Pod，再停止旧 Pod |
     | `querier` | Deployment | 2 | `querier` |
     | `compactor` | Deployment | 1 | `compactor`，可增加副本 |
     | `alert` | Deployment | 1 | `alert`，可以增加副本 |
@@ -168,7 +168,7 @@ docker pull ghcr.io/molesignal/molesignal:26.1.0.0
 
     网页界面内嵌在二进制中，通过 Ingress 或负载均衡器暴露 `router` 工作负载的 `5080` 端口即可。
 
-    `router` 工作负载在 `5080` 提供完整 API，它的就绪探针请求 `GET /api/v1/healthz`。其余工作负载都在 `5080` 提供健康、就绪与指标监听，并以 `GET /api/v1/readyz` 作为就绪探针。对 `intake` 来说，这个监听在 WAL replay 完成后才启动，所以就绪的 Pod 可以接收写入。
+    `router` 工作负载在 `5080` 提供完整 API，它的就绪探针请求 `GET /api/v1/healthz`。其余工作负载都在 `5080` 提供健康、就绪与指标监听，并以 `GET /api/v1/readyz` 作为就绪探针。就绪的 `intake` Pod 立即可以接收写入：启动时不重放任何数据，丢失的 Pod 的 WAL 由其余 intake Pod 接管。它的终止宽限期为 45 秒，停止前可以刷写并释放 WAL。
   </Tab>
 </Tabs>
 
@@ -199,7 +199,7 @@ Chart 的安装步骤参见[在 Kubernetes 上运行 Agent](/zh-Hans/synthetics#
 
 ## 健康检查与指标
 
-- `GET /api/v1/healthz` 为公开端点。服务正常时返回 `200` 与 `{"status":"ok"}`；WAL 重放期间或对象存储不可达时返回 `503` 并附带 `reason`。容器与负载均衡器探针使用它。
+- `GET /api/v1/healthz` 为公开端点。服务正常时返回 `200` 与 `{"status":"ok"}`；对象存储不可达时返回 `503` 并附带 `reason`。容器与负载均衡器探针使用它。
 - `GET /metrics` 为公开端点，返回 Prometheus 指标。请在代理或网络层限制访问。
 - 在 `standalone` 或 `router` 节点上，`GET /api/v1/readyz` 与 `GET /api/v1/version` 需要 Bearer Token。`version` 返回版本、commit、构建 id、发布通道与版本类型。
 - 分角色集群中不提供完整 API 的节点，在同一端口上不经认证地响应 `GET /api/v1/healthz`、`GET /api/v1/readyz` 与 `GET /metrics`。

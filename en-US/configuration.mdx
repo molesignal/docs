@@ -90,7 +90,7 @@ Also set `MS_CIPHER_KEY` in the environment. See the [Production checklist](/en-
 |---|---|---|
 | `roles` | `["standalone"]` | Roles to run: `standalone`, `router`, `intake`, `querier`, `compactor`, `alert`. `standalone` runs all of them in one process. |
 | `id` | empty | Node id, at most 64 characters. An empty value uses the OS hostname. Set a distinct id for every process when several run on one host. |
-| `drain_timeout_secs` | `30` | Time to wait for pending intake data to flush after `SIGTERM` or `SIGINT`. The process exits when the time elapses. |
+| `drain_timeout_secs` | `30` | Time to wait for pending intake data to flush after `SIGTERM` or `SIGINT`. The process exits when the time elapses, and another intake node takes over what was not flushed. |
 
 ## Listeners
 
@@ -234,18 +234,17 @@ Transient errors of the cloud backends are retried with exponential backoff:
 
 ### Write-ahead log
 
-`[wal]` configures the write-ahead log of nodes that run the `intake` role. Put the directory on a persistent local volume. See [Backup and restore](/en-US/backup-restore).
+`[wal]` configures the write-ahead log (WAL), which every node keeps in the object store. A write is acknowledged only after its WAL object is stored, so a node needs no persistent volume. See [Architecture](/en-US/architecture#durability-and-takeover).
 
 | Key | Default | Description |
 |---|---|---|
-| `dir` | `./data/wal` | WAL directory. |
-| `segment_size` | `256` | Segment size in MiB. A full segment starts a new one. |
-| `flush_strategy` | `batch` | When to `fsync`. `none` never syncs and relies on the page cache. `every_write` syncs each record, which gives the strongest durability and the highest latency. `batch` syncs after `batch_max_pending` records or `batch_max_delay_ms`. |
-| `sync_level` | `data` | Depth of each sync. `none` skips it. `data` syncs file data. `all` also syncs metadata and the parent directory. |
-| `batch_max_pending` | `64` | Records that trigger a sync in `batch` mode. |
-| `batch_max_delay_ms` | `50` | Longest time between syncs in `batch` mode. |
-| `encrypt` | `false` | Encrypts each record payload with the root key (`MS_CIPHER_KEY`) before writing it to disk. Absent from the sample file. |
-| `max_replay_size` | `512` | Memory limit for startup replay in MiB. Replay flushes once the limit is exceeded. |
+| `lease_secs` | `15` | The writer lease in seconds, at least `3`. Another intake node takes over a node that stops renewing it this long after the last renewal, plus up to one `takeover_interval_secs`. Read at start only. |
+| `max_group_size` | `8` | Largest WAL object in MiB. Writes that arrive while the previous object of the same dataset is being written are grouped into the next one, up to this size. |
+| `put_timeout_secs` | `10` | Time one object write may take. |
+| `put_attempts` | `3` | Attempts per object write. When all fail, the writes in the object are refused with `503` and can be retried. |
+| `takeover_interval_secs` | `5` | How often an intake node looks for lapsed writers to take over. |
+| `encrypt` | `false` | Encrypts each WAL object with the root key (`MS_CIPHER_KEY`). |
+| `max_takeover_size` | `512` | Memory a takeover holds in MiB before it publishes a segment. `0` counts as `1`. |
 
 ### Intake
 

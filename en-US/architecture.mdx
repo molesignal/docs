@@ -12,7 +12,7 @@ MoleSignal is one Rust binary that embeds the web application. The `[node].roles
 |---|---|
 | HTTP API and web UI | Port `5080`. Serves the product API, the embedded web application, `/metrics`, and the health endpoint. |
 | Intake | Receives telemetry over HTTP and OTLP gRPC (`4317`), validates it, applies masking and pipelines, and writes it to the WAL and an in-memory buffer. |
-| Write-ahead log (WAL) | Local, durable log of records that are not yet flushed. Replayed on start. |
+| Write-ahead log (WAL) | Objects in object storage that hold the records not yet flushed. A write is acknowledged only after its WAL object is stored. |
 | Object storage | Parquet data files, search index sidecars, sealed partition manifests, profile blobs, exports, and large Agent evidence. |
 | PostgreSQL | Metadata: identities, organizations, streams and schemas, the file catalog, product resources, and job state. |
 | Query engine | Apache DataFusion over Arrow. Runs SQL and PromQL-compatible queries, prunes files with catalog metadata and search indexes, and merges local and federated scans. |
@@ -22,7 +22,7 @@ MoleSignal is one Rust binary that embeds the web application. The `[node].roles
 | Probe runner | Executes synthetic monitors. A standalone node runs a built-in one, and external Probe Agents connect on ports `5084` and `5085`. |
 | Mole Agent | Investigates issues through the shared tool catalog, with the permissions of the signed-in user. |
 
-There is no Kafka, Redis, or consensus service. Caches live in process memory and on local disk.
+There is no Kafka, Redis, or consensus service. Caches live in process memory and on local disk, and no node keeps acknowledged data on its local disk.
 
 ## Runtime roles
 
@@ -32,7 +32,7 @@ The `[node].roles` setting composes one or more roles into the process:
 |---|---|
 | `standalone` | All APIs, the web UI, and all workers in one process. |
 | `router` | The full HTTP API and web UI, rate limiting, and forwarding of writes to intake nodes and of queries to querier nodes. |
-| `intake` | Validation, pipelines, masking, WAL, buffers, and flush to Parquet. |
+| `intake` | Validation, pipelines, masking, WAL, buffers, flush to Parquet, and takeover of the WAL of lost intake nodes. |
 | `querier` | Query execution for requests that other nodes forward, and asynchronous search jobs. |
 | `compactor` | File compaction, retention, and storage maintenance. |
 | `alert` | Rule evaluation, schedules, escalation, delivery dispatch, and connectors. |
@@ -46,15 +46,30 @@ The same binary and configuration model serve every role, and changing roles req
   <img src="/images/architecture/data-path_en_dark.svg" alt="Write path: sender, protocol receiver, authentication and IAM, schema, masking and pipeline, WAL and Arrow buffer, Parquet and search index, then object storage and a catalog row in PostgreSQL. Read path: query, planner and organization rewrite, catalog and index pruning, DataFusion or PromQL, local or federated scan, then rows, NDJSON, or an async search job" className="hidden dark:block" />
 </Frame>
 
-A flush uploads the files first and records them in the catalog afterwards, then truncates the flushed WAL segments. A query reads the catalog to find the files that overlap its time range and stream, so only those files are fetched from object storage.
+A flush uploads the files first and records them in the catalog afterwards, then deletes the WAL objects it covers. A query reads the catalog to find the files that overlap its time range and stream, so only those files are fetched from object storage.
+
+## Durability and takeover
+
+A write is acknowledged only after the WAL object that holds it is in object storage. Writes that arrive while an object of the same dataset is being written go into the next object together, up to `[wal].max_group_size`.
+
+Each process registers a WAL writer in PostgreSQL. The writer has an epoch that is unique across the cluster and a lease of `[wal].lease_secs`, which the process renews. A process stops acknowledging writes before its lease can lapse.
+
+| Event | What happens |
+|---|---|
+| A node crashes or loses its disk | Once its lease lapses, another intake node fences the writer, publishes every WAL record past the last committed flush, and deletes the objects. |
+| A node pauses and comes back | The catalog refuses the flushes of the fenced writer, and its buffered rows are dropped. The node takes a new epoch and keeps accepting writes; the node that took over publishes the earlier records. |
+| A node drains on `SIGTERM` | It stops acknowledging, flushes its buffers, deletes the WAL objects of the flushed data, and releases its writer, so another node takes over whatever is left at once. |
+| A takeover fails half-way | The next round resumes from the last committed flush. A flush carries a deterministic id, so a record is never published twice. |
+
+Intake nodes share the takeover work by hashing datasets across the live intake nodes and check for lapsed writers every `[wal].takeover_interval_secs`. Records acknowledged by a lost node can be queried again once the takeover has published them.
 
 ## What lives where
 
 | Location | Content |
 |---|---|
 | PostgreSQL | Metadata and the file catalog. |
-| Object storage | `artifacts/v1/...` data and index files, `manifests/v1/...` sealed partition manifests, `search_jobs/v1/...` results of search jobs, and other blobs such as profiles and session replays. Objects are grouped by organization, signal type, dataset, and time partition. |
-| Local disk of an intake node | The WAL and, optionally, caches under `./data/cache`. |
+| Object storage | `artifacts/v1/...` data and index files, `manifests/v1/...` sealed partition manifests, `wal/v1/...` WAL objects of records not yet flushed, `search_jobs/v1/...` results of search jobs, and other blobs such as profiles and session replays. Objects are grouped by organization, signal type, dataset, and time partition. |
+| Local disk of a node | Optional caches under `./data/cache`, which can be rebuilt. |
 
 Streams and organizations are logical: a stream is a dataset in object storage and a row of metadata in PostgreSQL, and an organization is a prefix and a scope that the query planner enforces.
 

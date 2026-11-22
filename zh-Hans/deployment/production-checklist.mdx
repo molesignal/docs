@@ -17,7 +17,6 @@ Compose 沙箱与示例文件 `conf/config.toml` 以快速上手为先。部署�
 | 对象存储后端 | 容器卷中的 RustFS | 具备持久性的 `s3`、`azure` 或 `gcs`。 |
 | `[http].external_url` | 空 | 对外的 HTTPS 地址。 |
 | TLS | 关闭 | 终止 TLS 的代理，或 `[http.tls]`。 |
-| `[wal].dir` | `./data/wal` | 持久化卷。 |
 | 镜像标签 | `latest` | 固定的版本标签，例如 `26.1.0.0`。 |
 
 ## 检查清单
@@ -81,8 +80,8 @@ Compose 沙箱与示例文件 `conf/config.toml` 以快速上手为先。部署�
 
     把 `/metrics` 限制为内部访问。只有发送端需要时，才公开接入路径 `/api/v1/_bulk`、`/api/v1/_kinesis_firehose`、`/api/v1/_cloudflare` 与 `/api/v1/_heroku`。
   </Step>
-  <Step title="保护预写日志">
-    在每个运行 `intake` 角色的节点上，把持久化的本地卷挂载到 `[wal].dir`。默认的 `flush_strategy = "batch"` 与 `sync_level = "data"` 每 64 条记录或 50 毫秒同步一次。不允许丢失任何记录时，使用 `every_write` 加 `sync_level = "all"`，代价是更高的延迟。
+  <Step title="为节点丢失做准备">
+    预写日志（WAL）保存在对象存储中，WAL 对象写入后才确认写入，所以节点不需要持久化卷。节点消失后，其他 intake 节点在 `[wal].lease_secs`（默认 15 秒）加上最多一个 `[wal].takeover_interval_secs` 之后接管它的 WAL。在此之前，该节点已确认但尚未刷写的记录查询不到。单节点重启后会接管自己之前的 WAL。每次写入都要等待一次对象写入，所以对象存储的延迟会计入每次写入的延迟。参见[持久性与接管](/zh-Hans/architecture#持久性与接管)。
 
     让进程在退出时有时间排空数据：把编排系统的终止宽限时间设为大于 `[node].drain_timeout_secs`（默认 30 秒）。
   </Step>
@@ -93,7 +92,7 @@ Compose 沙箱与示例文件 `conf/config.toml` 以快速上手为先。部署�
     `alert` 与 `compactor` 角色都可以运行多个实例，节点之间分工。`alert` 节点按规则、报告、流水线与连接器分工，由一个主节点运行只能运行一份的任务；`compactor` 节点按数据流与组织分工。为每个节点设置唯一的 `[node].id`，并保持时钟同步。`standalone` 节点已经包含这两个角色。除非必须拆分角色，否则使用 `standalone`，拆分之前请阅读[分角色部署](/zh-Hans/deployment/role-based)。
   </Step>
   <Step title="监控部署">
-    用 Prometheus 抓取 `/metrics`。探测 `GET /api/v1/healthz`：该端点公开，在 WAL 重放期间或对象存储不可达时返回 `503`。容器镜像已经把这项检查作为 `HEALTHCHECK`。
+    用 Prometheus 抓取 `/metrics`。探测 `GET /api/v1/healthz`：该端点公开，在对象存储不可达时返回 `503`。容器镜像已经把这项检查作为 `HEALTHCHECK`。
 
     保持 `[telemetry.self_collect]` 启用，让服务记录自身的指标、链路与 Profile，并基于这些指标创建告警规则，参见[自身可观测性](/zh-Hans/self-observability)。
   </Step>

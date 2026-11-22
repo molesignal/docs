@@ -4,17 +4,16 @@ description: "What to back up, how to keep PostgreSQL and object storage consist
 "zh-Hans_link": "/zh-Hans/backup-restore"
 ---
 
-MoleSignal keeps state in PostgreSQL, in object storage, on the intake WAL volume, and in configuration and secrets. Back up each of them, and rehearse a restore before relying on the backups.
+MoleSignal keeps state in PostgreSQL, in object storage, and in configuration and secrets. Nodes keep only caches on their disks. Back up each of them, and rehearse a restore before relying on the backups.
 
 ## What to back up
 
 | State | Holds | Backup |
 |---|---|---|
 | PostgreSQL | Users, organizations, tokens, streams, dashboards, alert rules, and the file catalog that maps streams to objects | Required |
-| Object storage | Parquet data files, search indexes, and profile blobs | Required |
+| Object storage | Parquet data files, search indexes, profile blobs, and the write-ahead log (WAL) objects of records not yet flushed (`wal/v1/`) | Required |
 | `MS_CIPHER_KEY` | The root key for secrets in PostgreSQL | Required. Store it apart from the database backup. |
 | Configuration | `config.toml`, environment variables, and `MS_AUTH_JWT_SECRET_OVERRIDE` when used | Required |
-| WAL volume (`[wal].dir`) | Records that are not yet flushed to object storage | Optional. Holds only records that are not flushed yet. |
 | ACME directory (`[http.tls].key_storage_dir`) | ACME account key and domain keys | Optional. Certificates can be issued again. |
 | Cache directory (`[cache.object].root`) | Local copy of remote object ranges | Do not back up. |
 
@@ -68,8 +67,8 @@ For an S3-compatible service such as RustFS, add `--endpoint-url`. Back up with 
   <Step title="Restore secrets and configuration">
     Provide the configuration and the same `MS_CIPHER_KEY` that the backed-up deployment used. A node with a different key cannot decrypt the stored secrets and fails to start with an error such as `open Probe CA key`.
   </Step>
-  <Step title="Restore the WAL volume if available">
-    Mount the WAL volume at `[wal].dir`. Intake replays it on start. Without the volume, records that were not flushed at the time of the failure are lost.
+  <Step title="Let intake take over the WAL">
+    WAL objects come back with the bucket. Once the nodes run, an intake node publishes the WAL of every writer that the restored database lists, after that writer's lease lapses. WAL objects of writers registered after the database backup are not published.
   </Step>
   <Step title="Start and verify">
     Start the nodes and wait for `GET /api/v1/healthz` to return `200`. Sign in, open a stream, and run a query over the restored range.
@@ -82,7 +81,7 @@ For an S3-compatible service such as RustFS, add `--endpoint-url`. Back up with 
 
 | Lost | Effect | Recovery |
 |---|---|---|
-| WAL volume of an intake node | Records not yet flushed are lost. | Start the node with an empty volume. |
+| Local disk of a node | Nothing acknowledged. Caches are rebuilt. | Replace the node. Another intake node publishes its WAL after `[wal].lease_secs`. See [Durability and takeover](/en-US/architecture#durability-and-takeover). |
 | PostgreSQL | All metadata is lost, and the objects are unreachable. | Restore the latest backup. Data written after that backup cannot be recovered, because its objects have no catalog entry. |
 | Bucket | Queries over the lost range fail. | Restore the bucket. Catalog entries without objects appear as `missing` in `/metrics`. |
 | `MS_CIPHER_KEY` | Stored secrets cannot be decrypted, and nodes fail to start. | Restore the key from the secret manager. Without it, the encrypted columns cannot be recovered. |

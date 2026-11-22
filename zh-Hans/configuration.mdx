@@ -90,7 +90,7 @@ root_password = "<初始密码>"
 |---|---|---|
 | `roles` | `["standalone"]` | 要运行的角色：`standalone`、`router`、`intake`、`querier`、`compactor`、`alert`。`standalone` 在一个进程内运行全部角色。 |
 | `id` | 空 | 节点 id，最长 64 个字符。留空时使用操作系统的主机名。同一台主机运行多个进程时，必须为每个进程设置不同的 id。 |
-| `drain_timeout_secs` | `30` | 收到 `SIGTERM` 或 `SIGINT` 后，等待 intake 待处理数据刷写完成的时间。超时后进程退出。 |
+| `drain_timeout_secs` | `30` | 收到 `SIGTERM` 或 `SIGINT` 后，等待 intake 待处理数据刷写完成的时间。超时后进程退出，未刷写的部分由其他 intake 节点接管。 |
 
 ## 监听端口
 
@@ -234,18 +234,17 @@ S3 与 Azure 客户端从下列来源中第一个同时提供 access key 与 sec
 
 ### 预写日志
 
-`[wal]` 配置运行 `intake` 角色的节点的预写日志。请把目录放在持久化的本地卷上，参见[备份与恢复](/zh-Hans/backup-restore)。
+`[wal]` 配置预写日志（WAL）。每个节点都把 WAL 保存在对象存储中：WAL 对象写入后才确认写入，所以节点不需要持久化卷。参见[架构](/zh-Hans/architecture#持久性与接管)。
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
-| `dir` | `./data/wal` | WAL 目录。 |
-| `segment_size` | `256` | 分段大小，单位 MiB。写满后切换到新分段。 |
-| `flush_strategy` | `batch` | 何时执行 `fsync`。`none` 从不同步，只依赖页缓存。`every_write` 每条记录都同步，持久性最强、延迟最高。`batch` 在积累 `batch_max_pending` 条记录或经过 `batch_max_delay_ms` 后同步。 |
-| `sync_level` | `data` | 每次同步的深度。`none` 跳过同步。`data` 同步文件数据。`all` 同时同步元数据与父目录。 |
-| `batch_max_pending` | `64` | `batch` 模式下触发同步的记录数。 |
-| `batch_max_delay_ms` | `50` | `batch` 模式下两次同步之间的最长间隔。 |
-| `encrypt` | `false` | 写入磁盘前，用根密钥（`MS_CIPHER_KEY`）加密每条记录的内容。示例文件中没有该键。 |
-| `max_replay_size` | `512` | 启动重放的内存上限，单位 MiB。超出后重放会先刷写一次。 |
+| `lease_secs` | `15` | 写入者租约，单位秒，最小 `3`。节点停止续约后，再过这段时间加上最多一个 `takeover_interval_secs`，由其他 intake 节点接管。只在启动时读取。 |
+| `max_group_size` | `8` | 单个 WAL 对象的上限，单位 MiB。同一数据集上一个对象写入期间到达的写入，合并进下一个对象，最多到这个大小。 |
+| `put_timeout_secs` | `10` | 单次对象写入的超时。 |
+| `put_attempts` | `3` | 每个对象的写入次数。全部失败时，该对象中的写入以 `503` 拒绝，可以重试。 |
+| `takeover_interval_secs` | `5` | intake 节点多久检查一次需要接管的写入者。 |
+| `encrypt` | `false` | 用根密钥（`MS_CIPHER_KEY`）加密每个 WAL 对象。 |
+| `max_takeover_size` | `512` | 接管时攒够多少内存数据发布一个段，单位 MiB。`0` 按 `1` 处理。 |
 
 ### 接入缓冲
 

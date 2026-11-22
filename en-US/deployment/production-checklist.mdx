@@ -17,7 +17,6 @@ The Compose sandbox and the sample `conf/config.toml` favor a fast start. Work t
 | Object backend | RustFS in a container volume | `s3`, `azure`, or `gcs` with durable storage. |
 | `[http].external_url` | Empty | The public HTTPS address. |
 | TLS | Off | A TLS-terminating proxy or `[http.tls]`. |
-| `[wal].dir` | `./data/wal` | A persistent volume. |
 | Image tag | `latest` | A pinned version tag such as `26.1.0.0`. |
 
 ## Checklist
@@ -81,8 +80,8 @@ The Compose sandbox and the sample `conf/config.toml` favor a fast start. Work t
 
     Restrict `/metrics` to internal callers. Expose the intake paths `/api/v1/_bulk`, `/api/v1/_kinesis_firehose`, `/api/v1/_cloudflare`, and `/api/v1/_heroku` only when a sender needs them.
   </Step>
-  <Step title="Protect the write-ahead log">
-    Mount a persistent local volume at `[wal].dir` on every node that runs the `intake` role. The default `flush_strategy = "batch"` with `sync_level = "data"` syncs every 64 records or 50 ms. Use `every_write` with `sync_level = "all"` when no record may be lost at the cost of latency.
+  <Step title="Plan for losing a node">
+    The write-ahead log (WAL) lives in the object store, and a write is acknowledged only after its WAL object is stored, so nodes need no persistent volume. When a node disappears, another intake node takes its WAL over after `[wal].lease_secs` (15 seconds by default) plus up to `[wal].takeover_interval_secs`. Until then, the records that node acknowledged and had not flushed cannot be queried. A single node that restarts takes its own earlier WAL over. Every write waits for one object write, so the latency of the object store adds to the latency of each write. See [Durability and takeover](/en-US/architecture#durability-and-takeover).
 
     Give the process time to drain on shutdown. Set the termination grace period of the orchestrator above `[node].drain_timeout_secs`, which defaults to 30 seconds.
   </Step>
@@ -93,7 +92,7 @@ The Compose sandbox and the sample `conf/config.toml` favor a fast start. Work t
     The `alert` and `compactor` roles can run several instances, which divide the work. The `alert` nodes divide it by rule, report, pipeline, and connector, and one primary node runs the jobs that must run once. The `compactor` nodes divide it by stream and by organization. Set a unique `[node].id` on every node and keep the clocks synchronized. A `standalone` node already includes both roles. Use `standalone` unless splitting roles is required, and read [Role-based deployment](/en-US/deployment/role-based) before splitting.
   </Step>
   <Step title="Monitor the deployment">
-    Scrape `/metrics` with Prometheus. Probe `GET /api/v1/healthz`, which is public and answers `503` while the WAL replays or the object store is unreachable. The container image already runs this check as its `HEALTHCHECK`.
+    Scrape `/metrics` with Prometheus. Probe `GET /api/v1/healthz`, which is public and answers `503` when the object store is unreachable. The container image already runs this check as its `HEALTHCHECK`.
 
     Keep `[telemetry.self_collect]` enabled so the service records its own metrics, traces, and profiles. Create alert rules on those metrics. See [Self-observability](/en-US/self-observability).
   </Step>

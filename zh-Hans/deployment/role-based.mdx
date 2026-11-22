@@ -12,9 +12,9 @@ MoleSignal 是单个二进制文件。`[node].roles` 配置决定进程承担哪
 
 | 角色 | 运行内容 | 状态 | 扩缩容 |
 |---|---|---|---|
-| `standalone` | 同进程内的全部角色、完整 HTTP API、网页界面、内部 gRPC、OTLP gRPC 以及 Probe Agent gRPC 端点 | 有状态：内嵌带 WAL 的 intake | 单进程，不是水平扩展单元。 |
+| `standalone` | 同进程内的全部角色、完整 HTTP API、网页界面、内部 gRPC、OTLP gRPC 以及 Probe Agent gRPC 端点 | 无状态：WAL 保存在对象存储中 | 单进程，不是水平扩展单元。 |
 | `router` | 完整的 HTTP API 与网页界面、OTLP gRPC 接收端、把写入转发给 intake 节点、把查询转发给 querier 节点，以及按组织限流 | 无状态 | 在负载均衡器之后水平扩展。 |
-| `intake` | WAL 重放、内存缓冲、周期性刷写为 Parquet、实时告警规则、内部 gRPC 接入端点，以及 OTLP gRPC 接收端 | 有状态：最近一个刷写窗口内的 WAL | 按数据流做 rendezvous 哈希分片。扩缩容前先规划 WAL 卷与再平衡。 |
+| `intake` | 对象存储中的 WAL、内存缓冲、周期性刷写为 Parquet、接管丢失的 intake 节点的 WAL、实时告警规则、内部 gRPC 接入端点，以及 OTLP gRPC 接收端 | 无状态：尚未刷写的记录保存在对象存储的 WAL 对象中 | 按数据流做 rendezvous 哈希分片，可以水平扩展。 |
 | `querier` | 执行其它节点发来的 SQL 与 PromQL 查询、面向联邦查询的 Arrow Flight 扫描端点，以及异步搜索任务 | 无状态 | 水平扩展。 |
 | `compactor` | 文件合并、保留策略清理，以及存储维护：索引重建、延迟对象删除与目录对账 | 两次运行之间无状态 | 水平扩展。多个节点按数据流与组织分工，参见 [Compactor 节点之间的分工](#compactor-节点之间的分工)。 |
 | `alert` | 规则评估、升级派发、定时报告、定时日志巡检、连接器运行、流水线运行、只在一个节点上运行的后台任务，以及 Probe Agent gRPC 端点 | 两次运行之间无状态：评估状态与事件保存在元数据库 | 水平扩展。多个节点按规则、报告、流水线与连接器分工，由一个主节点运行只能运行一份的任务，参见 [Alert 节点之间的分工](#alert-节点之间的分工)。 |
@@ -37,7 +37,7 @@ MoleSignal 是单个二进制文件。`[node].roles` 配置决定进程承担哪
 | 路径 | 响应 |
 |---|---|
 | `GET /api/v1/healthz` | `200`；子系统降级时返回 `503` 并附带 `reason`。 |
-| `GET /api/v1/readyz` | WAL 重放完成前返回 `503`，完成后返回 `200`。 |
+| `GET /api/v1/readyz` | 节点启动后返回 `200`。启动时不重放任何数据。 |
 | `GET /metrics` | Prometheus 指标。 |
 
 请把这个监听放在内部网络中。
@@ -82,7 +82,7 @@ MoleSignal 是单个二进制文件。`[node].roles` 配置决定进程承担哪
 
 集群中的所有节点必须使用同一个 PostgreSQL 数据库和同一个对象存储，并共用以下设置：`MS_CIPHER_KEY`、`MS_AUTH_JWT_SECRET_OVERRIDE`（需要固定签名密钥时）与 `MS_SELF_TELEMETRY_CLUSTER_TOKEN`。为每个节点设置唯一的 `[node].id`，以及对端能通过内部 gRPC 端口访问到的 `advertise_addr`。
 
-两个进程以同一个 `[node].id` 发布同一个数据集时会互相栅栏：其中一个发布过之后，另一个的刷写会被拒绝。被栅栏的进程会丢弃仍在内存中的行，WAL 保留在磁盘上，并且对该数据集的写入返回 `503`，直到它换用唯一的 id 重启。
+每个进程启动时从 PostgreSQL 领取一个写入者 epoch，所以节点无论是否带着原来的磁盘回来，都不会重用 epoch。进程停顿或连不上 PostgreSQL 超过 `[wal].lease_secs` 后租约过期，会被栅栏：它的刷写被拒绝，缓冲中的行被丢弃，这些行由接管它 WAL 的节点发布；该进程换一个新 epoch 后继续接收写入。
 
 ## 数据流向
 
@@ -90,16 +90,16 @@ MoleSignal 是单个二进制文件。`[node].roles` 配置决定进程承担哪
 
 发往 router 接入端点（`/api/v1/intake/*` 或 OTLP gRPC）的请求，先在 router 上完成认证与解码。随后 router 经内部 gRPC 端口把批次转发给一个 intake 节点：按组织与数据流，在存活 intake 节点的 ID 上做 rendezvous 哈希选出。各个 router 把同一条数据流的记录发给同一个节点；该节点不可达时，各个 router 也按同样的顺序改投下一个，最多尝试三个节点。节点加入或离开时，只迁移它自己名下的数据流。一条数据流的写入全部进同一个节点，数据量大的来源可以拆成几条数据流来分摊。没有存活的 intake 节点时，router 返回 `503`。
 
-intake 节点执行流水线、脱敏与 schema 演化，先把每个批次追加到 WAL，再写入内存缓冲，并向 router 返回与 standalone 节点相同的结果。后台刷写把缓冲编码为 Parquet 文件和检索索引，上传到对象存储，把它们登记到 PostgreSQL 中的文件目录，并截断已刷写的 WAL 分段。大小达到 `[object_store].multipart_threshold_size` 的对象分片上传。
+intake 节点执行流水线、脱敏与 schema 演化，先把每个批次写成对象存储中的 WAL 对象，再写入内存缓冲，之后才向 router 返回与 standalone 节点相同的结果。后台刷写把缓冲编码为 Parquet 文件和检索索引，上传到对象存储，把它们登记到 PostgreSQL 中的文件目录，并删除这次刷写覆盖的 WAL 对象。大小达到 `[object_store].multipart_threshold_size` 的对象分片上传。
 
 采集器也可以把 OTLP gRPC 直接发给 intake 节点。其他角色自身产生的数据（例如派生数据集）在各自节点上用同样的 WAL 与刷写写入。
 
 <Frame caption="接入路径">
-  <img src="/images/architecture/intake_zh-Hans_light.svg" alt="接入路径：客户端请求到达 router，router 按 rendezvous 哈希转发给 intake 节点。节点先追加 WAL，再写入内存缓冲。后台刷写上传到对象存储，把文件登记到 PostgreSQL，并截断 WAL。客户端也可以把 OTLP gRPC 直接发给 intake 节点" className="block dark:hidden" />
-  <img src="/images/architecture/intake_zh-Hans_dark.svg" alt="接入路径：客户端请求到达 router，router 按 rendezvous 哈希转发给 intake 节点。节点先追加 WAL，再写入内存缓冲。后台刷写上传到对象存储，把文件登记到 PostgreSQL，并截断 WAL。客户端也可以把 OTLP gRPC 直接发给 intake 节点" className="hidden dark:block" />
+  <img src="/images/architecture/intake_zh-Hans_light.svg" alt="接入路径：客户端请求到达 router，router 按 rendezvous 哈希转发给 intake 节点。节点先把 WAL 对象写进对象存储，再写入内存缓冲并确认。后台刷写上传到对象存储，把文件登记到 PostgreSQL，并删除 WAL 对象。客户端也可以把 OTLP gRPC 直接发给 intake 节点" className="block dark:hidden" />
+  <img src="/images/architecture/intake_zh-Hans_dark.svg" alt="接入路径：客户端请求到达 router，router 按 rendezvous 哈希转发给 intake 节点。节点先把 WAL 对象写进对象存储，再写入内存缓冲并确认。后台刷写上传到对象存储，把文件登记到 PostgreSQL，并删除 WAL 对象。客户端也可以把 OTLP gRPC 直接发给 intake 节点" className="hidden dark:block" />
 </Frame>
 
-WAL 目录、分段大小、刷写策略、缓冲大小与刷写间隔由[配置](/zh-Hans/configuration)中的 `[wal]` 与 `[intake]` 控制。
+写入者租约、WAL 对象大小、接管间隔、缓冲大小与刷写间隔由[配置](/zh-Hans/configuration)中的 `[wal]` 与 `[intake]` 控制。intake 节点丢失后的处理参见[持久性与接管](/zh-Hans/architecture#持久性与接管)。
 
 ### 查询路径
 
@@ -195,9 +195,9 @@ SQL 或 PromQL 请求到达 router 后，router 检查授权、准入与结果�
 
 - **Router。** 在负载均衡器之后增加副本。
 - **Querier。** 增加副本。每个查询在一个 querier 上运行，因此 querier 越多，能同时运行的查询越多。
-- **Intake。** 每个节点使用自己的持久化 WAL 卷（Kubernetes 中使用 StatefulSet）。节点数变化时，加入或离开的节点名下的数据流会迁移，因此缩容前要确认 WAL 已刷写，并在把流量路由给重启的节点之前留出 WAL 重放时间。
+- **Intake。** 增减副本都不需要持久化卷（Kubernetes 中使用 Deployment）。收到 `SIGTERM` 的节点会刷写缓冲并释放 WAL，剩余部分立即由其他 intake 节点接管；丢失的节点在 `[wal].lease_secs` 之后被接管。节点数变化时，加入或离开的节点名下的数据流会迁移到其他节点。
 - **Compactor。** 增加副本。节点之间按数据流与组织分工，某个节点故障后由其余节点接管，可以滚动更新，参见 [Compactor 节点之间的分工](#compactor-节点之间的分工)。
 - **Alert。** 增加副本。节点之间按规则、报告、流水线与连接器分工，由一个主节点运行只能运行一份的任务，某个节点故障后由其余节点接管，可以滚动更新，参见 [Alert 节点之间的分工](#alert-节点之间的分工)。
-- **多节点共识。** intake 节点之间不做 WAL 复制。丢失某个 intake 节点的卷，会丢失尚未刷写的记录。修改 `[node].roles` 需要重启。
+- **多节点共识。** 不需要：已确认的记录在对象存储中，由 PostgreSQL 决定哪个节点发布丢失节点的 WAL。修改 `[node].roles` 需要重启。
 
 安装与端口参见[部署 MoleSignal](/zh-Hans/deployment)，上线前参见[生产检查清单](/zh-Hans/deployment/production-checklist)。

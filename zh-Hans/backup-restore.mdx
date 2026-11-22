@@ -4,17 +4,16 @@ description: "需要备份哪些内容、如何保持 PostgreSQL 与对象存储
 "en_link": "/en-US/backup-restore"
 ---
 
-MoleSignal 的状态保存在 PostgreSQL、对象存储、intake 的 WAL 卷以及配置与密钥中。请逐一备份，并在依赖备份之前演练一次恢复。
+MoleSignal 的状态保存在 PostgreSQL、对象存储以及配置与密钥中，节点的磁盘上只有缓存。请逐一备份，并在依赖备份之前演练一次恢复。
 
 ## 需要备份的内容
 
 | 状态 | 内容 | 备份 |
 |---|---|---|
 | PostgreSQL | 用户、组织、Token、数据流、仪表盘、告警规则，以及把数据流映射到对象的文件目录 | 必须 |
-| 对象存储 | Parquet 数据文件、检索索引与 Profile 数据块 | 必须 |
+| 对象存储 | Parquet 数据文件、检索索引、Profile 数据块，以及尚未刷写记录的预写日志（WAL）对象（`wal/v1/`） | 必须 |
 | `MS_CIPHER_KEY` | PostgreSQL 中密文的根密钥 | 必须，与数据库备份分开保存。 |
 | 配置 | `config.toml`、环境变量，以及使用时的 `MS_AUTH_JWT_SECRET_OVERRIDE` | 必须 |
-| WAL 卷（`[wal].dir`） | 尚未刷写到对象存储的记录 | 可选，只包含尚未刷写的记录。 |
 | ACME 目录（`[http.tls].key_storage_dir`） | ACME 账号密钥与域名密钥 | 可选，证书可以重新签发。 |
 | 缓存目录（`[cache.object].root`） | 远程对象字节范围的本地副本 | 不需要备份。 |
 
@@ -68,8 +67,8 @@ RustFS 等兼容 S3 的服务需要加上 `--endpoint-url`。备份所用的凭�
   <Step title="恢复密钥与配置">
     提供配置，以及被备份的部署所使用的同一个 `MS_CIPHER_KEY`。使用不同密钥的节点无法解密已保存的密文，启动时会失败，并报类似 `open Probe CA key` 的错误。
   </Step>
-  <Step title="有条件时恢复 WAL 卷">
-    把 WAL 卷挂载到 `[wal].dir`，intake 会在启动时重放。没有这块卷时，故障发生时尚未刷写的记录将丢失。
+  <Step title="由 intake 接管 WAL">
+    WAL 对象随存储桶一起恢复。节点运行后，intake 节点会在写入者租约过期后，发布恢复后的数据库中登记的每个写入者的 WAL。数据库备份之后才登记的写入者，其 WAL 对象不会被发布。
   </Step>
   <Step title="启动并验证">
     启动节点，等待 `GET /api/v1/healthz` 返回 `200`。登录后打开一个数据流，对恢复的时间范围执行查询。
@@ -82,7 +81,7 @@ RustFS 等兼容 S3 的服务需要加上 `--endpoint-url`。备份所用的凭�
 
 | 丢失的内容 | 影响 | 恢复方式 |
 |---|---|---|
-| intake 节点的 WAL 卷 | 尚未刷写的记录丢失。 | 用空卷启动节点。 |
+| 节点的本地磁盘 | 不丢失已确认的数据，缓存会重建。 | 替换节点。其他 intake 节点在 `[wal].lease_secs` 之后发布它的 WAL，参见[持久性与接管](/zh-Hans/architecture#持久性与接管)。 |
 | PostgreSQL | 全部元数据丢失，对象无法访问。 | 恢复最新备份。备份之后写入的数据无法恢复，因为它们的对象在目录中没有条目。 |
 | bucket | 对丢失时间范围的查询失败。 | 恢复 bucket。目录中没有对象的条目会在 `/metrics` 中显示为 `missing`。 |
 | `MS_CIPHER_KEY` | 已保存的密文无法解密，节点无法启动。 | 从密钥管理系统恢复密钥。没有它，加密的列无法找回。 |

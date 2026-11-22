@@ -13,7 +13,7 @@ MoleSignal ships as one binary and one container image. Configuration selects wh
 | PostgreSQL | Stores metadata, identities, the file catalog, and product resources. PostgreSQL is the only supported metadata database. The Compose sandbox and the Kubernetes manifests use PostgreSQL 17. |
 | Object storage | Stores Parquet files, search indexes, and profile blobs. Use `s3` (AWS S3 or an S3-compatible service such as RustFS, Cloudflare R2, or Alibaba Cloud OSS), `azure`, or `gcs`. The `local` backend is for a single node and for development. |
 | Compute | Linux on x86-64 or arm64 with the container image (`linux/amd64` and `linux/arm64`). The sandbox needs about 2 GB of memory. |
-| Intake disk | A persistent local volume for the write-ahead log (WAL) on every node that runs the `intake` role. |
+| Local disk | Only caches, which can be rebuilt. A write is acknowledged once its write-ahead log (WAL) object is in object storage, so no node needs a persistent volume. See [Durability and takeover](/en-US/architecture#durability-and-takeover). |
 
 Memory and disk use depend on the ingest volume, the number of active streams, and the cache settings in [Configuration](/en-US/configuration). Size from observed usage: [intake usage](/en-US/streams#intake-usage-and-budgets) shows what each source takes in, and the process exposes Prometheus metrics at `/metrics`. See the [Production checklist](/en-US/deployment/production-checklist).
 
@@ -134,12 +134,12 @@ The same image serves every role. The runtime variable `RELEASE_CHANNEL` (`alpha
 
     The manifests do not include PostgreSQL or object storage. Provide PostgreSQL 17 under the service name `postgresql` (or edit `meta_database.dsn` in the ConfigMap) and any S3-compatible object store (edit `object_store` in the ConfigMap).
 
-    The manifests deploy the role-split topology: the `router` workload serves the web UI and the HTTP API, and the other workloads run the data and background roles. To run one process that carries every role instead, start from `40-intake.yaml` (a StatefulSet with a persistent volume for the WAL), set `MS_NODE_ROLES` to `["standalone"]`, add the Service port `5080`, and probe `/api/v1/healthz`.
+    The manifests deploy the role-split topology: the `router` workload serves the web UI and the HTTP API, and the other workloads run the data and background roles. To run one process that carries every role instead, start from `40-intake.yaml` (a Deployment without a persistent volume), set `MS_NODE_ROLES` to `["standalone"]`, add the Service port `5080`, and probe `/api/v1/healthz`.
 
     | Workload | Kind | Replicas | Role |
     |---|---|---|---|
     | `router` | Deployment | 2 | `router`: the web UI, the HTTP API, and OTLP gRPC |
-    | `intake` | StatefulSet | 2 | `intake`, with a 20 Gi persistent volume per replica for the WAL |
+    | `intake` | Deployment | 2 | `intake`, without a persistent volume; a rolling update starts a new pod before it stops an old one |
     | `querier` | Deployment | 2 | `querier` |
     | `compactor` | Deployment | 1 | `compactor`, replicas can be added |
     | `alert` | Deployment | 1 | `alert`, replicas can be added |
@@ -168,7 +168,7 @@ The same image serves every role. The runtime variable `RELEASE_CHANNEL` (`alpha
 
     The web UI is embedded in the binary. Expose port `5080` of the `router` workload through an Ingress or load balancer.
 
-    The `router` workload serves the full API on `5080`, and its readiness probe requests `GET /api/v1/healthz`. Every other workload serves a health, readiness, and metrics listener on `5080` and uses `GET /api/v1/readyz` as its readiness probe. For `intake`, the listener starts after WAL replay, so a ready pod accepts writes.
+    The `router` workload serves the full API on `5080`, and its readiness probe requests `GET /api/v1/healthz`. Every other workload serves a health, readiness, and metrics listener on `5080` and uses `GET /api/v1/readyz` as its readiness probe. A ready `intake` pod accepts writes at once: it replays nothing on start, because the WAL of a lost pod is taken over by the other intake pods. Its termination grace period of 45 seconds lets it flush and release its WAL before it stops.
   </Tab>
 </Tabs>
 
@@ -199,7 +199,7 @@ See [Run Agents on Kubernetes](/en-US/synthetics#run-agents-on-kubernetes) for t
 
 ## Health and metrics
 
-- `GET /api/v1/healthz` is public. It returns `200` with `{"status":"ok"}`, or `503` with a `reason` while the intake WAL replays or when the object store is unreachable. Use it for container and load balancer probes.
+- `GET /api/v1/healthz` is public. It returns `200` with `{"status":"ok"}`, or `503` with a `reason` when the object store is unreachable. Use it for container and load balancer probes.
 - `GET /metrics` is public and returns Prometheus metrics. Restrict it at the proxy or network layer.
 - `GET /api/v1/readyz` and `GET /api/v1/version` require a bearer token on a `standalone` or `router` node. `version` returns the version, commit, build id, release channel, and edition.
 - A node in a role-split cluster that does not serve the full API answers `GET /api/v1/healthz`, `GET /api/v1/readyz`, and `GET /metrics` without authentication on the same port.
