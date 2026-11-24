@@ -66,6 +66,7 @@ description: "通过数据源页面、接入 Token，以及原生、OpenTelemetr
 - **压缩。** OTLP over HTTP 不接受压缩的请求体，会返回 `400`。请在发送端关闭压缩；OpenTelemetry Collector 的 `otlphttp` 导出端默认使用 gzip 压缩，需要设置 `compression: none`。原生 JSON 接入、Elasticsearch `_bulk`、Loki push 与推送型连接器接受 `Content-Encoding: gzip`。
 - **Loki 编码。** 只解析 JSON 请求格式。Promtail 与 Grafana Alloy 默认发送 snappy 压缩的 protobuf，无法向该端点发送数据。
 - **速率限制。** `router` 角色按组织限制请求，超限时返回 `429` 并附带 `Retry-After` 响应头。`standalone` 节点不应用这个限制。参见[分角色部署](/zh-Hans/deployment/role-based#速率限制)。
+- **拒收的事件。** 值与数据流中字段类型不符的事件单独被拒收，请求中的其余事件照常写入。`int64` 字段收到带小数的数不会被拒收，字段会变为 `float64`（参见 [Schema 与字段](/zh-Hans/streams#schema-与字段)）。各端点都会报告拒收的事件：原生 JSON 写在 `rejected` 与 `errors` 中，OTLP 写在 `partialSuccess` 中，Elasticsearch `_bulk` 对应条目的状态为 `400`，Splunk HEC 返回错误码 `6`，Prometheus remote write 与 Loki push 返回 `400`。发送端不会重试这些事件。推送型连接器仍返回成功，因为平台会重发整个请求，拒收情况写在连接器上。
 - **平台数据流。** [平台数据流](/zh-Hans/streams#平台数据流)（例如存放服务自身遥测的 `_molesignal` 和存放审计记录的 `_audit`）只由 MoleSignal 写入，公开接入会返回 `403`。
 
 ## 数据流与 Schema
@@ -191,7 +192,7 @@ curl -X POST http://localhost:5080/api/v1/_bulk \
 | `POST /api/v1/services/collector/raw` | 文本，每行一条日志事件；`host`、`source`、`sourcetype`、`index` 取自查询参数 |
 | `GET /api/v1/services/collector/health` | 不需要 Token，返回 `{"text":"HEC is healthy","code":17}` |
 
-`event` 是 JSON 对象时作为日志的字段，否则放进 `message`。`fields`、`host`、`source`、`sourcetype` 成为字段，`time`（秒）成为事件时间。`index` 决定数据流，否则取查询参数 `index`，再否则取 `stream-name` 请求头，都没有时为 `default`。成功返回 `{"text":"Success","code":0}`，失败时返回 `400` 和 HEC 自己的错误码。不支持索引器确认（indexer acknowledgement）。
+`event` 是 JSON 对象时作为日志的字段，否则放进 `message`。`fields`、`host`、`source`、`sourcetype` 成为字段，`time`（秒）成为事件时间。`index` 决定数据流，否则取查询参数 `index`，再否则取 `stream-name` 请求头，都没有时为 `default`。成功返回 `{"text":"Success","code":0}`，失败时返回 `400` 和 HEC 自己的错误码。数据流因值与字段类型不符拒收事件时，其余事件照常写入，返回错误码 `6`：`invalid-event-number` 是第一个被拒收事件在请求体中的位置，`text` 写明原因。不支持索引器确认（indexer acknowledgement）。
 
 ## 相关页面
 
