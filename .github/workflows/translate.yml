@@ -10,14 +10,17 @@ name: Translate
 # points it at another OpenAI-compatible service.
 
 on:
+  # Starts on the hand-written English and Simplified Chinese text: the pages, their navigation
+  # in docs.json, and the translation scripts. docs.json also holds the other languages'
+  # navigation and the site's settings, so the job `changes` below compares the en and zh-Hans
+  # navigation itself.
   push:
     branches: [main]
     paths:
-      - 'en-US/**'
-      - 'zh-Hans/**'
+      - 'en-US/**.mdx'
+      - 'zh-Hans/**.mdx'
       - 'docs.json'
       - 'scripts/i18n/**'
-      - '.github/workflows/translate.yml'
   workflow_dispatch:
 
 permissions:
@@ -28,8 +31,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  changes:
+    name: Look for changed source text
+    runs-on: ubuntu-latest
+    outputs:
+      translate: ${{ steps.look.outputs.translate }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - id: look
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          # A manual run, or a push whose previous commit is unknown, always translates.
+          if [ "$EVENT" != push ] || [ -z "${BEFORE//0/}" ] || ! git fetch -q --no-tags --depth=1 origin "$BEFORE"; then
+            echo 'translate=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          files=$(git diff --name-only "$BEFORE" "$AFTER" -- 'en-US/*.mdx' 'zh-Hans/*.mdx' scripts/i18n)
+          nav() {
+            git show "$1:docs.json" | jq -S '[.navigation.languages[] | select(.language == "en" or .language == "zh-Hans")]'
+          }
+
+          if [ "$(nav "$BEFORE")" != "$(nav "$AFTER")" ]; then
+            files=$(printf '%s\n' "$files" 'docs.json (en or zh-Hans navigation)')
+          fi
+
+          files=$(printf '%s\n' "$files" | grep -v '^$' || true)
+          if [ -n "$files" ]; then
+            printf '%s\n' "$files" | head -20
+            echo 'translate=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'No English or Simplified Chinese text changed.'
+            echo 'translate=false' >> "$GITHUB_OUTPUT"
+          fi
+
   translate:
     name: Translate
+    needs: changes
+    if: ${{ needs.changes.outputs.translate == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
