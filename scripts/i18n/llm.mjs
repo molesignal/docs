@@ -6,10 +6,11 @@ const DEFAULT_MODEL = 'gpt-4o';
 const ATTEMPTS = 4;
 const TIMEOUT_MS = 10 * 60 * 1000;
 
-export function connect(model = process.env.TRANSLATE_MODEL ?? DEFAULT_MODEL) {
+// An unset GitHub Actions variable arrives as an empty string, which means the default here.
+export function connect(model = process.env.TRANSLATE_MODEL || DEFAULT_MODEL) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('Set OPENAI_API_KEY first.');
-  const base = (process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1').replace(/\/+$/, '');
+  const base = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
 
   async function post(body) {
     let lastError;

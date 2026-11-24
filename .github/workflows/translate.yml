@@ -1,0 +1,72 @@
+name: Translate
+
+# English and Simplified Chinese pages are written by hand. When they change on main, this
+# translates the other languages with scripts/i18n/translate.mjs and commits the result to main,
+# which Mintlify then deploys. Only pages that are missing or whose source changed are
+# translated. The product's interface translations are checked out beside the site, as the
+# script reads its labels from ../molesignal.
+#
+# Needs the secret OPENAI_API_KEY and the variable TRANSLATE_MODEL; the variable OPENAI_BASE_URL
+# points it at another OpenAI-compatible service.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'en-US/**'
+      - 'zh-Hans/**'
+      - 'docs.json'
+      - 'scripts/i18n/**'
+      - '.github/workflows/translate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: translate
+  cancel-in-progress: false
+
+jobs:
+  translate:
+    name: Translate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          path: docs
+      - uses: actions/checkout@v5
+        with:
+          repository: molesignal/molesignal
+          path: molesignal
+          sparse-checkout: web/src/i18n
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Translate the pages
+        working-directory: docs
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          TRANSLATE_MODEL: ${{ vars.TRANSLATE_MODEL }}
+        run: node scripts/i18n/translate.mjs --concurrency=8
+
+      - name: Commit the translations
+        # Runs even when some pages failed, so the pages that were translated are kept.
+        if: ${{ !cancelled() }}
+        working-directory: docs
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'Nothing to commit.'
+            exit 0
+          fi
+          git commit -m 'docs: update machine translations'
+          # Another push may have landed while this ran.
+          git pull --rebase origin main
+          git push origin HEAD:main
