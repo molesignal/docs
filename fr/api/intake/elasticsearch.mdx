@@ -1,6 +1,6 @@
 ---
 title: "Elasticsearch _bulk"
-description: "Envoyez des journaux à l’aide du protocole bulk d’Elasticsearch."
+description: "Envoyez des logs avec le protocole bulk d’Elasticsearch."
 "en_link": "/en-US/api/intake/elasticsearch"
 "zh-Hans_link": "/zh-Hans/api/intake/elasticsearch"
 "zh-Hant_link": "/zh-Hant/api/intake/elasticsearch"
@@ -15,14 +15,16 @@ description: "Envoyez des journaux à l’aide du protocole bulk d’Elasticsear
 POST /api/v1/_bulk
 ```
 
-Ingestion NDJSON compatible avec l’API `_bulk` d’Elasticsearch pour Filebeat, Logstash et la destination `elasticsearch` de Vector. L’appel nécessite `logs.write`. Le point de terminaison accepte les corps de requête avec `Content-Encoding: gzip`.
+Ingestion NDJSON compatible avec `_bulk` d'Elasticsearch pour Filebeat, Logstash et le sink `elasticsearch` de Vector. L'appel nécessite `logs.write`. Un corps avec `Content-Encoding: gzip` est accepté.
 
 | Action | Traitement |
 |---|---|
-| `index`, `create`, `update` | Le point de terminaison enregistre le document source comme événement de journal. |
-| `delete` | Le point de terminaison ignore l’action sans renvoyer d’élément de réponse. Il ne supprime jamais de données de télémétrie. |
+| `index`, `create`, `update` | Le document source est stocké en tant qu'événement de journal. |
+| `delete` | Ignoré sans élément de réponse. La télémétrie n'est jamais supprimée via ce point de terminaison. |
 
-Le champ `_index` d’une action sélectionne le flux de journaux cible. À défaut, le point de terminaison utilise l’en-tête `stream-name` ou, si cet en-tête est absent, le flux `default`.
+Le champ `_index` d'une action sélectionne le flux de journaux cible. S'il est absent, l'en-tête `stream-name` s'applique, puis `default`.
+
+Un document dont une valeur ne correspond pas au type de son champ dans le flux est refusé isolément. Son élément porte `status: 400` et un `error` avec la `reason`, `errors` vaut `true`, et les autres documents sont écrits. Filebeat et Logstash ne réessaient pas un tel élément.
 
 <RequestExample>
 ```bash cURL
@@ -41,30 +43,31 @@ curl -X POST http://localhost:5080/api/v1/_bulk \
 
 ## Choisir ce point de terminaison
 
-Utilisez ce point de terminaison si un expéditeur existant peut envoyer du NDJSON au format de l’API `_bulk` d’Elasticsearch. Ce point de terminaison est un adaptateur d’ingestion, pas un cluster Elasticsearch : cette API ne gère ni la recherche, ni les modèles d’index, ni les identifiants de documents, ni les mises à jour sur place. Utilisez des [requêtes SQL](/fr/query) pour lire les événements enregistrés.
+Utilisez ce point de terminaison lorsqu'un émetteur existant peut produire du NDJSON bulk Elasticsearch. Il s'agit d'un adaptateur d'ingestion, et non d'un cluster Elasticsearch : la recherche, les index templates, les ID de document et la sémantique de mise à jour sur place ne sont pas fournis par cette API. Utilisez [les requêtes SQL](/fr/query) pour lire les événements stockés.
 
 ## Construire un lot valide
 
-- Envoyez un objet d’action et un objet de document sur deux lignes distinctes pour chaque opération `index` ou `create`. Terminez le lot par un saut de ligne.
-- Pour `update`, placez les champs de l’événement sous `doc`. Ces champs forment un nouvel événement au lieu de modifier un événement enregistré.
-- Définissez `_index` dans l’action pour choisir un flux. Sinon, utilisez `stream-name` ou laissez le point de terminaison utiliser le flux `default`.
-- Pour conserver l’heure de l’événement, indiquez dans `_timestamp` un horodatage Unix entier en microsecondes. Sinon, le récepteur utilise l’heure actuelle.
-- Le point de terminaison ignore les actions `delete`. Ces actions ne suppriment aucune donnée de télémétrie et n’ajoutent aucun élément d’événement enregistré à la réponse.
+- Envoyez un objet d'action et un objet de document sur des lignes séparées pour chaque opération `index` ou `create`. Terminez le lot par un saut de ligne.
+- Pour `update`, placez les champs de l'événement sous `doc` ; les champs forment un nouvel événement au lieu de modifier un événement stocké.
+- Définissez `_index` sur l'action pour choisir un flux. Sinon, utilisez `stream-name` ou acceptez le flux `default`.
+- Fournissez `_timestamp` sous forme d'horodatage Unix entier en microsecondes pour préserver l'heure de l'événement. Sinon, le récepteur utilise l'heure actuelle.
+- Une action `delete` est ignorée. Elle ne supprime aucune télémétrie et n'ajoute aucun élément d'événement stocké à la réponse.
 
-## Vérifier l’ingestion
+## Vérifier l'ingestion
 
-Pour un lot contenant un seul événement, vérifiez que la réponse contient `errors: false` et un seul élément avec `status: 201`. Comparez le nombre d’éléments renvoyés au nombre d’événements à ingérer. Un code de succès HTTP ne suffit pas à confirmer que le lot correspond à ce qui était prévu.
+Pour un lot d'un seul événement, attendez-vous à `errors: false` et à un élément de réponse avec `status: 201`. Comparez le nombre d'éléments au nombre d'événements destinés à l'ingestion ; un simple succès HTTP ne prouve pas que le lot a été construit comme prévu.
 
-Ouvrez **Journaux**, sélectionnez le flux indiqué par `_index` et utilisez une plage temporelle qui inclut l’horodatage de l’événement. Lancez une requête sur un champ distinctif de l’exemple. Si l’événement n’apparaît pas, vérifiez le flux sélectionné et l’unité de l’horodatage avant de renvoyer le lot entier. Cette interface n’utilise pas les identifiants de documents Elasticsearch pour éviter les doublons lors des nouvelles tentatives.
+Ouvrez **Journaux**, sélectionnez le flux choisi par `_index` et utilisez une plage temporelle contenant l'horodatage de l'événement. Interrogez un champ distinctif de l'échantillon. Si l'événement est absent, vérifiez la sélection du flux et l'unité d'horodatage avant de renvoyer le lot entier. Cette interface n'utilise pas les ID de document Elasticsearch pour dédupliquer les nouvelles tentatives.
 
-## Diagnostiquer une requête rejetée
+## Résoudre les problèmes d'une requête rejetée
 
 | Symptôme | Vérification |
 |---|---|
-| Erreur d’authentification ou d’autorisation | Utilisez un jeton d’API de l’organisation cible doté de l’autorisation `logs.write`. |
-| L’action ou le document n’est pas un objet JSON | Vérifiez les sauts de ligne du NDJSON. N’envoyez ni tableau JSON ni objet mis en forme sur plusieurs lignes. |
-| Action inconnue | Utilisez les noms d’action pris en charge indiqués ci-dessus. |
-| Erreur de décompression | Définissez `Content-Encoding: gzip` uniquement si le corps de la requête est compressé. |
-| Succès, mais moins d’événements que prévu | Vérifiez que chaque action d’écriture a sa ligne de document et distinguez les actions de suppression ignorées des événements enregistrés. |
+| Erreur d'authentification ou de permission | Utilisez un jeton d'API pour l'organisation visée avec `logs.write`. |
+| L'action ou le document n'est pas un objet JSON | Vérifiez les limites de lignes NDJSON. N'envoyez pas de tableau JSON ni d'objet multiligne formaté. |
+| Action inconnue | Utilisez les noms d'action pris en charge ci-dessus. |
+| Erreur de décompression | Définissez `Content-Encoding: gzip` uniquement lorsque le corps est réellement compressé. |
+| Succès avec moins d'événements que prévu | Vérifiez que chaque action d'écriture a sa ligne de document et distinguez les suppressions ignorées des événements stockés. |
+| `errors: true` avec des éléments de statut `400` | Une valeur ne correspond pas au type de son champ dans le flux, comme du texte dans un champ `int64` ; la `reason` de l'élément nomme le champ. Envoyez le type que le flux stocke pour ce champ, ou convertissez-le dans un pipeline. |
 
-Consultez les [options d’intégration](/fr/intake/integrations), l’[ingestion JSON native](/fr/api/intake/native-json) et l’[exploration des journaux](/fr/logs).
+Voir [les choix d'intégration](/fr/intake/integrations), [l'ingestion JSON native](/fr/api/intake/native-json) et [l'exploration des journaux](/fr/logs).

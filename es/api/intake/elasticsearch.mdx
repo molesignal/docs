@@ -15,14 +15,16 @@ description: "Envía logs con el protocolo bulk de Elasticsearch."
 POST /api/v1/_bulk
 ```
 
-Ingesta de NDJSON compatible con `_bulk` de Elasticsearch para Filebeat, Logstash y el destino `elasticsearch` de Vector. La solicitud requiere `logs.write`. El endpoint acepta un cuerpo con `Content-Encoding: gzip`.
+Ingesta NDJSON compatible con `_bulk` de Elasticsearch para Filebeat, Logstash y el sink `elasticsearch` de Vector. La llamada requiere `logs.write`. Se acepta un cuerpo con `Content-Encoding: gzip`.
 
 | Acción | Comportamiento |
 |---|---|
-| `index`, `create`, `update` | El endpoint almacena el documento de origen como un evento de registro. |
-| `delete` | El endpoint omite la acción y no incluye un elemento en la respuesta. Este endpoint nunca elimina datos de telemetría. |
+| `index`, `create`, `update` | El documento de origen se almacena como un evento de registro. |
+| `delete` | Se omite sin un elemento de respuesta. La telemetría nunca se elimina a través de este endpoint. |
 
-El campo `_index` de la acción selecciona el flujo de registros de destino. Si falta, se usa el encabezado `stream-name`. Si tampoco se especifica el encabezado, se usa `default`.
+El `_index` de una acción selecciona el flujo de registros de destino. Sin él, se aplica la cabecera `stream-name` y, después, `default`.
+
+Un documento con un valor que no se ajusta al tipo de su campo en el flujo se rechaza por sí solo. Su elemento tiene `status: 400` y un `error` con el `reason`, `errors` es `true`, y los demás documentos se escriben. Filebeat y Logstash no reintentan ese elemento.
 
 <RequestExample>
 ```bash cURL
@@ -41,30 +43,31 @@ curl -X POST http://localhost:5080/api/v1/_bulk \
 
 ## Elige este endpoint
 
-Usa este endpoint si un emisor existente puede enviar datos en el formato NDJSON de la API masiva de Elasticsearch. Es un adaptador de ingesta, no un clúster de Elasticsearch: esta API no admite búsquedas, plantillas de índice, IDs de documentos ni actualizaciones de documentos existentes. Usa [consultas SQL](/es/query) para leer los eventos almacenados.
+Usa este endpoint cuando un emisor existente pueda emitir NDJSON masivo de Elasticsearch. Es un adaptador de ingesta, no un clúster de Elasticsearch: esta API no ofrece búsqueda, plantillas de índice, IDs de documento ni semántica de actualización en el lugar. Usa [consultas SQL](/es/query) para leer los eventos almacenados.
 
-## Crea un lote válido
+## Construye un lote válido
 
 - Envía un objeto de acción y un objeto de documento en líneas separadas para cada operación `index` o `create`. Termina el lote con un salto de línea.
-- Para `update`, coloca los campos del evento dentro de `doc`. El endpoint crea un evento con esos campos en lugar de modificar un evento almacenado.
-- Define `_index` en la acción para elegir un flujo. Si no lo defines, usa `stream-name` o deja que el endpoint use el flujo `default`.
-- Para conservar la hora del evento, especifica `_timestamp` como una marca de tiempo Unix en microsegundos, expresada como un número entero. De lo contrario, el receptor usa la hora actual.
-- El endpoint omite las acciones `delete`. Estas acciones no eliminan datos de telemetría ni generan elementos de eventos almacenados en la respuesta.
+- Para `update`, coloca los campos del evento bajo `doc`; los campos se convierten en un evento nuevo en lugar de modificar un evento almacenado.
+- Define `_index` en la acción para elegir un flujo. De lo contrario, usa `stream-name` o acepta el flujo `default`.
+- Proporciona `_timestamp` como una marca de tiempo Unix entera en microsegundos cuando quieras conservar la hora del evento. De lo contrario, el receptor usa la hora actual.
+- Una acción `delete` se omite. No elimina telemetría ni aporta un elemento de evento almacenado a la respuesta.
 
 ## Verifica la ingesta
 
-Para un lote de un solo evento, la respuesta debe incluir `errors: false` y un elemento con `status: 201`. Compara la cantidad de elementos con la cantidad de eventos que esperabas ingerir. Una respuesta HTTP exitosa no basta para confirmar que el lote tenga la estructura prevista.
+Para un lote de un solo evento, espera `errors: false` y un elemento de respuesta con `status: 201`. Compara el número de elementos con el número de eventos que pretendías ingerir; un éxito HTTP por sí solo no demuestra que el lote se haya construido como se pretendía.
 
-Abre **Registros**, selecciona el flujo indicado en `_index` y usa un intervalo de tiempo que incluya la marca de tiempo del evento. Haz una consulta con un campo distintivo del ejemplo. Si el evento no aparece, verifica el flujo seleccionado y la unidad de la marca de tiempo antes de reenviar todo el lote. Esta interfaz no usa los IDs de documentos de Elasticsearch para evitar duplicados en los reintentos.
+Abre **Registros**, selecciona el flujo elegido por `_index` y usa un rango de tiempo que contenga la marca de tiempo del evento. Consulta un campo distintivo de la muestra. Si el evento no aparece, revisa la selección del flujo y la unidad de la marca de tiempo antes de reenviar el lote completo. Esta interfaz no usa los IDs de documento de Elasticsearch para deduplicar reintentos.
 
-## Soluciona problemas con solicitudes rechazadas
+## Soluciona problemas de una solicitud rechazada
 
-| Síntoma | Qué verificar |
+| Síntoma | Qué revisar |
 |---|---|
-| Error de autenticación o de permisos | Usa un token de API de la organización correspondiente con el permiso `logs.write`. |
-| La acción o el documento no es un objeto JSON | Verifica los saltos de línea del NDJSON. No envíes un arreglo JSON ni un objeto con formato de varias líneas. |
-| Acción desconocida | Usa los nombres de las acciones admitidas que aparecen arriba. |
-| Error de descompresión | Define `Content-Encoding: gzip` solo si el cuerpo está comprimido con gzip. |
-| Respuesta exitosa con menos eventos de los esperados | Verifica que cada acción de escritura tenga su línea de documento y distingue las acciones `delete` omitidas de los eventos almacenados. |
+| Error de autenticación o de permisos | Usa un API Token de la organización prevista con `logs.write`. |
+| La acción o el documento no es un objeto JSON | Revisa los límites de línea del NDJSON. No envíes un array JSON ni un objeto multilínea con formato indentado. |
+| Acción desconocida | Usa los nombres de acción compatibles indicados arriba. |
+| Error de descompresión | Define `Content-Encoding: gzip` solo cuando el cuerpo esté realmente comprimido. |
+| Éxito con menos eventos de los esperados | Revisa que cada acción de escritura tenga su línea de documento y distingue las eliminaciones omitidas de los eventos almacenados. |
+| `errors: true` con elementos de estado `400` | Un valor no se ajusta al tipo de su campo en el flujo, como texto en un campo `int64`; el `reason` del elemento indica el campo. Envía el tipo que el flujo almacena para ese campo o conviértelo en una pipeline. |
 
-Consulta las [opciones de integración](/es/intake/integrations), la [ingesta de JSON nativo](/es/api/intake/native-json) y la [exploración de registros](/es/logs).
+Consulta [opciones de integración](/es/intake/integrations), [ingesta JSON nativa](/es/api/intake/native-json) y [exploración de registros](/es/logs).
