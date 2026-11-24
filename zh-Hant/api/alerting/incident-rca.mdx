@@ -16,14 +16,14 @@ GET /api/v1/alerts/incidents/{id}/rca
 POST /api/v1/alerts/incidents/{id}/rca
 ```
 
-[Mole Agent](/zh-Hant/agent) 根據事件的脈絡撰寫根因分析（RCA）。每個事件最多有一份分析。
+[Mole Agent](/zh-Hant/agent) 會根據事件脈絡為事件撰寫根因分析（RCA）。每個事件最多只有一份分析。
 
-`alert` 角色會自動建立分析。當組織設定的模型服務供應商已啟用且具備 API 金鑰時，該角色每三分鐘為尚無分析的進行中事件撰寫分析，每輪最多處理 20 個事件。`GET` 呼叫會讀取已儲存的分析。`POST` 呼叫會立即產生新的分析，並取代已儲存的分析。
+`alert` 角色會自動建立分析。組織設定了已啟用且帶有 API Key 的模型服務商時，該角色每三分鐘為尚無分析的作用中事件撰寫分析，每輪最多 20 個。`GET` 呼叫會讀取已儲存的分析。`POST` 呼叫會立即產生新的分析，並取代已儲存的分析。
 
 | 呼叫 | 權限 | 說明 |
 |---|---|---|
-| `GET` | `alerts.incidents.read` | 尚未產生分析時，傳回 `404`，訊息為 `no root-cause analysis for this incident yet`。 |
-| `POST` | `alerts.incidents.rca` | 等待模型產生分析，再傳回新的分析。選用的查詢參數 `locale` 可指定輸出語言為 `en-us` 或 `zh-cn`，預設採用發出呼叫的使用者所設定的偏好語言。 |
+| `GET` | `alerts.incidents.read` | 分析產生之前會回傳 `404`，訊息為 `no root-cause analysis for this incident yet`。 |
+| `POST` | `alerts.incidents.rca` | 等待模型並回傳新的分析。選填的查詢參數 `locale` 可選擇輸出語言，`en-us` 或 `zh-cn`，預設使用呼叫使用者的語言偏好。 |
 
 <RequestExample>
 ```bash cURL
@@ -51,21 +51,39 @@ curl -X POST "http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/rca?loc
 ```
 </ResponseExample>
 
-**應變**
+**回應**
 
 | 欄位 | 說明 |
 |---|---|
 | `incidentId`、`orgId` | 事件與組織的識別碼。 |
-| `summary` | Markdown 文字格式的分析內容。 |
-| `provider`、`model` | 模型服務供應商類型，例如 `openai`、`anthropic` 或 `openai_compatible`，以及模型名稱。 |
-| `promptBuiltinKey`、`promptHash` | 提示詞範本與轉譯後提示詞的雜湊值，供稽核使用。 |
-| `promptTokens`、`completionTokens`、`finishReason` | Token 用量，以及服務供應商回報的結束原因。 |
-| `createdAt`、`updatedAt` | 自 Unix 紀元起算的微秒數。重新產生分析時，`updatedAt` 會變更。 |
+| `summary` | 以 Markdown 文字形式呈現的分析內容，會用編號引用證據，例如 `[E2]`。 |
+| `evidence` | 分析所依據的編號證據，最多 30 筆，見下文。 |
+| `provider`、`model` | 模型服務商類型，例如 `openai`、`anthropic` 或 `openai_compatible`，以及模型名稱。 |
+| `promptBuiltinKey`、`promptHash` | 提示詞範本，以及轉譯後提示詞的雜湊值，用於稽核。 |
+| `promptTokens`、`completionTokens`、`finishReason` | Token 用量，以及服務商回報的結束原因。 |
+| `createdAt`、`updatedAt` | 自 Unix 紀元起的微秒數。重新產生分析時，`updatedAt` 會變更。 |
+
+**證據**
+
+每筆證據有 `label`（`E1`、`E2`……）、`kind`、`source`，已知時還有 `service`、`subject`（證據是關於什麼的，不含數字）、`detail`、`at`、`figures` 和 `link`。
+
+| `kind` | `source` | `figures` |
+|---|---|---|
+| `insight` | `apm` | `value`、`previous`、`lastWeek`、`calls`、`p95Time`；`detail` 是洞察類型和變化的指標，例如 `anomaly.p95`。 |
+| `new_error_group` | `apm` | `occurrences`。 |
+| `sample_trace` | `traces` | `duration`，單位為微秒；`link.traceId`。 |
+| `error_logs` | `logs` | `now` 和 `lastWeek`，即這段期間及上週同一時段的錯誤層級日誌行數。 |
+| `new_log_pattern` | `logs` | `lines`，即該模式在這段期間內的錯誤層級日誌行數，取樣時為估計值。`subject` 是模式，`detail` 是它的一則訊息。 |
+| `attribute_skew` | `traces` | `failedShare` 和 `otherShare`，即失敗請求和其他請求中帶有此取值的佔比；`score`，兩組在這個欄位上的差距（0 到 1）；`failed`，讀取的失敗請求數。`subject` 是欄位，`detail` 是取值。 |
+| `business_impact` | `traces` | 有失敗請求的取值的 `errors` 和 `requests`，`values` 是這些取值的個數，`important` 是其中重點取值的個數。`subject` 是鍵的顯示名稱，`detail` 最多列出 3 個取值。 |
+| `change`、`similar_incident`、`investigation` | `incident` | 無。 |
+
+只有持有對應來源權限的呼叫方才拿得到數字：`apm` 需要 `apm.services.read`，`traces` 和 `logs` 需要 `streams.query`，或持有 `sys.telemetry.read`。其他呼叫方拿不到 `figures`，且 `withheld` 為 `true`。`POST` 的回應和 Mole Agent 的 `get_incident_rca` 也是如此。
 
 **錯誤**
 
 | 狀態碼 | 原因 |
 |---|---|
-| `400` | `POST` 呼叫找不到該組織已啟用且具備 API 金鑰的模型服務供應商。 |
+| `400` | `POST` 呼叫沒有找到該組織已啟用且帶有 API Key 的模型服務商。 |
 | `403` | Token 缺少此呼叫所需的權限。 |
 | `404` | 事件不存在，或 `GET` 呼叫尚未找到分析。 |

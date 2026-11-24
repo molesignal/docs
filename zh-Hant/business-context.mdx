@@ -1,0 +1,82 @@
+---
+title: "業務上下文"
+description: "宣告租戶、方案這類業務鍵，以 baggage 將它們帶到每個 Span 和日誌記錄上，並依它們拆分請求、查看事件影響。"
+"en_link": "/en-US/business-context"
+"zh-Hans_link": "/zh-Hans/business-context"
+"ja_link": "/ja/business-context"
+"ko_link": "/ko/business-context"
+"de_link": "/de/business-context"
+"es_link": "/es/business-context"
+"fr_link": "/fr/business-context"
+"pt-BR_link": "/pt-BR/business-context"
+---
+
+業務鍵把遙測資料和它服務的對象聯繫起來：租戶、方案、使用者分層或實驗分組。宣告業務鍵之後，APM 服務頁可以依它拆分請求，事件會列出受影響的取值，根因分析也會知道哪些租戶出了錯。MoleSignal 不會為此改寫資料：業務鍵由應用程式寫進遙測資料，伺服器端只讀取宣告裡指定的欄位。
+
+## 宣告業務鍵
+
+開啟 **APM → 設定**，使用**業務情境**卡片。每個鍵包括：
+
+| 欄位 | 說明 |
+|---|---|
+| **鍵** | 連結和 Mole Agent 使用的名稱：小寫字母、數字和 `_`，例如 `tenant`。 |
+| **顯示名稱** | 讀者看到的名稱，例如 `租戶`。 |
+| **Span 屬性** | Trace 資料流裡承載它的欄位，例如 `tenant.id`。 |
+| **日誌欄位** | 承載它的日誌欄位。 |
+| **RUM 欄位** | RUM 欄位，可以是 JSON 欄位裡的鍵，例如 `context.tenant`。 |
+| **重點取值** | 最重要的取值，例如重點客戶，以逗號分隔。凡是顯示事件影響的地方都會標出它們。 |
+
+每個鍵至少指定一個訊號裡的欄位，最多 8 個鍵。管理這張卡片需要 `apm.settings.manage`。也可以透過 [API](/zh-Hant/api/business-context) 設定。
+
+## 把業務鍵寫進遙測資料
+
+Span 和日誌的屬性在接入時會成為所在資料流的欄位，所以作為屬性寫入的業務鍵可以直接用來拆分。要讓一個請求產生的每個 Span 和日誌記錄都帶上業務鍵，通常使用 W3C baggage：在請求進入的地方設定一次，baggage 處理器會把它複製到這個請求在所經過的每個服務裡產生的每個 Span 上（SDK 提供日誌處理器時，也複製到每條日誌記錄上）。
+
+<Warning>
+baggage 會隨請求標頭傳給所有下游服務，包括第三方。只複製宣告過的鍵，不要把金鑰或個人資料放進 baggage。
+</Warning>
+
+| 語言 | 把 baggage 複製到 Span 上的元件 |
+|---|---|
+| Java | OpenTelemetry Java agent，或搭配自動設定使用 `io.opentelemetry.contrib:opentelemetry-baggage-processor`：設定 `otel.java.experimental.span-attributes.copy-from-baggage.include=tenant.id`（日誌用 `otel.java.experimental.log-attributes.copy-from-baggage.include`）。 |
+| Go | `go.opentelemetry.io/contrib/processors/baggagecopy`：在 tracer provider 上註冊 `baggagecopy.NewSpanProcessor(filter)`。 |
+| Node.js | `@opentelemetry/baggage-span-processor`（`BaggageSpanProcessor`）和 `@opentelemetry/baggage-log-record-processor`（`BaggageLogRecordProcessor`）。 |
+| Python | `opentelemetry-processor-baggage`：在 tracer provider 上註冊 `BaggageSpanProcessor(predicate)`。 |
+| .NET | `OpenTelemetry.Extensions` 裡的 baggage activity 處理器，要註冊在所有匯出處理器之前。 |
+| Ruby | `opentelemetry-processor-baggage` gem。 |
+| PHP、Rust、Erlang/Elixir | 在請求進入的地方從 baggage 讀出業務鍵，自行把它設為 Span 屬性和日誌屬性。 |
+
+每個處理器都接受一個判斷要複製哪些鍵的函式；請傳入只保留宣告過的鍵的函式，不要複製全部。以 Python 為例：
+
+```python
+from opentelemetry.processor.baggage import BaggageSpanProcessor
+
+declared = {"tenant.id", "plan"}
+tracer_provider.add_span_processor(BaggageSpanProcessor(lambda key: key in declared))
+```
+
+在請求進入的地方：
+
+```python
+from opentelemetry import baggage, context
+
+token = context.attach(baggage.set_baggage("tenant.id", tenant_id))
+```
+
+RUM 方面，在瀏覽器 SDK 的 context 裡設定業務鍵，例如 `context.tenant`，並把這個欄位填為該鍵的 **RUM 欄位**。
+
+## 業務鍵用在哪裡
+
+| 頁面 | 顯示內容 |
+|---|---|
+| [APM](/zh-Hant/apm) 服務頁 | **依業務鍵拆分請求**：每個取值的請求數、錯誤率和 P95，標出重點取值，並可跳到 Trace 頁面依任意欄位拆分。 |
+| [事件](/zh-Hant/alerting/incidents#事件詳情) | **業務影響**：對每個鍵，列出事件觸發前後送往事件相關服務的請求中失敗最多的取值。只對具有 `streams.query` 或 `sys.telemetry.read` 權限的讀者顯示。 |
+| [根因分析](/zh-Hant/alerting/incidents) | 每個有失敗取值的鍵對應一條**業務影響**證據。 |
+
+[Trace](/zh-Hant/traces) 的 RED 檢視可以依任意 Span 欄位拆分，包括業務鍵；它的**比較**卡片會指出失敗請求或慢速請求在哪些欄位的取值上與其他請求不同。
+
+## 相關頁面
+
+- [APM 設定](/zh-Hant/apm/settings)
+- [Trace](/zh-Hant/traces)
+- [跨訊號關聯](/zh-Hant/correlation)

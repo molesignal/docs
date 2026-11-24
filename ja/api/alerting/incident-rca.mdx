@@ -1,6 +1,6 @@
 ---
 title: "根本原因分析"
-description: "インシデントの根本原因分析をAIで生成するか、生成済みの分析結果を取得します。"
+description: "インシデントの AI による根本原因分析を取得または生成します。"
 "en_link": "/en-US/api/alerting/incident-rca"
 "zh-Hans_link": "/zh-Hans/api/alerting/incident-rca"
 "zh-Hant_link": "/zh-Hant/api/alerting/incident-rca"
@@ -16,14 +16,14 @@ GET /api/v1/alerts/incidents/{id}/rca
 POST /api/v1/alerts/incidents/{id}/rca
 ```
 
-[Mole Agent](/ja/agent) は、インシデントのコンテキストに基づいて根本原因分析（RCA）を作成します。分析はインシデントごとに最大1件です。
+[Mole Agent](/ja/agent)は、インシデントのコンテキストからインシデントの根本原因分析（RCA）を作成します。各インシデントには最大1つの分析があります。
 
-`alert` ロールは分析を自動で作成します。組織に API キーが設定された有効なモデルプロバイダーがある場合、3分ごとに、分析がまだないアクティブなインシデントを対象として、1回の処理で最大20件の分析を作成します。`GET` 呼び出しは保存済みの分析を取得します。`POST` 呼び出しは新しい分析をすぐに生成し、保存済みの分析を置き換えます。
+`alert` ロールは分析を自動的に作成します。3分ごとに、このロールは分析がまだないアクティブなインシデントに対して分析を作成します（1パスあたり最大20件）。これは、組織にAPIキー付きの有効なモデルプロバイダーがある場合に実行されます。`GET` 呼び出しは保存された分析を読み取ります。`POST` 呼び出しは新しい分析を即座に生成し、保存されている分析を置き換えます。
 
 | 呼び出し | 権限 | 備考 |
 |---|---|---|
-| `GET` | `alerts.incidents.read` | 分析が作成されるまでは、`no root-cause analysis for this incident yet` を含む `404` を返します。 |
-| `POST` | `alerts.incidents.rca` | モデルの応答を待ち、新しい分析を返します。オプションのクエリパラメーター `locale` で、出力言語として `en-us` または `zh-cn` を指定できます。デフォルトでは、呼び出し元ユーザーの言語設定を使用します。 |
+| `GET` | `alerts.incidents.read` | 分析が存在するまで、`no root-cause analysis for this incident yet` を付けて `404` を返します。 |
+| `POST` | `alerts.incidents.rca` | モデルを待機し、新しい分析を返します。オプションのクエリパラメータ `locale` で出力言語（`en-us` または `zh-cn`）を選択します。デフォルトは呼び出し元ユーザーの言語設定です。 |
 
 <RequestExample>
 ```bash cURL
@@ -55,17 +55,35 @@ curl -X POST "http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/rca?loc
 
 | フィールド | 備考 |
 |---|---|
-| `incidentId`, `orgId` | インシデントと組織の識別子です。 |
-| `summary` | Markdown 形式の分析テキストです。 |
-| `provider`, `model` | モデルプロバイダーの種類（`openai`、`anthropic`、`openai_compatible` など）とモデル名です。 |
-| `promptBuiltinKey`, `promptHash` | 監査用のプロンプトテンプレートと、レンダリング済みプロンプトのハッシュです。 |
-| `promptTokens`, `completionTokens`, `finishReason` | プロバイダーが報告するトークン使用量と生成の終了理由です。 |
-| `createdAt`, `updatedAt` | Unix エポックからの経過時間（マイクロ秒）です。分析を再生成すると `updatedAt` が変わります。 |
+| `incidentId`、`orgId` | インシデントと組織の識別子。 |
+| `summary` | Markdown テキストとしての分析。`[E2]` などのラベルで証拠を引用します。 |
+| `evidence` | 分析に与えられたラベル付き証拠。最大30件。以下を参照してください。 |
+| `provider`、`model` | モデルプロバイダーの種類（`openai`、`anthropic`、`openai_compatible` など）とモデル名。 |
+| `promptBuiltinKey`、`promptHash` | 監査用のプロンプトテンプレートと、レンダリングされたプロンプトのハッシュ。 |
+| `promptTokens`、`completionTokens`、`finishReason` | プロバイダーが報告するトークン使用量と終了理由。 |
+| `createdAt`、`updatedAt` | Unix エポックからのマイクロ秒。`updatedAt` は分析が再生成されると変更されます。 |
+
+**証拠**
+
+各項目には `label`（`E1`、`E2`、…）、`kind`、`source` があり、判明している場合は `service`、`subject`（何についてかを示し、数値は含みません）、`detail`、`at`、`figures`、`link` もあります。
+
+| `kind` | `source` | `figures` |
+|---|---|---|
+| `insight` | `apm` | `value`、`previous`、`lastWeek`、`calls`、`p95Time`。`detail` はインサイトの種類と変動した数値（`anomaly.p95` など）です。 |
+| `new_error_group` | `apm` | `occurrences`。 |
+| `sample_trace` | `traces` | マイクロ秒単位の `duration`。`link.traceId`。 |
+| `error_logs` | `logs` | `now` と `lastWeek`。ウィンドウ内と1週間前の同じウィンドウ内のエラーレベルの行数。 |
+| `new_log_pattern` | `logs` | `lines`。ウィンドウ内のパターンのエラーレベルの行数で、ウィンドウがサンプリングされた場合は推定値です。`subject` はパターン、`detail` はそのメッセージの1つです。 |
+| `attribute_skew` | `traces` | `failedShare` と `otherShare`（その値を持つ失敗リクエストとその他のリクエストの割合）、`score`（そのフィールド上で2つの集合がどれだけ離れているか。0〜1）、`failed`（読み取った失敗リクエスト）。`subject` はフィールド、`detail` は値です。 |
+| `business_impact` | `traces` | リクエストが失敗した値の `errors` と `requests`、`values`（その数）、`important`（そのうち重要なものとしてマークされている数）。`subject` はキーのラベル、`detail` は最大3つの値の名前です。 |
+| `change`、`similar_incident`、`investigation` | `incident` | なし。 |
+
+数値は、そのソースの権限を持つ呼び出し元にのみ返されます。`apm` には `apm.services.read`、 `traces` と `logs` には `streams.query`、または `sys.telemetry.read` です。その他の呼び出し元では `figures` は省略され、`withheld` は `true` になります。同じことが `POST` レスポンスと Mole Agent の `get_incident_rca` にも当てはまります。
 
 **エラー**
 
 | ステータス | 原因 |
 |---|---|
-| `400` | `POST` 呼び出しの対象組織に、API キーが設定された有効なモデルプロバイダーがありません。 |
-| `403` | トークンに呼び出しに必要な権限がありません。 |
-| `404` | インシデントが存在しないか、`GET` 呼び出しの対象となる分析がまだありません。 |
+| `400` | `POST` 呼び出しで、組織にAPIキー付きの有効なモデルプロバイダーが見つかりませんでした。 |
+| `403` | トークンに呼び出しの権限がありません。 |
+| `404` | インシデントが存在しないか、`GET` 呼び出しでまだ分析が見つかりませんでした。 |

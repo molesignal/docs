@@ -1,6 +1,6 @@
 ---
 title: "Análise de causa raiz"
-description: "Consulte ou gere com IA a análise de causa raiz de um incidente."
+description: "Leia ou gere a análise de causa raiz de um incidente com IA."
 "en_link": "/en-US/api/alerting/incident-rca"
 "zh-Hans_link": "/zh-Hans/api/alerting/incident-rca"
 "zh-Hant_link": "/zh-Hant/api/alerting/incident-rca"
@@ -16,14 +16,14 @@ GET /api/v1/alerts/incidents/{id}/rca
 POST /api/v1/alerts/incidents/{id}/rca
 ```
 
-O [Mole Agent](/pt-BR/agent) gera uma análise de causa raiz (RCA) com base no contexto do incidente. Cada incidente tem no máximo uma análise.
+[Mole Agent](/pt-BR/agent) grava uma análise de causa raiz (RCA) de um incidente a partir do contexto do incidente. Cada incidente tem no máximo uma análise.
 
-A função `alert` gera análises automaticamente. A cada três minutos, a função gera análises para até 20 incidentes ativos que ainda não têm análise, desde que a organização tenha um provedor de modelos habilitado com uma chave de API. A chamada `GET` lê a análise armazenada. A chamada `POST` gera uma nova análise imediatamente e substitui a análise armazenada.
+A função `alert` cria análises automaticamente. A cada três minutos, a função grava uma análise para os incidentes ativos que não têm nenhuma, até 20 por execução, quando a organização tem um provedor de modelo habilitado com uma chave de API. A chamada `GET` lê a análise armazenada. A chamada `POST` gera uma nova análise imediatamente e substitui a armazenada.
 
 | Chamada | Permissão | Observações |
 |---|---|---|
-| `GET` | `alerts.incidents.read` | Retorna `404` com `no root-cause analysis for this incident yet` enquanto não houver uma análise. |
-| `POST` | `alerts.incidents.rca` | Aguarda a resposta do modelo e retorna a nova análise. O parâmetro de consulta opcional `locale` define o idioma da análise: `en-us` ou `zh-cn`. Por padrão, usa o idioma de preferência do usuário que faz a chamada. |
+| `GET` | `alerts.incidents.read` | Responde `404` com `no root-cause analysis for this incident yet` até que exista uma análise. |
+| `POST` | `alerts.incidents.rca` | Aguarda o modelo e retorna a nova análise. O parâmetro de consulta opcional `locale` seleciona o idioma de saída, `en-us` ou `zh-cn`. O padrão é a preferência de idioma do usuário que faz a chamada. |
 
 <RequestExample>
 ```bash cURL
@@ -55,17 +55,39 @@ curl -X POST "http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/rca?loc
 
 | Campo | Observações |
 |---|---|
-| `incidentId`, `orgId` | Identificadores do incidente e da organização. |
-| `summary` | Análise em formato Markdown. |
-| `provider`, `model` | Tipo de provedor de modelos, como `openai`, `anthropic` ou `openai_compatible`, e nome do modelo. |
-| `promptBuiltinKey`, `promptHash` | Modelo de prompt e hash do prompt renderizado, para fins de auditoria. |
-| `promptTokens`, `completionTokens`, `finishReason` | Uso de tokens e motivo do encerramento informados pelo provedor. |
-| `createdAt`, `updatedAt` | Microssegundos desde a época Unix. O campo `updatedAt` muda quando o sistema gera a análise novamente. |
+| `incidentId`, `orgId` | Os identificadores do incidente e da organização. |
+| `summary` | A análise, como texto Markdown. Ela cita evidências por rótulo, como `[E2]`. |
+| `evidence` | As evidências rotuladas fornecidas à análise, no máximo 30 itens. Veja abaixo. |
+| `provider`, `model` | O tipo de provedor de modelo, como `openai`, `anthropic` ou `openai_compatible`, e o nome do modelo. |
+| `promptBuiltinKey`, `promptHash` | O template de prompt e um hash do prompt renderizado, para auditoria. |
+| `promptTokens`, `completionTokens`, `finishReason` | O uso de tokens e o motivo de finalização informados pelo provedor. |
+| `createdAt`, `updatedAt` | Microssegundos desde a época Unix. `updatedAt` muda quando a análise é gerada novamente. |
+
+**Evidências**
+
+Cada item tem `label` (`E1`, `E2`, …), `kind`, `source` e, quando conhecidos, `service`, `subject` (sobre o que
+se trata, sem números), `detail`, `at`, `figures` e `link`.
+
+| `kind` | `source` | `figures` |
+|---|---|---|
+| `insight` | `apm` | `value`, `previous`, `lastWeek`, `calls`, `p95Time`; `detail` é o tipo de insight e a métrica que variou, como `anomaly.p95`. |
+| `new_error_group` | `apm` | `occurrences`. |
+| `sample_trace` | `traces` | `duration` em microssegundos; `link.traceId`. |
+| `error_logs` | `logs` | `now` e `lastWeek`, linhas de nível de erro na janela e na mesma janela uma semana antes. |
+| `new_log_pattern` | `logs` | `lines`, as linhas de nível de erro do padrão na janela, estimadas quando a janela foi amostrada. `subject` é o padrão e `detail` uma de suas mensagens. |
+| `attribute_skew` | `traces` | `failedShare` e `otherShare`, a proporção das requisições com falha e das demais com o valor; `score`, o quão distantes os dois conjuntos estão no campo (0 a 1); `failed`, as requisições com falha lidas. `subject` é o campo e `detail` o valor. |
+| `business_impact` | `traces` | `errors` e `requests` dos valores cujas requisições falharam, `values`, quantos são, e `important`, quantos deles estão marcados como importantes. `subject` é o rótulo da chave e `detail` nomeia até 3 valores. |
+| `change`, `similar_incident`, `investigation` | `incident` | Nenhum. |
+
+Os números são retornados apenas para chamadores que têm a permissão da origem: `apm.services.read` para
+`apm`, `streams.query` para `traces` e `logs`, ou `sys.telemetry.read`. Para outros chamadores, `figures` é
+omitido e `withheld` é `true`. O mesmo vale para a resposta do `POST` e para o
+`get_incident_rca` do Mole Agent.
 
 **Erros**
 
 | Status | Causa |
 |---|---|
-| `400` | A chamada `POST` não encontrou um provedor de modelos habilitado com uma chave de API para a organização. |
-| `403` | O token não tem a permissão exigida pela chamada. |
-| `404` | O incidente não existe ou a chamada `GET` ainda não encontrou uma análise. |
+| `400` | A chamada `POST` não encontrou nenhum provedor de modelo habilitado com uma chave de API para a organização. |
+| `403` | O token não tem a permissão da chamada. |
+| `404` | O incidente não existe, ou a chamada `GET` ainda não encontrou uma análise. |

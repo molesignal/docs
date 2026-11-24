@@ -1,0 +1,93 @@
+---
+title: "Business-Kontext"
+description: "Deklarieren Sie Business-Schlüssel wie einen Tenant oder einen Plan, hängen Sie sie als Baggage an jeden Span und jeden Log-Datensatz an und teilen Sie Anfragen und Incidents danach auf."
+"en_link": "/en-US/business-context"
+"zh-Hans_link": "/zh-Hans/business-context"
+"zh-Hant_link": "/zh-Hant/business-context"
+"ja_link": "/ja/business-context"
+"ko_link": "/ko/business-context"
+"es_link": "/es/business-context"
+"fr_link": "/fr/business-context"
+"pt-BR_link": "/pt-BR/business-context"
+---
+
+Business-Schlüssel verbinden Telemetrie damit, wem sie gedient hat: einem Tenant, einem Plan, einer Nutzerstufe
+oder einer Experimentgruppe. Sobald die Schlüssel deklariert sind, teilt die APM-Service-Seite Anfragen nach ihnen
+auf, ein Incident listet die Werte auf, die seine Störung getroffen hat, und der Root-Cause-Analyse wird mitgeteilt,
+welche Tenants ausgefallen sind. MoleSignal schreibt dafür keine Daten um: Anwendungen setzen die Schlüssel auf ihre Telemetrie, und der Server liest die Felder, die die Deklaration benennt.
+
+## Schlüssel deklarieren
+
+Öffnen Sie **APM → Einstellungen** und verwenden Sie die Karte **Business-Kontext**. Jeder Schlüssel hat:
+
+| Feld | Hinweise |
+|---|---|
+| **Schlüssel** | Der Name, der in Links und von Mole Agent verwendet wird: Kleinbuchstaben, Ziffern und `_`, zum Beispiel `tenant`. |
+| **Bezeichnung** | Was Leser sehen, zum Beispiel `Tenant`. |
+| **Span-Attribut** | Das Feld des Traces-Streams, das ihn trägt, zum Beispiel `tenant.id`. |
+| **Log-Feld** | Das Log-Feld, das ihn trägt. |
+| **RUM-Feld** | Das RUM-Feld, ein Schlüssel eines eingeschlossenen JSON-Felds, zum Beispiel `context.tenant`. |
+| **Wichtige Werte** | Werte, die am wichtigsten sind, etwa Schlüsselkunden, durch Kommas getrennt. Sie werden überall gekennzeichnet, wo die Auswirkung eines Incidents angezeigt wird. |
+
+Ein Schlüssel benennt das Feld mindestens eines Signals; bis zu 8 Schlüssel. Für die Verwaltung der Karte wird
+`apm.settings.manage` benötigt. Dieselbe Deklaration kann über die [API](/de/api/business-context) festgelegt werden.
+
+## Schlüssel auf die Telemetrie setzen
+
+Span- und Log-Attribute werden bei der Annahme zu Feldern ihres Streams, sodass ein als Attribut gesetzter Schlüssel
+sofort zum Aufteilen genutzt werden kann. Der übliche Weg, ihn auf jedem Span und jedem Log-Record einer Anfrage zu setzen, ist W3C-Baggage:
+Setzen Sie den Schlüssel einmal dort, wo die Anfrage eingeht, und ein Baggage-Prozessor kopiert ihn auf jeden Span (und,
+wo das SDK einen besitzt, jeden Log-Record), den die Anfrage erzeugt, in jedem Service, den sie erreicht.
+
+<Warning>
+Baggage wird in Request-Headern an jeden nachgelagerten Service übertragen, auch an Drittanbieter. Kopieren Sie nur die
+Schlüssel, die Sie deklariert haben, und legen Sie niemals Secrets oder personenbezogene Daten in Baggage ab.
+</Warning>
+
+| Sprache | Was Baggage auf Spans kopiert |
+|---|---|
+| Java | Der OpenTelemetry-Java-Agent oder `io.opentelemetry.contrib:opentelemetry-baggage-processor` mit Autoconfigure: Setzen Sie `otel.java.experimental.span-attributes.copy-from-baggage.include=tenant.id` (und `otel.java.experimental.log-attributes.copy-from-baggage.include` für Logs). |
+| Go | `go.opentelemetry.io/contrib/processors/baggagecopy`: `baggagecopy.NewSpanProcessor(filter)` auf dem Tracer Provider. |
+| Node.js | `@opentelemetry/baggage-span-processor` (`BaggageSpanProcessor`) und `@opentelemetry/baggage-log-record-processor` (`BaggageLogRecordProcessor`). |
+| Python | `opentelemetry-processor-baggage`: `BaggageSpanProcessor(predicate)` auf dem Tracer Provider. |
+| .NET | `OpenTelemetry.Extensions`: der Baggage-Activity-Prozessor, registriert vor jedem exportierenden Prozessor. |
+| Ruby | Das Gem `opentelemetry-processor-baggage`. |
+| PHP, Rust, Erlang/Elixir | Lesen Sie den Schlüssel dort aus Baggage, wo die Anfrage eingeht, und setzen Sie ihn selbst als Span-Attribut und Log-Attribut. |
+
+Jeder Prozessor nimmt ein Prädikat entgegen, das die zu kopierenden Schlüssel auswählt; übergeben Sie eines, das nur die
+deklarierten Schlüssel behält, statt eines, das alles kopiert. Zum Beispiel in Python:
+
+```python
+from opentelemetry.processor.baggage import BaggageSpanProcessor
+
+declared = {"tenant.id", "plan"}
+tracer_provider.add_span_processor(BaggageSpanProcessor(lambda key: key in declared))
+```
+
+und dort, wo die Anfrage eingeht:
+
+```python
+from opentelemetry import baggage, context
+
+token = context.attach(baggage.set_baggage("tenant.id", tenant_id))
+```
+
+Für RUM setzen Sie den Schlüssel im Kontext des Browser-SDK, etwa `context.tenant`, und benennen Sie dieses Feld als
+**RUM-Feld** des Schlüssels.
+
+## Wo die Schlüssel verwendet werden
+
+| Seite | Was angezeigt wird |
+|---|---|
+| [APM](/de/apm) Service-Seite | **Anfragen nach Business-Schlüsseln**: Anfragen, Fehlerrate und P95 jedes Werts, wichtige Werte gekennzeichnet, und ein Link zum Aufteilen nach einem beliebigen anderen Feld auf der Traces-Seite. |
+| [Incidents](/de/alerting/incidents#vorfallsdetails) | **Business-Auswirkung**: für jeden Schlüssel die Werte, deren Anfragen an die Services des Incidents rund um seine Auslösung am häufigsten fehlgeschlagen sind. Wird Lesern mit `streams.query` oder `sys.telemetry.read` angezeigt. |
+| [Root-Cause-Analyse](/de/alerting/incidents) | Ein Beleg der Kategorie **Business-Auswirkung** für jeden Schlüssel mit fehlgeschlagenen Werten. |
+
+Die [Traces](/de/traces) RED-Ansicht teilt nach jedem Span-Feld auf, Business-Schlüssel eingeschlossen, und ihre
+Karte **Vergleichen** zeigt, durch welche Feldwerte sich die fehlgeschlagenen oder langsamen Anfragen abheben.
+
+## Verwandte Seiten
+
+- [APM-Einstellungen](/de/apm/settings)
+- [Traces](/de/traces)
+- [Signalübergreifende Korrelation](/de/correlation)

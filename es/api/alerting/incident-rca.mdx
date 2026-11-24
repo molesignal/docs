@@ -1,6 +1,6 @@
 ---
 title: "Análisis de causa raíz"
-description: "Consulta o genera el análisis de causa raíz de un incidente con IA."
+description: "Lee o genera el análisis de causa raíz con IA de un incidente."
 "en_link": "/en-US/api/alerting/incident-rca"
 "zh-Hans_link": "/zh-Hans/api/alerting/incident-rca"
 "zh-Hant_link": "/zh-Hant/api/alerting/incident-rca"
@@ -16,14 +16,14 @@ GET /api/v1/alerts/incidents/{id}/rca
 POST /api/v1/alerts/incidents/{id}/rca
 ```
 
-[Mole Agent](/es/agent) redacta un análisis de causa raíz (RCA) a partir del contexto del incidente. Cada incidente tiene como máximo un análisis.
+[Mole Agent](/es/agent) escribe un análisis de causa raíz (RCA) de un incidente a partir del contexto del incidente. Cada incidente tiene como máximo un análisis.
 
-El rol `alert` crea análisis automáticamente. Cada tres minutos, si la organización tiene un proveedor de modelos habilitado con una clave de API, el rol redacta un análisis para hasta 20 incidentes activos que aún no tienen uno. La llamada `GET` lee el análisis almacenado. La llamada `POST` genera un nuevo análisis de inmediato y reemplaza el anterior.
+El rol `alert` crea análisis automáticamente. Cada tres minutos, el rol escribe un análisis para los incidentes activos que no tengan ninguno, hasta 20 por pasada, cuando la organización tiene un proveedor de modelos habilitado con una clave de API. La llamada `GET` lee el análisis almacenado. La llamada `POST` genera un análisis nuevo de inmediato y reemplaza el almacenado.
 
 | Llamada | Permiso | Notas |
 |---|---|---|
-| `GET` | `alerts.incidents.read` | Devuelve `404` con el mensaje `no root-cause analysis for this incident yet` hasta que exista un análisis. |
-| `POST` | `alerts.incidents.rca` | Espera la respuesta del modelo y devuelve el nuevo análisis. El parámetro de consulta opcional `locale` selecciona el idioma de salida: `en-us` o `zh-cn`. De forma predeterminada, usa el idioma configurado en la cuenta que realiza la llamada. |
+| `GET` | `alerts.incidents.read` | Responde `404` con `no root-cause analysis for this incident yet` hasta que exista un análisis. |
+| `POST` | `alerts.incidents.rca` | Espera al modelo y devuelve el nuevo análisis. El parámetro de consulta opcional `locale` selecciona el idioma de salida, `en-us` o `zh-cn`. El valor predeterminado es la preferencia de idioma de quien llama. |
 
 <RequestExample>
 ```bash cURL
@@ -55,17 +55,38 @@ curl -X POST "http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/rca?loc
 
 | Campo | Notas |
 |---|---|
-| `incidentId`, `orgId` | Identificadores del incidente y de la organización. |
-| `summary` | Análisis en formato Markdown. |
-| `provider`, `model` | Tipo de proveedor de modelos, como `openai`, `anthropic` u `openai_compatible`, y nombre del modelo. |
-| `promptBuiltinKey`, `promptHash` | Plantilla de la instrucción y hash de la instrucción generada a partir de ella, para auditoría. |
-| `promptTokens`, `completionTokens`, `finishReason` | Consumo de tokens y motivo de finalización que informa el proveedor. |
-| `createdAt`, `updatedAt` | Microsegundos desde el inicio de la época Unix. `updatedAt` cambia cada vez que se vuelve a generar el análisis. |
+| `incidentId`, `orgId` | Los identificadores del incidente y de la organización. |
+| `summary` | El análisis, como texto Markdown. Cita la evidencia por su etiqueta, como `[E2]`. |
+| `evidence` | La evidencia etiquetada que recibió el análisis, como máximo 30 piezas. Consulta más abajo. |
+| `provider`, `model` | El tipo de proveedor de modelos, como `openai`, `anthropic` u `openai_compatible`, y el nombre del modelo. |
+| `promptBuiltinKey`, `promptHash` | La plantilla del prompt y un hash del prompt renderizado, para auditoría. |
+| `promptTokens`, `completionTokens`, `finishReason` | El uso de tokens y el motivo de finalización que informa el proveedor. |
+| `createdAt`, `updatedAt` | Microsegundos desde la época Unix. `updatedAt` cambia cuando se regenera el análisis. |
+
+**Evidencia**
+
+Cada pieza tiene `label` (`E1`, `E2`, …), `kind`, `source` y, cuando se conocen, `service`, `subject` (de qué
+trata, sin cifras), `detail`, `at`, `figures` y `link`.
+
+| `kind` | `source` | `figures` |
+|---|---|---|
+| `insight` | `apm` | `value`, `previous`, `lastWeek`, `calls`, `p95Time`; `detail` es el tipo de insight y la cifra que cambió, como `anomaly.p95`. |
+| `new_error_group` | `apm` | `occurrences`. |
+| `sample_trace` | `traces` | `duration` en microsegundos; `link.traceId`. |
+| `error_logs` | `logs` | `now` y `lastWeek`, líneas de nivel de error en la ventana y en la misma ventana una semana antes. |
+| `new_log_pattern` | `logs` | `lines`, las líneas de nivel de error del patrón en la ventana, estimadas cuando se muestreó la ventana. `subject` es el patrón y `detail`, uno de sus mensajes. |
+| `attribute_skew` | `traces` | `failedShare` y `otherShare`, la proporción de las solicitudes fallidas y de las demás con el valor; `score`, qué tan separados están los dos conjuntos en el campo (0 a 1); `failed`, las solicitudes fallidas leídas. `subject` es el campo y `detail`, el valor. |
+| `business_impact` | `traces` | `errors` y `requests` de los valores cuyas solicitudes fallaron, `values`, cuántos hay, e `important`, cuántos de ellos están marcados como importantes. `subject` es la etiqueta de la clave y `detail` nombra hasta 3 valores. |
+| `change`, `similar_incident`, `investigation` | `incident` | Ninguna. |
+
+Las cifras solo se devuelven a quien llama y tiene un permiso de su origen: `apm.services.read` para
+`apm`, `streams.query` para `traces` y `logs`, o `sys.telemetry.read`. Para las demás llamadas, `figures` se
+omite y `withheld` es `true`. Lo mismo se aplica a la respuesta de `POST` y a `get_incident_rca` de Mole Agent.
 
 **Errores**
 
 | Estado | Causa |
 |---|---|
 | `400` | La llamada `POST` no encontró ningún proveedor de modelos habilitado con una clave de API para la organización. |
-| `403` | El token no tiene el permiso que requiere la llamada. |
-| `404` | El incidente no existe o la llamada `GET` aún no encontró ningún análisis. |
+| `403` | Al token le falta el permiso de la llamada. |
+| `404` | El incidente no existe, o la llamada `GET` todavía no encontró ningún análisis. |

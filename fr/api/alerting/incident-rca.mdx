@@ -1,6 +1,6 @@
 ---
-title: "Analyse des causes profondes"
-description: "Consultez l’analyse des causes profondes d’un incident ou générez-la à l’aide de l’IA."
+title: "Analyse des causes racines"
+description: "Lisez ou générez l'analyse des causes racines d'un incident par l'IA."
 "en_link": "/en-US/api/alerting/incident-rca"
 "zh-Hans_link": "/zh-Hans/api/alerting/incident-rca"
 "zh-Hant_link": "/zh-Hant/api/alerting/incident-rca"
@@ -16,14 +16,14 @@ GET /api/v1/alerts/incidents/{id}/rca
 POST /api/v1/alerts/incidents/{id}/rca
 ```
 
-[Mole Agent](/fr/agent) rédige une analyse des causes profondes (RCA) à partir du contexte de l’incident. Chaque incident peut avoir au plus une analyse.
+[Mole Agent](/fr/agent) rédige une analyse de cause racine (RCA) pour un incident à partir du contexte de l'incident. Chaque incident a au plus une analyse.
 
-Le rôle `alert` crée automatiquement les analyses. Si l’organisation dispose d’un fournisseur de modèles activé et doté d’une clé API, ce rôle rédige toutes les trois minutes une analyse pour les incidents actifs qui n’en ont pas, dans la limite de 20 incidents par cycle. L’appel `GET` récupère l’analyse enregistrée. L’appel `POST` génère immédiatement une nouvelle analyse et remplace celle qui est enregistrée.
+Le rôle `alert` crée les analyses automatiquement. Toutes les trois minutes, le rôle rédige une analyse pour les incidents actifs qui n'en ont pas, jusqu'à 20 par passe, lorsque l'organisation dispose d'un fournisseur de modèle activé avec une clé d'API. L'appel `GET` lit l'analyse enregistrée. L'appel `POST` génère immédiatement une nouvelle analyse et remplace celle qui est enregistrée.
 
-| Appel | Autorisation | Remarques |
+| Appel | Permission | Remarques |
 |---|---|---|
-| `GET` | `alerts.incidents.read` | Renvoie `404` avec le message `no root-cause analysis for this incident yet` tant qu’aucune analyse n’existe. |
-| `POST` | `alerts.incidents.rca` | Attend la réponse du modèle et renvoie la nouvelle analyse. Le paramètre de requête facultatif `locale` définit la langue de l’analyse : `en-us` ou `zh-cn`. Par défaut, l’appel utilise la préférence linguistique du compte à l’origine de l’appel. |
+| `GET` | `alerts.incidents.read` | Renvoie `404` avec `no root-cause analysis for this incident yet` tant qu'aucune analyse n'existe. |
+| `POST` | `alerts.incidents.rca` | Attend le modèle et renvoie la nouvelle analyse. Le paramètre de requête facultatif `locale` choisit la langue de sortie, `en-us` ou `zh-cn`. La valeur par défaut est la préférence de langue de l'utilisateur appelant. |
 
 <RequestExample>
 ```bash cURL
@@ -55,17 +55,39 @@ curl -X POST "http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/rca?loc
 
 | Champ | Remarques |
 |---|---|
-| `incidentId`, `orgId` | Les identifiants de l’incident et de l’organisation. |
-| `summary` | L’analyse au format Markdown. |
-| `provider`, `model` | Le type de fournisseur de modèles, par exemple `openai`, `anthropic` ou `openai_compatible`, et le nom du modèle. |
-| `promptBuiltinKey`, `promptHash` | Le gabarit de l’invite et l’empreinte de l’invite générée, à des fins d’audit. |
-| `promptTokens`, `completionTokens`, `finishReason` | Le nombre de jetons utilisés et le motif de fin de génération indiqués par le fournisseur. |
-| `createdAt`, `updatedAt` | Le nombre de microsecondes écoulées depuis l’époque Unix. `updatedAt` change à chaque nouvelle génération de l’analyse. |
+| `incidentId`, `orgId` | Les identifiants de l'incident et de l'organisation. |
+| `summary` | L'analyse, en texte Markdown. Elle cite les éléments probants par leur libellé, par exemple `[E2]`. |
+| `evidence` | Les éléments probants étiquetés fournis à l'analyse, 30 au maximum. Voir ci-dessous. |
+| `provider`, `model` | Le type de fournisseur de modèle, par exemple `openai`, `anthropic` ou `openai_compatible`, et le nom du modèle. |
+| `promptBuiltinKey`, `promptHash` | Le modèle de prompt et un hachage du prompt rendu, à des fins d'audit. |
+| `promptTokens`, `completionTokens`, `finishReason` | L'usage de tokens et la raison de fin signalés par le fournisseur. |
+| `createdAt`, `updatedAt` | Microsecondes depuis l'époque Unix. `updatedAt` change lorsque l'analyse est régénérée. |
+
+**Éléments probants**
+
+Chaque élément possède `label` (`E1`, `E2`, …), `kind`, `source` et, lorsqu'ils sont connus, `service`, `subject` (son objet, sans
+chiffres), `detail`, `at`, `figures` et `link`.
+
+| `kind` | `source` | `figures` |
+|---|---|---|
+| `insight` | `apm` | `value`, `previous`, `lastWeek`, `calls`, `p95Time` ; `detail` est le type d'insight et le chiffre qui a évolué, par exemple `anomaly.p95`. |
+| `new_error_group` | `apm` | `occurrences`. |
+| `sample_trace` | `traces` | `duration` en microsecondes ; `link.traceId`. |
+| `error_logs` | `logs` | `now` et `lastWeek`, lignes de niveau erreur dans la fenêtre et dans la même fenêtre une semaine auparavant. |
+| `new_log_pattern` | `logs` | `lines`, les lignes de niveau erreur du motif dans la fenêtre, estimées lorsque la fenêtre a été échantillonnée. `subject` est le motif et `detail` l'un de ses messages. |
+| `attribute_skew` | `traces` | `failedShare` et `otherShare`, la part des requêtes en échec et des autres présentant la valeur ; `score`, l'écart entre les deux ensembles sur le champ (0 à 1) ; `failed`, les requêtes en échec lues. `subject` est le champ et `detail` la valeur. |
+| `business_impact` | `traces` | `errors` et `requests` des valeurs dont les requêtes ont échoué, `values`, leur nombre, et `important`, combien d'entre elles sont marquées comme importantes. `subject` est le libellé de la clé et `detail` nomme jusqu'à 3 valeurs. |
+| `change`, `similar_incident`, `investigation` | `incident` | Aucun. |
+
+Les chiffres ne sont renvoyés qu'aux appelants qui détiennent une permission de leur source : `apm.services.read` pour
+`apm`, `streams.query` pour `traces` et `logs`, ou `sys.telemetry.read`. Pour les autres appelants, `figures` est
+omis et `withheld` vaut `true`. Il en va de même pour la réponse du `POST` et pour
+`get_incident_rca` de Mole Agent.
 
 **Erreurs**
 
 | Statut | Cause |
 |---|---|
-| `400` | Pour l’appel `POST`, l’organisation ne dispose d’aucun fournisseur de modèles activé et doté d’une clé API. |
-| `403` | Le jeton ne dispose pas de l’autorisation requise pour l’appel. |
-| `404` | L’incident n’existe pas, ou aucune analyse n’est encore disponible pour l’appel `GET`. |
+| `400` | L'appel `POST` n'a trouvé aucun fournisseur de modèle activé avec une clé d'API pour l'organisation. |
+| `403` | Le token ne dispose pas de la permission de l'appel. |
+| `404` | L'incident n'existe pas, ou l'appel `GET` n'a pas encore trouvé d'analyse. |
