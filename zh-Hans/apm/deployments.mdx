@@ -66,7 +66,7 @@ curl -X POST "https://<host>/api/v1/apm/deployments" \
 |---|---|---|
 | `service` | 是 | 服务名，与 Span 的 `service.name` 一致。最多 255 个字符。 |
 | `version` | 发布时必填 | 发布的版本，与 Span 的 `service.version` 一致。最多 192 个字符。 |
-| `kind` | 否 | `deployment`（默认）、`configuration` 或 `feature_flag`。 |
+| `kind` | 否 | `deployment`（默认）、`configuration`、`feature_flag`、`scaling` 或 `infrastructure`。 |
 | `namespace` | 否 | 服务的 `service.namespace`。不填时在所有 Namespace 中显示。 |
 | `environment` | 否 | 环境，即 `deployment.environment.name`。不填时在所有环境中显示。 |
 | `status` | 否 | `succeeded`（默认）、`failed`，或 `rolled_back`，表示这次发布把服务回滚到 `version`。 |
@@ -174,13 +174,43 @@ post {
 
 ## 上报配置变更与功能开关
 
-配置变更和功能开关使用同一个接口上报，设置 `kind`，并在描述里写明改了什么，不需要版本。
+配置变更、功能开关、扩缩容和服务所依赖的基础设施变更都使用同一个接口上报，设置 `kind`，并在描述里写明改了什么，不需要版本。
+
+上报的变更也会出现在 [`GET /api/v1/changes`](/zh-Hans/api/changes) 中，标记在日志和 Trace 的直方图上、指标图表下方，以及告警的**变更**页里。
 
 ```bash
 curl -X POST "https://<host>/api/v1/apm/deployments" \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"service": "checkout", "environment": "production", "kind": "feature_flag", "description": "new_checkout on for 10% of users"}'
+```
+
+## 从 Webhook 上报变更
+
+能自定义请求体和请求头的 Webhook（如 Argo CD notifications、Spinnaker、带请求体模板的 Unleash webhook 插件）按上文调用 `POST /api/v1/apm/deployments`。请求体固定、或者设不了请求头的工具改为调用 `POST /api/v1/intake/changes`。API Token 放在 `Authorization: Bearer` 中；设不了请求头时放在 `?token=` 中，Token 需要有 `apm.deploy` 权限。放在地址里的 Token 可能被代理记进日志：给这类工具单独发一个只含 `apm.deploy` 的 Token。
+
+| 参数 | 说明 |
+|---|---|
+| `format` | `generic`（默认）、`launchdarkly`、`unleash`、`nacos` 或 `apollo`。 |
+| `service`、`namespace`、`environment` | 请求体没有说明时使用。没有服务名的变更会被拒绝。 |
+| `kind` | `deployment`、`configuration`、`feature_flag`、`scaling` 或 `infrastructure`，覆盖请求体中的值。 |
+| `serviceField`、`environmentField`、`versionField`、`descriptionField`、`authorField` | 用于 `generic`：JSON Pointer（如 `/app/name`）或顶层字段名。不填时读取与 `POST /api/v1/apm/deployments` 同名的字段。 |
+
+| 格式 | 读取方式 |
+|---|---|
+| `launchdarkly` | 记为功能开关。环境取审计资源中的 `env/` 部分，描述取记录的标题，作者取成员邮箱。 |
+| `unleash` | 记为功能开关：事件类型和开关名、所在环境以及操作人。 |
+| `nacos` | 记为配置变更，内容是 Data ID 和分组；Nacos 命名空间作为 Namespace。 |
+| `apollo` | 记为配置变更：App ID 作为服务，集群作为环境，命名空间和发布标题说明改了什么。 |
+
+**数据接入 → DevOps** 下有 LaunchDarkly、Unleash、Nacos 和 Apollo 各自的接入指南，地址已按当前工作区填好。
+
+请求体可以是一个变更，也可以是至多 100 个变更的列表。返回 `201` 和保存下来的变更。这些预设按各工具文档中的请求体编写，还没有在真实账号上验证；工具的请求体不一致时，改用 `generic` 并指定 JSON Pointer。
+
+```bash
+curl -X POST "https://<host>/api/v1/intake/changes?format=launchdarkly&service=checkout&token=<token>" \
+  -H "Content-Type: application/json" \
+  -d @launchdarkly-event.json
 ```
 
 ## 故障排查

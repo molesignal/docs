@@ -80,7 +80,7 @@ curl -X POST "https://<host>/api/v1/apm/deployments" \
 |---|---|---|
 | `service` | Yes | The service, as its spans name it in `service.name`. Up to 255 characters. |
 | `version` | For a deployment | The version deployed, as its spans report it in `service.version`. Up to 192 characters. |
-| `kind` | No | `deployment` (the default), `configuration`, or `feature_flag`. |
+| `kind` | No | `deployment` (the default), `configuration`, `feature_flag`, `scaling`, or `infrastructure`. |
 | `namespace` | No | The service's `service.namespace`. A deployment without one shows in every namespace. |
 | `environment` | No | The environment, as `deployment.environment.name`. A deployment without one shows in every environment. |
 | `status` | No | `succeeded` (the default), `failed`, or `rolled_back` when the deployment took the service back to `version`. |
@@ -195,14 +195,54 @@ post {
 
 ## Report configuration changes and feature flags
 
-Report a configuration change or a feature flag with the same endpoint, with `kind` set and a
-description of what changed. It needs no version.
+Report a configuration change, a feature flag, a change of scale, or a change of the infrastructure
+under a service with the same endpoint, with `kind` set and a description of what changed. It needs no
+version.
+
+Every reported change is also listed by [`GET /api/v1/changes`](/en-US/api/changes), marked on the
+histograms of Logs and Traces and under the Metrics chart, and on the **Changes** page of Alerts.
 
 ```bash
 curl -X POST "https://<host>/api/v1/apm/deployments" \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"service": "checkout", "environment": "production", "kind": "feature_flag", "description": "new_checkout on for 10% of users"}'
+```
+
+## Report changes from webhooks
+
+A tool whose webhook can set the body and a header, such as Argo CD notifications, Spinnaker, or the
+Unleash webhook add-on with a body template, calls `POST /api/v1/apm/deployments` as above. A tool that
+sends a body of its own, or cannot set a header, calls `POST /api/v1/intake/changes` instead. The API
+token goes in `Authorization: Bearer` or, where no header can be set, in `?token=`, and must hold
+`apm.deploy`. A token in an address can end up in proxy logs: give such a tool a token of its own,
+scoped to `apm.deploy` alone.
+
+| Parameter | Notes |
+|---|---|
+| `format` | `generic` (the default), `launchdarkly`, `unleash`, `nacos`, or `apollo`. |
+| `service`, `namespace`, `environment` | What the body leaves unsaid. A change that names no service is refused. |
+| `kind` | `deployment`, `configuration`, `feature_flag`, `scaling`, or `infrastructure`; overrides what the body says. |
+| `serviceField`, `environmentField`, `versionField`, `descriptionField`, `authorField` | For `generic`: a JSON pointer such as `/app/name`, or a top-level field name. Without one, the field of the same name that `POST /api/v1/apm/deployments` takes is read. |
+
+| Format | Read as |
+|---|---|
+| `launchdarkly` | A feature flag. The environment is the `env/` part of the audited resource, the description the entry's title, the author the member's email. |
+| `unleash` | A feature flag: the event type and the toggle's name, its environment, and who made it. |
+| `nacos` | A configuration change of the data ID and group; the Nacos namespace is the namespace. |
+| `apollo` | A configuration change: the app ID is the service, the cluster the environment, and the namespace and release title what changed. |
+
+**Data sources → DevOps** has a guide for each of LaunchDarkly, Unleash, Nacos, and Apollo, with the
+address filled in for the workspace.
+
+A body may carry one change or a list of up to 100. The answer is `201` with the changes kept. The
+presets were written against the tools' documented payloads and have not been checked against live
+accounts; where a tool's payload differs, use `generic` with pointers.
+
+```bash
+curl -X POST "https://<host>/api/v1/intake/changes?format=launchdarkly&service=checkout&token=<token>" \
+  -H "Content-Type: application/json" \
+  -d @launchdarkly-event.json
 ```
 
 ## Troubleshooting

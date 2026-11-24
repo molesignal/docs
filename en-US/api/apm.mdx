@@ -33,6 +33,7 @@ An organization workspace requires the read permission of the area: `apm.service
 | `GET /api/v1/apm/services/{service}` | Service summary, trend, transactions, dependencies, errors, and versions. |
 | `GET /api/v1/apm/services/{service}/instances` | The instances of a service in an environment, with their version, resource attributes, and what each served. |
 | `GET /api/v1/apm/services/{service}/coverage` | Whether the service's logs, metrics, profiles, and browser sessions reach MoleSignal, over the day before `to`. |
+| `GET /api/v1/apm/correlation` | How well each service in view ties to its logs, metrics, traces, and changes, and the service names in logs and metrics APM does not know. |
 | `GET /api/v1/apm/transactions` | Paginated transaction RED metrics and total-time ranking. |
 | `GET /api/v1/apm/transactions/{transaction}` | Transaction trend, affected errors, versions, and trace filters. |
 | `GET /api/v1/apm/dependencies` | Paginated caller/dependency RED metrics and total-time ranking. |
@@ -59,7 +60,6 @@ An organization workspace requires the read permission of the area: `apm.service
 | `PUT /api/v1/apm/slos/{id}` | Replace a service level objective. Requires `apm.slos.manage`. |
 | `DELETE /api/v1/apm/slos/{id}` | Delete a service level objective. Requires `apm.slos.delete`. |
 | `POST /api/v1/apm/deployments` | Report a deployment. Requires `apm.deploy`. |
-| `GET /api/v1/apm/deployments` | The deployments pipelines reported, the newest first. |
 | `GET /api/v1/apm/settings` | The organization's APM settings, the defaults when none were saved. |
 | `PUT /api/v1/apm/settings` | Replace the organization's APM settings. Requires `apm.settings.manage`. |
 
@@ -137,12 +137,12 @@ Each finding carries:
 
 | Field | Notes |
 |---|---|
-| `kind` | `anomaly`, `regression`, `slow_dependency`, `repeated_call`, `slowQuery`, or `hot_endpoint`. |
+| `kind` | `anomaly`, `regression`, `slow_dependency`, `repeated_call`, `slowQuery`, `hot_endpoint`, or `log_errors`. |
 | `severity` | `critical`, `warning`, or `info` for a suggestion. |
 | `service` | `namespace`, `name`, and `environment`. |
 | `transaction`, `dependency` | The endpoint of a hot endpoint; the dependency of a bottleneck, a repeated call, or a slow statement. |
 | `metric` | What moved or got worse: `errorRate`, `p95`, or `throughput`. |
-| `value` | The figure now: an error rate as a ratio, a P95 in microseconds, or requests a second. A bottleneck or a hot endpoint gives its share of the time, a repeated call its calls a request, and a slow statement its P95 in microseconds. |
+| `value` | The figure now: an error rate as a ratio, a P95 in microseconds, or requests a second. A bottleneck or a hot endpoint gives its share of the time, a repeated call its calls a request, a slow statement its P95 in microseconds, and `log_errors` its error-level log lines a minute, with `metric` `log_errors`. |
 | `previous`, `lastWeek` | The same figure over the stretch before and over the same stretch a week before; for a regression, the figure of the version before. |
 | `since` | When a move began, or when a regressed version was first seen. |
 | `version`, `previousVersion` | A regression's version and the version before it. |
@@ -295,6 +295,54 @@ Content-Type: application/json
 so changes nothing. A service without a definition gets one. A service keeps up to 50 key
 transactions, and the overflow row `__other__` cannot be one. The response is the definition after
 the change.
+
+## Read how well services tie to other data
+
+`GET /api/v1/apm/correlation` takes the common range and filter parameters (`from`, `to`,
+`namespace`, `environment`, `service`) and tells, for each service in view, how well it ties to its
+logs, metrics, traces, and changes. Services are read over the range, logs and metrics over the last
+hour before `to`, and changes over the week before `to`. Only counts and names are read from the
+streams, never lines. Each report is kept for five minutes.
+
+```json
+{
+  "from": 1792312896695000,
+  "to": 1792316496695000,
+  "changesSince": 1791711696695000,
+  "services": [
+    {
+      "service": { "namespace": "shop", "name": "checkout", "environment": "prod" },
+      "logs": { "state": "reported", "streams": ["default"], "lines": 1200, "traced": 480, "sampled": 10, "matched": 9 },
+      "metrics": "missing",
+      "resource": { "environment": true, "version": true, "instance": true, "placement": false },
+      "changes": { "count": 3, "lastAt": 1792312896695000 },
+      "grades": { "traceIds": "partial", "resource": "partial", "metrics": "missing", "changes": "good" }
+    }
+  ],
+  "unmatched": [{ "name": "checkout-svc", "signal": "logs", "streams": ["default"], "lines": 640 }]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `logs` | The lines of the service in log streams with a `service.name`, `service_name`, or `service` field, at most eight streams, `default` first. `traced` counts the lines with a `trace_id`, `traceId`, or `trace.id`. Up to ten recent trace IDs of the service, 200 in all, are looked for among the traces: `sampled` and `matched`. |
+| `metrics` | Whether a metrics stream holds a series with the service's `service.name`. |
+| `resource` | Whether the spans report an environment, any version, and an instance, and whether an instance reports `host.name`, `k8s.pod.name`, `k8s.node.name`, or `container.id` (`placement`). |
+| `changes` | The deployments, configuration changes, and feature flags reported for the service since `changesSince`. |
+| `unmatched` | Up to 20 service names in logs or metrics that no APM service answers to, naming rules and aliases applied, the most lines first. |
+
+Each grade is `good`, `partial`, `missing`, or `unknown`:
+
+| Grade | `good` | `partial` | `missing` |
+|---|---|---|---|
+| `traceIds` | At least 90% of the lines carry a trace ID, and at least 80% of those sampled are found. | Some lines carry one. | No line carries one, or the service wrote no lines. |
+| `resource` | All four of `resource` are true. | Some are. | None is. |
+| `metrics` | Metrics carry the name. | | None do. |
+| `changes` | At least one change. | | None. |
+
+`unknown` means a look failed or took longer than three seconds; a name not found while a stream could
+not be read is `unknown`, never `missing`. Mole Agent reads the same report with
+`get_correlation_quality`.
 
 ## Read a service's coverage
 
@@ -539,7 +587,7 @@ left out.
 | `health` | A service's own health. For what is called, the health that its failing calls give. |
 | `red`, `call` | What it served or was asked, and the calls between it and `via`. |
 
-## Report and list deployments
+## Report deployments
 
 `POST /api/v1/apm/deployments` takes the deployment as JSON and answers `201` with it, its `id`,
 `createdBy`, and `createdAt` added. The fields, their limits, and CI examples are in
@@ -548,9 +596,8 @@ are named as the organization's naming rules, environment mapping, and aliases r
 repository address is kept with its password masked. A configuration change or a feature flag sets
 `kind` to `configuration` or `feature_flag` and needs no `version`.
 
-`GET /api/v1/apm/deployments` takes `service`, `namespace`, `environment`, `from`, and `to`, the
-range in microseconds, and answers at most 200 deployments, the newest first. A deployment reported
-without a namespace or an environment is listed for every one.
+A change of scale or of the infrastructure sets `kind` to `scaling` or `infrastructure`. Reported changes
+are listed by [`GET /api/v1/changes`](/en-US/api/changes).
 
 ## Keep APM settings
 

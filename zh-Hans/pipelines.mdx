@@ -244,6 +244,7 @@ del(."db.statement")
 | **生成指标** | 从挑中的事件算出一个指标，写进指标数据流。 | 日志、RUM 事件和 Span。 |
 | **配额** | 每个 UTC 自然日只放行设定的量。 | 日志，以及允许丢弃的 RUM 事件。 |
 | **限流** | 每个时间窗只放行设定的条数。 | 日志，以及允许丢弃的 RUM 事件。 |
+| **记录变更** | 把 Kubernetes 对象识别为变更，保存到[变更列表](/zh-Hans/api/changes)。 | 日志，不含 RUM 事件。 |
 
 这些步骤都不改事件的字段。每个步骤只处理 **适用于** 挑中的事件：几条字段条件，全部满足才算，条件和 **过滤事件** 的相同。不加条件就处理所有事件。没挑中的事件原样经过这一步。步骤的计数按步骤名保存，所以同一条流水线里这些步骤的名字不能重复，配额改名后当天的计数从零开始。
 
@@ -336,6 +337,21 @@ histogram_quantile(0.99, sum by (le) (rate(request_duration_ms_bucket[5m])))
 ## 定时流水线
 
 定时流水线按间隔读取它的来源数据流，应用转换链，并把输出写入它的目标数据流。它还可以把同一批事件投递到连接器。
+
+#### 记录变更
+
+**记录变更** 读取 OpenTelemetry Collector 的 `k8sobjects` receiver 监听并写入日志数据流的 Kubernetes 对象：`body` 中是 receiver 的 `{type, object}`，可以是对象，也可以是 JSON 文本。Collector 的配置见 **集成** 中的 [Kubernetes 接入指南](/zh-Hans/intake)。
+
+| 对象 | 变更 |
+|---|---|
+| `metadata.generation` 变化的 Deployment、StatefulSet 或 DaemonSet | 容器镜像变化记为发布，版本取镜像的 tag 或 digest；`spec.replicas` 变化记为扩缩容；spec 其他部分变化记为配置变更。状态更新不改 generation，不算变更。 |
+| 创建后不到 10 分钟就被看到的工作负载 | 记为发布。 |
+| 被删除的工作负载 | 记为基础设施变更。 |
+| `data` 变化的 ConfigMap | 记为配置变更。 |
+
+服务取对象的 `app.kubernetes.io/name` 或 `app` 标签，没有则取对象名，并按组织的命名规则处理；Namespace 取对象所在的 Namespace。**环境** 设定所有变更所属的环境；不设时由 **环境字段** 指定从哪个字段读取，默认是 `k8s.cluster.name`。
+
+每个对象上次的样子保存在处理它的节点上，每个节点最多 50,000 个对象。第一次看到某个对象只开始监听：Collector 重启时会列出所有对象，这不算变更。节点重启后也会重新开始监听。这个步骤不改字段，对象照常作为日志存进数据流。
 
 ### 目标与连接器出口
 

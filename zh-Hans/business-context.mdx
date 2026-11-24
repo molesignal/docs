@@ -1,0 +1,75 @@
+---
+title: "业务上下文"
+description: "声明租户、套餐这类业务键，以 baggage 把它们带到每个 Span 和日志记录上，并按它们拆分请求、查看事件影响。"
+"en_link": "/en-US/business-context"
+---
+
+业务键把遥测数据和它服务的对象联系起来：租户、套餐、用户分层或实验分组。声明业务键之后，APM 服务页可以按它拆分请求，事件会列出受影响的取值，根因分析也会知道哪些租户出了错。MoleSignal 不会为此改写数据：业务键由应用写进遥测数据，服务端只读取声明里指定的字段。
+
+## 声明业务键
+
+打开 **APM → 设置**，使用**业务上下文**卡片。每个键包括：
+
+| 字段 | 说明 |
+|---|---|
+| **键** | 链接和 Mole Agent 使用的名字：小写字母、数字和 `_`，例如 `tenant`。 |
+| **显示名** | 读者看到的名字，例如 `租户`。 |
+| **Span 属性** | Trace 流里承载它的字段，例如 `tenant.id`。 |
+| **日志字段** | 承载它的日志字段。 |
+| **RUM 字段** | RUM 字段，可以是 JSON 字段里的键，例如 `context.tenant`。 |
+| **重点取值** | 最重要的取值，例如重点客户，用逗号分隔。凡是显示事件影响的地方都会标出它们。 |
+
+每个键至少指定一个信号里的字段，最多 8 个键。管理这张卡片需要 `apm.settings.manage`。也可以通过 [API](/zh-Hans/api/business-context) 设置。
+
+## 把业务键写进遥测数据
+
+Span 和日志的属性在接入时会成为所在流的字段，所以作为属性写入的业务键可以直接用来拆分。要让一个请求产生的每个 Span 和日志记录都带上业务键，通常使用 W3C baggage：在请求进入的地方设置一次，baggage 处理器会把它复制到这个请求在所经过的每个服务里产生的每个 Span 上（SDK 提供日志处理器时，也复制到每条日志记录上）。
+
+<Warning>
+baggage 会随请求头传给所有下游服务，包括第三方。只复制声明过的键，不要把密钥或个人数据放进 baggage。
+</Warning>
+
+| 语言 | 把 baggage 复制到 Span 上的组件 |
+|---|---|
+| Java | OpenTelemetry Java agent，或配合自动配置使用 `io.opentelemetry.contrib:opentelemetry-baggage-processor`：设置 `otel.java.experimental.span-attributes.copy-from-baggage.include=tenant.id`（日志用 `otel.java.experimental.log-attributes.copy-from-baggage.include`）。 |
+| Go | `go.opentelemetry.io/contrib/processors/baggagecopy`：在 tracer provider 上注册 `baggagecopy.NewSpanProcessor(filter)`。 |
+| Node.js | `@opentelemetry/baggage-span-processor`（`BaggageSpanProcessor`）和 `@opentelemetry/baggage-log-record-processor`（`BaggageLogRecordProcessor`）。 |
+| Python | `opentelemetry-processor-baggage`：在 tracer provider 上注册 `BaggageSpanProcessor(predicate)`。 |
+| .NET | `OpenTelemetry.Extensions` 里的 baggage activity 处理器，要注册在所有导出处理器之前。 |
+| Ruby | `opentelemetry-processor-baggage` gem。 |
+| PHP、Rust、Erlang/Elixir | 在请求进入的地方从 baggage 读出业务键，自己把它设为 Span 属性和日志属性。 |
+
+每个处理器都接受一个判断要复制哪些键的函数；请传入只保留声明过的键的函数，不要复制全部。以 Python 为例：
+
+```python
+from opentelemetry.processor.baggage import BaggageSpanProcessor
+
+declared = {"tenant.id", "plan"}
+tracer_provider.add_span_processor(BaggageSpanProcessor(lambda key: key in declared))
+```
+
+在请求进入的地方：
+
+```python
+from opentelemetry import baggage, context
+
+token = context.attach(baggage.set_baggage("tenant.id", tenant_id))
+```
+
+RUM 方面，在浏览器 SDK 的 context 里设置业务键，例如 `context.tenant`，并把这个字段填为该键的 **RUM 字段**。
+
+## 业务键用在哪里
+
+| 页面 | 显示内容 |
+|---|---|
+| [APM](/zh-Hans/apm) 服务页 | **按业务键拆分请求**：每个取值的请求数、错误率和 P95，标出重点取值，并可跳到 Trace 页面按任意字段拆分。 |
+| [事件](/zh-Hans/alerting/incidents#事件详情) | **业务影响**：对每个键，列出事件触发前后发往事件相关服务的请求中失败最多的取值。只对有 `streams.query` 或 `sys.telemetry.read` 的读者显示。 |
+| [根因分析](/zh-Hans/alerting/incidents) | 每个有失败取值的键对应一条**业务影响**证据。 |
+
+[Trace](/zh-Hans/traces) 的 RED 视图可以按任意 Span 字段拆分，包括业务键；它的**对比**卡片会指出失败请求或慢请求在哪些字段的取值上与其他请求不同。
+
+## 相关页面
+
+- [APM 设置](/zh-Hans/apm/settings)
+- [Trace](/zh-Hans/traces)
+- [跨信号关联](/zh-Hans/correlation)

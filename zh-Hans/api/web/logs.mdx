@@ -1,6 +1,6 @@
 ---
 title: "日志检索"
-description: "分页列出日志数据流的记录，按时间统计记录数量，并描述某个字段的取值。"
+description: "分页列出日志数据流的记录，按时间统计记录数量，描述某个字段的取值，并归并为模式。"
 "en_link": "/en-US/api/web/logs"
 "zh-Hant_link": "/zh-Hant/api/web/logs"
 "ja_link": "/ja/api/web/logs"
@@ -13,7 +13,7 @@ description: "分页列出日志数据流的记录，按时间统计记录数量
 
 这些调用读取组织的一个日志数据流，读法与**日志**页相同。数据流不存在时返回空结果。所有调用都需要 `logs.read`，系统范围内则需要 `sys.telemetry.read`。
 
-每个调用都接受带 JSON 请求体的 `POST`，或在查询字符串中带同样字段的 `GET`：`filters` 和 `freeText` 写成 JSON 列表的文本，`where` 写成 JSON 对象的文本。查询太长、放不进地址时请用 `POST` 发送。
+除归并模式外，每个调用都接受带 JSON 请求体的 `POST`，或在查询字符串中带同样字段的 `GET`：`filters` 和 `freeText` 写成 JSON 列表的文本，`where` 写成 JSON 对象的文本。查询太长、放不进地址时请用 `POST` 发送。
 
 ## 调用匹配的记录
 
@@ -147,6 +147,59 @@ GET  /api/v1/web/logs/field-stats
 ```
 
 `kind` 为 `number`、`time`、`text` 或 `bool`。`total` 是匹配的记录数，`present` 是其中有该字段值的记录数。`top` 按从多到少列出最常见的取值；几乎每个值都不相同时 `topSkipped` 为 `true`，不列出取值。`range` 以文本给出最小值和最大值。数字字段还会给出 `spread` 和 `bars`。`trend` 统计最常见取值随时间的变化，没有哪个值明显更常见时不出现。
+
+## 归并为模式
+
+```http
+POST /api/v1/web/logs/patterns
+```
+
+把整个时间窗内匹配的记录归并为消息模式，并与对比时段比较。时间窗内匹配记录超过 5,000 条时，把时间窗分成四等份，各读取最新的记录作为样本，每种模式的 `estimatedCount` 是换算到整个时间窗的数量。需要 `logs.read`。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `stream` | string | 必填。 |
+| `from`、`to` | integer | 必填。时间窗，单位为微秒。 |
+| `filters`、`freeText`、`where`、`expression` | | 调用匹配的内容。 |
+| `field` | string | 消息所在字段；不填时取数据流中 `message`、`body`、`summary`、`log`、`event`、`error`、`msg`、`content`、`text` 里第一个存在的字段。 |
+| `baseline` | string | `previous`（默认，之前同样长的一段）、`week_before` 或 `none`。 |
+| `limit` | integer | 最多列出的模式数：默认 100，最多 200。 |
+
+```json
+{
+  "stream": "app_logs",
+  "field": "message",
+  "levelField": "level",
+  "timeRange": { "startTime": 1795510800000000, "endTime": 1795514399999999 },
+  "logs": 48210,
+  "read": 5000,
+  "unread": 0,
+  "sampled": true,
+  "baseline": { "kind": "previous", "startTime": 1795507199999999, "endTime": 1795510799999999, "logs": 40102, "read": 5000, "sampled": true },
+  "newPatterns": 1,
+  "surgingPatterns": 0,
+  "droppingPatterns": 0,
+  "patternCount": 37,
+  "patterns": [
+    {
+      "pattern": "upstream timeout after <number>ms",
+      "tokens": [{ "lead": "", "trail": "", "text": "upstream", "wild": null, "unit": "" }],
+      "count": 41,
+      "share": 0.0082,
+      "estimatedCount": 395,
+      "firstSeen": 1795513020000000,
+      "lastSeen": 1795514390000000,
+      "levels": [{ "level": "ERROR", "count": 41 }],
+      "baselineCount": 0,
+      "change": "new",
+      "fragment": "upstream timeout after",
+      "example": "upstream timeout after 3000ms"
+    }
+  ]
+}
+```
+
+新出现和激增的模式排在最前，时间窗内已不再出现的模式排在最后。`change` 为 `new`（对比时段没有）、`surging`（至少两倍且多出至少 5 条）、`dropping`（减少到一半以下且少了至少 5 条）或 `steady`；`ratio` 是时间窗的估算数量与对比时段之比。`tokens` 是模式中的词，`wild` 表示开放位置上变化的内容类型。静态加密的字段返回 `400`。没有写入过数据的数据流返回空报告。
 
 ## 错误
 

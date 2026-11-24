@@ -1,0 +1,86 @@
+---
+title: "Business context"
+description: "Declare business keys such as a tenant or a plan, put them on every span and log record as baggage, and split requests and incidents by them."
+"zh-Hans_link": "/zh-Hans/business-context"
+---
+
+Business keys tie telemetry to who it served: a tenant, a plan, a user tier, or an experiment group. Once
+the keys are declared, the APM service page splits requests by them, an incident lists the values its
+trouble hit, and the root-cause analysis is told which tenants failed. MoleSignal never rewrites data for
+this: applications put the keys on their telemetry, and the server reads the fields the declaration names.
+
+## Declare the keys
+
+Open **APM → Settings** and use the **Business context** card. Each key has:
+
+| Field | Notes |
+|---|---|
+| **Key** | The name used in links and by Mole Agent: lower-case letters, digits, and `_`, such as `tenant`. |
+| **Label** | What readers see, such as `Tenant`. |
+| **Span attribute** | The field of the traces stream that carries it, such as `tenant.id`. |
+| **Log field** | The log field that carries it. |
+| **RUM field** | The RUM field, a key of a JSON field included, such as `context.tenant`. |
+| **Important values** | Values that matter most, such as key customers, separated by commas. They are flagged wherever an incident's impact is shown. |
+
+A key names the field of at least one signal; up to 8 keys. Managing the card needs
+`apm.settings.manage`. The same declaration can be set through the [API](/en-US/api/business-context).
+
+## Put the keys on telemetry
+
+Span and log attributes become fields of their stream at intake, so a key set as an attribute can be
+split by right away. The usual way to set it on every span and log record of a request is W3C baggage:
+set the key once where the request comes in, and a baggage processor copies it onto every span (and,
+where the SDK has one, every log record) the request makes, in every service it reaches.
+
+<Warning>
+Baggage travels to every downstream service in request headers, third parties included. Copy only the
+keys you declared, and never put secrets or personal data in baggage.
+</Warning>
+
+| Language | What copies baggage onto spans |
+|---|---|
+| Java | The OpenTelemetry Java agent, or `io.opentelemetry.contrib:opentelemetry-baggage-processor` with autoconfigure: set `otel.java.experimental.span-attributes.copy-from-baggage.include=tenant.id` (and `otel.java.experimental.log-attributes.copy-from-baggage.include` for logs). |
+| Go | `go.opentelemetry.io/contrib/processors/baggagecopy`: `baggagecopy.NewSpanProcessor(filter)` on the tracer provider. |
+| Node.js | `@opentelemetry/baggage-span-processor` (`BaggageSpanProcessor`) and `@opentelemetry/baggage-log-record-processor` (`BaggageLogRecordProcessor`). |
+| Python | `opentelemetry-processor-baggage`: `BaggageSpanProcessor(predicate)` on the tracer provider. |
+| .NET | `OpenTelemetry.Extensions`: the baggage activity processor, registered before any exporting processor. |
+| Ruby | The `opentelemetry-processor-baggage` gem. |
+| PHP, Rust, Erlang/Elixir | Read the key from baggage where the request comes in and set it as a span attribute and a log attribute yourself. |
+
+Each processor takes a predicate that chooses the keys to copy; pass one that keeps only the declared
+keys rather than one that copies everything. For example, in Python:
+
+```python
+from opentelemetry.processor.baggage import BaggageSpanProcessor
+
+declared = {"tenant.id", "plan"}
+tracer_provider.add_span_processor(BaggageSpanProcessor(lambda key: key in declared))
+```
+
+and where the request comes in:
+
+```python
+from opentelemetry import baggage, context
+
+token = context.attach(baggage.set_baggage("tenant.id", tenant_id))
+```
+
+For RUM, set the key in the browser SDK's context, such as `context.tenant`, and name that field as the
+key's **RUM field**.
+
+## Where the keys are used
+
+| Page | What it shows |
+|---|---|
+| [APM](/en-US/apm) service page | **Requests by business key**: requests, error rate, and P95 of each value, important values flagged, and a link to split by any other field on the Traces page. |
+| [Incidents](/en-US/alerting/incidents#incident-details) | **Business impact**: for each key, the values whose requests to the incident's services failed most around its trigger. Shown to readers with `streams.query` or `sys.telemetry.read`. |
+| [Root-cause analysis](/en-US/alerting/incidents) | A **Business impact** piece of evidence for each key with failed values. |
+
+The [Traces](/en-US/traces) RED view splits by any span field, business keys included, and its
+**Compare** card tells which field values set the failed or slow requests apart.
+
+## Related pages
+
+- [APM settings](/en-US/apm/settings)
+- [Traces](/en-US/traces)
+- [Cross-signal correlation](/en-US/correlation)

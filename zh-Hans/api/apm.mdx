@@ -29,6 +29,7 @@ Authorization: Bearer <token>
 | `GET /api/v1/apm/services/{service}` | 服务汇总、趋势、事务、依赖、错误与版本。 |
 | `GET /api/v1/apm/services/{service}/instances` | 某个环境中服务的实例，含版本、资源属性和每个实例处理的请求情况。 |
 | `GET /api/v1/apm/services/{service}/coverage` | 在 `to` 之前的一天内，服务的日志、指标、Profiles 和浏览器会话是否接入了 MoleSignal。 |
+| `GET /api/v1/apm/correlation` | 当前范围内每个服务与日志、指标、Trace 和变更的关联情况，以及日志和指标里 APM 不认识的服务名。 |
 | `GET /api/v1/apm/transactions` | 分页事务 RED 指标与总耗时排名。 |
 | `GET /api/v1/apm/transactions/{transaction}` | 事务趋势、相关错误、版本与链路过滤条件。 |
 | `GET /api/v1/apm/dependencies` | 分页调用方/依赖 RED 指标与总耗时排名。 |
@@ -55,7 +56,6 @@ Authorization: Bearer <token>
 | `PUT /api/v1/apm/slos/{id}` | 替换服务等级目标。需要 `apm.slos.manage`。 |
 | `DELETE /api/v1/apm/slos/{id}` | 删除服务等级目标。需要 `apm.slos.delete`。 |
 | `POST /api/v1/apm/deployments` | 上报一次发布。需要 `apm.deploy`。 |
-| `GET /api/v1/apm/deployments` | 流水线上报的发布，按时间从新到旧。 |
 | `GET /api/v1/apm/settings` | 组织的 APM 设置，未保存过时返回默认值。 |
 | `PUT /api/v1/apm/settings` | 替换组织的 APM 设置。需要 `apm.settings.manage`。 |
 
@@ -129,12 +129,12 @@ curl --get 'http://localhost:5080/api/v1/apm/overview' \
 
 | 字段 | 说明 |
 |---|---|
-| `kind` | `anomaly`、`regression`、`slow_dependency`、`repeated_call`、`slowQuery` 或 `hot_endpoint`。 |
+| `kind` | `anomaly`、`regression`、`slow_dependency`、`repeated_call`、`slowQuery`、`hot_endpoint` 或 `log_errors`。 |
 | `severity` | `critical`、`warning`，建议为 `info`。 |
 | `service` | `namespace`、`name` 和 `environment`。 |
 | `transaction`、`dependency` | 热点端点的端点；瓶颈、重复调用或慢语句对应的依赖。 |
 | `metric` | 变化或变差的指标：`errorRate`、`p95` 或 `throughput`。 |
-| `value` | 现在的值：错误率为比值，P95 单位为微秒，吞吐为每秒请求数。瓶颈和热点端点为耗时占比，重复调用为每个请求的调用次数，慢语句为以微秒计的 P95。 |
+| `value` | 现在的值：错误率为比值，P95 单位为微秒，吞吐为每秒请求数。瓶颈和热点端点为耗时占比，重复调用为每个请求的调用次数，慢语句为以微秒计的 P95，`log_errors` 为每分钟错误级别日志行数（`metric` 为 `log_errors`）。 |
 | `previous`、`lastWeek` | 同一指标在上一时段和上周同时段的值；版本变差时为上一个版本的值。 |
 | `since` | 突变开始的时间，或变差的版本首次出现的时间。 |
 | `version`、`previousVersion` | 变差的版本和它之前的版本。 |
@@ -273,6 +273,48 @@ Content-Type: application/json
 ```
 
 `key: true` 把端点加入 `keyTransactions`，`false` 将其移除；状态已经如此时不做任何改动。服务还没有定义时会自动创建。每个服务最多 50 个关键事务，溢出行 `__other__` 不能标为关键事务。响应是改动后的定义。
+
+## 读取服务的关联质量
+
+`GET /api/v1/apm/correlation` 接受通用的时间范围和筛选参数（`from`、`to`、`namespace`、`environment`、`service`），返回当前范围内每个服务与日志、指标、Trace 和变更的关联情况。服务按整个时间范围读取，日志和指标看 `to` 之前的一小时，变更看 `to` 之前的一周。只从数据流读取计数和名字，不读取日志内容。每份报告保留五分钟。
+
+```json
+{
+  "from": 1792312896695000,
+  "to": 1792316496695000,
+  "changesSince": 1791711696695000,
+  "services": [
+    {
+      "service": { "namespace": "shop", "name": "checkout", "environment": "prod" },
+      "logs": { "state": "reported", "streams": ["default"], "lines": 1200, "traced": 480, "sampled": 10, "matched": 9 },
+      "metrics": "missing",
+      "resource": { "environment": true, "version": true, "instance": true, "placement": false },
+      "changes": { "count": 3, "lastAt": 1792312896695000 },
+      "grades": { "traceIds": "partial", "resource": "partial", "metrics": "missing", "changes": "good" }
+    }
+  ],
+  "unmatched": [{ "name": "checkout-svc", "signal": "logs", "streams": ["default"], "lines": 640 }]
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `logs` | 服务在含 `service.name`、`service_name` 或 `service` 字段的日志数据流中的行数，最多查看八个数据流，`default` 优先。`traced` 是带 `trace_id`、`traceId` 或 `trace.id` 的行数。每个服务取最近的至多十个 TraceID（总共至多 200 个）到 Trace 中查找，即 `sampled` 和 `matched`。 |
+| `metrics` | 是否有指标数据流中的序列带这个服务的 `service.name`。 |
+| `resource` | Span 是否上报了环境、任意版本和实例，以及是否有实例上报 `host.name`、`k8s.pod.name`、`k8s.node.name` 或 `container.id`（`placement`）。 |
+| `changes` | 从 `changesSince` 起为这个服务上报的部署、配置变更和 Feature Flag 变更。 |
+| `unmatched` | 日志或指标中套用命名规则和别名后对不上任何 APM 服务的服务名，至多 20 个，行数多的在前。 |
+
+每项评级为 `good`、`partial`、`missing` 或 `unknown`：
+
+| 评级 | `good` | `partial` | `missing` |
+|---|---|---|---|
+| `traceIds` | 至少 90% 的日志带 TraceID，且抽样的 TraceID 至少 80% 能找到。 | 部分日志带 TraceID。 | 没有日志带 TraceID，或服务没有写日志。 |
+| `resource` | `resource` 的四项都为 true。 | 部分为 true。 | 都不为 true。 |
+| `metrics` | 有指标带这个服务名。 | | 没有。 |
+| `changes` | 至少一次变更。 | | 没有。 |
+
+`unknown` 表示查看失败或超过三秒；有数据流读取失败时，没找到的服务名记为 `unknown`，不会记为 `missing`。Mole Agent 用 `get_correlation_quality` 读取同一份报告。
 
 ## 读取服务的数据覆盖
 
@@ -463,11 +505,11 @@ Content-Type: application/json
 | `health` | 服务自身的健康状态。被调用的对象按调用失败的情况给出。 |
 | `red`、`call` | 它处理或收到的请求，以及它和 `via` 之间的调用。 |
 
-## 上报与列出发布
+## 上报发布
 
 `POST /api/v1/apm/deployments` 接收 JSON 格式的发布，返回 `201` 和这次发布，并补上 `id`、`createdBy` 和 `createdAt`。字段、限制和 CI 示例见[部署](/zh-Hans/apm/deployments#从-ci-上报发布)。服务名和环境按组织的命名规则、环境映射和别名处理。仓库地址保存时会遮盖其中的密码。配置变更和功能开关把 `kind` 设为 `configuration` 或 `feature_flag`，不需要 `version`。
 
-`GET /api/v1/apm/deployments` 接收 `service`、`namespace`、`environment`、`from` 和 `to`（微秒时间范围），按时间从新到旧最多返回 200 次发布。没有 Namespace 或环境的发布会出现在所有 Namespace 或环境的列表中。
+扩缩容和基础设施变更把 `kind` 设为 `scaling` 或 `infrastructure`。上报的变更由 [`GET /api/v1/changes`](/zh-Hans/api/changes) 列出。
 
 ## 维护 APM 设置
 
