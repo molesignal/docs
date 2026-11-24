@@ -1,0 +1,86 @@
+---
+title: "Ingestão nativa de JSON"
+description: "Envie registros em JSON para um fluxo de dados."
+"en_link": "/en-US/api/intake/native-json"
+"zh-Hans_link": "/zh-Hans/api/intake/native-json"
+"zh-Hant_link": "/zh-Hant/api/intake/native-json"
+"ja_link": "/ja/api/intake/native-json"
+"ko_link": "/ko/api/intake/native-json"
+"de_link": "/de/api/intake/native-json"
+"es_link": "/es/api/intake/native-json"
+"fr_link": "/fr/api/intake/native-json"
+---
+
+```http
+POST /api/v1/intake/{type}/{stream}
+```
+
+Envia um objeto de registro ou um array de registros para um fluxo. A primeira gravação cria o fluxo, e o esquema evolui à medida que surgem novos campos. A chamada exige a permissão do sinal: `logs.write`, `metrics.write` ou `traces.write`. Use o token de ingestão padrão ou um token de conta de serviço com uma função que permita gravação.
+
+**Parâmetros de caminho**
+
+| Parâmetro | Tipo | Observações |
+|---|---|---|
+| `type` | string | `logs`, `metrics` ou `traces`. Qualquer outro valor retorna `404`. |
+| `stream` | string | Nome do fluxo com letras, números, `_`, `-` e `.`. Um [fluxo da plataforma](/pt-BR/streams#fluxos-da-plataforma), como `_molesignal` ou `_audit`, retorna `403`. |
+
+**Corpo**
+
+Um objeto JSON ou um array de objetos JSON. Cada elemento deve ser um objeto. O corpo da solicitação tem um limite de 16 MiB. O servidor descompacta o corpo enviado com `Content-Encoding: gzip` e aplica o mesmo limite de 16 MiB ao corpo descompactado.
+
+| Campo | Observações |
+|---|---|
+| `_timestamp` | Horário do evento em microssegundos desde a época Unix. Se o campo estiver ausente, o servidor usa o horário de recebimento. |
+| `metric_name` | Em `metrics`, indica a métrica à qual o registro pertence. Um fluxo de métricas armazena as métricas de uma única origem. Um registro sem `metric_name` pertence à métrica com o mesmo nome do fluxo. |
+| qualquer outro campo | O fluxo armazena o campo. Os registros posteriores devem usar o mesmo tipo que o fluxo já armazena para esse campo. |
+
+**Gravação de rastreamentos**
+
+O servidor armazena os spans gravados em `traces` conforme chegam. Esses spans não passam pela [amostragem de cauda](/pt-BR/configuration#captura-de-traces-e-amostragem-ao-final) nem geram os resumos que a lista de rastreamentos usa. Para usar todos os recursos de rastreamento, envie os spans via [OTLP](/pt-BR/api/intake/otlp).
+
+| Área | Esses spans |
+|---|---|
+| A aba **Rastreamentos** da página **Rastreamentos** e seu histograma | Não aparecem. |
+| A ferramenta `list_traces` do Mole Agent e **Rastreamentos relacionados** em **RUM** | Não aparecem nos resultados. |
+| **APM** | Não entram na contagem. |
+| A aba **Spans** e o **Detalhamento RED** da página **Rastreamentos**, além dos detalhes de um rastreamento aberto pelo ID | Ficam disponíveis. |
+| **Grafo de serviços** | Entram na contagem. |
+
+Quando uma organização tem vários fluxos de rastreamentos, a lista de rastreamentos e o Mole Agent consultam apenas um deles e dão preferência a um fluxo com resumos. Assim, um fluxo que recebe gravações apenas por esse endpoint não oculta um fluxo que recebe gravações via OTLP.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/logs/app \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "accepted": 1, "rejected": 0, "errors": [] }
+```
+</ResponseExample>
+
+Se um registro entrar em conflito com o esquema, o servidor rejeita apenas esse registro e aceita o restante do lote:
+
+```json
+{
+  "accepted": 1,
+  "rejected": 1,
+  "errors": [
+    { "index": 0, "reason": "type mismatch on field `level`: expected Utf8, got Number" }
+  ]
+}
+```
+
+**Erros**
+
+| Status | Causa |
+|---|---|
+| `400` | Nome do fluxo inválido, JSON inválido ou elemento do array que não é um objeto (`event #1 must be a JSON object`). |
+| `401` | Token ausente ou inválido. |
+| `403` | O token não tem a permissão exigida ou o fluxo é da plataforma. |
+| `413` | O corpo excede 16 MiB antes ou depois da descompactação. |
+| `429` | O roteador aplica o limite de taxa ou os buffers de ingestão do nó estão cheios (`intake buffer memory limit exceeded`). A resposta inclui `Retry-After`. |

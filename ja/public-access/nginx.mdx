@@ -1,0 +1,318 @@
+---
+title: "nginx"
+description: "nginx で内部用と公開用のエントリーポイントを構成します。内部用はすべてのリクエストを転送し、公開用は外部コールバックと公開ページへのリクエストのみを転送して、それ以外のパスには 404 を返します。"
+"en_link": "/en-US/public-access/nginx"
+"zh-Hans_link": "/zh-Hans/public-access/nginx"
+"zh-Hant_link": "/zh-Hant/public-access/nginx"
+"ko_link": "/ko/public-access/nginx"
+"de_link": "/de/public-access/nginx"
+"es_link": "/es/public-access/nginx"
+"fr_link": "/fr/public-access/nginx"
+"pt-BR_link": "/pt-BR/public-access/nginx"
+---
+
+以下の設定は、[パブリックアクセス](/ja/public-access)の推奨構成に従います。ホスト名は `molesignal.example.com` の1つだけを使い、内部DNSではnginxの内部アドレス `10.0.0.10` に、パブリックDNSでは公開アドレス `203.0.113.10` に解決します。2つの `server` ブロックは1つの証明書を共有し、リッスンアドレスで区別します。使用する `location` ブロックだけを残してください。
+
+## 共通設定
+
+アップストリーム、公開アクセス用のログフォーマット、レート制限ゾーンを `http` ブロック内に配置します。たとえば、`/etc/nginx/conf.d/molesignal.conf` の先頭に配置します。
+
+```nginx
+upstream molesignal {
+    # A standalone node, or the router of a role-split deployment
+    server 10.0.1.20:5080;
+    keepalive 16;
+}
+
+# The public entry point logs paths, never query strings; heartbeat, calendar, action link and Huawei
+# Cloud callback paths carry a token, so only their prefix is logged.
+map $uri $molesignal_log_uri {
+    ~^(/api/v1/(?:intake/heartbeats|public/calendar|public/notify/actions)/)  $1<token>;
+    ~^(/notify/actions/)                                                      $1<token>;
+    ~^(/api/v1/public/notify/[^/]+/(?:replies|keypress)/)                     $1<token>;
+    default                                                                   $uri;
+}
+
+log_format molesignal_public '$remote_addr [$time_local] "$request_method $molesignal_log_uri $server_protocol" '
+                             '$status $body_bytes_sent "$http_user_agent" $request_time';
+
+limit_req_zone $binary_remote_addr zone=molesignal_public:10m rate=20r/s;
+```
+
+転送を行うすべての `location` で、`/etc/nginx/snippets/molesignal-proxy.conf` にまとめた共通のプロキシ設定を使います。
+
+```nginx
+proxy_pass http://molesignal;
+proxy_http_version 1.1;
+proxy_set_header Connection "";
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+```
+
+## 内部エントリーポイント
+
+内部エントリーポイントは、公開エントリーポイントがない場合と同様に、すべてのパスを転送します。ライブクエリのレスポンスはストリーミングで返すため、バッファリングを無効にしてください。
+
+```nginx
+server {
+    listen 10.0.0.10:443 ssl;
+    server_name molesignal.example.com;
+    ssl_certificate     /etc/nginx/tls/molesignal.crt;
+    ssl_certificate_key /etc/nginx/tls/molesignal.key;
+
+    client_max_body_size 16m;
+
+    location /api/v1/query/stream {
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+    location / {
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+## 公開エントリーポイント
+
+公開エントリーポイントには公開するパスだけを指定し、パスごとに使用するHTTPメソッドだけを許可します。最後の `location /` は、それ以外のすべてのリクエストに404を返します。
+
+```nginx
+server {
+    listen 203.0.113.10:443 ssl;
+    server_name molesignal.example.com;
+    ssl_certificate     /etc/nginx/tls/molesignal.crt;
+    ssl_certificate_key /etc/nginx/tls/molesignal.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    access_log /var/log/nginx/molesignal-public.log molesignal_public;
+    client_max_body_size 2m;
+    limit_req zone=molesignal_public burst=40 nodelay;
+    limit_req_status 429;
+
+    # External alerts
+    location = /api/v1/intake/alerts {
+        limit_except POST { deny all; }
+        client_max_body_size 4m;
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Heartbeat check-ins
+    location ^~ /api/v1/intake/heartbeats/ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # The Jira ticket webhook
+    location ~ ^/api/v1/public/tickets/jira/[^/]+$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # On-call calendar subscriptions
+    location ^~ /api/v1/public/calendar/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Mole Agent in Teams
+    location ^~ /api/v1/public/im/teams/ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Replies to texts and calls; Huawei Cloud's address ends with the callback token
+    location ~ ^/api/v1/public/notify/[^/]+/(replies|keypress)(/[^/]+)?$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Buttons from a WeCom app: WeCom checks the address with a GET first
+    location ~ ^/api/v1/public/notify/[^/]+/wecom$ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Buttons from a Mattermost bot
+    location ~ ^/api/v1/public/notify/[^/]+/mattermost$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # One-time action links: the confirm page and its API
+    location ^~ /notify/actions/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/notify/actions/ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Automation API triggers
+    location ~ ^/api/v1/public/automations/[^/]+/trigger$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Push sources
+    location ~ ^/api/v1/(_kinesis_firehose|_cloudflare|_heroku)$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # RUM: browsers send a CORS preflight first
+    location ~ ^/api/v1/rum/(events|replay)$ {
+        limit_except POST OPTIONS { deny all; }
+        client_max_body_size 8m;
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Synthetics Probe Agent artifact uploads
+    location ^~ /api/v1/synthetics/artifacts/ {
+        limit_except PUT { deny all; }
+        client_max_body_size 10m;
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Status pages
+    location ^~ /status/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/status-pages/ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Resource sharing
+    location ^~ /s/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location = /shared {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/share {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Web files of status pages, shared resources and action link pages
+    location ^~ /assets/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ~ ^/favicon(-dark)?\.(ico|svg)$ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # No other path exists on the internet
+    location / {
+        return 404;
+    }
+}
+```
+
+`limit_except GET` は `HEAD` も許可します。特定のパスへのアクセスを送信元アドレスで制限するには、そのパスの `location` に `allow` と `deny all;` を追加します。たとえば、Azureのサービスタグ `AzureBotService` のアドレス範囲からのみTeamsのコールバックにアクセスできるようにします。
+
+## ステータスページのカスタムドメイン
+
+ステータスページで `status.example.org` を使う場合は、そのページのルートパス、エンドポイント、Webファイルだけを公開する `server` を追加します。
+
+```nginx
+server {
+    listen 203.0.113.10:443 ssl;
+    server_name status.example.org;
+    ssl_certificate     /etc/nginx/tls/status.example.org.crt;
+    ssl_certificate_key /etc/nginx/tls/status.example.org.key;
+
+    access_log /var/log/nginx/molesignal-public.log molesignal_public;
+    limit_req zone=molesignal_public burst=40 nodelay;
+    limit_req_status 429;
+
+    location ~ ^/(history|uptime)?$ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /incidents/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/status-pages/ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /assets/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ~ ^/favicon(-dark)?\.(ico|svg)$ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location / {
+        return 404;
+    }
+}
+```
+
+MoleSignalがカスタムドメインの証明書を発行する場合、MoleSignalでTLSを終端します。この場合、nginxは `stream` モジュールを使ってSNIに基づいて接続をそのまま転送することしかできません。リクエストパスを参照できないため、ステータスページだけを公開することはできません。エントリーポイントでパスを制限するには、nginxで証明書を管理してください。
+
+## エントリーポイントが1つの場合
+
+nginxのリッスンアドレスが1つの場合は、送信元をアドレスで区別します。公開用の `server` で公開しているパスはそのままにし、最後の `location /` をオフィスネットワークとVPNのアドレス範囲だけを許可する設定に置き換えます。さらに、ライブクエリ用のストリーミング設定を追加します。
+
+```nginx
+location /api/v1/query/stream {
+    allow 10.0.0.0/8;
+    allow 192.168.0.0/16;
+    deny all;
+    include /etc/nginx/snippets/molesignal-proxy.conf;
+    proxy_buffering off;
+    proxy_read_timeout 600s;
+    proxy_send_timeout 600s;
+}
+
+location / {
+    allow 10.0.0.0/8;
+    allow 192.168.0.0/16;
+    deny all;
+    include /etc/nginx/snippets/molesignal-proxy.conf;
+}
+```
+
+内部リクエストも同じ `server` を経由します。`client_max_body_size` を `16m` に引き上げてください。アクセスログには、内部リクエストのパスも記録されます。nginxの前段にロードバランサーがある場合は、`set_real_ip_from` と `real_ip_header` を使って元の送信元アドレスを取得してください。これらを設定しないと、`allow` はロードバランサーのアドレスだけを参照します。
+
+## 確認
+
+設定を確認し、リロードします。
+
+```bash
+nginx -t
+```
+
+```bash
+nginx -s reload
+```
+
+インターネットからアクセスすると、サインインエンドポイントは `404` を返します。
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://molesignal.example.com/api/v1/auth/signin
+```
+
+インターネットからトークンなしでアラートの受信エンドポイントにアクセスすると、`401` が返ります。これにより、リクエストがMoleSignalに到達したことを確認できます。
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://molesignal.example.com/api/v1/intake/alerts
+```
+
+最後に、`_sys` 組織の **設定 → クライアントIPの識別** で、nginxのアドレスを信頼済みプロキシとして登録します。詳しくは、[クライアントIPの識別](/ja/settings/platform#クライアントipの識別)を参照してください。

@@ -1,0 +1,117 @@
+---
+title: "Compatibilité avec PromQL"
+description: "Consultez les fonctions, opérateurs et modificateurs PromQL pris en charge par le moteur de MoleSignal, ainsi que les limitations connues."
+"en_link": "/en-US/query/promql-subset"
+"zh-Hans_link": "/zh-Hans/query/promql-subset"
+"zh-Hant_link": "/zh-Hant/query/promql-subset"
+"ja_link": "/ja/query/promql-subset"
+"ko_link": "/ko/query/promql-subset"
+"de_link": "/de/query/promql-subset"
+"es_link": "/es/query/promql-subset"
+"pt-BR_link": "/pt-BR/query/promql-subset"
+---
+
+MoleSignal exécute les requêtes PromQL sur les flux de métriques avec un évaluateur intégré (`promql-parser` et un
+évaluateur Arrow/DataFusion). Il prend en charge les requêtes **instantanées** et **sur une plage** : une requête avec un
+`step` parcourt `[start, end]` selon ce pas et renvoie une matrice ; sans ce paramètre, la requête est instantanée à
+`end`. Cette page fait référence pour la prise en charge de PromQL.
+
+## Fonctionnalités prises en charge
+
+### Fonctions sur les vecteurs de plage (`metric[range]`)
+
+`rate`, `irate`, `increase`, `delta`, `idelta`, `deriv`, `predict_linear`, `resets`, `changes`,
+`holt_winters` (alias `double_exponential_smoothing`) et toute la famille `*_over_time` :
+`avg_over_time` / `min_over_time` / `max_over_time` / `sum_over_time` / `count_over_time` /
+`quantile_over_time` / `stddev_over_time` / `stdvar_over_time` / `last_over_time` /
+`present_over_time` / `mad_over_time`.
+
+`rate`, `increase` et `delta` extrapolent jusqu’aux bornes de la fenêtre la variation entre le premier et le dernier
+échantillon de la fenêtre, comme Prometheus. Les mêmes échantillons donnent donc les mêmes valeurs.
+
+### Agrégations (avec `by()` / `without()`)
+
+`sum`, `avg`, `min`, `max`, `count`, `stddev`, `stdvar`, `quantile`, `group`, `count_values`,
+`topk`, `bottomk`, `limitk`, `limit_ratio`.
+
+### Histogrammes
+
+`histogram_quantile(q, sum by(le)(rate(metric_bucket[range])))` — interpolation linéaire sur les
+intervalles `le` des histogrammes classiques.
+
+`histogram_fraction(lower, upper, v)` — estime, à partir des intervalles `le` classiques, la proportion
+d’observations comprises dans `[lower, upper]` (même fonction de répartition linéaire par morceaux :
+`(rank(upper) - rank(lower)) / total`).
+
+### Étiquettes et tri
+
+`label_replace`, `label_join`, `sort`, `sort_desc`, `sort_by_label`, `sort_by_label_desc`.
+
+### Temps
+
+`time`, `timestamp`, `minute`, `hour`, `day_of_week`, `day_of_month`, `day_of_year`,
+`days_in_month`, `month`, `year` (UTC ; les fonctions de date utilisent `vector(time())` par défaut).
+
+### Type et absence
+
+`vector`, `scalar`, `absent`, `absent_over_time`.
+
+### Mathématiques, arrondi et trigonométrie
+
+`abs`, `ceil`, `floor`, `round`, `exp`, `ln`, `log2`, `log10`, `sqrt`, `sgn`,
+`clamp` / `clamp_min` / `clamp_max`, `sin` / `cos` / `tan` / `asin` / `acos` / `atan` / `sinh` /
+`cosh` / `tanh` / `asinh` / `acosh` / `atanh`, `pi`, `deg`, `rad`.
+
+### Opérateurs
+
+Opérateurs arithmétiques `+ - * / % ^`, opérateurs de comparaison `== != > < >= <=` (avec `bool`), opérateurs ensemblistes
+`and` / `or` / `unless`, mise en correspondance des vecteurs avec `on(...)` / `ignoring(...)` et
+`group_left` / `group_right`, et négation unaire.
+
+### Modificateurs et structure
+
+Sélecteur `@` (`start()` / `end()` / `<ts>`) et `offset` (y compris sur les sélecteurs de matrice) ;
+sous-requêtes `inner[range:step]`.
+
+## Fonctionnalités non implémentées et différences connues
+
+| Fonctionnalité | Statut | Remarques |
+|---|---|---|
+| Fonctions d’histogramme natif `histogram_count` / `histogram_sum` / `histogram_avg` / `histogram_stddev` / `histogram_stdvar` | ❌ → 400 | Sans objet pour le modèle classique à intervalles `le` ; utilisez `histogram_quantile` pour les quantiles et `histogram_fraction` pour les proportions par intervalle |
+| Remplissage par défaut avec l’opérateur binaire `default` | ❌ → 400 | — |
+| Sous-requêtes dans une requête sur une plage | ⚠️ | Le moteur se replie sur une évaluation instantanée (sans combinaison des pas externes et internes) ; l’évaluation des requêtes instantanées et des alertes reste exacte |
+| `timestamp()` | ⚠️ | Renvoie l’instant d’évaluation pour une requête instantanée et l’horodatage du point pour une requête sur une plage |
+| Paramètres scalaires des fonctions (`predict_linear` `t`, `holt_winters` `sf`/`tf`, quantiles) | ⚠️ | Littéraux numériques uniquement |
+
+Les fonctions et les syntaxes non prises en charge renvoient l’erreur `promql function not yet supported: <name>`,
+que `POST /api/v1/query` (`language: "promql"`) traduit en code `400`.
+
+<Note>
+  Lorsqu’une règle d’alerte a pour `query.language` la valeur `promql`, elle évalue l’expression PromQL comme une requête instantanée à
+  la fin de la fenêtre d’évaluation. La règle elle-même est un objet `AlertRule` de MoleSignal, incompatible
+  avec le format des règles Prometheus. Consultez [Créer une règle](/fr/api/alerting/create-rule).
+</Note>
+
+## Correspondance des étiquettes
+
+`=`, `!=`, `=~`, `!~` (expressions régulières via RE2, dont la syntaxe diffère légèrement de celle de PCRE dans Prometheus). `__name__` correspond à
+la colonne `metric_name`. Placez un nom entre guillemets pour sélectionner une métrique dont le nom contient des points, comme dans
+`{"http.server.duration"}`. Un sélecteur sans nom de métrique, comme `{job="api"}` ou
+`{__name__=~"http_.*"}`, lit toutes les métriques qui répondent à ses critères, et les séries obtenues conservent `__name__`.
+
+## Organisation des flux de métriques
+
+Un flux de métriques regroupe les métriques d’une seule source, par exemple un serveur Prometheus, et stocke les étiquettes
+dans des **colonnes distinctes** plutôt que dans un bloc JSON :
+
+```sql
+_timestamp   Timestamp(Microsecond)  NOT NULL   -- time
+metric_name  Utf8                    NOT NULL   -- the metric, PromQL's __name__
+value        Float64                 NOT NULL   -- the measurement (Int64 etc. is accepted and cast to f64)
+<label_x>    Utf8 …                             -- every non-reserved column is a label
+```
+
+Les fichiers regroupent les lignes de chaque métrique et les trient par `metric_name`, puis par horodatage. Un sélecteur lit les
+flux qui contiennent la métrique recherchée. Dans les fichiers Parquet de ces flux dont la plage temporelle chevauche celle de la requête, il ne lit que les pages
+qui contiennent cette métrique. Il crée une série par ensemble distinct d’étiquettes et applique les critères de correspondance (`=`, `!=`, `=~`,
+`!~`) dans le moteur. `@` et `offset` décalent l’instant d’évaluation. Pour les métriques reçues via OTLP, consultez les [champs des métriques OTLP](/fr/query#champs-des-métriques-otlp).

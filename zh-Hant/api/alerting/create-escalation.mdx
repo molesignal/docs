@@ -1,0 +1,124 @@
+---
+title: "建立升級原則"
+description: "為事件定義依序執行的通知步驟。"
+"en_link": "/en-US/api/alerting/create-escalation"
+"zh-Hans_link": "/zh-Hans/api/alerting/create-escalation"
+"ja_link": "/ja/api/alerting/create-escalation"
+"ko_link": "/ko/api/alerting/create-escalation"
+"de_link": "/de/api/alerting/create-escalation"
+"es_link": "/es/api/alerting/create-escalation"
+"fr_link": "/fr/api/alerting/create-escalation"
+"pt-BR_link": "/pt-BR/api/alerting/create-escalation"
+---
+
+```http
+POST /api/v1/alerts/escalations
+```
+
+建立一項升級原則。原則由依序執行的步驟組成，每個步驟都會通知其目標並等待確認。此呼叫需要 `alerts.escalations.manage` 權限。
+
+## 升級運作方式
+
+1. `alert` 角色每隔 `[alert].dispatch_interval_secs`（預設 10 秒）檢查一次活動事件。只有狀態為 `open` 的事件會繼續升級。確認事件後即停止升級。
+2. 設定 `minSeverity` 的步驟只適用於達到該嚴重程度或更高的事件。系統會略過不適用的步驟。
+3. 目前步驟的每個目標都會收到一則通知事件。[通知管道](/zh-Hant/notification-channels)決定訊息的傳送方式。
+4. 若超過 `ackTimeoutSecs` 仍未確認，則開始下一個適用的步驟。
+5. 最後一個適用步驟逾時後，`repeat` 為 `true` 的原則會從第一步重新開始，直到完成 `maxLoops` 輪。
+6. 設定 `ackRetriggerSecs` 後，若 `acknowledged` 事件在確認後超過這段時間仍未解決，就會回到 `open`。如果有負責人，就通知負責人；否則重新通知目前步驟的目標。兩種情況的 `escalation.reason` 都是 `ack_timeout`。目前步驟會重新計算確認逾時時間，之後照常升級。暫緩中的事件不受此時間限制。
+
+規則透過 `escalationPolicyId` 選擇原則。未指定時，規則會使用 `default`，它是組織內名為 `default` 的原則的別名，比對時不區分大小寫。開始升級時，事件會儲存該原則的實際 ID，因此之後重新命名原則，不會讓已開啟的事件改用其他原則。如果組織沒有名為 `default` 的原則，這類規則的事件就不會升級，但系統仍會將觸發事件傳送給通知原則。請建立名為 `default` 的原則，或將規則指向特定原則的 ID。
+
+**請求本文**
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `name` | string | 是 | 不可留空。 |
+| `steps` | array | 否 | 預設為空。沒有步驟的原則不會通知任何人。 |
+| `repeat` | boolean | 否 | 預設為 `false`。啟用後，最後一步結束時會重新開始。 |
+| `maxLoops` | integer | 否 | 預設為 `1`。`repeat` 為 `true` 時，表示執行步驟的總輪數。小於 1 的值以 1 計。 |
+| `ackRetriggerSecs` | integer | 否 | 事件確認後仍未解決時，重新通知前要等待的秒數，範圍為 300 至 86400 秒。預設為 `null`，表示不重新通知。 |
+| `urgencyRule` | object | 否 | 決定未指定緊急程度的事件要使用哪個等級。預設為 `{"mode": "by_severity"}`：依嚴重程度套用組織設定的等級（未變更設定時，嚴重和錯誤為高，警告和提示為低）。也可設為 `{"mode": "always", "urgency": "high"}` 或 `{"mode": "support_hours", "hours": {"timezone": "Asia/Shanghai", "ranges": [{"weekdayMask": 62, "start": "09:00", "end": "18:00"}], "calendar": {"calendarId": "<id>", "holidays": "exclude"}}, "inside": "high", "outside": "low", "raiseAtStart": true}`：支援時段內使用 `inside`，時段外使用 `outside`，預設分別為 `high` 和 `low`。啟用 `raiseAtStart` 後，支援時段一開始，系統就會將尚未確認且緊急程度低於 `inside` 的事件調高至 `inside`，並從第一級重新通知。緊急程度請填入組織[等級](/zh-Hant/alerting/on-call#緊急度與優先順序等級)的鍵。`weekdayMask` 的第 0 個位元代表星期日。`calendar` 為選填，`holidays` 可設為 `exclude` 或 `only`（請參閱[假日行事曆](/zh-Hant/alerting/on-call#假日行事曆)）。請參閱[緊急程度](/zh-Hant/alerting/on-call#緊急程度)。 |
+| `escalateLowUrgency` | boolean | 否 | 預設為 `false`：對於不逐級升級的等級，只會通知第一級，不會進入後續層級或重複執行整輪。設為 `true` 時，這些等級在此原則下會照常升級。 |
+
+步驟包含以下欄位：
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `targets` | array | 是 | 此步驟的接收者會同時收到通知。 |
+| `ackTimeoutSecs` | integer | 否 | 進入下一步前等待確認的秒數。若省略此欄位，系統會採用 `[alert].default_ack_timeout_secs`（預設 300），並將該值與步驟一併儲存。 |
+| `minSeverity` | string | 否 | `info`、`warning`、`error` 或 `critical`。步驟適用於達到該嚴重程度或更高的事件。省略時適用於所有事件。 |
+
+目標透過 `kind` 選擇接收者：
+
+| `kind` | 額外欄位 | 接收者 |
+|---|---|---|
+| `user` | `userId` | 一位使用者。 |
+| `team` | `teamId` | 團隊成員。 |
+| `schedule` | `scheduleId` | 值班排程中目前的值班人員。 |
+
+此呼叫不會檢查引用的使用者、團隊或值班排程是否存在。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/escalations \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "Primary operations",
+    "steps": [
+      { "targets": [{ "kind": "user", "userId": "<user-id>" }],
+        "ackTimeoutSecs": 300 },
+      { "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+        "ackTimeoutSecs": 900,
+        "minSeverity": "critical" }
+    ],
+    "repeat": true,
+    "maxLoops": 2,
+    "ackRetriggerSecs": 3600
+  }'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KED3sy8RBNYIdLayGZN0bp2IIY",
+  "orgId": "<organization-id>",
+  "name": "Primary operations",
+  "steps": [
+    {
+      "targets": [{ "kind": "user", "userId": "<user-id>" }],
+      "ackTimeoutSecs": 300,
+      "minSeverity": null
+    },
+    {
+      "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+      "ackTimeoutSecs": 900,
+      "minSeverity": "critical"
+    }
+  ],
+  "repeat": true,
+  "maxLoops": 2,
+  "ackRetriggerSecs": 3600
+}
+```
+</ResponseExample>
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | `name` 為空，或 `ackRetriggerSecs` 不在 300 至 86400 的範圍內。 |
+| `403` | 權杖缺少 `alerts.escalations.manage` 權限。 |
+| `422` | 欄位缺漏或無效，例如目標的 `kind` 不是 `user`、`team` 或 `schedule`，或 `minSeverity` 的值無法辨識。回應為純文字。 |
+
+## 其他原則路由
+
+| 操作 | 端點 | 權限 |
+|---|---|---|
+| 列出 | `GET /api/v1/alerts/escalations` | `alerts.escalations.read` |
+| 讀取 | `GET /api/v1/alerts/escalations/{id}` | `alerts.escalations.read` |
+| 取代 | `PUT /api/v1/alerts/escalations/{id}` | `alerts.escalations.manage` |
+| 刪除 | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.escalations.delete` |
+
+`PUT` 的請求本文與建立原則時相同，並會取代整項原則。`DELETE` 會傳回純文字 `deleted`；如果 `id` 不存在，則傳回 `404`。刪除原則時，系統不會檢查引用該原則的規則，而這些規則會停止升級。

@@ -1,0 +1,79 @@
+---
+title: "アラートの送信"
+description: "外部システムからアラートを送信し、発報、確認応答、解決を行います。"
+"en_link": "/en-US/api/alerting/send-alerts"
+"zh-Hans_link": "/zh-Hans/api/alerting/send-alerts"
+"zh-Hant_link": "/zh-Hant/api/alerting/send-alerts"
+"ko_link": "/ko/api/alerting/send-alerts"
+"de_link": "/de/api/alerting/send-alerts"
+"es_link": "/es/api/alerting/send-alerts"
+"fr_link": "/fr/api/alerting/send-alerts"
+"pt-BR_link": "/pt-BR/api/alerting/send-alerts"
+---
+
+```http
+POST /api/v1/intake/alerts
+```
+
+外部システムは、[アラートソース](/ja/alerting/sources)のトークンを使ってリクエストを送信します。`Authorization: Bearer <token>` ヘッダーを使用し、ヘッダーを設定できない場合は、URL に `?token=<token>` を指定します。すべてのソースで同じ URL を使用します。トークンでアラートの所属先を特定し、ソースの種類に応じた形式でボディを読み取ります。[送信元を設定する](/ja/alerting/sources#送信元を設定する)では、送信元ごとの形式を説明します（メールソースは `Content-Type: message/rfc822` で未加工のメールを読み取ります）。このページでは、**API** ソースのリクエストボディについて説明します。ボディの上限は 4 MiB です。
+
+ボディには、単一のアラートオブジェクト、または最大 100 件のアラートオブジェクトを含む配列を指定します。不明なフィールドがある場合は、リクエストを拒否します。
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `action` | 文字列 | `trigger`（デフォルト）、`acknowledge`、または `resolve`。 |
+| `dedupKey` | 文字列 | ソース内で使用する最大 255 文字の重複排除キーです。同じキーで同時にアクティブにできるインシデントは 1 件までです。`acknowledge` と `resolve` では必須です。`trigger` で省略すると、`summary` と `labels` からキーを生成し、レスポンスで返します。 |
+| `summary` | 文字列 | 最大 1024 文字のインシデントタイトルです。`trigger` では必須です。 |
+| `severity` | 文字列 | `critical`、`error`、`warning`、または `info`。省略すると、ソースのデフォルトの重要度を適用します。 |
+| `priority` | 文字列 | インシデントの優先度です。`P1`〜`P9`（`1`〜`9` も可）を指定します。組織のレベルの範囲外の値を指定すると、最も低い優先度を適用します。省略すると、優先度は設定しません。 |
+| `urgency` | 文字列 | インシデントの緊急度です。`high` や `low` など、組織で定義したレベルのキーを指定します。不明なキーは無視します。省略すると、ソースのエスカレーションポリシーに従います。`severity` も指定していない場合、緊急度は `high` です。 |
+| `labels` | オブジェクト | 最大 64 件のラベルです。キーの先頭に `alert.` または `__molesignal` は使用できません。`external.kind` もキーとして使用できません。 |
+| `annotations` | オブジェクト | アノテーションです。リンクと合わせて最大 64 件です。 |
+| `links` | 配列 | `{"name": "…", "url": "https://…"}` を最大 10 件指定できます。`name` をキーとしてアノテーションに書き込みます。`name` を省略した場合は `link` を使用します。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/alerts \
+  -H "authorization: Bearer $SOURCE_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"dedupKey": "disk-full/web-1", "summary": "Disk almost full on web-1", "severity": "critical", "labels": {"host.name": "web-1"}, "links": [{"name": "Runbook", "url": "https://wiki.example.com/disk"}]}'
+```
+</RequestExample>
+
+レスポンスは、各アラートの処理結果をリクエストと同じ順序で返します。PagerDuty のテストイベントのように、ボディを読み取れたものの処理対象のアラートがない場合は、`message` に処理を行わなかった理由を示します。
+
+<ResponseExample>
+```json 200
+{
+  "alerts": [
+    {
+      "dedupKey": "disk-full/web-1",
+      "outcome": "opened",
+      "incidentId": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+      "reason": null
+    }
+  ],
+  "message": null
+}
+```
+</ResponseExample>
+
+| `outcome` | 意味 |
+|---|---|
+| `opened` | 新しいインシデントをオープンしました。 |
+| `updated` | アクティブなインシデントの重要度、またはその通知グループ内のアラートが変わりました。 |
+| `unchanged` | アクティブなインシデントがすでに同じ状態だったか、手動で確認済みになっていました。 |
+| `acknowledged` | インシデントを確認済みにしました。 |
+| `resolved` | インシデントを解決済みにしました。確認済みのインシデントも対象です。 |
+| `ignored` | 変更はありません。アクティブなインシデントがない、メッセージが前回のものより古いなどの理由を `reason` に示します。 |
+
+**エラー**
+
+| ステータス | 原因 |
+|---|---|
+| `400` | ボディを読み取れません。理由は `message` に示します。 |
+| `401` | トークンがないか正しくない、またはソースが存在しません。 |
+| `403` | 組織が無効です。 |
+| `409` | ソースが無効です。 |
+| `413` | ボディが 4 MiB を超えています。 |
+| `503` | ソースの受信クラスターに接続できないか、リクエストを最後まで処理できませんでした。再試行してください。再試行してもインシデントが重複してオープンすることはありません。 |

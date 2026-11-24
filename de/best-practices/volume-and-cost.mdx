@@ -1,0 +1,105 @@
+---
+title: "Telemetrievolumen und Kosten kontrollieren"
+sidebarTitle: "Volumen und Kosten"
+description: "Ermitteln Sie, welche Quellen wie viele Bytes liefern, und verwerfen Sie ungenutzte Daten vor dem Speichern. Bewahren Sie Daten nur so lange auf, wie sie genutzt werden, und begrenzen Sie Metrikzeitreihen und Abfragen."
+"en_link": "/en-US/best-practices/volume-and-cost"
+"zh-Hans_link": "/zh-Hans/best-practices/volume-and-cost"
+"zh-Hant_link": "/zh-Hant/best-practices/volume-and-cost"
+"ja_link": "/ja/best-practices/volume-and-cost"
+"ko_link": "/ko/best-practices/volume-and-cost"
+"es_link": "/es/best-practices/volume-and-cost"
+"fr_link": "/fr/best-practices/volume-and-cost"
+"pt-BR_link": "/pt-BR/best-practices/volume-and-cost"
+---
+
+Das Telemetrievolumen wächst schneller als die Zahl der Fragen, die sich damit beantworten lassen. Aktiviertes Debug-Logging, ein Label mit einer Nutzer-ID oder ein
+sekündlich protokollierter Health Check kann den Speicherbedarf verdoppeln, ohne die Behebung eines Vorfalls zu erleichtern. Reduzieren Sie
+das Volumen dort, wo die Daten keinen Nutzen bringen, und behalten Sie, was für die Untersuchung von Vorfällen nötig ist.
+
+## Zuerst messen
+
+Ermitteln Sie vor jeder Änderung, welche Streams das größte Datenvolumen haben.
+
+| Wo | Was dort angezeigt wird |
+|---|---|
+| [Startseite](/de/home#datenerfassung) | Das empfangene und gespeicherte Datenvolumen je Signal im ausgewählten Zeitraum. |
+| [Streams](/de/streams#die-stream-liste) | Pro Stream: komprimiertes Datenvolumen im Zeitraum, **Erfasstes Datenvolumen** vor der Transformation, **Gespeichertes Datenvolumen**, **Indexgröße** und **Datensätze**. Vergleichen Sie die Werte, um die größten Streams zu finden. |
+| [Nutzung der Datenerfassung](/de/streams#dateneingang-und-budgets) | Das erfasste Datenvolumen je Token, Connector, Stream und Dienst. Ein Budget warnt, wenn sich eine Quelle dem Grenzwert nähert oder ihn überschreitet. |
+| [Metriken](/de/metrics#ergebnis-analysieren) | **Kardinalität** einer Metrik, also die Anzahl ihrer aktiven Zeitreihen. |
+| [Mole Agent-Nutzung](/de/agent#nutzung-und-budget) | Modell-Token nach Quelle und Tag sowie das Tagesbudget. |
+
+Notieren Sie die Werte der größten Streams. Nutzen Sie sie als Ausgangspunkt, um jede Änderung zu bewerten.
+
+## Ungenutzte Daten vor dem Speichern verwerfen
+
+Am wenigsten kostet ein Byte, das gar nicht erst im Speicher landet. Für Logs läuft eine Echtzeit-
+[Pipeline](/de/pipelines#echtzeitpipelines) bereits bei der Erfassung, noch vor dem Speichern:
+
+- **Ereignisse filtern** verwirft Health Checks, Readiness-Probes und Debug-Zeilen, die in der
+  Produktionsumgebung nicht benötigt werden.
+- **Stichprobe** behält einen Teil der häufigen, aber nützlichen Ereignisse eines Typs. Mit **Stichprobe nach Feld** bleiben Ereignisse mit
+  demselben Wert, etwa derselben Request-ID, entweder alle erhalten oder werden gemeinsam verworfen.
+- **Felder entfernen** verwirft große Felder, die in keiner Abfrage vorkommen, etwa vollständige Request-Bodys.
+
+Passen Sie nach Möglichkeit zuerst die Quelle an: Die Log-Stufe `info` in der Produktionsumgebung oder ein Prozessor im Collector,
+der unnötige Daten herausfiltert, senkt auch die Netzwerklast. Verworfene Ereignisse gehen endgültig verloren. Wenden Sie Stichproben nur auf
+wiederkehrende Ereignisse an, nie auf Fehler.
+
+Reduzieren Sie das Trace-Volumen möglichst an der Quelle oder im OpenTelemetry Collector. Halten Sie alle Spans eines
+Traces zusammen. Beachten Sie, dass APM-Kennzahlen und SLOs nur eingehende Spans berücksichtigen. Eine
+[Echtzeit-Pipeline](/de/pipelines#traces) auf einem Trace-Stream kann nach dem Tail-Sampling eine weitere Stichprobe ziehen: Setzen Sie
+**Stichprobe nach Feld** auf `trace_id`, um ganze Traces zu behalten oder zu verwerfen. Die Berechnung der APM-Kennzahlen erfolgt vor der
+Ausführung der Pipeline und berücksichtigt daher auch die von ihr verworfenen Spans. Konfigurieren Sie für RUM das
+[Sitzungs-Sampling](/de/rum/sampling) pro Anwendung.
+
+## Daten nur so lange wie nötig aufbewahren
+
+| Daten | Aufbewahrungsdauer | Vorgehen |
+|---|---|---|
+| Debug-Logs und ausführliche Logs | Tage | Verwenden Sie einen eigenen Stream und setzen Sie **Datenaufbewahrung (Tage)** auf einen niedrigen Wert. |
+| Anwendungs- und Zugriffslogs | Wochen | Verwenden Sie den [Plattformstandard](/de/settings/platform#datenaufbewahrung) von 30 Tagen oder einen eigenen Wert pro Stream. |
+| Audit- und Compliance-Logs | Monate oder Jahre | Verwenden Sie einen Stream mit langer Aufbewahrungsdauer und eingeschränktem Zugriff. |
+| Metriken | Monate | Aktivieren Sie **Ältere Messpunkte aggregieren** auf der Registerkarte **Nutzerbindung** des Metrik-Streams. Die Aggregation fasst ältere Messpunkte in Zeitintervallen zusammen. So lesen Abfragen über lange Zeiträume deutlich weniger Daten. |
+
+Richten Sie die Aufbewahrungsdauer danach aus, wie weit Untersuchungen tatsächlich zurückreichen. Planen Sie einen Puffer für Vorfälle ein, die erst spät auffallen.
+Wenn Sie die Aufbewahrungsdauer verkürzen, löscht die nächste Bereinigung alle Daten, die dann zu alt sind. Die Aggregation
+löscht die ursprünglichen Messpunkte. Beides lässt sich nicht rückgängig machen. Lassen Sie **Kleine Dateien pro Tag zusammenführen** für Logs und
+Traces aktiviert, damit Abfragen über mehrere Tage weniger Dateien öffnen.
+
+## Anzahl der Metrik-Zeitreihen begrenzen
+
+Jede eindeutige Kombination von Label-Werten bildet eine Zeitreihe. Labels mit unbegrenzt vielen möglichen Werten, etwa Nutzer-IDs,
+Request-IDs oder unveränderten URLs, lassen die Anzahl der Zeitreihen unbegrenzt wachsen. Bei Erreichen der
+[Kardinalitätsgrenzen](/de/settings/platform#metrikkardinalität) akzeptiert die Plattform keine neuen Zeitreihen mehr für die gesamte
+Organisation.
+
+- Prüfen Sie nach dem Hinzufügen eines Labels unter „Metriken“ die **Kardinalität**.
+- Ersetzen Sie unveränderte Pfade durch Routenvorlagen und IDs durch Kategorien wie Tarif oder Region.
+- Erfassen Sie Details zu einzelnen Requests in Logs oder Spans. Dort verursachen unterschiedliche Werte keine zusätzlichen Zeitreihen.
+- Wenn sich die Quelle nicht ändern lässt, entfernen oder ändern Sie das Label mit einer [Echtzeit-Pipeline](/de/pipelines#metriken-und-traces) im
+  Metrik-Stream, bevor die Pipeline die Messpunkte speichert.
+
+## Aufwand für Abfragen gering halten
+
+| Vorgehen | Auswirkung |
+|---|---|
+| Legen Sie für große Streams **Max. Abfragezeitraum (Stunden)** fest | Eine versehentliche Abfrage für die „letzten 90 Tage“ scheitert, statt alle Daten zu durchsuchen. |
+| Indizieren Sie die Felder, nach denen Dashboards filtern | Filter überspringen Dateien, statt sie zu lesen. Siehe [Streams und Felder entwerfen](/de/best-practices/stream-design#filterfelder-indizieren). |
+| Beginnen Sie mit dem kleinsten Zeitraum | Grenzen Sie den Zeitraum zuerst ein und erweitern Sie ihn nur bei Bedarf. |
+| Führen Sie aufwendige Suchläufe als [Suchaufträge](/de/streams#suchjobs) aus | Die Abfrage läuft im Hintergrund und speichert das Ergebnis. Die Seite muss nicht geöffnet bleiben. |
+| Aktualisieren Sie Dashboards nur so oft wie nötig | Die Einstellung **Automatisch** passt das Aktualisierungsintervall an den Zeitraum an. Vermeiden Sie auf Wandbildschirmen kurze Intervalle bei Panels mit aufwendigen Abfragen. |
+
+## Abnahmekriterien
+
+- Die fünf größten Streams und ihr tägliches Datenvolumen vor und nach den Änderungen sind dokumentiert.
+- Kein Stream speichert versehentlich Health Checks, Readiness-Probes oder Debug-Logs aus der Produktionsumgebung.
+- Für jeden Stream ist die Aufbewahrungsdauer bewusst festgelegt. Bei Metriken mit langer Aufbewahrungsdauer fasst die Aggregation ältere Messpunkte zusammen.
+- Die Anzahl der Metrik-Zeitreihen bleibt von Woche zu Woche stabil und liegt deutlich unter den Grenzwerten.
+- Für große Streams gilt ein maximaler Abfragezeitraum. Felder, nach denen häufig gefiltert wird, haben einen Index.
+
+## Weiterführende Anleitungen
+
+- [Pipelines](/de/pipelines)
+- [Streams](/de/streams)
+- [Plattformeinstellungen](/de/settings/platform)
+- [Streams und Felder für den langfristigen Einsatz entwerfen](/de/best-practices/stream-design)

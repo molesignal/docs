@@ -1,0 +1,105 @@
+---
+title: "Controle o volume e o custo da telemetria"
+sidebarTitle: "Volume e custo"
+description: "Meça o volume de dados por origem, descarte antes do armazenamento o que ninguém consulta, retenha os dados apenas enquanto forem usados e limite as séries de métricas e as consultas."
+"en_link": "/en-US/best-practices/volume-and-cost"
+"zh-Hans_link": "/zh-Hans/best-practices/volume-and-cost"
+"zh-Hant_link": "/zh-Hant/best-practices/volume-and-cost"
+"ja_link": "/ja/best-practices/volume-and-cost"
+"ko_link": "/ko/best-practices/volume-and-cost"
+"de_link": "/de/best-practices/volume-and-cost"
+"es_link": "/es/best-practices/volume-and-cost"
+"fr_link": "/fr/best-practices/volume-and-cost"
+---
+
+O volume da telemetria cresce mais rápido que o número de perguntas que ela responde. Deixar o log de depuração ativo, usar um rótulo com ID de usuário ou
+registrar uma verificação de integridade a cada segundo pode dobrar o armazenamento sem facilitar a resolução de incidentes. Reduza
+o volume de dados sem utilidade e preserve o que as investigações exigem.
+
+## Meça primeiro
+
+Identifique os fluxos com maior volume antes de fazer alterações.
+
+| Onde | O que mostra |
+|---|---|
+| [Início](/pt-BR/home#ingestão-de-dados) | Volume por sinal no intervalo selecionado, com o total recebido e o total armazenado. |
+| [Fluxos](/pt-BR/streams#lista-de-fluxos) | Por fluxo: dados compactados no período, **Tamanho dos dados coletados** antes das transformações, **Tamanho dos dados armazenados**, **Tamanho dos índices** e **Registros**. Compare os valores para identificar os maiores fluxos. |
+| [Uso da ingestão](/pt-BR/streams#uso-de-ingestão-e-orçamentos) | Volume ingerido por token, conector, fluxo e serviço. O orçamento gera avisos quando uma fonte se aproxima do limite ou o ultrapassa. |
+| [Métricas](/pt-BR/metrics#analisar-o-resultado) | **Cardinalidade** de uma métrica, ou seja, o número de séries ativas. |
+| [Uso do Mole Agent](/pt-BR/agent#uso-e-orçamento) | Tokens do modelo por fonte e por dia, além do orçamento diário. |
+
+Anote os números dos maiores fluxos. Use esses valores como referência para avaliar cada alteração.
+
+## Descarte o que ninguém lê antes de armazenar
+
+O byte mais barato é aquele que não ocupa espaço. Para logs, um
+[pipeline em tempo real](/pt-BR/pipelines#pipelines-em-tempo-real) atua durante a ingestão, antes do armazenamento:
+
+- **Filtrar eventos** descarta verificações de integridade, sondas de prontidão e linhas de depuração que ninguém lê em
+  produção.
+- **Amostra** mantém uma parte dos eventos de um tipo útil, mas muito frequente. Com **Amostragem por campo**, o pipeline mantém ou descarta em conjunto os eventos que
+  compartilham um valor, como o mesmo ID de requisição.
+- **Remover campos** descarta campos grandes que nenhuma consulta usa, como corpos completos de requisições.
+
+Sempre que possível, altere primeiro a origem: defina o nível de log como `info` em produção ou use um processador no coletor
+para descartar ruído e reduzir também o tráfego de rede. O descarte é definitivo. Aplique amostragem apenas a eventos
+repetitivos, nunca a erros.
+
+Reduza o volume de traces de preferência na origem ou no OpenTelemetry Collector. Mantenha juntos todos os spans de um
+trace. Lembre que os indicadores de APM e os SLOs contam apenas os spans que chegam. Um
+[pipeline em tempo real](/pt-BR/pipelines#traces) em um fluxo de traces pode aplicar amostragem após a amostragem na cauda. Defina
+**Amostragem por campo** como `trace_id` para manter ou descartar traces inteiros. O MoleSignal calcula os indicadores de APM antes de executar o pipeline,
+por isso eles ainda incluem os spans que o pipeline descarta. Para RUM, configure a
+[amostragem de sessões](/pt-BR/rum/sampling) por aplicação.
+
+## Mantenha os dados só enquanto forem úteis
+
+| Dados | Retenção | Como |
+|---|---|---|
+| Logs de depuração e logs detalhados | Dias | Use um fluxo separado com um valor baixo em **Retenção de dados (dias)**. |
+| Logs de aplicação e de acesso | Semanas | Use o [padrão da plataforma](/pt-BR/settings/platform#retenção-de-dados), de 30 dias, ou defina um valor por fluxo. |
+| Logs de auditoria e conformidade | Meses ou anos | Use um fluxo com retenção longa e acesso restrito. |
+| Métricas | Meses | Ative **Reduzir a resolução de amostras antigas** na aba **Retenção** do fluxo de métricas. O MoleSignal agrega amostras antigas em intervalos de tempo, e as consultas de períodos longos leem bem menos dados. |
+
+Defina a retenção com base no histórico que as investigações realmente consultam. Reserve uma margem para problemas que demoram a aparecer.
+Ao encurtar a retenção, a próxima limpeza exclui os dados que ultrapassarem o novo prazo. A redução de resolução
+exclui as amostras originais. Nenhuma dessas exclusões pode ser desfeita. Mantenha **Mesclar arquivos pequenos por dia** ativado para logs e
+traces, assim as consultas de vários dias abrem menos arquivos.
+
+## Limite o número de séries de métricas
+
+Cada combinação distinta de valores de rótulos corresponde a uma série. Rótulos com valores sem limite, como IDs de usuário,
+IDs de requisição ou URLs brutas, geram séries sem limite. Ao atingir os
+[limites de cardinalidade](/pt-BR/settings/platform#cardinalidade-de-métricas), o MoleSignal rejeita novas séries em toda a
+organização.
+
+- Confira a **Cardinalidade** em Métricas após adicionar um rótulo.
+- Substitua caminhos brutos por modelos de rota e IDs por categorias como plano ou região.
+- Registre detalhes de cada requisição em logs ou spans, que não geram custo por valor distinto.
+- Se não for possível alterar a origem, use um [pipeline em tempo real](/pt-BR/pipelines#métricas-e-traces) no
+  fluxo de métricas para remover ou reescrever o rótulo antes de armazenar as amostras.
+
+## Reduza o custo das consultas
+
+| Prática | Efeito |
+|---|---|
+| Defina **Intervalo máximo de consulta (horas)** em fluxos grandes | O MoleSignal rejeita uma consulta acidental dos "últimos 90 dias" em vez de examinar todos os dados. |
+| Indexe os campos usados nos filtros dos dashboards | Os filtros pulam arquivos em vez de lê-los. Consulte [Planeje fluxos e campos](/pt-BR/best-practices/stream-design#indexe-os-campos-usados-em-filtros). |
+| Comece com o menor intervalo de tempo | Comece com um intervalo curto e amplie apenas quando necessário. |
+| Execute buscas demoradas como [tarefas de busca](/pt-BR/streams#tarefas-de-busca) | A consulta roda em segundo plano e conserva o resultado, sem manter a página aberta. |
+| Atualize os dashboards só na frequência com que são consultados | A atualização no modo **Automático** se ajusta ao intervalo de tempo. Evite intervalos curtos em telas de parede com painéis pesados. |
+
+## Critérios de aceitação
+
+- Os cinco maiores fluxos constam no levantamento, com o volume diário antes e depois das alterações.
+- Nenhum fluxo armazena por engano verificações de integridade, sondas de prontidão ou logs de depuração de produção.
+- Cada fluxo tem uma retenção adequada à finalidade, e as métricas de retenção longa têm resolução reduzida nas amostras antigas.
+- A contagem de séries de métricas permanece estável de uma semana para outra e bem abaixo dos limites.
+- Os fluxos grandes têm um intervalo máximo de consulta e índices para os campos usados nos filtros mais comuns.
+
+## Guias relacionados
+
+- [Pipelines](/pt-BR/pipelines)
+- [Fluxos](/pt-BR/streams)
+- [Configurações da plataforma](/pt-BR/settings/platform)
+- [Planeje fluxos e campos que continuem úteis](/pt-BR/best-practices/stream-design)

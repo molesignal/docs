@@ -1,0 +1,201 @@
+---
+title: "RUM ソースマップとシンボル"
+sidebarTitle: "ソースマップとシンボル"
+description: "RUM のスタックトレースを復元するために、ブラウザーのソースマップ、Flutter のシンボル、Android のマッピングファイルとネイティブシンボル、または Apple の dSYM ファイルをアップロードします。"
+"en_link": "/en-US/rum/source-maps"
+"zh-Hans_link": "/zh-Hans/rum/source-maps"
+"zh-Hant_link": "/zh-Hant/rum/source-maps"
+"ko_link": "/ko/rum/source-maps"
+"de_link": "/de/rum/source-maps"
+"es_link": "/es/rum/source-maps"
+"fr_link": "/fr/rum/source-maps"
+"pt-BR_link": "/pt-BR/rum/source-maps"
+---
+
+MoleSignal は、デバッグアーティファクトを使って、ミニファイされた JavaScript、難読化された Dart や Android コード、 Android や iOS のネイティブコードのスタックフレームを復元します。すべての種類のアーティファクトは `/api/v1/debug-artifacts` で管理します。
+
+## アーティファクトの種類を選択する
+
+| ランタイム | `kind` | `platform` | ファイル |
+|---|---|---|---|
+| ブラウザーの JavaScript | `javascript_sourcemap` | `web` | 外部 `.map` ファイル |
+| Flutter Web | `javascript_sourcemap` | `flutter` | `main.dart.js.map` またはその他の生成された `.map` ファイル |
+| Flutter Android または iOS の AOT | `flutter_symbols` | `android` または `ios` | Flutter の `--split-debug-info` で生成した `.symbols` ファイル |
+| Android R8 | `android_mapping` | `android` | リリースの `mapping.txt` |
+| Android NDK | `android_native_symbols` | `android` | シンボルを除去していない ELF 共有オブジェクト |
+| Apple ネイティブ | `apple_dsym` | `ios` | 対応する `.dSYM` バンドル内の DWARF バイナリ |
+
+非圧縮ファイルと gzip 圧縮ファイルをアップロードできます。アップロードの上限は 50 MiB です。gzip 圧縮したアーティファクトの展開後の上限は 256 MiB です。
+
+## ビルド識別情報を一致させる
+
+MoleSignal は、RUM エラーのビルド識別情報に基づいてアーティファクトを選択します。
+
+| アップロードフィールド | 照合する RUM の値 | ルール |
+|---|---|---|
+| `applicationId` | クライアントトークンに紐づくアプリケーションの `application.id` | 完全に一致させます |
+| `service` | イベントの `service` | 大文字と小文字を区別して完全に一致させます |
+| `release` | イベントの `version` | 大文字と小文字を区別して完全に一致させます |
+| `kind` | フレームの `artifact_kind`。`artifact_kind` がなく、`file` と `line` があるフレームは JavaScript フレームとして扱います | 対応するアーティファクトの表から選択します |
+| `platform` | イベントの `os.name`。`os.name` がない場合はイベントの `source` | 上の表に従って `web`、`flutter`、`android`、`ios` のいずれかを指定します |
+| `architecture` | イベントの `device.architecture` | モバイルおよびネイティブのアーティファクトには `arm64` や `x86_64` などを指定します |
+| `debugId` | フレームの `debug_id` を優先し、なければイベントの `build_id` を使用します | 同じ Flutter ビルド ID、ELF ビルド ID、または Mach-O UUID を指定します |
+| ファイル名 | ランタイムのモジュールまたはバンドル | ブラウザーのソースマップには `<deployed bundle basename>.map` を使用します |
+
+MoleSignal は一般的な ABI のエイリアスを正規化します。たとえば、`arm64-v8a` と `aarch64` は `arm64` に、 `amd64` と `x64` は `x86_64` になります。16 進数のデバッグ ID と UUID の比較では、大文字と小文字の違い、波括弧、ハイフン、先頭の `0x` を無視します。
+
+<Warning>
+  `applicationId`、`service`、`release`、`architecture`、`debugId` は、アーティファクトを生成するビルドパイプラインで管理してください。ビルド識別情報が古いか曖昧な場合、イベントはそのまま保持されますが、シンボリケーションの結果は `missing` または `partial` になります。
+</Warning>
+
+### ブラウザーの例
+
+ビルドごとに `service` と `version` に固定値を設定します。
+
+```ts
+import { init } from '@molesignal/browser-rum';
+
+init({
+  applicationId: 'checkout-web',
+  clientToken: 'mspat-your-client-token',
+  site: 'https://molesignal.example.com',
+  service: 'web-frontend',
+  version: '2026.08.04.1',
+});
+```
+
+同じビルド識別情報を指定し、デプロイ済みバンドルの名前と正確に対応するソースマップをアップロードします。
+
+| アップロードフィールド | SDK フィールド | 例 |
+|---|---|---|
+| アプリケーション ID | `applicationId` | `checkout-web` |
+| サービス | `service` | `web-frontend` |
+| リリース | `version` | `2026.08.04.1` |
+| ファイル | 生成した `.map` ファイル | `app.8f312.js.map` |
+
+デプロイ後のフレームの URL が `/assets/app.8f312.js` で終わる場合は、`app.8f312.js.map` をアップロードします。メインバンドルだけでなく、遅延読み込みするすべてのチャンクのソースマップもアップロードします。
+
+## UI からアップロードする
+
+<Steps>
+  <Step title="ソースマップを有効にしてビルドする">
+    本番ビルドで外部ソースマップを生成します。セキュリティポリシーでソースコードの非公開が求められる場合は、公開するデプロイ成果物にソースマップを含めないでください。
+  </Step>
+  <Step title="アップロードページを開く">
+    **RUM → RUM 設定 → ソースマップとシンボル**に移動し、**デバッグアーティファクトをアップロード**をクリックします。
+  </Step>
+  <Step title="ビルド識別情報を入力する">
+    アーティファクトの種類とプラットフォームを選択します。ビルドと完全に一致するアプリケーション、サービス、リリースを入力します。モバイルのアーティファクトにはアーキテクチャとデバッグ ID も指定し、生成したファイルを選択します。
+  </Step>
+  <Step title="シンボリケーションを確認する">
+    対象のリリースからエラーを送信します。**RUM → エクスプローラー**を開いて**エラー**を選択し、送信したエラーを開きます。スタックに元のソースコード上の位置が表示されることを確認します。
+  </Step>
+</Steps>
+
+## リリースアーティファクトを準備する
+
+<Tabs>
+  <Tab title="Web">
+    実際にデプロイするブラウザーバンドルから外部ソースマップを生成します。ソースコードの公開が許可されていない場合は、 `.map` ファイルを非公開にします。
+
+    ソースマップを有効にして Flutter Web をビルドします。
+
+    ```bash
+    flutter build web \
+      --release \
+      --source-maps \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=javascript \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    `kind=javascript_sourcemap`、`platform=flutter`、 `architecture=javascript` を指定して `main.dart.js.map` をアップロードします。
+  </Tab>
+  <Tab title="Flutter Android">
+    本番環境で使用する ABI ごとに Flutter シンボルファイルを 1 つ生成します。
+
+    ```bash
+    flutter build apk \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/android-arm64 \
+      --target-platform=android-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    `kind=flutter_symbols`、`platform=android`、 `architecture=arm64`、`debugId=${BUILD_ID}` を指定して `app.android-arm64.symbols` をアップロードします。
+  </Tab>
+  <Tab title="Flutter iOS">
+    リリース用 IPA のビルドから Flutter の AOT シンボルを生成します。
+
+    ```bash
+    flutter build ipa \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/ios-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    `kind=flutter_symbols`、`platform=ios`、 `architecture=arm64`、`debugId=${BUILD_ID}` を指定して `app.ios-arm64.symbols` をアップロードします。
+  </Tab>
+  <Tab title="Android ネイティブ">
+    R8 を使用するリリースごとに `app/build/outputs/mapping/release/mapping.txt` を保存します。 `kind=android_mapping` と `platform=android` を指定してアップロードします。
+
+    NDK の ABI ごとに、シンボルを除去していない ELF `.so` ファイルを保存します。プラットフォームのツールチェーンで ELF ビルド ID を抽出します。`kind=android_native_symbols`、`platform=android`、正規化されたアーキテクチャ、およびクラッシュフレームで送信されるものと同じビルド ID を指定してアップロードします。
+  </Tab>
+  <Tab title="iOS ネイティブ">
+    アーカイブした dSYM から UUID を読み取り、必要に応じて DWARF バイナリを圧縮します。
+
+    ```bash
+    dwarfdump --uuid Checkout.app.dSYM
+    gzip -k Checkout.app.dSYM/Contents/Resources/DWARF/Checkout
+    ```
+
+    `kind=apple_dsym`、`platform=ios`、対応するアーキテクチャを指定し、正規化した Mach-O UUID を `debugId` に設定して、DWARF ファイルまたは `.gz` ファイルをアップロードします。
+  </Tab>
+</Tabs>
+
+## CI からアップロードする
+
+`debug_artifacts.manage` 権限を持つ管理トークンを使用します。このトークンをブラウザーやモバイルのアプリケーションに埋め込まないでください。また、アーティファクトの管理に公開クライアントトークンを使用しないでください。
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${MOLESIGNAL_TOKEN}" \
+  -F "applicationId=${APPLICATION_ID}" \
+  -F "service=${SERVICE}" \
+  -F "release=${RELEASE_VERSION}" \
+  -F "kind=${ARTIFACT_KIND}" \
+  -F "platform=${PLATFORM}" \
+  -F "architecture=${ARCHITECTURE}" \
+  -F "debugId=${DEBUG_ID}" \
+  -F "file=@${ARTIFACT_PATH}" \
+  "${MOLESIGNAL_SITE}/api/v1/debug-artifacts"
+```
+
+フォールバック用のアーティファクトを意図的に登録する場合に限り、`architecture` または `debugId` を空欄にします。モバイルでは、ビルド識別情報を完全に一致させることで、曖昧な照合を防ぎます。
+
+`GET /api/v1/debug-artifacts` でアーティファクトを一覧表示します。`applicationId`、`service`、`kind`、 `platform` で絞り込めます。`DELETE /api/v1/debug-artifacts/{id}` でアーティファクトを 1 件削除します。一覧表示には `debug_artifacts.read` 権限が、アップロードと削除には `debug_artifacts.manage` 権限が必要です。
+
+## リリースチェックリスト
+
+- 実際にデプロイするバイナリまたはバンドルから生成したアーティファクトを保存します。
+- エラーが記録される前に、変更されないバージョン値を SDK に設定します。
+- アプリケーション、サービス、リリース、アーキテクチャ、デバッグ ID をビルドと一致させます。
+- Web のすべてのチャンクのソースマップと、配布するすべてのモバイルアーキテクチャのアーティファクトをアップロードします。
+- 管理トークンはリリースパイプライン内にのみ保管します。
+- デプロイ後にテスト用のエラーを 1 件発生させ、フレームの `original_*` フィールドが復元されることを確認します。
+- リリースがユーザーに届く前にアーティファクトをアップロードします。エラーがどの[イシュー](/ja/rum/errors#エラーをイシューにまとめる仕組み)に属するかは、復元されたフレームに基づいて決まります。そのため、同じエラーでも、ソースマップのアップロード前に届くと、アップロード後に届いた場合とは別のイシューに分類されます。
+
+<CardGroup cols={2}>
+  <Card title="ブラウザー RUM SDK" icon="code" href="/ja/rum/browser-sdk">
+    ブラウザーのアプリケーション、サービス、リリースの識別情報を設定します。
+  </Card>
+  <Card title="Flutter アプリ RUM SDK" icon="mobile" href="/ja/rum/flutter-sdk">
+    Flutter のビルド識別情報とエラー収集を設定します。
+  </Card>
+</CardGroup>

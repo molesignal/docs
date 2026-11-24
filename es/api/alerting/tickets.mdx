@@ -1,0 +1,186 @@
+---
+title: "API de tickets"
+sidebarTitle: "Tickets"
+description: "Conecta Jira, ServiceNow o Meegle (Feishu Project) y crea tickets para los incidentes. Mantén los tickets al día con los comentarios y las transiciones de los incidentes y sincroniza su estado."
+"en_link": "/en-US/api/alerting/tickets"
+"zh-Hans_link": "/zh-Hans/api/alerting/tickets"
+"zh-Hant_link": "/zh-Hant/api/alerting/tickets"
+"ja_link": "/ja/api/alerting/tickets"
+"ko_link": "/ko/api/alerting/tickets"
+"de_link": "/de/api/alerting/tickets"
+"fr_link": "/fr/api/alerting/tickets"
+"pt-BR_link": "/pt-BR/api/alerting/tickets"
+---
+
+Un conector de tickets conecta Jira (Cloud o Data Center / Server), ServiceNow o Feishu Project (Meegle fuera de
+China). Los tickets creados para un incidente reflejan su evolución: el conector puede registrar las confirmaciones, las resoluciones y las notas
+como comentarios y marcar el ticket como completado al resolver el incidente. El conector sincroniza el estado del ticket
+cada 5 minutos, y Jira también puede enviarlo de inmediato mediante un webhook. Consulta cómo usan los tickets las páginas en
+[Tickets](/es/alerting/tickets).
+
+| Método y ruta | Función | Permiso |
+|---|---|---|
+| `GET /api/v1/alerts/tickets/connectors` | Devuelve los conectores de tickets de la organización como `{ "connectors": [ ... ] }`. | `alerts.tickets.read` |
+| `POST /api/v1/alerts/tickets/connectors` | Crea un conector. | `alerts.tickets.manage` |
+| `PUT /api/v1/alerts/tickets/connectors/{id}` | Reemplaza un conector. No permite cambiar `system`. | `alerts.tickets.manage` |
+| `DELETE /api/v1/alerts/tickets/connectors/{id}` | Elimina un conector. | `alerts.tickets.manage` |
+| `POST /api/v1/alerts/tickets/connectors/{id}/test` | Prueba la conexión: Jira devuelve `{ "ok": true, "detail": "<signed-in user>" }` y Feishu Project consulta una vez el tipo de elemento de trabajo. | `alerts.tickets.manage` |
+| `GET /api/v1/alerts/tickets/sites` | Devuelve la dirección de cada plataforma de Feishu Project: `{ "meegle": [{ "key": "feishu", "url": "https://project.feishu.cn" }, { "key": "lark", "url": "https://meegle.com" }] }`. | `alerts.tickets.read` |
+| `GET /api/v1/alerts/incidents/{id}/tickets` | Devuelve los tickets del incidente como `{ "tickets": [ ... ] }`. | `alerts.incidents.read` en el incidente |
+| `POST /api/v1/alerts/incidents/{id}/tickets` | Crea un ticket para el incidente mediante un conector. | `alerts.incidents.tickets` en el incidente |
+| `POST /api/v1/public/tickets/jira/{connectorId}` | Recibe el webhook de Jira sin requerir inicio de sesión. | `X-Hub-Signature` |
+
+## Conectores
+
+**Cuerpo de la solicitud**
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `name` | cadena | Sí | Nombre del conector. |
+| `system` | cadena | Sí | `jira` o `meegle`. |
+| `settings` | objeto | Sí | El sitio, el proyecto, el tipo y las asignaciones. Consulta las secciones siguientes. |
+| `secrets` | objeto | Al crear | El sistema almacena las credenciales cifradas y nunca las devuelve. Jira requiere `apiToken` (un token de API de Cloud o un token de acceso personal de Data Center) y admite un `webhook_secret` opcional. Feishu Project requiere `plugin_secret`. Si dejas un secreto vacío al editar el conector, conserva su valor. |
+| `comments` | objeto | No | `{ "acknowledged": true, "resolved": true, "notes": true }`: agrega comentarios al confirmar o resolver el incidente y publica sus notas como comentarios. El valor predeterminado de las tres opciones es `false`. |
+| `transitionOnResolve` | booleano | No | Marca el ticket como completado al resolver el incidente. Valor predeterminado: `false`. |
+| `resolveIncidentWhenDone` | booleano | No | Resuelve el incidente al completar el ticket, tanto si está abierto como si está confirmado, sin atribuir la resolución a nadie. Valor predeterminado: `false`. |
+| `auto` | objeto | No | Tickets automáticos: `{ "enabled": true, "minSeverity": "error", "conditions": [ ... ] }`. El conector crea un ticket para cada incidente nuevo cuya gravedad sea igual o superior a `minSeverity` y cuyas etiquetas cumplan `conditions`. Escribe `conditions` como en las [reglas de enrutamiento](/es/api/alerting/create-routing-rule). |
+| `onMajorIncident` | booleano | No | Crea un ticket cuando se declara un [incidente grave](/es/api/alerting/major-incidents). Valor predeterminado: `false`. |
+| `enabled` | booleano | No | Valor predeterminado: `true`. Un conector desactivado no crea ni sincroniza tickets ni recibe webhooks. |
+
+**`settings`: Jira**
+
+| Campo | Notas |
+|---|---|
+| `siteUrl` | La dirección del sitio. Debe comenzar con `https://`, por ejemplo, `https://example.atlassian.net`. |
+| `deployment` | `cloud` (predeterminado): usa el correo electrónico de la cuenta y un token de API con la API REST v3 y cuerpos de solicitud en Atlassian Document Format. `data_center`: usa un token de acceso personal con la API REST v2. |
+| `email` | El correo electrónico de la cuenta de Cloud. |
+| `projectKey`, `issueType` | La clave del proyecto y el tipo de incidencia, por ejemplo, `OPS` e `Incident`. |
+| `priorities` | Correspondencias entre los niveles de gravedad y los nombres de prioridad de Jira, por ejemplo, `{ "critical": "Highest" }`. Si un nivel no tiene correspondencia, el conector no asigna prioridad. |
+| `labels` | Etiquetas que el conector agrega a los tickets, además de `molesignal`, que agrega a todos. |
+| `fields` | Valores predeterminados para otros campos al crear el ticket. Usa el ID de campo de Jira como clave. |
+| `resolveTransition` | Nombre o ID de la transición que aplica el conector al resolver el incidente. Si lo dejas vacío, usa la primera transición a un estado de finalización. |
+
+**`settings`: Feishu Project**
+
+| Campo | Notas |
+|---|---|
+| `site` | La plataforma: `feishu` (predeterminada, Feishu Project, en `https://project.feishu.cn`) o `lark` (Meegle, en `https://meegle.com`). La plataforma determina la dirección y no puedes modificarla. |
+| `pluginId` | El ID del complemento. El conector lo usa junto con `plugin_secret` para obtener un token del complemento. |
+| `userKey` | Identifica a la persona en cuyo nombre el conector crea tickets y publica comentarios. |
+| `projectKey`, `workItemTypeKey` | El espacio y el tipo de elemento de trabajo. |
+| `priorityField`, `priorities` | La clave del campo de prioridad y las correspondencias entre los niveles de gravedad y los valores de las opciones de prioridad. Si dejas la configuración vacía, el conector no asigna prioridad. |
+| `fields` | Valores predeterminados para otros campos al crear el ticket. Usa field_key como clave. |
+| `resolveTransitionId` | Para un elemento de trabajo con flujo de estados: el ID de la transición que aplica el conector al resolver el incidente. |
+| `resolveNodeId` | Para un elemento de trabajo con flujo de nodos: el ID del nodo que completa el conector al resolver el incidente. |
+| `doneStates` | Claves de los estados que indican que el ticket está completado. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/tickets/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "Jira OPS",
+    "system": "jira",
+    "settings": {
+      "siteUrl": "https://example.atlassian.net",
+      "deployment": "cloud",
+      "email": "oncall-bot@example.com",
+      "projectKey": "OPS",
+      "issueType": "Incident",
+      "priorities": { "critical": "Highest", "error": "High" }
+    },
+    "secrets": { "apiToken": "<jira-api-token>", "webhookSecret": "<webhook-secret>" },
+    "comments": { "acknowledged": true, "resolved": true, "notes": true },
+    "transitionOnResolve": true,
+    "auto": { "enabled": true, "minSeverity": "critical", "conditions": [] }
+  }'
+```
+</RequestExample>
+
+La respuesta devuelve el conector guardado. Omite `secrets` y usa `secretsSet` para indicar qué credenciales
+están configuradas. Un conector de Jira también incluye `webhook_path`, cuyo valor es
+`/api/v1/public/tickets/jira/<connector ID>`. El registro de auditoría recoge la creación, la modificación y la eliminación de conectores.
+
+**`settings` para ServiceNow**
+
+| Campo | Descripción |
+|---|---|
+| `instanceUrl` | La dirección de la instancia. Debe comenzar con https. |
+| `auth` | `basic` (predeterminado, secreto `password`), `oauth` (credenciales de cliente, secreto `clientSecret`) o `apiKey` (secreto `apiKey`). |
+| `username`, `clientId` | El usuario de autenticación básica y el ID de cliente de OAuth, respectivamente. |
+| `table` | La tabla donde el conector crea los tickets. Debe extender `task`. Valor predeterminado: `incident`. |
+| `assignmentGroup`, `callerId`, `category` | Campos que el conector rellena al crear un ticket. Los dos primeros son identificadores `sys_id`. |
+| `priorities` | Nivel de gravedad o prioridad → `impact/urgency`. Si indicas un solo número, el conector lo aplica a ambos. |
+| `fields` | Valores predeterminados para otros campos al crear el ticket (nombre del campo → valor). |
+| `resolveState`, `closeCode` | Valores de `state` y `closeCode` que escribe el conector al resolver el incidente. Los valores predeterminados son `6` y `Solution provided`. Si dejas `closeCode` vacío, el conector no escribe ningún código de cierre. |
+| `doneStates` | Valores de `state` que indican que el ticket está completado. Valores predeterminados: `6`, `7` y `8`. |
+
+La prueba del conector devuelve `{ "ok": true, "detail": "<table>" }`.
+
+## Crea un ticket para un incidente
+
+```http
+POST /api/v1/alerts/incidents/{id}/tickets
+```
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `connectorId` | cadena | Sí | El conector con el que se crea el ticket. Si el incidente ya tiene un ticket en ese conector, la API devuelve el ticket existente. |
+
+El título del ticket sigue el formato `[severity] incident summary`. El cuerpo incluye la gravedad y el estado del incidente,
+los servicios, las etiquetas, la consulta que lo activó, el resumen del análisis de causa raíz generado por IA y la dirección de la página del incidente, en el
+idioma predeterminado del espacio de trabajo. La línea de tiempo del incidente y el registro de auditoría incluyen el ticket.
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KJ4m8T1qHd0Ue6WzB2nLc9RfPa",
+  "orgId": "<organization-id>",
+  "incidentId": "<incident-id>",
+  "connectorId": "<connector-id>",
+  "system": "jira",
+  "externalId": "10482",
+  "externalKey": "OPS-42",
+  "url": "https://example.atlassian.net/browse/OPS-42",
+  "status": "To Do",
+  "done": false,
+  "incidentStatus": "open",
+  "createdBy": "<user-id>",
+  "createdAt": 1790000000000000,
+  "syncedAt": 1790000000000000,
+  "lastError": "",
+  "actionItemId": null
+}
+```
+</ResponseExample>
+
+| Campo | Notas |
+|---|---|
+| `externalId`, `externalKey` | El ID y la clave de la incidencia de Jira. En Feishu Project, ambos contienen el ID del elemento de trabajo. |
+| `status`, `done` | El nombre del estado en la última sincronización y si el ticket está completado. Jira usa la categoría de estado `done` y Feishu Project usa los valores de `doneStates` del conector. |
+| `syncedAt`, `lastError` | La fecha y hora de la última sincronización y el error de la última sincronización o del último intento de publicar un comentario. El conector borra el error tras una operación exitosa. |
+| `actionItemId` | Identifica la [acción de seguimiento del análisis retrospectivo](/es/api/alerting/postmortems) para la que se creó el ticket. El conector no publica comentarios ni aplica transiciones a esos tickets a partir del incidente. |
+
+## Sincronización de estados y webhook de Jira
+
+MoleSignal sincroniza los tickets que aún no se han completado cada 5 minutos. Cuando un ticket se completa y su conector tiene
+`resolveIncidentWhenDone`, MoleSignal resuelve el incidente, salvo si el ticket corresponde a una tarea de seguimiento
+del análisis post mortem.
+
+Cuando el conector de Jira tenga un `webhook_secret`, agrega un webhook en Jira en **Configuración del sistema → WebHooks**:
+usa como URL la dirección externa de MoleSignal seguida de `webhook_path`, usa el mismo secreto
+`webhook_secret` y selecciona como eventos las actualizaciones de incidencias.
+
+```http
+POST /api/v1/public/tickets/jira/{connectorId}
+```
+
+MoleSignal calcula el HMAC-SHA256 del cuerpo con `webhook_secret` y lo compara con
+`X-Hub-Signature: sha256=<hex>`. El cuerpo no supera 1 MiB.
+
+| Estado | Motivo |
+|---|---|
+| `204` | MoleSignal acepta el webhook. También devuelve `204` si la incidencia del cuerpo no corresponde a un ticket que haya creado. |
+| `401` | La firma no coincide o el conector no tiene `webhook_secret` y no acepta webhooks. |
+| `404` | El conector no existe, está desactivado o no es de Jira. |

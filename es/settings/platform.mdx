@@ -1,0 +1,177 @@
+---
+title: "Configuración de la plataforma"
+description: "Configura en la organización _sys los ajustes que se aplican a toda la instancia: organizaciones, límites de inicio de sesión, identificación de la IP del cliente, retención predeterminada, cardinalidad de métricas, uso de la ingesta y retención de registros de auditoría."
+"en_link": "/en-US/settings/platform"
+"zh-Hans_link": "/zh-Hans/settings/platform"
+"zh-Hant_link": "/zh-Hant/settings/platform"
+"ja_link": "/ja/settings/platform"
+"ko_link": "/ko/settings/platform"
+"de_link": "/de/settings/platform"
+"fr_link": "/fr/settings/platform"
+"pt-BR_link": "/pt-BR/settings/platform"
+---
+
+La configuración de la plataforma se encuentra en la organización protegida `_sys`. Cambia a esa organización con el selector
+de espacios de trabajo. Solo pueden acceder el superadministrador y las cuentas con un rol de plataforma. Las páginas
+aparecen en **Configuración** dentro de esa organización. Para consultar una página, se requiere el permiso
+`.read` de su grupo; para modificarla, se requiere el permiso `.manage`.
+
+| Sección | Grupo | Permiso |
+|---|---|---|
+| **Gestión de organizaciones** | Plataforma | `sys.organizations.read` |
+| **Límites de inicio de sesión** | Plataforma | `sys.settings.signin.manage` |
+| **Identificación de la IP del cliente** | Plano de datos | `sys.settings.signin.manage` |
+| **Retención de datos** | Plano de datos | `sys.settings.retention.manage` |
+| **Cardinalidad de métricas** | Plano de datos | `sys.settings.limits.manage` |
+| **Uso de ingesta** | Plano de datos | `sys.settings.limits.manage` |
+| **Retención de registros de auditoría** | Seguridad de los datos | `sys.settings.retention.manage` |
+
+Cada nodo lee esta configuración desde la base de datos, por lo que los cambios no requieren un reinicio.
+
+## Gestión de organizaciones
+
+**Gestión de organizaciones** muestra las organizaciones de la instancia con el nombre, el slug,
+el estado y el ID.
+
+| Acción | Efecto |
+|---|---|
+| **Crear organización** | Crea una organización a partir de un **Nombre** y un **Slug**. El slug no se puede cambiar después. |
+| Deshabilitar | Bloquea de inmediato el acceso a la organización: el sistema rechaza sus sesiones y credenciales de API hasta que se vuelva a habilitar. |
+| Habilitar | Restablece el acceso de los miembros y las credenciales de la organización. |
+| Eliminar | Elimina la organización de forma permanente: la organización desaparece de inmediato y el sistema elimina sus datos, incluidos los archivos almacenados, en segundo plano en cuestión de minutos. El slug se puede reutilizar de inmediato. |
+
+Al menos una organización debe permanecer habilitada y no se puede modificar la organización `_sys`.
+Administra los miembros de una organización desde su página de
+[Identidad y acceso](/es/identity/members). Para abrirla, haz clic en **Administrar IAM** en
+[Organizaciones](/es/identity/teams#organizaciones).
+
+## Límites de inicio de sesión
+
+Los **Límites de inicio de sesión** impiden el relleno de credenciales y los intentos de adivinar contraseñas sin que una contraseña incorrecta permita bloquear
+el acceso a una cuenta ajena. Cuentan las verificaciones fallidas de la contraseña de una cuenta: al iniciar sesión con contraseña,
+por LDAP o desde un cliente de base de datos; al confirmar la contraseña para
+[vincular una cuenta existente](/es/identity/sso); y antes de
+[agregar un segundo factor](/es/identity/mfa). La contraseña de acceso de un
+[enlace público](/es/resource-sharing#límites-de-la-contraseña-de-acceso) también cuenta, y cada enlace se trata como una cuenta.
+Las claves de acceso y el inicio de sesión único con OIDC, OAuth 2.0 o SAML no se contabilizan ni están sujetos a límites.
+
+| Configuración | Valor predeterminado | Al alcanzar el límite |
+|---|---|---|
+| **Una cuenta desde una dirección** | 5 fallos | Se bloquea el acceso a esta cuenta desde esta dirección. El bloqueo no afecta a otras direcciones. |
+| **Una dirección, cualquier cuenta** | 30 fallos | Ya no se puede iniciar sesión con contraseña desde esta dirección. El bloqueo también afecta a quienes comparten la dirección. |
+| **Una cuenta desde todas las direcciones** | 20 fallos | La cuenta no se bloquea, pero se reduce la frecuencia con la que se verifica su contraseña. Las direcciones desde las que se inició sesión en los últimos 30 días quedan exentas de la restricción. El contador se restablece tras un período de recuento sin nuevos fallos. |
+| **Con la restricción activa, verificar una contraseña cada** | 60 segundos | De 1 a 600 segundos. |
+| **Duración del bloqueo y período de recuento** | 15 minutos | Determina cuánto tiempo permanece bloqueada una dirección y qué antigüedad pueden tener los fallos que se cuentan. De 1 a 1440 minutos. |
+
+Ingresa `0` para desactivar un contador. El valor máximo es 100000. Los cambios se aplican de inmediato y quedan registrados en el
+registro de auditoría de la plataforma como `signin_limits.update`.
+
+| Caso | Resultado |
+|---|---|
+| Una solicitud rechazada | El sistema responde con `429` y el encabezado `Retry-After`. No verifica la contraseña ni prolonga el bloqueo, que dura como máximo el tiempo configurado. |
+| Una cuenta inexistente | El sistema contabiliza los intentos y responde igual que para una cuenta existente, sin revelar si la cuenta existe. |
+| La contraseña correcta | El sistema borra los fallos de esta cuenta desde esta dirección. Solo descuenta este intento de los contadores de la dirección y de la cuenta, sin restablecerlos. |
+| Un servicio no disponible, como un directorio inaccesible | No cuenta como fallo. |
+| Se alcanza un límite | El sistema registra el evento como `signin.lockout` en el registro de auditoría de la plataforma e incluye la dirección y el límite alcanzado. Solo registra la cuenta si existe. |
+| Se restablece la contraseña correctamente | El sistema desbloquea la cuenta de inmediato y deja de restringir la frecuencia de verificación desde esta dirección. |
+| La contraseña de acceso de un enlace público | Cada enlace cuenta como una cuenta. Las direcciones desde las que se abrió el enlace en los últimos 30 días quedan exentas de la restricción. Las contraseñas de acceso incorrectas y los inicios de sesión fallidos se suman en **Una dirección, cualquier cuenta**. Al alcanzar este límite, también se bloquea el inicio de sesión con contraseña desde esa dirección. |
+| Se alcanza un límite en un enlace público | El sistema registra el evento como `resource_share.lockout` en el registro de auditoría del espacio de trabajo al que pertenece el enlace e incluye el enlace, la dirección y el límite alcanzado. Cuando se alcanza **Una dirección, cualquier cuenta**, también registra el evento como `signin.lockout` en el registro de auditoría de la plataforma. |
+
+La dirección se obtiene mediante la [Identificación de la IP del cliente](#identificación-de-la-ip-del-cliente). En IPv6, el recuento se agrupa por prefijo /64.
+De forma predeterminada, el sistema no cuenta las direcciones privadas. Si hay un proxy que no se ha configurado aquí, todas las solicitudes
+tienen la dirección del proxy. Contarla permitiría bloquear el acceso general con unas pocas contraseñas incorrectas.
+En ese caso, solo se aplica **Una cuenta desde todas las direcciones**. Si las conexiones provienen de una red
+privada, activa **Contar las direcciones privadas como clientes**.
+
+En la página, **Tu dirección** muestra la dirección que el sistema atribuyó a esta solicitud e indica si la
+contabiliza. Si la solicitud incluye encabezados de reenvío pero el sistema usa la dirección de la conexión, aparece una advertencia:
+probablemente hay un proxy sin configurar.
+
+Si necesitas levantar un bloqueo antes de tiempo, ejecuta `DELETE FROM signin_attempts` en la base de datos de metadatos.
+El comando borra todos los recuentos.
+
+## Identificación de la IP del cliente
+
+La ingesta de RUM registra la dirección de cada navegador o dispositivo y la usa para determinar el país, la subdivisión
+y la ciudad. Los [límites de inicio de sesión](#límites-de-inicio-de-sesión) cuentan los fallos por dirección, y el registro de auditoría de los
+[enlaces públicos](/es/resource-sharing#auditoría-y-permisos) guarda la dirección de cada visitante.
+La **Identificación de la IP del cliente** determina de dónde se obtiene la dirección. Se aplica a todas las organizaciones.
+
+| **Origen de la dirección** | Uso |
+|---|---|
+| **Dirección de la conexión directa** | Opción predeterminada. Usa la dirección del extremo remoto de la conexión TCP e ignora todos los encabezados de reenvío. Usa esta opción si el punto de conexión de ingesta está expuesto directamente. |
+| **Encabezado de valor único** | Lee una sola dirección IP, sin datos adicionales, de un encabezado que establece una CDN o un proxy, como `CF-Connecting-IP`. |
+| **Cadena de IP reenviadas** | Recorre una cadena de direcciones IP, como `X-Forwarded-For`, de derecha a izquierda. Omite los proxies de confianza y toma la primera dirección que no es de confianza. **Longitud máxima de la cadena** limita la cantidad de direcciones que se leen por solicitud. Admite valores de 1 a 64. |
+
+Si hay un proxy delante del servicio, configura también lo siguiente:
+
+| Campo | Regla |
+|---|---|
+| **Encabezado de IP del cliente** | Encabezado que se debe leer. El sistema rechaza `Authorization`, `Cookie` y los encabezados de clave de API o de certificado del cliente. |
+| **CIDR de proxies de confianza** | Un CIDR IPv4 o IPv6 por línea, hasta 64. El sistema solo lee el encabezado si el extremo remoto de la conexión pertenece a una de estas redes. Una red `/0` considera de confianza cualquier origen de su familia de direcciones. Úsala solo detrás de un punto de entrada protegido. |
+| **Usar la dirección de conexión como alternativa** | Usa la dirección del extremo remoto de la conexión TCP si falta el encabezado, tiene un formato incorrecto, es demasiado largo o no contiene ninguna dirección válida. |
+
+Puedes activar **Contar las direcciones privadas como clientes** con cualquier origen de la dirección. Esta opción acepta direcciones privadas, de bucle invertido
+y de enlace local de un encabezado de confianza, y hace que los [límites de inicio de sesión](#límites-de-inicio-de-sesión) las contabilicen.
+Actívala cuando las conexiones provengan de una red privada. Déjala desactivada si hay un proxy que no se ha configurado aquí.
+De lo contrario, todas las conexiones se contabilizan bajo una misma dirección.
+
+## Retención de datos
+
+**Retención de datos** define cuántos días se conservan los datos de un flujo sin retención propia: 30 de forma
+predeterminada, con un rango de 1 a 3650. Configura la retención de cada flujo en [Flujos](/es/streams#retención-y-eliminación).
+La siguiente limpieza elimina los datos que superan el período de retención. No se pueden recuperar.
+
+Al ingresar un período de retención más corto, la página usa el catálogo de archivos para estimar qué
+eliminaría el cambio: las filas, el tamaño y los datos más antiguos de cada flujo, por orden descendente de tamaño. Al guardar, la página pide
+confirmación y solicita que vuelvas a ingresar el número de días si la estimación alcanza 1 GiB o un millón de filas, o si no hay
+una estimación disponible. Si amplías el período, la página no pide nada. Las reproducciones de sesiones y los archivos de perfiles
+también siguen esta configuración, pero no se incluyen en la estimación.
+
+**Resultados de pruebas sintéticas**, en la misma página, define cuántos días se conservan las ejecuciones de las comprobaciones sintéticas:
+30 de forma predeterminada, con un rango de 0 a 3650. El valor 0 las conserva indefinidamente. Una vez al día, el sistema elimina las ejecuciones antiguas, sus artefactos y las tareas
+finalizadas. Conserva la ejecución que una ubicación muestra como la más reciente y la ejecución de prueba en la que se
+publicó una revisión. El flujo `_synthetic_results`, que se consulta para calcular la disponibilidad, aplica su propio período de
+retención. Consulta [Pruebas sintéticas](/es/synthetics#flujo-de-resultados-y-retención).
+
+**Historial del catálogo de almacenamiento**, en la misma página, define cuántos días conserva el catálogo de archivos los registros
+de operaciones completadas: 7 de forma predeterminada, con un rango de 0 a 3650. El valor 0 los conserva indefinidamente. Estos registros corresponden a
+los archivos que ya eliminó el recolector de basura, los segmentos antiguos y los manifiestos de partición a los que pertenecían esos
+archivos, y los registros de volcado de los flujos de escritura que ya se cerraron. Cada diez
+minutos, el sistema elimina los registros que superan este período. No modifica los datos ni el total de ingesta acumulado
+desde la creación del flujo.
+
+## Cardinalidad de métricas
+
+**Cardinalidad de métricas** limita cuántas series de Prometheus pueden estar activas al mismo tiempo. Así, las etiquetas con muchos
+valores no agotan la memoria ni el espacio de almacenamiento.
+
+| Límite | Valor predeterminado | Significado |
+|---|---|---|
+| **Por organización** | 200 000 | Cantidad de series activas de una organización. |
+| **Por métrica** | 100 000 | Cantidad de series activas de una métrica en una organización. No puede superar el límite de la organización. |
+
+Al alcanzar un límite, el sistema rechaza las escrituras de series nuevas, pero sigue aceptando las de las series existentes. Una serie
+deja de estar activa si pasa un tiempo sin recibir datos. Los nodos vuelven a consultar los límites cada 30 segundos.
+Identifica las etiquetas que generan series en la vista de cardinalidad de [Métricas](/es/metrics).
+
+## Uso de ingesta
+
+**Uso de ingesta** define cuánto tiempo se conserva el registro de [lo que ingirió cada fuente](/es/streams#uso-de-ingesta-y-presupuestos)
+y cuántos servicios se contabilizan por separado.
+
+| Campo | Valor predeterminado | Significado |
+|---|---|---|
+| **Conservar los registros durante** | 90 días | Una vez al día, el sistema elimina los registros por hora que superan este período. El rango es de 35 a 3650 días. El mínimo de 35 días permite consultar siempre un presupuesto mensual. |
+| **Servicios por organización** | 1000 | Cantidad de servicios de una organización que cada nodo contabiliza por separado en una hora. El rango es de 1 a 100 000. Al superar el límite, el nodo agrupa el resto en **Otros servicios**. Así, un emisor no puede aumentar el volumen de registros asignando nombres a más servicios. |
+
+## Retención de registros de auditoría
+
+**Retención de registros de auditoría** define cuántos días se conservan los registros de auditoría de cada organización y de la plataforma:
+90 de forma predeterminada, con un rango de 0 a 3650. El valor `0` los conserva indefinidamente. Una vez
+al día, el sistema elimina los registros que superan ese período. No se pueden recuperar. La plataforma anota cada cambio en su registro de auditoría como
+`audit_retention.update`.
+
+Al ingresar un período de retención más corto, la página cuenta los registros que eliminaría el cambio. Al guardar,
+pide confirmación y solicita que vuelvas a ingresar el número de días si el recuento alcanza los 1000 registros o si no puede
+contarlos.

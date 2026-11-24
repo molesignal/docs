@@ -1,0 +1,134 @@
+---
+title: "Catálogo REST de Iceberg"
+sidebarTitle: "Catálogo REST de Iceberg"
+description: "Consulta la telemetría de MoleSignal desde Spark, Trino, Flink y DuckDB a través de un catálogo REST administrado de Apache Iceberg."
+tag: "enterprise cloud"
+"en_link": "/en-US/editions/iceberg-rest-catalog"
+"zh-Hans_link": "/zh-Hans/editions/iceberg-rest-catalog"
+"zh-Hant_link": "/zh-Hant/editions/iceberg-rest-catalog"
+"ja_link": "/ja/editions/iceberg-rest-catalog"
+"ko_link": "/ko/editions/iceberg-rest-catalog"
+"de_link": "/de/editions/iceberg-rest-catalog"
+"fr_link": "/fr/editions/iceberg-rest-catalog"
+"pt-BR_link": "/pt-BR/editions/iceberg-rest-catalog"
+---
+
+<Warning>
+  Funcionalidad prevista para Enterprise y MoleSignal Cloud. Está en fase de diseño y no está disponible en ninguna versión. La edición de código abierto no la incluye. Los nombres, el alcance y el comportamiento que se describen en esta página pueden cambiar antes del lanzamiento.
+</Warning>
+
+El catálogo REST de Iceberg publica la telemetría de una organización como tablas de [Apache Iceberg](https://iceberg.apache.org). Un motor de consultas que se ejecuta en la infraestructura que elige la organización se conecta al catálogo, encuentra los flujos como tablas y lee los archivos Parquet directamente desde el almacenamiento de objetos. MoleSignal administra las tablas, los metadatos, los permisos, el aislamiento entre organizaciones y la ubicación de los datos. La organización conserva el control del motor, las consultas y los recursos de cómputo.
+
+## Quién se encarga de qué
+
+MoleSignal administra:
+
+- **Tablas.** Cada flujo expuesto aparece como una tabla de Iceberg de solo lectura con el esquema del flujo.
+- **Metadatos.** Las instantáneas, los archivos de datos y las estadísticas mantienen la coherencia con la compactación y la retención.
+- **Permisos.** El catálogo determina qué tablas puede enumerar y leer cada identidad.
+- **Aislamiento entre organizaciones.** Cada organización solo ve sus propias tablas y archivos.
+- **Ubicación de los datos.** MoleSignal decide dónde almacenar los archivos y emite credenciales de solo lectura y de corta duración para acceder a ellos.
+
+La organización se encarga de:
+
+- **El motor.** Apache Spark, Trino, Apache Flink, DuckDB o cualquier otro cliente compatible con la especificación del catálogo REST de Iceberg.
+- **Las cargas de trabajo.** Consultas, canalizaciones de ETL, trabajos de aprendizaje automático y paneles de BI.
+- **Los recursos de cómputo y su costo.** Clústeres, programación de trabajos y almacenamiento de resultados.
+
+## Cómo funciona una conexión
+
+<Steps>
+  <Step title="Autenticar">
+    El motor presenta un token de API o una credencial de cuenta de servicio al punto de conexión del catálogo.
+  </Step>
+  <Step title="Buscar tablas">
+    El catálogo enumera los flujos que la identidad tiene permiso para leer y los agrupa por tipo de flujo.
+  </Step>
+  <Step title="Cargar una tabla">
+    El catálogo devuelve el esquema, el particionamiento y los archivos de datos de una misma instantánea coherente, junto con credenciales de solo lectura y de corta duración para acceder a la ubicación de almacenamiento de la tabla.
+  </Step>
+  <Step title="Leer archivos">
+    El motor lee los archivos Parquet directamente desde el almacenamiento de objetos. El contenido de los archivos no pasa por MoleSignal.
+  </Step>
+</Steps>
+
+## Elige una vía de acceso
+
+| | Catálogo REST de Iceberg | [Arrow Flight SQL](/es/query/database-clients) |
+|---|---|---|
+| Dónde se ejecutan las consultas | En el motor de la organización | En MoleSignal |
+| Uso habitual | Análisis masivo, ETL, aprendizaje automático y BI en intervalos de tiempo | Consultas SQL interactivas desde clientes de bases de datos |
+| Enmascaramiento de campos | No se aplica. Consulta [Límites de la protección de datos](#límites-de-la-protección-de-datos). | Se aplica |
+| Ediciones | Enterprise y Cloud (previsto) | Todas las ediciones |
+
+Usa Flight SQL o la API de consultas para hacer consultas interactivas sujetas a controles de gobernanza. Usa el catálogo cuando un trabajo recorra intervalos de tiempo amplios y el motor se encargue del procesamiento.
+
+## Qué expone el catálogo
+
+- **Una tabla por flujo.** Los espacios de nombres corresponden a los tipos de flujo `logs`, `metrics`, `traces` y `profiles`.
+- **Las columnas siguen el esquema del flujo.** `_timestamp` aparece primero, con precisión de microsegundos en UTC. Los campos JSON son cadenas de texto. Los campos cifrados conservan su contenido cifrado.
+- **Los archivos se particionan por hora del evento.** Los filtros por intervalo de tiempo descartan los archivos que quedan fuera del intervalo.
+- **Elementos que el catálogo no expone.** Las tablas Extend, que residen en memoria, y los modelos de lectura derivados que MoleSignal mantiene para funciones internas.
+
+## Control de acceso
+
+- **Autenticación.** El catálogo usa tokens de API (`mspat-<36>`) y cuentas de servicio, las mismas credenciales que la API HTTP y Flight SQL.
+- **Autorización.** El catálogo requiere un permiso específico cuyo nombre se anunciará en el lanzamiento. Para leer una tabla, se necesita ese permiso y `streams.query`.
+- **Aislamiento entre organizaciones.** Cada organización tiene su propio ámbito en el catálogo. Las credenciales de almacenamiento solo dan acceso a los archivos de la tabla solicitada, vencen al poco tiempo y nunca permiten escribir ni eliminar archivos.
+- **Auditoría.** MoleSignal registra la emisión de credenciales y los cambios de exposición como eventos de auditoría.
+
+## Límites de la protección de datos
+
+<Warning>
+  Un motor que lee archivos Parquet ve los valores almacenados. Las reglas de enmascaramiento de campos se aplican a las consultas de MoleSignal y a los resultados de Flight SQL. No se aplican a los archivos que un motor lee directamente. Los campos cifrados permanecen cifrados en los archivos, así que el motor recibe los valores cifrados.
+</Warning>
+
+Por lo tanto, el acceso al catálogo equivale al acceso a los datos sin procesar de los flujos expuestos:
+
+- Otorga el permiso del catálogo solo a las identidades autorizadas para leer datos sin enmascarar.
+- Los administradores eligen qué flujos expone el catálogo. El catálogo no expone un flujo con una regla de enmascaramiento de campos activa hasta que un administrador lo autoriza expresamente.
+- El enmascaramiento de campos no se aplica a los flujos de métricas, que siguen la configuración habitual de exposición.
+
+## Actualización y coherencia de los datos
+
+- Cada instantánea enumera solo los archivos confirmados. Los registros que aún están en el búfer de ingesta quedan visibles después del siguiente vaciado.
+- La siguiente instantánea refleja los cambios de compactación y retención. Los archivos que reemplaza la compactación permanecen en el almacenamiento de objetos durante un período de gracia. Así, un trabajo que se planificó con una instantánea anterior puede terminar. Vuelve a planificar los trabajos que duren más que el período de gracia.
+
+## Motores compatibles
+
+El catálogo sigue la especificación abierta del catálogo REST de Iceberg. Está previsto comprobar la compatibilidad con estos motores:
+
+| Motor | Estado |
+|---|---|
+| Apache Spark | Previsto |
+| Trino | Previsto |
+| Apache Flink | Previsto |
+| DuckDB | Previsto |
+| PyIceberg y otros clientes del catálogo REST | Compatibilidad prevista, sin verificar |
+
+Las versiones verificadas y la configuración de conexión se publicarán en el lanzamiento.
+
+## Límites de la primera versión
+
+- **Solo lectura.** El catálogo rechaza las escrituras, la creación de tablas y los cambios de esquema. Cambia el esquema y la retención en el flujo.
+- **Solo la instantánea actual.** No puedes consultar estados históricos ni usar ramas o etiquetas.
+- **Sin vistas ni transacciones entre varias tablas.**
+- **Sin tablas propiedad de la organización.** Un motor puede conectarse a varios catálogos a la vez. Así, puede combinar los resultados con datos de un catálogo que administre la organización y escribirlos en ese catálogo.
+- **Solo almacenamiento de objetos que permita limitar el alcance del acceso.** El backend de almacenamiento de objetos `local` no puede entregar archivos a motores externos.
+
+## Disponibilidad
+
+| Edición | Disponibilidad |
+|---|---|
+| Código abierto | No incluye esta función. Usa [Arrow Flight SQL](/es/query/database-clients) para el acceso externo mediante SQL. |
+| Enterprise | Previsto. Requiere almacenamiento de objetos al que puedan acceder los motores y una licencia que incluya la función. |
+| MoleSignal Cloud | Previsto. Cada región aloja el catálogo junto con los datos de sus organizaciones. |
+
+<CardGroup cols={2}>
+  <Card title="Conéctate con un cliente de bases de datos" icon="database" href="/es/query/database-clients">
+    Consulta MoleSignal mediante Arrow Flight SQL desde hoy.
+  </Card>
+  <Card title="Seguridad y arquitectura multiinquilino" icon="shield" href="/es/security">
+    Aislamiento entre organizaciones, enmascaramiento de campos y cifrado de campos.
+  </Card>
+</CardGroup>

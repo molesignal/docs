@@ -1,0 +1,144 @@
+---
+title: "API de connexion"
+sidebarTitle: "Connexion"
+description: "Ouvrez une session dans le navigateur avec une adresse e-mail et un mot de passe."
+"en_link": "/en-US/api/auth/login"
+"zh-Hans_link": "/zh-Hans/api/auth/login"
+"zh-Hant_link": "/zh-Hant/api/auth/login"
+"ja_link": "/ja/api/auth/login"
+"ko_link": "/ko/api/auth/login"
+"de_link": "/de/api/auth/login"
+"es_link": "/es/api/auth/login"
+"pt-BR_link": "/pt-BR/api/auth/login"
+---
+
+```http
+POST /api/v1/auth/signin
+```
+
+Ouvre une session dans l’interface web. Cette route **ne nécessite pas d’authentification**. La réponse définit les cookies de session et renvoie l’identité du compte connecté dans `login`. Le corps ne contient aucun jeton. Pour un compte avec authentification multifacteur, consultez [La deuxième étape](#la-deuxième-étape).
+
+**Corps**
+
+| Champ | Type | Obligatoire | Remarques |
+|---|---|---|---|
+| `email` | chaîne | Oui | |
+| `password` | chaîne | Oui | |
+| `remember` | booléen | Non | Maintient la session après la fermeture du navigateur. Vaut `false` par défaut. |
+
+<RequestExample>
+```bash cURL
+curl -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+  -H 'content-type: application/json' \
+  -d '{"email":"admin@example.com","password":"admin"}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "login": {
+    "userId": "<user-id>",
+    "email": "admin@example.com",
+    "displayName": "root",
+    "orgId": "<organization-id>",
+    "orgName": "default",
+    "displayRole": "Owner",
+    "roles": [
+      {
+        "id": "<role-id>",
+        "key": "owner",
+        "name": "Owner",
+        "builtin": true
+      }
+    ],
+    "scope": "organization"
+  }
+}
+```
+</ResponseExample>
+
+La connexion sélectionne la première organisation dont le compte est membre et qui autorise la connexion. Les programmes envoient plutôt un jeton d’API dans l’en-tête `Authorization`. Cet en-tête n’accepte pas les jetons de session. Consultez [Émettre un jeton d’API](/fr/api/auth/issue-token).
+
+## Trop de tentatives infructueuses
+
+Après trop de tentatives infructueuses, la route renvoie `429` avec un en-tête `Retry-After` exprimé en secondes, le code `signin_limited` et le même message, que le compte existe ou non. La route ne vérifie pas le mot de passe. Un mot de passe incorrect ou un compte inconnu entraîne une réponse `401` ; un mot de passe correct pour un compte désactivé ou en attente entraîne une réponse `403` qui en indique le motif. Consultez [Limites de connexion](/fr/settings/platform#limites-de-connexion).
+
+```json
+{
+  "error": "resource_exhausted",
+  "code": "signin_limited",
+  "message": "too many failed password attempts; try again in 14 minutes"
+}
+```
+
+## La deuxième étape
+
+Pour un compte avec [authentification multifacteur](/fr/identity/mfa), le mot de passe seul ne suffit pas à définir les cookies. La réponse contient `mfa` à la place de `login` et indique les méthodes disponibles pour terminer la connexion :
+
+```json
+{
+  "mfa": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp", "recovery_code"],
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| Point de terminaison | Fonction |
+|---|---|
+| `POST /api/v1/auth/signin/verify` | Termine la connexion. Accepte `challenge` et soit `method` (`totp` ou `recovery_code`) avec `code`, soit `method` avec la valeur `passkey`, accompagné de `ceremony` et `credential`. Renvoie `{"login": …}` avec les cookies de session et inclut `recoveryCodesLeft` si la connexion utilise un code de récupération. |
+| `POST /api/v1/auth/signin/verify/passkey` | Accepte `challenge` et renvoie `ceremony` et `options` pour vérifier une clé d’accès. Transmettez `options` à `navigator.credentials.get()` et renvoyez `ceremony` avec le résultat. `ceremony` ne sert qu’une fois. |
+
+## Configuration d’un second facteur à la connexion
+
+Lorsque l’organisation [exige l’authentification multifacteur](/fr/identity/sso#exigences-de-connexion) et que le compte n’a pas encore de second facteur, la réponse contient `enroll` à la place de `login` :
+
+```json
+{
+  "enroll": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp"],
+    "organizationName": "default",
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| Point de terminaison | Fonction |
+|---|---|
+| `POST /api/v1/auth/signin/enroll/totp` | Accepte `challenge` et renvoie `setup`, `secret`, `otpauthUrl`, `qrSvg` et `expiresAt`. |
+| `POST /api/v1/auth/signin/enroll/totp/confirm` | Accepte `challenge`, `setup` et `code`. Renvoie `{"login": …, "recoveryCodes": […]}` avec les cookies de session. |
+| `POST /api/v1/auth/signin/enroll/passkey/options` | Accepte `challenge` et renvoie `ceremony` et `options` pour `navigator.credentials.create()`. |
+| `POST /api/v1/auth/signin/enroll/passkey` | Accepte `challenge`, `ceremony`, `credential` et, facultativement, `name`. Renvoie `{"login": …, "recoveryCodes": […]}` avec les cookies de session. |
+
+Si l’organisation [n’autorise que l’authentification unique](/fr/identity/sso#exigences-de-connexion), la route renvoie `403` en cas de connexion par mot de passe. Lorsque le compte appartient à plusieurs organisations, la connexion sélectionne la première qui l’autorise.
+
+## Connexion par clé d’accès
+
+Une [clé d’accès](/fr/identity/mfa#avec-une-clé-d’accès-sans-mot-de-passe) permet de se connecter sans mot de passe ni deuxième étape.
+
+| Point de terminaison | Fonction |
+|---|---|
+| `POST /api/v1/auth/signin/passkey/options` | Renvoie `ceremony` et `options`. Renvoie `400` si l’adresse `[http].external_url` de l’instance ne peut pas servir de [partie de confiance](/fr/identity/mfa#prérequis-de-l’instance) pour une clé d’accès. |
+| `POST /api/v1/auth/signin/passkey` | Accepte `ceremony`, `credential` et, facultativement, `remember`. Renvoie `{"login": …}` avec les cookies de session. |
+
+## Cookies de session
+
+| Cookie | Chemin | Contenu | Durée de vie |
+|---|---|---|---|
+| `accessToken` | `/api` | Le jeton d’accès, que le navigateur envoie à chaque requête d’API. | 15 minutes. Pour renouveler le jeton, utilisez `POST /api/v1/auth/refresh`. |
+| `refreshToken` | `/api/v1/auth` | Le jeton de renouvellement, qui sert uniquement à renouveler le jeton d’accès. | Jusqu’à la fin de la session, soit `[auth].session_ttl_secs` après la connexion. 24 heures par défaut. |
+
+Les deux cookies portent les attributs `HttpOnly` et `SameSite=Strict`, ainsi que `Secure` lorsque le navigateur accède à MoleSignal via HTTPS. Sans `remember`, le navigateur les supprime à sa fermeture. Les deux jetons sont des JWT signés. Le serveur n’en conserve aucune trace et vérifie leur signature, leur usage et leur expiration. La désactivation ou la suppression du compte met fin à la session à la requête suivante.
+
+## Points de terminaison de session
+
+| Point de terminaison | Fonction |
+|---|---|
+| `POST /api/v1/auth/refresh` | Émet un nouveau jeton d’accès à partir du jeton de renouvellement et renvoie `204` avec un nouveau cookie `accessToken`. L’heure de fin de la session ne change pas. Si la session a expiré, si le compte est désactivé ou si un cookie manque, la route renvoie `401` et supprime les deux cookies. |
+| `GET /api/v1/auth/session` | Renvoie l’identité associée à la session en cours, au même format que `login` dans la réponse de connexion. |
+| `POST /api/v1/auth/signout` | Supprime les deux cookies et renvoie `204`. |
+
+Toute requête qui utilise le cookie de session pour modifier des données doit provenir d’une page de MoleSignal. Le serveur renvoie `403` si une requête du navigateur contient un en-tête `Sec-Fetch-Site` dont la valeur diffère de `same-origin`.

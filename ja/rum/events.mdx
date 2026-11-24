@@ -1,0 +1,324 @@
+---
+title: "RUM イベント形式"
+sidebarTitle: "イベント形式"
+description: "RUM SDK やその他のクライアントが MoleSignal に送信する JSON イベントについて、取り込みエンドポイントとそのレスポンス、イベントのルール、イベントタイプごとのフィールドを説明します。"
+"en_link": "/en-US/rum/events"
+"zh-Hans_link": "/zh-Hans/rum/events"
+"zh-Hant_link": "/zh-Hant/rum/events"
+"ko_link": "/ko/rum/events"
+"de_link": "/de/rum/events"
+"es_link": "/es/rum/events"
+"fr_link": "/fr/rum/events"
+"pt-BR_link": "/pt-BR/rum/events"
+---
+
+すべての RUM SDK は、同じ形式の JSON イベントを 1 つのエンドポイントに送信します。SDK がまだ提供されていないネイティブアプリなど、 SDK を使用しないクライアントも、HTTP リクエストで同じイベントを送信します。
+
+イベントには、`type`、`date`、所属する `session` と `view` に加え、イベントタイプと同じ名前のオブジェクトがあり、そのオブジェクトに詳細が含まれます。イベントの JSON Schema はソースに `contracts/rum/events/v1.schema.json` として含まれ、有効なイベントと無効なイベントの例も付属します。
+
+## イベントの送信
+
+```http
+POST /api/v1/rum/events
+Authorization: Bearer mspat-<36>
+Content-Type: application/json
+```
+
+| 項目 | ルール |
+|---|---|
+| 認証情報 | アプリケーションの[クライアントトークン](/ja/rum/applications#クライアントトークン)を使用します。このトークンは、対象アプリケーションに限り `rum.write` 権限を持ちます。`rum.write` 権限を持つ他の認証情報を使用する場合は、すべてのイベントの `application.id` にアプリケーションを指定してください。 |
+| ボディ | イベントの JSON 配列を送信します。単一のイベントオブジェクトや NDJSON（`Content-Type: application/x-ndjson`、1 行に 1 イベント）でも送信できます。 |
+| 圧縮 | `Content-Encoding: gzip` はオプションです。他のエンコーディングには対応していません。 |
+| サイズ | 展開後の上限は 5000 イベントかつ 5 MiB です。上限を超えるリクエストには `413` を返します。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST "http://localhost:5080/api/v1/rum/events" \
+  -H "authorization: Bearer $RUM_CLIENT_TOKEN" \
+  -H "content-type: application/json" \
+  -d '[{
+    "type": "error",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34", "url": "https://shop.example.com/checkout" },
+    "error": {
+      "id": "e7b1c9a2-3d4f-4b65-8a90-1c2d3e4f5a61",
+      "message": "Payment provider timeout",
+      "source": "custom",
+      "handling": "handled"
+    }
+  }]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "accepted": 1,
+  "rejected": []
+}
+```
+</ResponseExample>
+
+## レスポンス
+
+レスポンスはイベントごとに処理結果を報告します。不正なイベントが 1 件あっても、リクエスト内の他のイベントは破棄しません。
+
+| フィールド | 意味 |
+|---|---|
+| `accepted` | 受理したイベントの数です。拒否したイベントも `sampled` に含めたイベントも数えません。[リアルタイムパイプライン](/ja/pipelines#rum-ストリーム)が意図的に破棄したイベントは保存しませんが、ここでは数えます。 |
+| `rejected` | 拒否したイベントごとに 1 件のエントリを返します。各エントリには、リクエスト内の位置（`0` から始まる `index`）と拒否理由（`reason`）が含まれます。 |
+| `sampled` | アプリケーションが[セッションの一部を保持する](/ja/rum/sampling#セッションの一部をサーバー側で保持する)設定で、保持対象外のセッションに属するため、意図的に除外したイベントの数です。すべてのエラーを保持する設定では、対象外のセッションで発生したエラーもここには含めません。除外したイベントがある場合のみ返します。これらのイベントは拒否扱いではなく、`accepted` にも含めません。 |
+
+すべてのイベントが不正な場合でも、`accepted` を `0` として `200` を返します。一方、リクエスト自体を読み取れない場合は、リクエスト全体が失敗します。ボディが JSON ではない、対応していない `Content-Encoding` を指定した、または gzip ストリームをデコードできない場合は `400`、トークンがない、失効している、または `rum.write` 権限がない場合は `401` または `403`、上記の上限を超えた場合は `413` を返します。
+
+以下のいずれかの理由でイベントを拒否します。
+
+| 理由 | 原因 |
+|---|---|
+| フィールド名を含むメッセージ | イベントがスキーマと一致しません。必須フィールドがない、値の型が違う、値が許可リストにない、または数値が負です。 |
+| `date is more than a day in the future` | デバイスの時計が大幅に進んでいます。 |
+| `application.id is not the application of the client token` | イベントが、トークンに紐づくアプリケーションとは異なるアプリケーションを指定しています。 |
+| ``application `<id>` does not exist`` | アプリケーションは削除済みか、一度も作成されていません。 |
+| `application.id is required` | 認証情報がクライアントトークンではなく、イベントにアプリケーションの指定がありません。 |
+| `line is not JSON` | NDJSON ボディ内の行をパースできません。 |
+| ``<stream>: realtime transform `<step>` …`` | ストリームの[リアルタイムパイプライン](/ja/pipelines#rum-ストリーム)のステップが、イベントの処理に失敗したか、パイプラインが保持する列を変更したか、ビューまたはバイタルを破棄しました。 |
+
+SDK は拒否されたイベントをエラーコールバックで報告し、再送信しません。
+
+## ルール
+
+- `date` はイベントの開始時刻をエポックミリ秒で表します。`view` の `date` はビューの開始時刻で、リビジョンが変わっても変更しません。
+- すべての経過時間と、`performance.lcp.timestamp` や `resource.dns.start` などのビュー開始時点からの相対時刻は、**ナノ秒単位の整数**で表します。送信前に丸めてください。
+- ビューの内容が変わるたびに、`view.revision` を増やし、その時点までのカウントを含めてビューを再送信します。 MoleSignal は最も大きいリビジョンを保持します。カウントには差分ではなく累計を使用します。
+- クライアントはセッションイベントを送信しません。MoleSignal はビューからセッションの開始時刻と終了時刻、継続時間、カウント、ランディングページ、離脱ページ、リプレイの記録有無を特定します。
+- `session.start` はエポックミリ秒で指定します。指定は任意ですが、指定を想定しています。セッションをまだ認識していないノードは、この値を使って、開始直後のセッションと追跡できなくなったセッションを区別します。
+- `application.id` はオプションです。クライアントトークンに紐づくアプリケーションが対象となり、異なる値を指定するとイベントを拒否します。
+- MoleSignal は `geo` と `network` を設定し、送信された値は無視します。`retention` も同様です。`retention.rate` は対象となる行の保持率（パーセント）、`retention.filter` はその行を保持した根拠（[フィルター](/ja/rum/sampling#フィルター)の ID、 `default`、または保持対象外のセッションのエラーを示す `errors`）です。MoleSignal はこれらの値を使って合計を算出します。
+- スキーマに定義のないフィールドも受理して保持します。スキーマに定義されているフィールドの型や値が正しくない場合は、イベントを拒否します。
+- `error.frames` には、ソースマップ、マッピングファイル、ネイティブシンボルファイルの適用対象となる構造化スタックが含まれます。`error.stack` は、表示と検索に使う同じスタックのテキスト表現です。
+
+## すべてのイベントに共通する属性
+
+| 属性 | 型 | 備考 |
+|---|---|---|
+| `type` | 文字列 | 必須です。`view`、`action`、`error`、`resource`、`long_task`、`vital`、`log` のいずれかです。 |
+| `date` | 整数 | 必須です。エポックミリ秒で指定します。 |
+| `source` | 文字列 | 必須です。`browser`、`android`、`ios`、`flutter`、`react-native`、`kotlin-multiplatform`、`unity`、`roku`、`electron`、`other` のいずれかです。 |
+| `session` | オブジェクト | 必須です。`id` は必須です。`type` は `user`（デフォルト）、`synthetics`、`ci_test` のいずれかです。`start` はエポックミリ秒で指定します。`has_replay` はブール値です。 |
+| `view` | オブジェクト | 必須です。`id` は必須です。`url`、`name`、`referrer`、`in_foreground` はオプションです。 |
+| `application.id` | 文字列 | オプションです。上記のルールを参照してください。 |
+| `service`, `env`, `version` | 文字列 | リリースのディメンションです。`version` はソースマップとシンボルの検索キーです。 |
+| `build_version`, `build_id` | 文字列 | ビルド番号と、デバッグアーティファクトのアップロード時に指定したビルド ID です。 |
+| `action.id` | 文字列 | イベントのきっかけとなったアクションがある場合、そのアクションの ID です。 |
+| `usr` | オブジェクト | `id`、`name`、`email`、`anonymous_id` です。他のキーは `usr.extra` に保持します。 |
+| `account` | オブジェクト | `id` と `name` です。 |
+| `tab.id` | 文字列 | ブラウザータブの ID です。 |
+| `connectivity` | オブジェクト | `status`、`interfaces`、`effective_type`、`cellular`（`technology`、`carrier_name`）です。 |
+| `display.viewport` | オブジェクト | `width` と `height` です。 |
+| `browser`, `os`, `device` | オブジェクト | ブラウザー名とバージョン、OS、デバイスの種類（`mobile`、`desktop`、`tablet`、`tv`、`gaming_console`、`bot`、`other`）、モデル、ブランド、アーキテクチャ、ロケール、タイムゾーン、バッテリー、メモリです。 |
+| `sdk` | オブジェクト | `name`、`version`、`session_sample_rate`、`replay_sample_rate` です。 |
+| `context` | オブジェクト | アプリケーションに任意で定義できる属性です。 |
+| `feature_flags` | オブジェクト | 任意のキーを持つ機能フラグの評価結果です。各キーは `feature_flags.<key>` としてクエリできます。[機能フラグ](/ja/rum/feature-flags)を参照してください。 |
+| `synthetics` | オブジェクト | シンセティックチェックが生成したセッションに関する情報（`test_id`、`result_id`、`location_id`）です。[テストトラフィック](/ja/rum/test-traffic)を参照してください。 |
+| `ci_test` | オブジェクト | CI テストが生成したセッションの `test_execution_id` です。 |
+
+識別子に使用できる文字は `A-Z`、`a-z`、`0-9`、`.`、`_`、`:`、`-` で、最大 128 文字です。 `usr`、`account`、デバイスのテキスト属性は、最大 256 文字です。
+
+## ビュー
+
+`view` イベントには `view` オブジェクトが含まれます。このオブジェクトには、前述の `url`、`name`、`id` に加えて、次のフィールドがあります。
+
+| フィールド | 補足 |
+|---|---|
+| `revision` | 必須です。`1` から始まり、ビューを再送するたびに 1 ずつ増えます。 |
+| `time_spent` | 必須です。ビューが開いていた時間をナノ秒で表します。 |
+| `url` | 必須です。 |
+| `is_active` | 終了したビューの最後のリビジョンでは `false` です。 |
+| `loading_type` | `initial_load`、`route_change`、`bf_cache`、`activity_display`、`activity_redisplay`、`fragment_display`、`fragment_redisplay`、`view_controller_display`、`view_controller_redisplay`、`session_renewal` のいずれかです。 |
+| `loading_time`, `first_byte`, `dom_interactive`, `dom_content_loaded`, `dom_complete`, `load_event`, `network_settled_time`, `interaction_to_next_view_time` | ナビゲーションのタイミングをナノ秒で表します。 |
+| `performance.fcp`, `performance.lcp`, `performance.fid`, `performance.inp`, `performance.cls`, `performance.fbc` | Web Vitals の指標です。LCP には `timestamp`、`target_selector`、`resource_url`、`sub_parts`（`load_delay`、`load_time`、`render_delay`）があります。INP には `duration`、`timestamp`、`target_selector`、`sub_parts`（`input_delay`、`processing_duration`、`presentation_delay`）があります。CLS には `score` があります。 |
+| `custom_timings` | 名前付きのタイミングを格納するオブジェクトです。 |
+| `scroll` | ページのどこまでスクロールしたかを示します。`max_depth`（ページ上端からウィンドウ下端までの距離を CSS ピクセルで表した値）、`max_depth_scroll_top`、`max_scroll_height`、`max_scroll_height_time`（ナノ秒）を含みます。スクロールの[ヒートマップ](/ja/rum/heatmaps)に使う値です。 |
+| `action`, `error`, `resource`, `long_task`, `frustration`, `crash`, `frozen_frame` | 累計件数を格納する `{ "count": n }` 形式のオブジェクトです。 |
+| `memory_average`, `memory_max`, `cpu_ticks_count`, `cpu_ticks_per_second`, `refresh_rate_average`, `refresh_rate_min`, `slow_frames_rate`, `freeze_rate` | モバイルの計測値です。 |
+| `flutter_build_time`, `flutter_raster_time` | `{ min, max, average, metric_max }` 形式で、値はナノ秒です。 |
+
+## アクション
+
+| フィールド | 補足 |
+|---|---|
+| `id` | 必須です。 |
+| `type` | 必須です。`custom`、`click`、`tap`、`scroll`、`swipe`、`application_start`、`back` のいずれかです。 |
+| `loading_time` | ナノ秒です。 |
+| `target` | 要素の `name`、`selector`、`width`、`height`、タグ名と出現位置だけでページ内の要素の位置を表す `path`、要素内でのクリック位置の `x` と `y` を示す `offset` を含みます。 |
+| `position` | ポインターの `x` と `y` です。 |
+| `page_position` | ページ上でのクリック位置の `x` と `y` を CSS ピクセルで表します。 |
+| `name_source` | 名前の取得方法を示します。`custom_attribute`、`mask_placeholder`、`standard_attribute`、`text_content`、`mask_disallowed`、`blank` のいずれかです。 |
+| `frustration.type` | `rage_click`、`dead_click`、`error_click`、`rage_tap`、`error_tap` を値に取るリストです。 |
+| `error`, `crash`, `long_task`, `resource` | `{ "count": n }` 形式のオブジェクトです。 |
+
+## エラー
+
+| フィールド | 補足 |
+|---|---|
+| `id`, `message`, `source` | 必須です。`source` は `network`、`source`、`console`、`logger`、`agent`、`webview`、`custom`、`report` のいずれかです。 |
+| `type` | `TypeError` などのエラークラスです。 |
+| `stack` | テキスト形式のスタックトレースです。 |
+| `frames` | 最大 1000 件のフレームを含みます。各フレームには `file`、`function`、`class`、`module`、`line`、`column`、`debug_id`、`build_id`、`relative_address`、`instruction_addr`、`image_addr`、`artifact_kind`（`javascript_sourcemap`、`flutter_symbols`、`android_native_symbols`、`apple_dsym` のいずれか）があります。 |
+| `fingerprint` | 任意です。最大 128 文字です。同じアプリケーション内で同じフィンガープリントを指定したエラーは、メッセージやスタックトレースに関係なく、1 件の[イシュー](/ja/rum/errors)にまとまります。省略すると、MoleSignal はエラーの種類、メッセージ、アプリケーション固有のコードの先頭フレームに基づいてエラーをグループ化し、イシューの ID を `error.issue_id` に書き込みます。`issue_id` として送信した値は、MoleSignal が置き換えます。 |
+| `handling` | `handled` または `unhandled` です。 |
+| `is_crash`, `category`, `source_type` | `category` は `ANR`、`App Hang`、`Exception`、`Watchdog Termination`、`Memory Warning`、`Network` のいずれかです。 |
+| `resource` | `network` エラーで失敗したリクエストの `method`、`status_code`、`url` を含みます。 |
+| `causes`, `threads`, `binary_images` | 連鎖した原因、スレッドのスタックトレース、ロード済みのバイナリイメージです。 |
+
+## リソース
+
+| フィールド | 補足 |
+|---|---|
+| `type`, `url` | 必須です。`type` は `document`、`xhr`、`beacon`、`fetch`、`css`、`js`、`image`、`font`、`media`、`other`、`native` のいずれかです。 |
+| `method`, `status_code` | リクエストに応答がなかった場合、`status_code` は `0` です。 |
+| `duration` | ナノ秒です。 |
+| `size`, `encoded_body_size`, `decoded_body_size`, `transfer_size` | バイトです。 |
+| `redirect`, `dns`, `connect`, `ssl`, `first_byte`, `download`, `worker` | リクエストの各フェーズです。それぞれ `{ start, duration }` 形式で、値はナノ秒です。 |
+| `trace_id`, `span_id` | リクエストの W3C トレースコンテキストです。MoleSignal は `trace_id` を使ってセッションをバックエンドのトレースに関連付けます。 |
+| `graphql` | `operation_type`、`operation_name`、`payload`、`variables` を含みます。 |
+| `request.headers`, `response.headers` | ヘッダーを格納するオブジェクトです。 |
+
+## ロングタスク
+
+| フィールド | 補足 |
+|---|---|
+| `duration` | 必須です。単位はナノ秒です。 |
+| `entry_type` | `long-task` または `long-animation-frame` です。 |
+| `start_time`, `blocking_duration`, `render_start`, `style_and_layout_start`, `first_ui_event_timestamp` | ビューの開始を基準とするナノ秒単位の値です。 |
+| `is_frozen_frame` | モバイルアプリのフリーズフレームの場合は `true` です。 |
+| `scripts` | ロングアニメーションフレーム内のスクリプトです。各スクリプトには `duration`、`source_url`、`source_function_name`、`invoker`、`invoker_type` があります。 |
+
+## バイタル
+
+| フィールド | 補足 |
+|---|---|
+| `id`, `type` | 必須です。`type` は `duration`、`app_launch`、`operation_step` のいずれかです。 |
+| `name`, `duration` | タイプが `duration` の場合は必須です。 |
+| `app_launch_metric`, `startup_type` | `app_launch` では、`duration` とともに必須です。`app_launch_metric` は `ttid` または `ttfd`、`startup_type` は `cold_start` または `warm_start` です。 |
+| `step_type`, `operation_key`, `failure_reason` | `operation_step` 用です。`step_type` は `start`、`update`、`retry`、`end` のいずれかです。 |
+
+## ログ
+
+`log` イベントには、トップレベルの `level` と `message` に加え、`log` オブジェクトがあります。トップレベルにこれらのフィールドがあるため、ストリームを通常のログと同じように読めます。[ブラウザーログ](/ja/rum/logs)を参照してください。
+
+| フィールド | 補足 |
+|---|---|
+| `level` | 必須です。`debug`、`info`、`warn`、`error` のいずれかです。 |
+| `message` | 必須です。 |
+| `log.id` | 必須です。 |
+| `log.logger` | ロガーの名前です。 |
+| `log.origin` | `logger`、`console`、`report`、`sdk` のいずれかです。 |
+| `log.error_type`, `log.stack` | ログが記録するエラーの種類とスタックトレースです。 |
+
+## MoleSignal が追加する情報
+
+- **位置情報:** クライアントの IP アドレスに対応する国、行政区画、都市、大陸、座標を、次のデータベースで検索します。 DB-IP City Lite を使用します。アプリケーションが IP アドレスを保持する設定の場合に限り、IP アドレス自体も保持します。
+- **ブラウザー、システム、デバイス:** これらの情報を含まないブラウザーイベントでは、`User-Agent` ヘッダーを解析して補います。クローラーは `device.type: bot` として記録します。SDK が値を送信した場合は、その値を優先します。
+- **URL の構成要素:** `view.url_host`、`view.url_path`、`view.url_path_group` を追加します。`resource.url` にも同様のフィールドを追加します。
+- **ロングタスクのスクリプト:** `long_task.scripts` で実行時間が最も長いエントリから、`long_task.top_script.source_url`、`long_task.top_script.function`、`long_task.top_script.invoker_type` を設定します。ブラウザーがスクリプトを報告しない場合は、これらのフィールドを空のままにします。クライアントがこれらのフィールドに値を送信しても破棄します。
+- **セッション:** 各セッションのビューから、そのセッションに対応する `rum_sessions` の行を生成します。
+
+MoleSignal はイベントを保存する前に、アプリケーションの設定を適用します。保持対象外のセッションを除外し、除去対象に指定した[機密テキスト](/ja/rum/privacy#受信時に機密テキストを除去する)を置き換えます。
+
+IP アドレスと位置情報の取り扱いは、[アプリケーションの設定](/ja/rum/applications#データ収集)に従います。
+
+## イベントの保存先
+
+イベントタイプごとに専用の通常のログストリームがあり、最初のアプリケーションを作成するときに各ストリームを作成します。各ストリームではスキーマが固定されているため、型が一致しない値を受信しても列の定義は変わりません。
+
+| ストリーム | 行 |
+|---|---|
+| `rum_sessions` | セッションごとに1行。イベントから生成します。 |
+| `rum_views` | ビューごとに1行。 |
+| `rum_actions` | アクションごとに1行。 |
+| `rum_errors` | エラーごとに1行。 |
+| `rum_resources` | リクエストごとに1行。行数が最も多いため、ストリーム設定で保持期間を短めに設定してください。 |
+| `rum_long_tasks` | ロングタスクごとに1行。 |
+| `rum_vitals` | バイタルごとに1行。 |
+| `rum_logs` | ログごとに1行。 |
+
+これらのストリームに書き込むのは、RUM取り込み処理だけです。リアルタイムパイプラインでは、イベントの受信時にカスタムフィールド（`context`、`usr.extra`、`feature_flags`、`extra`）を変更できます。スケジュール済みパイプラインでは、ストリームを読み取れます。[RUMストリーム](/ja/pipelines#rum-ストリーム)を参照してください。
+
+列名には、`view.performance.lcp.timestamp` や `resource.status_code` のように、イベントのフィールド名をフラット化したものを使います。 [RUMエクスプローラー](/ja/rum/explorer)で列を確認するか、**ログ**でSQLを使ってストリームをクエリします。
+
+## 例
+
+再送されるビューを含むリクエスト、失敗したリクエスト、その失敗によって発生したエラーの例です。
+
+```json
+[
+  {
+    "type": "view",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user", "start": 1789999990000 },
+    "view": {
+      "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34",
+      "url": "https://shop.example.com/checkout",
+      "name": "/checkout",
+      "revision": 3,
+      "time_spent": 8200000000,
+      "loading_time": 1200000000,
+      "performance": { "lcp": { "timestamp": 900000000, "target_selector": "img.hero" } },
+      "error": { "count": 1 },
+      "resource": { "count": 22 }
+    },
+    "usr": { "id": "u-42" },
+    "context": { "plan": "pro" }
+  },
+  {
+    "type": "resource",
+    "date": 1790000001500,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "resource": {
+      "type": "fetch",
+      "method": "POST",
+      "url": "https://api.example.com/orders",
+      "status_code": 500,
+      "duration": 482000000,
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "span_id": "00f067aa0ba902b7"
+    }
+  },
+  {
+    "type": "error",
+    "date": 1790000001600,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "error": {
+      "id": "0a9b8c7d-6e5f-4a3b-8c1d-2e3f4a5b6c70",
+      "message": "Failed to fetch https://api.example.com/orders: 500",
+      "source": "network",
+      "type": "ServerError",
+      "handling": "handled",
+      "resource": { "method": "POST", "status_code": 500, "url": "https://api.example.com/orders" }
+    }
+  }
+]
+```
+
+<CardGroup cols={2}>
+  <Card title="RUMアプリケーション" icon="grid" href="/ja/rum/applications">
+    クライアントトークンの紐付け先となるアプリケーションを作成します。
+  </Card>
+  <Card title="RUMエクスプローラー" icon="magnifying-glass" href="/ja/rum/explorer">
+    タイプやフィールドでイベントを検索します。
+  </Card>
+</CardGroup>

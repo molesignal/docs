@@ -1,0 +1,106 @@
+---
+title: "匯入與匯出升級策略、排班和路由規則"
+description: "將升級策略、值班排班和路由規則匯出為依名稱參照的套件，再將這類套件匯入組織。"
+"en_link": "/en-US/api/alerting/oncall-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/oncall-transfer"
+"ja_link": "/ja/api/alerting/oncall-transfer"
+"ko_link": "/ko/api/alerting/oncall-transfer"
+"de_link": "/de/api/alerting/oncall-transfer"
+"es_link": "/es/api/alerting/oncall-transfer"
+"fr_link": "/fr/api/alerting/oncall-transfer"
+"pt-BR_link": "/pt-BR/api/alerting/oncall-transfer"
+---
+
+```http
+GET  /api/v1/alerts/escalations/export
+POST /api/v1/alerts/escalations/import
+GET  /api/v1/schedules/export
+POST /api/v1/schedules/import
+GET  /api/v1/alerts/routing/rules/export
+POST /api/v1/alerts/routing/rules/import
+```
+
+| 種類 | 匯出 | 匯入 | 格式 | 清單的鍵 |
+|---|---|---|---|---|
+| 升級策略 | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.escalation-policies/v1` | `policies` |
+| 值班排程 | `schedules.read` | `schedules.create` | `molesignal.schedules/v1` | `schedules` |
+| 路由規則 | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.routing-rules/v1` | `rules` |
+
+## 匯出
+
+在查詢參數 `ids` 中填入以逗號分隔的 ID，省略時會匯出全部。回應是一個套件：
+
+```json
+{
+  "format": "molesignal.escalation-policies/v1",
+  "policies": [
+    {
+      "name": "支付值班",
+      "steps": [
+        {"targets": [{"kind": "schedule", "schedule": "支付主值班"}], "ackTimeoutSecs": 300, "minSeverity": null},
+        {"targets": [{"kind": "user", "user": "lead@example.com"}], "ackTimeoutSecs": 600, "minSeverity": null}
+      ],
+      "repeat": false,
+      "maxLoops": 1,
+      "urgencyRule": {"mode": "by_severity"}
+    }
+  ]
+}
+```
+
+每個項目都保留完整的定義，但不含 ID 和組織。參照一律使用名稱：`user` 是使用者的電子郵件地址；`team`、`schedule`、`policy` 和 `calendar` 分別是團隊、值班排程、升級策略和假日日曆的名稱；輪值的 `members` 是電子郵件地址。值班排程不含臨時代班和時間戳記；路由規則不含位置和時間戳記。
+
+## 匯入
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `content` | string | 是 | 此類型的套件，使用 JSON 或 YAML，最多 4 MiB、500 個項目。值班排程也可以使用[從 Opsgenie 或 PagerDuty 遷移值班排程](/zh-Hant/alerting/schedule-migration)中的檔案。 |
+| `dryRun` | boolean | 否 | 預設為 `true`，只做預演；設為 `false` 才會寫入。 |
+| `createOnly` | boolean | 否 | 設為 `true` 時，不變更現有的同名項目。 |
+
+依名稱比對每個項目：沒有同名項目就建立新項目，恰好有一個同名項目就逐一比較欄位，有多個同名項目就回報錯誤，檔案中同一個名稱出現兩次也會回報錯誤。參照的對象必須存在於組織中，每個項目都會依儲存時的規則檢查。只要有一個項目出錯，就不會寫入任何項目；若沒有錯誤，就逐項寫入，並為每個會同步的項目各發出一個聯邦變更事件，再記錄一筆稽核事件：`escalation_policies.imported`、`schedules.imported` 或 `routing_rules.imported`。
+
+- 匯入現有的值班排程時，保留臨時代班、換班，以及檔案中未指定的設定。
+- 匯入的路由規則依檔案順序排在最前面，其餘規則維持原有順序排在後面。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content schedules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "molesignal.schedules/v1",
+  "items": [
+    {"name": "支付主值班", "action": "update", "changes": ["rotations"], "id": "3KC9..."},
+    {"name": "支付夜班", "action": "create"},
+    {"name": "搜索", "action": "error", "error": "no user is named `ann@example.com`"}
+  ],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` 是 `create`、`update`、`unchanged`、`skip`（啟用 `createOnly` 時的現有項目，或檔案中只有名稱的 PagerDuty shift-based 值班排程）或 `error`；寫入後，`id` 是新建或更新項目的 ID。`applied` 表示是否已寫入。
+
+`format` 說明讀取到的格式：套件格式、`pagerduty` 或 `opsgenie`。值班排程還可能包含下列欄位：
+
+| 欄位 | 位置 | 說明 |
+|---|---|---|
+| `unknownMembers` | 項目 | 列出所有在組織中找不到對應成員的電子郵件地址。 |
+| `blockers` | 項目 | 無法匯入且會影響值班人員的內容。只要有一筆，該項目就是 `error`。 |
+| `findings` | 項目、報告 | 略過的內容，以及此項目與來源產生的值班表比對後的結果。 |
+
+blocker 和 finding 的格式為 `{"code": "...", "params": {...}}`：`code` 指定訊息文字，`params` 提供要代入訊息的值。
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | 內容既非此類型的套件，也不是匯入值班排程時可讀取的檔案；或使用了其他格式、檔案過大、項目過多。 |
+| `403` | Token 缺少對應的權限。 |

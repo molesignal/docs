@@ -1,0 +1,94 @@
+---
+title: "Sicherung und Wiederherstellung"
+description: "Erfahren Sie, welche Daten Sie sichern sollten, wie Sie PostgreSQL und Objektspeicher konsistent halten und wie Sie ein MoleSignal-Deployment wiederherstellen."
+"en_link": "/en-US/backup-restore"
+"zh-Hans_link": "/zh-Hans/backup-restore"
+"zh-Hant_link": "/zh-Hant/backup-restore"
+"ja_link": "/ja/backup-restore"
+"ko_link": "/ko/backup-restore"
+"es_link": "/es/backup-restore"
+"fr_link": "/fr/backup-restore"
+"pt-BR_link": "/pt-BR/backup-restore"
+---
+
+MoleSignal speichert seinen Zustand in PostgreSQL, im Objektspeicher sowie in der Konfiguration und in Secrets. Auf den lokalen Datenträgern der Knoten liegen nur Caches. Sichern Sie alle Zustandsdaten und testen Sie die Wiederherstellung, bevor Sie sich auf die Backups verlassen.
+
+## Was Sie sichern müssen
+
+| Zustandsdaten | Inhalt | Backup |
+|---|---|---|
+| PostgreSQL | Benutzerkonten, Organisationen, Tokens, Streams, Dashboards, Alarmregeln und der Dateikatalog, der Streams Objekten zuordnet | Erforderlich |
+| Objektspeicher | Parquet-Datendateien, Suchindizes, Profil-Blobs und Write-Ahead-Log-Objekte (WAL-Objekte) für Datensätze, die noch nicht in Datendateien geschrieben wurden (`wal/v1/`) | Erforderlich |
+| `MS_CIPHER_KEY` | Der Hauptschlüssel für Secrets in PostgreSQL | Erforderlich. Bewahren Sie den Schlüssel getrennt vom Datenbank-Backup auf. |
+| Konfiguration | `config.toml`, Umgebungsvariablen und `MS_AUTH_JWT_SECRET_OVERRIDE`, falls verwendet | Erforderlich |
+| ACME-Verzeichnis (`[http.tls].key_storage_dir`) | ACME-Kontoschlüssel und Domainschlüssel | Optional. Zertifikate lassen sich erneut ausstellen. |
+| Cache-Verzeichnis (`[cache.object].root`) | Lokale Kopie von Bereichen aus Objekten im Objektspeicher | Nicht sichern. |
+
+## Datenbank und Objekte konsistent sichern
+
+Der Dateikatalog in PostgreSQL verweist auf Objekte im Bucket. Bei einem Flush lädt MoleSignal zuerst das Objekt hoch und trägt es danach in den Katalog ein. Bei der Kompaktierung und beim Durchsetzen der Aufbewahrungsfrist entfernt MoleSignal zuerst den Katalogverweis. Der Garbage Collector löscht das Objekt erst nach Ablauf der Karenzzeit `[storage.gc].grace_period_secs` (Standard: 3600 Sekunden).
+
+Halten Sie für ein konsistentes Backup diese Reihenfolge ein:
+
+1. Erstellen Sie das PostgreSQL-Backup.
+2. Kopieren Sie den Bucket direkt danach und schließen Sie den Kopiervorgang innerhalb der Karenzzeit ab.
+
+Wenn der Kopiervorgang innerhalb der Karenzzeit endet, enthält die Kopie alle Objekte, auf die das Datenbank-Backup verweist. Dauert der Kopiervorgang länger, erhöhen Sie vor dem Backup den Wert von `grace_period_secs` oder aktivieren Sie die Bucket-Versionierung und stellen Sie die Objekte mit dem Stand zum Zeitpunkt des Datenbank-Backups wieder her.
+
+## PostgreSQL sichern
+
+Nutzen Sie die Backup-Funktionen des PostgreSQL-Dienstes, etwa geplante Snapshots mit zeitpunktbezogener Wiederherstellung. Wenn Sie die Datenbank selbst betreiben, genügt bei kleinen Installationen ein logischer Dump:
+
+```bash
+pg_dump --format=custom --file=molesignal.dump "postgres://molesignal@db.internal:5432/molesignal"
+```
+
+## Objektspeicher sichern
+
+Nutzen Sie die Bucket-Replikation oder -Versionierung des Anbieters. Alternativ können Sie den Bucket regelmäßig in einen zweiten Bucket kopieren:
+
+```bash
+aws s3 sync s3://molesignal s3://molesignal-backup
+```
+
+Fügen Sie für einen S3-kompatiblen Dienst wie RustFS `--endpoint-url` hinzu. Verwenden Sie für das Backup Zugangsdaten ohne Löschberechtigung im Backup-Bucket.
+
+## Wiederherstellen
+
+<Steps>
+  <Step title="Alle Knoten stoppen">
+    Stoppen Sie alle MoleSignal-Prozesse, damit während des Datenaustauschs keine Schreibvorgänge stattfinden.
+  </Step>
+  <Step title="PostgreSQL wiederherstellen">
+    Stellen Sie das Backup in einer leeren Datenbank wieder her:
+
+    ```bash
+    pg_restore --no-owner --dbname "postgres://molesignal@db.internal:5432/molesignal" molesignal.dump
+    ```
+  </Step>
+  <Step title="Objekte wiederherstellen">
+    Kopieren Sie das Backup in den Bucket, den die Knoten verwenden. Stellen Sie den Bucket mit dem Stand zum Zeitpunkt des Datenbank-Backups oder zu einem späteren Zeitpunkt wieder her.
+
+    Der Reconciler reiht Objekte, auf die der wiederhergestellte Katalog nicht verweist, als verwaist in die Warteschlange ein. Der Garbage Collector löscht sie nach Ablauf von `[storage.reconciler].orphan_grace_secs` (Standard: 24 Stunden). Kopieren Sie neuere Objekte zuerst an einen anderen Speicherort, falls Sie sie noch benötigen.
+  </Step>
+  <Step title="Secrets und Konfiguration wiederherstellen">
+    Stellen Sie die Konfiguration und denselben `MS_CIPHER_KEY` bereit, den die gesicherte Installation verwendet hat. Mit einem anderen Schlüssel kann ein Knoten die gespeicherten Secrets nicht entschlüsseln. Der Start schlägt dann mit einer Fehlermeldung wie `open Probe CA key` fehl.
+  </Step>
+  <Step title="WAL von der Datenannahme übernehmen lassen">
+    Die WAL-Objekte werden zusammen mit dem Bucket wiederhergestellt. Sobald die Knoten laufen, veröffentlicht ein Knoten für die Datenannahme das WAL jeder Schreibinstanz, die in der wiederhergestellten Datenbank registriert ist, sobald deren Lease abläuft. WAL-Objekte von Schreibinstanzen, deren Registrierung nach dem Datenbank-Backup erfolgte, bleiben unveröffentlicht.
+  </Step>
+  <Step title="Starten und prüfen">
+    Starten Sie die Knoten und warten Sie, bis `GET /api/v1/healthz` den Statuscode `200` zurückgibt. Melden Sie sich an, öffnen Sie einen Stream und führen Sie eine Abfrage für den wiederhergestellten Zeitraum aus.
+
+    Prüfen Sie unter `/metrics` die Metrik `storage_reconciler_issues_total` mit `reason="missing"`. Solche Einträge zeigen an, dass der Katalog auf Objekte verweist, die im Bucket fehlen.
+  </Step>
+</Steps>
+
+## Ausfallszenarien
+
+| Verlust | Auswirkung | Wiederherstellung |
+|---|---|---|
+| Lokaler Datenträger eines Knotens | Keine bestätigten Daten gehen verloren. MoleSignal baut die Caches neu auf. | Ersetzen Sie den Knoten. Ein anderer Knoten für die Datenannahme veröffentlicht dessen WAL nach Ablauf von `[wal].lease_secs`. Siehe [Dauerhaftigkeit und Übernahme](/de/architecture#dauerhaftigkeit-und-übernahme). |
+| PostgreSQL | Alle Metadaten gehen verloren. Auf die Objekte lässt sich nicht mehr zugreifen. | Stellen Sie das neueste Backup wieder her. Daten, die nach diesem Backup geschrieben wurden, lassen sich nicht wiederherstellen, da für ihre Objekte keine Katalogeinträge vorliegen. |
+| Bucket | Abfragen für den verlorenen Zeitraum schlagen fehl. | Stellen Sie den Bucket wieder her. Katalogeinträge ohne zugehörige Objekte erscheinen unter `/metrics` als `missing`. |
+| `MS_CIPHER_KEY` | Die Knoten können die gespeicherten Secrets nicht entschlüsseln und starten nicht. | Stellen Sie den Schlüssel aus dem Secrets-Manager wieder her. Ohne den Schlüssel lassen sich die verschlüsselten Spalten nicht wiederherstellen. |

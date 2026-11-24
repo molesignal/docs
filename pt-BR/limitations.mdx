@@ -1,0 +1,60 @@
+---
+title: "Limitações conhecidas"
+description: "Confira os comportamentos da versão atual que podem divergir do esperado em uma implantação e veja como contorná-los."
+"en_link": "/en-US/limitations"
+"zh-Hans_link": "/zh-Hans/limitations"
+"zh-Hant_link": "/zh-Hant/limitations"
+"ja_link": "/ja/limitations"
+"ko_link": "/ko/limitations"
+"de_link": "/de/limitations"
+"es_link": "/es/limitations"
+"fr_link": "/fr/limitations"
+---
+
+MoleSignal ainda não chegou à versão 1.0. Esta página lista os limites que afetam o planejamento e a operação.
+
+## Implantação
+
+- **Atraso na transferência de controle.** O log de escrita antecipada fica no armazenamento de objetos. Assim, a perda de um nó de ingestão não causa a perda de dados cujo recebimento já foi confirmado. No entanto, os registros que ainda estavam no buffer só ficam disponíveis para consulta quando outro nó de ingestão assume o controle, após `[wal].lease_secs` (15 segundos por padrão). Consulte [Durabilidade e transferência de controle](/pt-BR/architecture#durabilidade-e-transferência-de-responsabilidade).
+- **Tarefas executadas em um único nó.** O nó `alert` primário executa o envio de eventos entre clusters e o gossip, o recálculo do grafo de serviços, a agregação de APM, a manutenção de páginas de status, a automação do monitoramento sintético, a análise de consultas lentas e a análise da causa raiz de incidentes. Essas tarefas não escalam com o número de nós `alert`. Outro nó retoma as tarefas quando o primário deixa de fazer parte do cluster. Consulte [Implantação por função](/pt-BR/deployment/role-based#divisão-do-trabalho-entre-nós-de-alertas).
+- **Somente PostgreSQL.** PostgreSQL é o único banco de dados de metadados.
+- **Reinicialização para aplicar a configuração.** Um processo em execução não aplica alterações no arquivo de configuração. Consulte [Configuração](/pt-BR/configuration).
+- **Migrações apenas para versões mais recentes.** Uma compilação anterior não consegue abrir um banco de dados migrado por uma compilação mais recente. Compilações anteriores à versão 1.0 podem alterar o esquema base. Consulte [Atualização](/pt-BR/upgrade).
+
+## Ingestão
+
+- **Tamanho da solicitação.** A ingestão rejeita com `413` solicitações com corpo acima de 2 MiB, ou de 16 MiB no caso da ingestão nativa de JSON.
+- **Compactação de OTLP sobre HTTP.** A ingestão rejeita com `400` solicitações com corpo compactado. Desative a compactação no remetente.
+- **Buckets de histogramas.** Os histogramas OTLP armazenam `count`, `sum`, `min` e `max`. A ingestão não armazena os limites nem as contagens dos buckets, nem os quantis dos resumos.
+- **Spans duplicados.** A ingestão descarta spans reenviados com os mesmos `trace_id` e `span_id`.
+- **Envio via Loki.** O endpoint decodifica apenas o formato de solicitação JSON. Remetentes que usam protobuf compactado com Snappy, como Promtail e Grafana Alloy, não conseguem enviar dados para esse endpoint.
+- **Prometheus remote_write.** A ingestão ignora histogramas nativos e metadados de métricas.
+- **OTLP gRPC sem TLS.** O receptor não faz a terminação TLS. Coloque um proxy que faça a terminação TLS na frente do receptor para o tráfego que sai de uma rede confiável.
+- **Limitação da taxa de solicitações.** Apenas a função `router` limita as solicitações. Cada réplica do roteador contabiliza separadamente as solicitações da organização autenticada.
+- **Streams da plataforma.** Apenas MoleSignal grava em `_molesignal`, `_synthetic_results`, `_audit`, `_agent_model_traces` e `_agent_score_traces`. Esses streams rejeitam a ingestão pública. Consulte [Streams da plataforma](/pt-BR/streams#fluxos-da-plataforma).
+
+## Consultas
+
+- **Intervalos longos são processados de forma assíncrona.** Uma consulta cujo tamanho estimado atinge `[querier].auto_async_threshold_rows` retorna `202` com uma tarefa para acompanhar. Com os valores padrão, isso equivale a um intervalo de cerca de 13,9 horas. Envie `Prefer: respond-sync` para executar a consulta na própria solicitação. Consulte [Consultas](/pt-BR/query#intervalos-de-tempo-e-tarefas-assíncronas).
+- **Subconjunto de PromQL.** O mecanismo de consultas implementa um subconjunto de PromQL. Consulte [Matriz de compatibilidade com PromQL](/pt-BR/query/promql-subset).
+- **Linhas por consulta.** O mecanismo rejeita com `400` consultas que leriam mais de `[querier].max_scan_rows` linhas (100 milhões por padrão). Reduza o intervalo de tempo ou adicione filtros. PromQL aplica o limite a cada seletor.
+- **Disponibilidade de dados recentes em clusters com funções separadas.** Uma consulta lê os arquivos listados no catálogo. Assim, um registro que ainda está no buffer de um nó de ingestão só fica visível após a próxima gravação do buffer, dentro de `[intake].flush_interval_secs`. Um nó `standalone` também lê o próprio buffer. Por padrão, as regras de alerta deslocam a janela para trás pelo atraso de avaliação definido em **Configurações → Avaliação de alertas** (60 segundos). Consulte [Atraso de avaliação](/pt-BR/alerting/rules#atraso-na-avaliação).
+
+## Alertas
+
+- **Contagens de regras em tempo real ficam na memória.** Uma regra `real_time` mantém uma contagem em cada nó que recebe gravações. O nó de alertas responsável pela regra soma as contagens a cada segundo, e o incidente abre em até um segundo após a gravação dos registros. Ao reiniciar, um nó perde apenas a própria contagem. Se a contagem de um nó estiver inacessível, o total daquele segundo não a inclui. Os nós usam o token bearer do cluster para ler as contagens uns dos outros. A soma não inclui contagens de clusters federados. A instrução se limita a `SELECT count(*) FROM <stream> [WHERE <condition>]`. Consulte [Regras em tempo real](/pt-BR/alerting/rules#regras-em-tempo-real).
+
+## Segurança e identidade
+
+- **O gRPC interno não usa autenticação.** A porta `5082` transporta tráfego entre nós sem autenticação. Mantenha essa porta em uma rede privada.
+- **Cada chave de acesso está vinculada a um único domínio.** Configure `[http].external_url` com uma URL HTTPS que use esse domínio. A chave de acesso não funciona ao abrir o console com outro nome de host.
+- **A redefinição de senha exige e-mail.** A redefinição de senha envia um link por e-mail. Configure `[notify.smtp]` e `[http].external_url`.
+- **O cadastro por autoatendimento sem aprovação exige e-mail.** O cadastro primeiro verifica o endereço de e-mail. Sem `[notify.smtp]` e `[http].external_url`, toda conta nova precisa aguardar a aprovação de um administrador.
+- **Os limites de login são contabilizados por endereço IP.** O recurso de [Reconhecimento do IP do cliente](/pt-BR/settings/platform#identificação-do-ip-do-cliente) precisa identificar o endereço corretamente. Atrás de um proxy público ou de uma CDN sem a configuração adequada, todos os usuários compartilham o mesmo endereço e podem bloquear o acesso uns dos outros. Por padrão, a contagem não inclui endereços privados. Assim, em uma implantação interna ou atrás de um proxy sem a configuração adequada, vale apenas o limite por conta.
+- **O limite por conta não bloqueia a conta.** Para impedir que terceiros bloqueiem uma conta, o limite ainda permite cerca de 1.400 tentativas de adivinhar a senha por dia. Em uma conta com autenticação multifator, acertar a senha não basta para obter acesso. Se alguém continuar consumindo as tentativas disponíveis, o titular da conta que ainda não fez login a partir desse endereço poderá continuar aguardando. Use uma chave de acesso ou o login único, ou redefina a senha para recuperar o acesso.
+- **Políticas de bloqueio do diretório LDAP.** A política de bloqueio do próprio diretório pode entrar em vigor primeiro. Assim, terceiros ainda podem provocar o bloqueio de uma conta do diretório. Defina [limites de login](/pt-BR/settings/platform#limites-de-login) menores que os do diretório.
+- **Sessões.** A página de configurações da conta gerencia apenas a sessão do navegador atual.
+
+## Relatórios
+
+- **A renderização de PDF e PNG** exige o Chrome em modo headless. A imagem de contêiner da versão inclui o Chromium. Para usar a instalação por binário, instale o Chrome e configure `[scheduled_reports.renderer].base_url` para acessar a interface web.

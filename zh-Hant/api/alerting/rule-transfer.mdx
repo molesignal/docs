@@ -1,0 +1,90 @@
+---
+title: "匯入與匯出規則"
+description: "將告警規則匯出為以名稱參照的規則套件，或匯入規則套件與 Prometheus 告警規則檔案。"
+"en_link": "/en-US/api/alerting/rule-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/rule-transfer"
+"ja_link": "/ja/api/alerting/rule-transfer"
+"ko_link": "/ko/api/alerting/rule-transfer"
+"de_link": "/de/api/alerting/rule-transfer"
+"es_link": "/es/api/alerting/rule-transfer"
+"fr_link": "/fr/api/alerting/rule-transfer"
+"pt-BR_link": "/pt-BR/api/alerting/rule-transfer"
+---
+
+```http
+GET  /api/v1/alerts/rules/export
+POST /api/v1/alerts/rules/import
+```
+
+## 匯出
+
+需要 `alerts.rules.read` 權限。查詢參數 `ids` 是以逗號分隔的規則 ID，留空則匯出所有規則。傳回規則套件：
+
+```json
+{
+  "format": "molesignal.alert-rules/v1",
+  "exportedAt": "2026-10-28T08:00:00Z",
+  "rules": [
+    {
+      "name": "High error rate",
+      "description": "",
+      "enabled": true,
+      "kind": "scheduled",
+      "query": {"language": "promql", "statement": "sum(rate(http_requests_total{code=~\"5..\"}[5m]))", "periodSecs": 60, "stream": {"name": "http_requests_total", "streamType": "metrics"}},
+      "trigger": {"operator": "gt", "threshold": 5, "forPeriods": 2, "silenceSecs": 300},
+      "thresholds": [],
+      "severity": "error",
+      "escalationPolicy": "Payments on-call",
+      "labels": {"service": "checkout"},
+      "annotations": {}
+    }
+  ]
+}
+```
+
+規則包含完整定義，不包含 ID、組織、評估狀態和時間。`escalationPolicy` 是升級策略的名稱，未指定時使用預設策略；複合規則的 `query.composite.rules` 包含子規則的名稱。心跳規則的簽到網址不包含在規則套件中。
+
+## 匯入
+
+需要 `alerts.rules.manage` 權限。
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `content` | string | 是 | 規則套件（含 `format` 的 JSON 或 YAML），或 Prometheus 告警規則檔案（最上層的 `groups`，或 `PrometheusRule` 的 `spec.groups`），上限為 4 MiB，最多 500 條規則。 |
+| `dryRun` | boolean | 否 | 預設為 `true`，只模擬執行；設為 `false` 才會寫入。 |
+| `createOnly` | boolean | 否 | 設為 `true` 時，不變更現有的同名規則。 |
+
+依名稱逐條比對現有規則：沒有同名規則就建立，恰有一條就比較欄位，有多條就回報錯誤。檔案中同一名稱出現兩次也會回報錯誤。每條規則都依照儲存規則時的方式驗證。只要有一條規則發生錯誤，就不寫入任何規則；若沒有錯誤，就在同一筆交易中寫入，逐條發送聯邦變更事件，並新增一筆 `alert_rules.imported` 稽核紀錄。關於如何將 Prometheus 規則轉換成 MoleSignal 規則，請參閱[匯入與匯出](/zh-Hant/alerting/rules#匯入與匯出)。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content rules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "prometheus",
+  "items": [
+    {"name": "HighErrorRate", "action": "create", "ruleId": "3KF1..."},
+    {"name": "DiskFull", "action": "update", "changes": ["query", "trigger"], "ruleId": "3KC9..."},
+    {"name": "TargetDown", "action": "error", "error": "no escalation policy is named `ops`"}
+  ],
+  "notes": ["recording rule `job:errors:rate5m` in group `api` is not imported"],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` 為 `create`、`update`、`unchanged`、`skip`（啟用 `createOnly` 時略過現有規則）或 `error`。`applied` 表示是否已寫入。
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | 內容既不是規則套件也不是 Prometheus 規則檔案、格式名稱不正確、檔案太大，或規則太多。 |
+| `403` | 權杖缺少權限。 |

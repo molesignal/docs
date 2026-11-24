@@ -1,0 +1,224 @@
+---
+title: "Bereitschaftspläne aus Opsgenie oder PagerDuty migrieren"
+description: "Importieren Sie Bereitschaftspläne über die REST API von Opsgenie oder PagerDuty. Vergleichen Sie die Vorschau vor dem Speichern mit der Darstellung im Quellsystem und prüfen Sie, was übernommen wird und was nicht."
+"en_link": "/en-US/alerting/schedule-migration"
+"zh-Hans_link": "/zh-Hans/alerting/schedule-migration"
+"zh-Hant_link": "/zh-Hant/alerting/schedule-migration"
+"ja_link": "/ja/alerting/schedule-migration"
+"ko_link": "/ko/alerting/schedule-migration"
+"es_link": "/es/alerting/schedule-migration"
+"fr_link": "/fr/alerting/schedule-migration"
+"pt-BR_link": "/pt-BR/alerting/schedule-migration"
+---
+
+**Dienstpläne importieren…** liest Bereitschaftspläne in dem Format ein, das die REST-APIs von Opsgenie und PagerDuty zurückgeben. So entfällt beim Wechsel das manuelle Nachbauen der Rotationen. Ein Skript ruft die Pläne mit dem API-Schlüssel des Quellsystems ab und speichert sie in einer Datei. Der Import läuft wie bei einem [Paket](/de/alerting/on-call#import-und-export) ab: Testen Sie zuerst den Import und speichern Sie dann alle Pläne auf einmal. MoleSignal speichert den Schlüssel nicht und ruft das Quellsystem nicht auf. Der Import erfordert `schedules.create`.
+
+Für den Import gilt eine Regel: Ab jetzt muss zu jedem Zeitpunkt dieselbe Person Bereitschaft haben. Kann MoleSignal eine Einstellung nicht abbilden und würde sich dadurch die Bereitschaft ändern, bricht der Import ab. Einstellungen, die sich ab jetzt nicht auf die Bereitschaft auswirken, lässt MoleSignal weg und führt sie im Ergebnis auf.
+
+## Schritte
+
+<Steps>
+  <Step title="Mitglieder hinzufügen">
+    Fügen Sie alle Personen aus den Rotationen mit derselben E-Mail-Adresse wie im Quellsystem zum Workspace hinzu. Siehe [Mitglieder](/de/identity/members). MoleSignal ordnet Mitglieder anhand der E-Mail-Adresse zu und ignoriert dabei die Groß- und Kleinschreibung.
+  </Step>
+  <Step title="Bereitschaftspläne abrufen">
+    Führen Sie das Skript für [Opsgenie](#opsgenie) oder [PagerDuty](#pagerduty) auf einem Rechner mit `curl` und `jq` aus. Das Skript erstellt eine einzige Datei.
+  </Step>
+  <Step title="Import testen">
+    Öffnen Sie **Alarme → Bereitschaftspläne** und wählen Sie **Import/Export → Dienstpläne importieren…**. Wählen Sie dann **Datei auswählen** und anschließend **Testen**. Das Ergebnis zeigt für jeden Plan, was beim Import passieren würde. Siehe [Ergebnis auswerten](#ergebnis-lesen).
+  </Step>
+  <Step title="Importfehler beheben">
+    Korrigieren Sie die Daten im Quellsystem und rufen Sie die Pläne erneut ab oder bearbeiten Sie die Datei. Solange ein Plan einen Fehler aufweist, speichert MoleSignal keinen der Pläne.
+  </Step>
+  <Step title="Importieren">
+    Wählen Sie **Importieren**, öffnen Sie dann einen importierten Plan und prüfen Sie, wer Bereitschaft hat. Hinterlegen Sie den Plan in einer [Eskalationsrichtlinie](/de/alerting/on-call#eskalationsrichtlinien), damit MoleSignal die jeweils diensthabende Person alarmiert.
+  </Step>
+</Steps>
+
+## Opsgenie
+
+Hinterlegen Sie einen API-Schlüssel mit Leseberechtigung für Bereitschaftspläne und führen Sie dann das Skript aus. Konten in der EU verwenden `api.eu.opsgenie.com`.
+
+```bash
+export OPSGENIE_API_KEY=<api key>
+```
+
+```bash
+API=https://api.opsgenie.com   # EU accounts: https://api.eu.opsgenie.com
+DAYS=200
+
+get() { curl -fsS -H "Authorization: GenieKey $OPSGENIE_API_KEY" "$API$1"; }
+
+get /v2/schedules | jq -r '.data[].id' | while read -r id; do
+  get "/v2/schedules/$id"
+  get "/v2/schedules/$id/timeline?expand=base&interval=$DAYS&intervalUnit=days"
+done | jq -s '{
+  data: map(.data | select(has("rotations"))),
+  timelines: map(.data | select(has("baseTimeline"))
+    | {_parent, startDate, endDate, baseTimeline}
+    | .baseTimeline.rotations[].periods |= map({startDate, endDate, type, recipient}))
+}' > opsgenie-schedules.json
+```
+
+Die Datei enthält unter `data` jeden Bereitschaftsplan aus `GET /v2/schedules/{id}` und unter `timelines` die zugehörige Zeitleiste aus `GET /v2/schedules/{id}/timeline`. `DAYS` legt fest, wie weit die Zeitleiste in die Zukunft reicht.
+
+| In Opsgenie | In MoleSignal |
+|---|---|
+| Name, Beschreibung, Zeitzone, Aktivierungsstatus | Unverändert. |
+| Zuständiges Team | Das gleichnamige Team, falls vorhanden. Andernfalls bleibt der Plan ohne Team und das Ergebnis weist darauf hin. |
+| `type` und `length` der Rotation | **Täglich** und **Wöchentlich** bei einer Länge von 1, sonst ein benutzerdefiniertes Intervall, z. B. 6 Stunden bei `hourly` und einer Länge von 6. |
+| `startDate`, `endDate` | Beginn und Ende der Rotation. Abgelaufene Rotationen lässt MoleSignal weg. |
+| `timeRestriction` | Wöchentliche Zeitfenster in der Zeitzone des Plans, auch über mehrere Tage hinweg. |
+| Mehrere Rotationen ohne Überschneidungen | Mehrere Rotationen, z. B. eine während und eine außerhalb der Geschäftszeiten. |
+| Einzelpersonen als Teilnehmende | Mitglieder in derselben Reihenfolge. Die Zuordnung erfolgt über `username`, also die E-Mail-Adresse. |
+
+Die folgenden Fälle verhindern den Import, solange die Rotation läuft:
+
+| In Opsgenie | Grund |
+|---|---|
+| Ein Team oder eine Eskalation als Teilnehmer | Eine Rotation in MoleSignal nimmt nur Einzelpersonen auf. |
+| Ein Eintrag mit **No-One** | In einer Rotation in MoleSignal darf keine Schicht unbesetzt bleiben. |
+| Rotationen mit Überschneidungen | In Opsgenie haben die Personen aus allen überlappenden Rotationen gleichzeitig Bereitschaft. In MoleSignal hat pro Plan immer nur eine Person Bereitschaft. Verteilen Sie die Rotationen in der Datei auf separate Pläne mit unterschiedlichen Namen und hinterlegen Sie beide Pläne im selben Schritt einer Eskalationsrichtlinie. |
+
+MoleSignal importiert keine Überschreibungen, Weiterleitungsregeln, Eskalationen oder Routing-Einstellungen.
+
+## PagerDuty
+
+Hinterlegen Sie einen API-Schlüssel mit Leseberechtigung für Dienstpläne und Benutzer und führen Sie dann das Skript aus. Konten in der EU verwenden `api.eu.pagerduty.com`.
+
+```bash
+export PAGERDUTY_API_KEY=<api key>
+```
+
+```bash
+API=https://api.pagerduty.com   # EU accounts: https://api.eu.pagerduty.com
+DAYS=200
+since=$(jq -rn 'now | todate')
+until=$(jq -rn "now + $DAYS * 86400 | todate")
+
+get() {
+  curl -fsSg -H "Authorization: Token token=$PAGERDUTY_API_KEY" \
+    -H 'Accept: application/vnd.pagerduty+json;version=2' "$API$1"
+}
+pages() {
+  offset=0
+  while page=$(get "$1?limit=100&offset=$offset"); do
+    printf '%s\n' "$page"
+    [ "$(printf '%s' "$page" | jq .more)" = true ] || break
+    offset=$((offset + 100))
+  done
+}
+shift_based=$(pages /v3/schedules)
+
+{
+  pages /users
+  printf '%s\n' "$shift_based"
+  printf '%s\n' "$shift_based" | jq -r '.schedules[].id' | while read -r id; do
+    get "/v3/schedules/$id?since=$since&until=$until&include[]=final_schedule"
+  done
+  pages /schedules | jq -r '.schedules[].id' | while read -r id; do
+    get "/schedules/$id?since=$since&until=$until&include[]=final_schedule&include[]=overrides_subschedule"
+  done
+} | jq -s --arg since "$since" --arg until "$until" '{
+  since: $since,
+  until: $until,
+  users: (map(.users // []) | add // [] | map({id, email})),
+  shift_based_schedules: (map(.schedules // []) | add // [] | map({id, type, summary})),
+  schedules: map(.schedule // empty
+    | del(.users, .escalation_policies)
+    | if .type == "schedule_v3" then
+        .final_schedule.computed_shift_assignments[]? |= {start_time, end_time, member, source: {type: .source.type}}
+      else
+        del(.schedule_layers[].rendered_schedule_entries)
+        | .final_schedule.rendered_schedule_entries |= map({start, end, user: (.user | select(.) | {id})})
+        | .overrides_subschedule.rendered_schedule_entries |= map({start, end})
+      end)
+}' > pagerduty-schedules.json
+```
+
+Die Datei enthält unter `schedules` die einzelnen Dienstpläne aus `GET /schedules/{id}` und `GET /v3/schedules/{id}`. Da Dienstpläne keine E-Mail-Adressen enthalten, stehen diese aus `GET /users` unter `users`. Die Liste aus `GET /v3/schedules` steht unter `shift_based_schedules`. `since` und `until` geben den Zeitraum an, für den PagerDuty den Dienstplan berechnet. `DAYS` legt fest, wie weit dieser Zeitraum in die Zukunft reicht.
+
+Rufen Sie die Dienstpläne einzeln und ohne `time_zone` ab. `GET /schedules` gibt Einschränkungen in der Zeitzone des Aufrufs statt in der Zeitzone des Dienstplans aus. Der Import erkennt abweichende Zeitzonen und lehnt solche Dienstpläne ab.
+
+### Dienstpläne mit Ebenen
+
+| In PagerDuty | In MoleSignal |
+|---|---|
+| Name, Beschreibung, Zeitzone | Unverändert. Ein pausierter Dienstplan bleibt nach der Aktualisierung pausiert. |
+| Teams | Das erste Team, für das es in MoleSignal ein gleichnamiges Team gibt. Das Ergebnis nennt die übrigen Teams. |
+| Ebenen | Rotationen mit derselben Prioritätsreihenfolge: Die neueste Ebene hat Vorrang. Außerhalb ihrer Zeitfenster übernehmen die darunterliegenden Ebenen. |
+| `rotation_turn_length_seconds` | **Täglich** bei genau 24 Stunden, **Wöchentlich** bei genau 7 Tagen, sonst eine benutzerdefinierte Dauer. |
+| `rotation_virtual_start` | Der Beginn der Rotation. Er legt den Übergabezeitpunkt fest und bestimmt, welches Mitglied Dienst hat. |
+| `start` | Der Zeitpunkt, ab dem die Ebene gilt. Liegt er in der Vergangenheit, ist nichts weiter nötig. Liegt er in der Zukunft, beginnt die Rotation zu diesem Zeitpunkt mit dem dann eingeteilten Mitglied. |
+| `end` | Das Ende der Rotation. Der Import überspringt bereits beendete Ebenen sowie frühere Versionen einer bearbeiteten Ebene. |
+| `restrictions` | Wöchentliche Zeitfenster in der Zeitzone des Dienstplans, sowohl für `daily_restriction` als auch für `weekly_restriction`. |
+| `users` | Mitglieder in derselben Reihenfolge. Die Zuordnung erfolgt anhand der E-Mail-Adressen in `users`. |
+
+### Schichtbasierte Dienstpläne
+
+Ein Dienstplan aus der V3-API von PagerDuty besteht aus Ereignissen. Ereignisse haben keine Priorität. Bei Überschneidungen haben alle Mitglieder der betroffenen Ereignisse gleichzeitig Bereitschaft.
+
+| In PagerDuty | In MoleSignal |
+|---|---|
+| Name, Beschreibung, Teams | Wie bei einem Dienstplan mit Ebenen. |
+| Zeitzone der Ereignisse | Die Zeitzone des Dienstplans, da die Übergaben zur Ortszeit des Ereignisses stattfinden. Weicht die Zeitzone in `time_zone` des Dienstplans davon ab, weist das Ergebnis darauf hin. |
+| Jedes Ereignis | Eine Rotation mit dem Namen des Ereignisses. Ereignisse ohne Überschneidungen, etwa eines für die Geschäftszeiten und eines für die Zeit außerhalb der Geschäftszeiten, können in beliebiger Reihenfolge stehen. |
+| `start_time`, `end_time`, `recurrence` | Die erste Schicht und ihre Wiederholung gemäß der nächsten Tabelle. |
+| `shifts_per_member` | Die Dienstdauer pro Mitglied. Sie ergibt sich aus den Wiederholungen ab `start_time`. Jeder Tag in `BYDAY` zählt als eine Wiederholung. |
+| `effective_since` | Der Zeitpunkt, ab dem das Ereignis gilt. Liegt er in der Vergangenheit, ist nichts weiter nötig. Er beeinflusst dann nicht, welches Mitglied Dienst hat. Liegt er in der Zukunft, beginnt die Rotation zu diesem Zeitpunkt mit dem dann eingeteilten Mitglied. |
+| `effective_until` | Das Ende der Rotation. Der Import überspringt bereits beendete Ereignisse. |
+| `members` | Mitglieder in derselben Reihenfolge. Die Zuordnung erfolgt anhand der E-Mail-Adressen in `users`. |
+
+| `recurrence` | Erste Schicht | In MoleSignal |
+|---|---|---|
+| `RRULE:FREQ=WEEKLY` | 7 Tage | Durchgehend aktiv. **Wöchentlich**, wenn `shifts_per_member` den Wert 1 hat, sonst eine benutzerdefinierte Dauer. |
+| `RRULE:FREQ=DAILY` | 24 Stunden | Durchgehend aktiv. **Täglich**, wenn `shifts_per_member` den Wert 1 hat, **Wöchentlich** beim Wert 7, sonst eine benutzerdefinierte Dauer. |
+| `FREQ=WEEKLY`, `FREQ=DAILY` oder `FREQ=HOURLY` mit `INTERVAL` | So lang wie das Intervall | Durchgehend aktiv, mit benutzerdefinierter Dauer, etwa 12 Stunden bei `RRULE:FREQ=HOURLY;INTERVAL=12`. |
+| `RRULE:FREQ=DAILY` | Teil eines Tages | Wöchentliche Zeitfenster für jeden Wochentag. |
+| `RRULE:FREQ=WEEKLY` oder mit einem Tag in `BYDAY` | Teil einer Woche | Ein wöchentliches Zeitfenster, das sich über mehrere Tage erstrecken kann. |
+| `RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` | Teil eines Tages | Wöchentliche Zeitfenster für diese Tage. Bei `shifts_per_member` mit dem Wert 5 dauert der Dienst pro Mitglied eine Woche, beim Wert 10 zwei Wochen. |
+
+Solange das Ereignis läuft, bricht der Import in folgenden Fällen ab:
+
+| In PagerDuty | Grund |
+|---|---|
+| `every_member_assignment_strategy` mit mehreren Mitgliedern | Alle Mitglieder haben gleichzeitig Bereitschaft. In MoleSignal sieht ein Dienstplan jeweils nur ein Mitglied vor. Legen Sie in der Datei für jedes Mitglied einen Dienstplan mit eigenem Namen an und geben Sie alle diese Dienstpläne in derselben Stufe einer Eskalationsrichtlinie an. |
+| `empty_member` neben anderen Mitgliedern | Eine Rotation in MoleSignal kann keinen Dienst unbesetzt lassen. |
+| Ereignisse mit Überschneidungen | Die Mitglieder der betroffenen Ereignisse haben gleichzeitig Bereitschaft. Teilen Sie die Ereignisse wie bei Opsgenie auf separate Dienstpläne auf. |
+| `EXDATE` oder `RDATE` | Eine Rotation in MoleSignal kann keinen einzelnen Termin auslassen oder hinzufügen. PagerDuty dokumentiert nicht, ob solche Termine bei `shifts_per_member` mitzählen. |
+| Jede andere Regel, etwa `FREQ=MONTHLY`, `COUNT`, `UNTIL` oder ein `INTERVAL` mit einer Schicht, die kürzer als das Intervall ist | Die Wechsel oder Bereitschaftszeiten wiederholen sich nicht jede Woche zu denselben Zeiten. |
+| `BYDAY` mit mehreren Mitgliedern und einem Wert für `shifts_per_member`, der kein Vielfaches der Anzahl der Tage ist | Die Übergaben liegen nicht in festen Abständen: Auf die Schicht am Freitag folgt die Schicht am Montag. |
+| Eine bevorstehende benutzerdefinierte Schicht | Eine Rotation in MoleSignal kann keine einmalige Schicht abbilden. Führen Sie den Import nach Ablauf der Schicht aus oder entfernen Sie die Schicht aus `final_schedule` in der Datei und fügen Sie nach dem Import eine Ausnahme hinzu. |
+| Ereignisse in verschiedenen Zeitzonen | Ein Dienstplan in MoleSignal hat genau eine Zeitzone. |
+
+Wenn die Datei einen schichtbasierten Dienstplan nur unter `shift_based_schedules` aufführt, überspringt der Import diesen Dienstplan und nennt ihn im Ergebnis. Das kann etwa passieren, wenn das Skript den Dienstplan nicht abrufen konnte. Führen Sie das Skript erneut aus, um den Dienstplan zu übernehmen. Der Import verarbeitet den Rest der Datei weiterhin.
+
+Der Import übernimmt keine Ausnahmen, Eskalationsrichtlinien oder Services.
+
+## Ergebnis lesen
+
+| Bezeichnung | Bedeutung |
+|---|---|
+| **Erstellen**, **Aktualisieren**, **Unverändert** | Wie bei einem Bundle erfolgt die Zuordnung anhand des Namens. **Aktualisieren** nennt die Felder, die sich ändern. |
+| **Überspringen** | Der Import überspringt schichtbasierte PagerDuty-Dienstpläne, die die Datei nur namentlich aufführt, sowie vorhandene Dienstpläne, wenn **Nur neue Regeln erstellen; Regeln mit vorhandenem Namen unverändert lassen** ausgewählt ist. |
+| **Fehler** | Der Import bricht für die gesamte Datei ab. Das Ergebnis nennt jeden Grund in einer eigenen Zeile und listet alle E-Mail-Adressen ohne zugeordnetes Mitglied auf. |
+
+Die übrigen Zeilen unter einem Dienstplan geben an, was der Import auslässt und wie der Dienstplan im Vergleich zur Quelle abschneidet.
+
+### Vergleich mit der Quelle
+
+Die Datei enthält die von der Quelle berechneten Daten: `final_schedule` von PagerDuty und die Zeitleiste von Opsgenie. Der Testlauf berechnet ab dem aktuellen Zeitpunkt, welche Mitglieder im verbleibenden Zeitraum Bereitschaft haben, und vergleicht das Ergebnis mit der Quelle. Bei einer Abweichung meldet der Testlauf einen Fehler mit den betroffenen Zeiten und beiden Mitgliedern. Der Import schreibt keine Daten.
+
+- Der Import übernimmt keine Ausnahmen und vergleicht die betroffenen Zeiträume daher nicht.
+- Der Import bricht ab, wenn laut `final_schedule` mehrere Mitglieder eines schichtbasierten Dienstplans gleichzeitig Bereitschaft haben. Das gilt auch dann, wenn sich die Ereignisse nicht überschneiden.
+- Der Import übernimmt in Opsgenie deaktivierte Dienstpläne als pausiert und vergleicht sie nicht.
+- Wenn der Vergleichszeitraum in einer Zeitzone mit Sommerzeit keine Zeitumstellung umfasst, weist das Ergebnis darauf hin. In MoleSignal finden Übergaben weiterhin zur selben Ortszeit statt. Erhöhen Sie `DAYS`, um die Übergaben über die nächste Zeitumstellung hinweg zu vergleichen.
+- Wenn die Datei keinen berechneten Dienstplan enthält, meldet das Ergebnis, dass kein Vergleich stattgefunden hat. Der Import läuft weiter. Entfernen Sie `final_schedule` oder `timelines` aus der Datei, um einen Dienstplan zu importieren, der absichtlich von der Quelle abweicht.
+
+### Grenzen
+
+Eine Datei darf bis zu 4 MiB groß sein und bis zu 500 Dienstpläne enthalten. Ein Dienstplan kann bis zu 60 laufende Rotationen enthalten. Verringern Sie `DAYS`, wenn eine Datei zu groß ist.
+
+## Erneut importieren
+
+Der Import ordnet Dienstpläne anhand ihres Namens zu. Ein erneuter Import aktualisiert die Rotationen der Dienstpläne, die sich in der Quelle geändert haben, und lässt die übrigen unverändert. In MoleSignal eingerichtete Ausnahmen und Diensttausche bleiben erhalten. Das gilt auch für Einstellungen, die die Datei nicht enthält, etwa das Team oder **Diensttausche müssen genehmigt werden**.

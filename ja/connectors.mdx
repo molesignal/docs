@@ -1,0 +1,468 @@
+---
+title: "コネクター"
+sidebarTitle: "コネクター"
+description: "CloudWatch Logs、Kafka トピック、S3 オブジェクト、Amazon Data Firehose、Cloudflare Logpush、Heroku からログを取り込み、パイプラインの出力を S3、Kafka、または HTTP エンドポイントに送信します。"
+"en_link": "/en-US/connectors"
+"zh-Hans_link": "/zh-Hans/connectors"
+"zh-Hant_link": "/zh-Hant/connectors"
+"ko_link": "/ko/connectors"
+"de_link": "/de/connectors"
+"es_link": "/es/connectors"
+"fr_link": "/fr/connectors"
+"pt-BR_link": "/pt-BR/connectors"
+---
+
+**コネクター**は、外部プラットフォームとの連携を管理する仕組みです。コネクターには、取り込みと送信の2つの方向があります。
+
+- **ソース**は、別のサービスからログを取り込み、ストリームに書き込みます。MoleSignalは、CloudWatch Logs、Kafkaのトピック、S3のオブジェクトからスケジュールに従ってデータを取得します。Amazon Data Firehose、Cloudflare Logpush、Herokuは、ログをMoleSignalにプッシュします。
+- **送信先**は、[スケジュール実行されるパイプライン](/ja/pipelines#書き込み先とコネクターへの外部配信)の出力を受け取ります。Amazon S3、S3互換ストレージ、Apache Kafka、任意のHTTPエンドポイントを指定できます。
+
+| 種類 | コネクター | 方向 | 認証 |
+|---|---|---|---|
+| `aws_cloudwatch_logs` | AWS CloudWatch Logs | ソース、30秒ごとに取得 | [AWS認証情報](#aws-認証) |
+| `kafka_source` | Kafkaトピック | ソース、30秒ごとに取得 | なし、SASL、またはクライアント証明書 |
+| `s3_source` | S3オブジェクト | ソース、30秒ごとに取得 | AWS認証情報 |
+| `aws_kinesis_firehose` | Amazon Data Firehose | ソース、プッシュ | [プッシュトークン](#プッシュ型ソース) |
+| `cloudflare_logpush` | Cloudflare Logpush | ソース、プッシュ | プッシュトークン |
+| `heroku_drain` | Herokuログドレイン | ソース、プッシュ | プッシュトークン |
+| `s3` | Amazon S3 | 送信先 | AWS認証情報 |
+| `kafka` | Apache Kafka | 送信先 | なし、SASL、またはクライアント証明書 |
+| `http` | HTTP / Webhook | 送信先 | なし、Bearerトークン、Basic認証、カスタムヘッダー、またはHMAC署名 |
+
+## コネクターを作成する
+
+<Steps>
+  <Step title="コネクター画面を開く">
+    **パイプライン → コネクター**に移動します。このページには**ソース**と**送信先**が表示されます。
+  </Step>
+  <Step title="種類を選択する">
+    **新規コネクター**をクリックし、接続するサービスやエンドポイントの種類を選択します。
+  </Step>
+  <Step title="設定を入力する">
+    組織内で一意の**名前**を入力し、コネクターの読み取り元または送信先を指定して、**認証**方法を選択します。
+  </Step>
+  <Step title="接続をテストして作成する">
+    保存する前に**接続をテスト**をクリックして設定を確認し、**コネクターを作成**をクリックします。プッシュ型のソースにはMoleSignalから接続しないため、接続テストはありません。
+  </Step>
+</Steps>
+
+APIでは、コネクターを`name`、`kind`、`configJson`で表します。`configJson`に指定するキーは、種類によって異なります。`configJson`の`auth`で認証方法を指定します。指定するキーは認証方法ごとに異なります。必須キーがない場合、対になる認証情報の片方しかない場合、または指定した`auth`で使用しないキーがある場合、APIは保存時に`400`を返します。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "archive",
+        "kind": "s3",
+        "configJson": {
+          "bucket": "acme-logs",
+          "region": "eu-west-1",
+          "prefix": "pipelines/checkout/",
+          "auth": "assume_role",
+          "roleArn": "arn:aws:iam::123456789012:role/molesignal-delivery"
+        }
+      }'
+```
+
+## シークレット
+
+`configJson`の次のキーにシークレットを格納します。
+
+| 種類 | シークレットのキー |
+|---|---|
+| `s3`, `aws_cloudwatch_logs` | `accessKey`, `secretKey`, `sessionToken` |
+| `aws_kinesis_firehose`, `cloudflare_logpush`, `heroku_drain` | `pushToken` |
+| `kafka` | `saslPassword`, `tlsClientKey` |
+| `http` | `url`, `bearerToken`, `basicPassword`, `headerValue`, `hmacSecret` |
+
+APIはシークレットの値を返しません。レスポンスは値の代わりに`***`を返し、値が設定されているシークレットのキーを`secretKeys`に列挙します。
+
+```json
+{
+  "kind": "kafka",
+  "configJson": {
+    "brokers": "b-1.example.com:9096",
+    "topic": "logs",
+    "tls": true,
+    "auth": "sasl_scram_sha_512",
+    "saslUsername": "molesignal",
+    "saslPassword": "***"
+  },
+  "secretKeys": ["saslPassword"]
+}
+```
+
+- 更新時に`***`を送信すると、保存済みの値を維持します。認証情報を再入力せずに、コネクターの名前変更、無効化、接続先の変更ができます。UIで保存済みのシークレットの入力欄を空欄のままにすると、保存済みの値を維持します。
+- 更新リクエストに含めなかったシークレットは削除します。
+- `kind`を変更すると、保存済みのシークレットをすべて削除します。
+
+MoleSignalは、`MS_CIPHER_KEY`のルートキーを使用して、シークレットを他の設定とは別にAES-256-GCMで暗号化します。シークレットを平文で保存することはありません。プッシュ型のソースは、トークンのSHA-256ハッシュで特定します。ルートキーのローテーション時は、`molesignal rewrap-kek`で、コネクターのシークレットを他のシークレットとまとめて再暗号化します。[本番環境のチェックリスト](/ja/deployment/production-checklist)を参照してください。
+
+## ソース
+
+### プッシュ型ソース
+
+3 種類のプッシュ型ソースは、同じ仕組みを使います。**`pushToken`** と **`target_stream`** を指定してコネクターを作成し、対応するエンドポイントをプラットフォームに設定します。これらのエンドポイントは JWT を使用しません。リクエストの認証にはプッシュトークンを使用します。プラットフォームが対応する方法でトークンを渡します。
+
+| 方法 | 使用するプラットフォーム |
+|---|---|
+| `X-Connector-Token` ヘッダー | Cloudflare など、ヘッダーを設定できるプラットフォーム |
+| `X-Amz-Firehose-Access-Key` ヘッダー | Amazon Data Firehose（自動で送信） |
+| `?token=` クエリパラメーター | Heroku など、ヘッダーを設定できないプラットフォーム |
+
+UI でコネクターを作成すると、トークンが生成され、プラットフォームに設定するエンドポイントとともに一度だけ表示されます。トークンを後から確認することはできません。**新しいトークンを生成**を選択すると、コネクターの保存時にトークンが置き換わります。API では、16 文字以上の `pushToken` を指定してください。同じ種類のコネクターでは、1 つのトークンを 1 つのコネクターにのみ使用できます。使用済みのトークンを指定すると `409` が返ります。トークンがない場合や不明な場合、または対象のコネクターが無効な場合、リクエストには `401` が返ります。トークンのないコネクターはリクエストを受け付けません。
+
+`Content-Encoding: gzip` を指定して送信したリクエストボディは、自動で展開されます。イベントは他のデータと同じ取り込み経路を通り、スキーマオンライト、[パイプライン](/ja/pipelines)、[マスキング](/ja/security)がすべて適用されます。
+
+<Tabs>
+  <Tab title="Amazon Data Firehose">
+    `kind: "aws_kinesis_firehose"` を指定してコネクターを作成し、Firehose ストリームの送信先に **HTTP エンドポイント**を選択します。
+
+    - **HTTP エンドポイント URL**: `https://molesignal.example.com/api/v1/_kinesis_firehose`
+    - **アクセスキー**: プッシュトークンを指定します。Firehose はトークンを `X-Amz-Firehose-Access-Key` として送信します。
+
+    MoleSignal は各レコードを Base64 デコードし、改行で分割して各行を JSON として解析します。プレーンテキストの行は `message` フィールドに格納します。MoleSignal は、Firehose が受信確認に使用する `200` を返します。
+  </Tab>
+  <Tab title="Cloudflare Logpush">
+    `kind: "cloudflare_logpush"` を指定してコネクターを作成し、HTTP を送信先とする Logpush ジョブを作成します。Cloudflare は `header_` クエリパラメーターをリクエストヘッダーに変換するため、トークンは `X-Connector-Token` で送信されます。
+
+    ```text
+    https://molesignal.example.com/api/v1/_cloudflare?header_X-Connector-Token=<pushToken>
+    ```
+
+    Cloudflare は gzip 圧縮した NDJSON を送信します。各行が 1 件のイベントになります。エンドポイントは `204 No Content` を返します。
+  </Tab>
+  <Tab title="Heroku">
+    `kind: "heroku_drain"` を指定してコネクターを作成し、ログドレインを追加します。Heroku ではカスタムヘッダーを設定できないため、URL にトークンを含めます。
+
+    ```bash
+    heroku drains:add "https://molesignal.example.com/api/v1/_heroku?token=<pushToken>"
+    ```
+
+    ログの各行は、`message` と `source: "heroku"` を持つイベントになります。エンドポイントは `204 No Content` を返します。
+  </Tab>
+</Tabs>
+
+<Tip>
+  `target_stream` は初回のデータ受信時に作成されます。他のストリームと同様に、新しいフィールドが現れるとスキーマが更新されます。`target_stream` を省略すると、ソースごとのデフォルト値（`kinesis`、`cloudflare`、`heroku` のいずれか）が使われます。
+</Tip>
+
+### CloudWatch Logs
+
+CloudWatch Logs は**プル型**ソースです。MoleSignal はプッシュを受信する代わりに、30 秒ごとに `FilterLogEvents` を呼び出します。初回は直近 5 分間のログを読み取ります。2 回目以降は前回成功した処理の終了位置から再開するため、読み取りや書き込みに失敗したイベントは次回の実行で再度読み取ります。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "cw-prod",
+        "kind": "aws_cloudwatch_logs",
+        "configJson": {
+          "region": "ap-southeast-1",
+          "logGroup": "/aws/lambda/checkout",
+          "auth": "node_role",
+          "targetStream": "cloudwatch"
+        }
+      }'
+```
+
+| フィールド | 説明 |
+|---|---|
+| `region` / `logGroup` | 必須です。読み取り対象の CloudWatch リージョンとロググループを指定します。 |
+| `auth` とそのキー | 認証情報を指定します。対象のロググループに対する `logs:FilterLogEvents` 権限が必要です。[AWS 認証](#aws-認証)を参照してください。 |
+| `targetStream` | 送信先ストリームです。デフォルトは `default` です。 |
+
+1 つのコネクターを同時にポーリングするノードは 1 台だけです。`alert` ノードはコネクターを分担し、各ノードはポーリングを始める前に対象のコネクターの処理権を取得します。[アラートノード間の処理分担](/ja/deployment/role-based#アラートノード間の処理分担)を参照してください。各イベントは `message`、`log_stream`、`log_group` を持つログになります。無効なコネクターはポーリングしません。
+
+### Kafka トピック
+
+`kafka_source` コネクターは 30 秒ごとにトピックを読み取り、前回書き込みに成功した位置から再開します。コンシューマーグループには参加せず、パーティションを直接割り当て、オフセットを MoleSignal に保持します。そのため、必要なのはトピックの読み取り権限だけで、クラスターにコンシューマーグループは表示されません。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "orders",
+        "kind": "kafka_source",
+        "configJson": {
+          "brokers": "b-1.example.com:9096,b-2.example.com:9096",
+          "topic": "orders",
+          "tls": true,
+          "auth": "sasl_scram_sha_512",
+          "saslUsername": "molesignal",
+          "saslPassword": "<password>",
+          "targetStream": "orders",
+          "startFrom": "latest"
+        }
+      }'
+```
+
+| フィールド | 説明 |
+|---|---|
+| `brokers`、`topic`、`tls`、`tlsCaCert`、`auth` とそのキー | [Kafka の送信先](#apache-kafka)と同じです。 |
+| `targetStream` | 送信先ストリームです。デフォルトは `default` です。 |
+| `startFrom` | 初回の読み取り開始位置です。デフォルトの `latest` は以降に届くメッセージを、`earliest` はブローカーが保持するすべてのメッセージを読み取ります。後から追加されたパーティションは先頭から読み取ります。UI では**読み取り開始位置**です。 |
+
+- メッセージの値が JSON オブジェクトの場合、その各フィールドがログのフィールドになります。それ以外の値は `message` に格納します。各ログには `kafka_topic`、`kafka_partition`、`kafka_offset`、メッセージにキーがある場合は `kafka_key`、および `source` も含まれます。ログの時刻にはメッセージのタイムスタンプを使用します。
+- 1 回の読み取りでは、10,000 件のメッセージまたは 32 MiB のいずれかに達するまで読み取ります。未読のメッセージがあれば直ちに次の読み取りを開始し、1 回のプルで最長 2 分間続けます。
+- オフセットはログの書き込みが完了してから進みます。読み取りや書き込みに失敗した場合は、30 秒後に同じ位置から再試行します。そのため、メッセージが二重に書き込まれることはありますが、失われることはありません。保持期間の経過によりオフセットに対応するメッセージがブローカーに残っていない場合は、保持されている最も古いメッセージから再開します。
+- オフセットはトピックごとに管理するため、`topic` を変更すると `startFrom` で指定した位置から読み取りを開始します。
+
+### S3 オブジェクト
+
+`s3_source` コネクターは、AWS S3 または S3 互換ストレージのバケット内のオブジェクトを 30 秒ごとに一覧取得し、未読のオブジェクトを古い順に読み取ります。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "elb-logs",
+        "kind": "s3_source",
+        "configJson": {
+          "bucket": "acme-logs",
+          "region": "us-east-1",
+          "prefix": "AWSLogs/123456789012/",
+          "auth": "node_role",
+          "targetStream": "elb",
+          "startFrom": "latest"
+        }
+      }'
+```
+
+| フィールド | 説明 |
+|---|---|
+| `bucket`、`region`、`endpoint`、`virtualHostedStyle`、`auth` とそのキー | [S3 の送信先](#amazon-s3)と同じです。認証情報には、バケットに対する `s3:ListBucket` 権限と、オブジェクトに対する `s3:GetObject` 権限が必要です。 |
+| `prefix` | このプレフィックス配下のオブジェクトのみを読み取ります。プルのたびに配下のオブジェクトをすべて一覧取得するため、ソースごとに専用のプレフィックスを指定してください。 |
+| `targetStream` | 送信先ストリームです。デフォルトは `default` です。 |
+| `startFrom` | 初回の読み取り開始位置です。デフォルトの `latest` は開始時点の 5 分前以降に現れたオブジェクトを、`earliest` はプレフィックス配下のすべてのオブジェクトを読み取ります。UI では**読み取り開始位置**です。 |
+
+- オブジェクトは行単位で読み取ります。行が JSON オブジェクトの場合は、そのフィールドをログのフィールドにします。CloudTrail の出力のように `Records` のみを含む場合は、レコードごとにログを作成します。それ以外の行は `message` に格納します。拡張子が `.gz` または `.zst` のオブジェクトは、拡張子に応じて展開します。各ログには `s3_bucket`、`s3_key`、`source` も含まれます。ログの時刻にはオブジェクトの最終更新時刻を使用します。
+- 1 回のプルでは、オブジェクト 100 個またはログ 50,000 件のいずれかに達するまで読み取ります。未読のオブジェクトがあれば直ちに次の読み取りを開始し、最長 2 分間続けます。
+- 読み取り位置はログの書き込みが完了してから進みます。オブジェクトの取得に失敗すると、その位置でプルを中断し、30 秒後に再試行します。そのため、ログが二重に書き込まれることはありますが、失われることはありません。
+- 読み取れないオブジェクトを再試行すると後続の処理が止まるため、そのオブジェクトをスキップし、コネクターに表示します。対象は、破損している、サイズが 256 MiB を超える、展開後のサイズが 512 MiB を超える、ログが 100 万件を超える、または 64 MiB を超える行があるオブジェクトです。
+- オブジェクトは、キーと最終更新時刻を使い、5 分間の許容範囲を設けて識別します。この範囲内に同じキーで上書きされたオブジェクトは再読み取りしません。また、読み取り済みの最新オブジェクトよりも最終更新時刻が 5 分を超えて古いオブジェクトは読み取りません。S3 はマルチパートアップロードの開始時刻をオブジェクトの時刻として記録するため、完了に 5 分を超えるアップロードは読み取られないことがあります。
+
+### プルの状態を確認する
+
+コネクターのページには、ソースが最後にデータを受信した時刻が表示されます。前回の読み取りに失敗した場合は、時刻の横に警告が表示されます。理由は警告のツールチップとコネクターの設定で確認できます。最後にスキップした項目も設定に表示されます。API では、`readState` に `lastError` と `lastWarning`（それぞれ `atTime` と `text` を含む）に加え、現在の読み取り位置を示す `position` が含まれます。コネクターを保存しても、読み取り位置は維持されます。
+
+## 送信先
+
+送信先は、スケジュール済みパイプラインの各ステップを通過したすべてのイベントを受信します。**送信先を追加 → コネクター**を選択して、フローの**送信先**にコネクターを追加します。配信に失敗した場合は、同じ実行内で再試行します。それでもコネクターが受信できなかったイベントは、デッドレターストリームに送信します。[再試行とデッドレター](/ja/pipelines#再試行とデッドレター)を参照してください。
+
+オフにした送信先はイベントを受信しません。各実行では、そのコネクターをスキップし、実行結果の `warning` にコネクター名を記録します。スキップしたイベントは失敗としてカウントせず、デッドレターにもなりません。コネクターを再びオンにしても送信しません。エディターでは、オフにしたコネクターに**オフ**と表示します。
+
+| 種類 | ペイロード |
+|---|---|
+| `s3` | バッチごとに 1 つの JSON Lines オブジェクトを `s3://<bucket>/<prefix><id>.jsonl` に `PUT` します。 |
+| `kafka` | イベントごとに 1 つのメッセージをトピックに送信します。JSON ペイロードにはイベントを格納します。 |
+| `http` | バッチを NDJSON または 1 つの JSON 配列として送信します。通常は 1 リクエストで送信し、大きいバッチは複数のリクエストに分けます。 |
+
+### Amazon S3
+
+`s3` タイプは、MinIO、Cloudflare R2、Alibaba Cloud OSS などの S3 互換ストレージにも配信できます。エンドポイントを設定するには、UI で **S3 互換ストレージ**をオンにします。
+
+| フィールド | 補足 |
+|---|---|
+| `bucket` | 必須です。 |
+| `region` | バケットのリージョンです。S3 互換ストレージによっては不要です。 |
+| `prefix` | オブジェクト名は `<prefix><id>.jsonl` になります。プレフィックスの先頭に `/` があれば削除し、末尾になければ `/` を追加します。 |
+| `endpoint` | S3 互換ストレージの S3 API アドレスです。`http://` または `https://` で始まります。 |
+| `virtualHostedStyle` | `true` にすると、バケット名をパスではなくホスト名に含めます。Alibaba Cloud OSS などのストレージでは、この形式が必要です。UI: **バケット名をホスト名に含める**。 |
+| `auth` とそのキー | 認証情報です。対象のバケットに対する `s3:PutObject` 権限が必要です。[AWS 認証](#aws-認証)を参照してください。 |
+
+### Apache Kafka
+
+| フィールド | 補足 |
+|---|---|
+| `brokers` | 必須です。ホストとポートを指定します。複数指定する場合はカンマで区切ります。 |
+| `topic` | 必須です。 |
+| `tls` | `true` にすると、TLS で接続を暗号化します。ブローカーの TLS ポートに接続します。一般的なポートは 9093、9094、9096 です。UI: **TLS で接続を暗号化**。 |
+| `tlsCaCert` | ブローカーの証明書を発行したプライベート CA の PEM 証明書です。`tls` を有効にした場合にのみ使用します。指定しない場合は、システムの CA を信頼します。 |
+
+| `auth` | UI | キー | 補足 |
+|---|---|---|---|
+| `none` | **なし** | | 認証情報を要求しないブローカーに使用します。 |
+| `sasl_plain` | **SASL/PLAIN** | `saslUsername`, `saslPassword` | パスワードをそのまま送信します。TLS を使用しない場合は、プライベートネットワークでのみ使用してください。 |
+| `sasl_scram_sha_256` | **SCRAM-SHA-256** | `saslUsername`, `saslPassword` | パスワード自体はネットワーク経由で送信しません。 |
+| `sasl_scram_sha_512` | **SCRAM-SHA-512** | `saslUsername`, `saslPassword` | Amazon MSK が使用する認証方式です。 |
+| `mtls` | **クライアント証明書** | `tlsClientCert`, `tlsClientKey` | 相互 TLS です。`tls` が必要です。証明書と秘密鍵はどちらも PEM 形式で、秘密鍵は暗号化できません。 |
+
+TLS と SASL は併用できます。TLS 上で SCRAM を使用する場合は、`SASL_SSL` で接続します。
+
+### HTTP / Webhook
+
+| フィールド | 補足 |
+|---|---|
+| `url` | 必須です。`http://` または `https://` で始まる絶対 URL を指定します。URL のパスやクエリにキーなどの認証情報が含まれることがあるため、URL はシークレットとして保存します。レスポンスには、スキーム、ホスト、ポートのみで構成する `urlOrigin` だけを表示します。ユーザー名やパスワードを含む URL は受け付けません。`basic` を使用してください。 |
+| `method` | `post`（デフォルト）または `put` です。 |
+| `format` | `ndjson`（デフォルト）は、1 行につき 1 イベントを `application/x-ndjson` として送信します。`json` は、1 つの JSON 配列を `application/json` として送信します。 |
+
+| `auth` | UI | キー | リクエスト |
+|---|---|---|---|
+| `none` | **なし** | | 認証情報はありません。 |
+| `bearer` | **Bearer トークン** | `bearerToken` | `Authorization: Bearer <token>` |
+| `basic` | **Basic 認証** | `basicUsername`, `basicPassword` | HTTP Basic 認証です。`https` 経由で使用してください。 |
+| `header` | **カスタムヘッダー** | `headerName`, `headerValue` | `X-API-Key` や `DD-API-KEY` など、指定した名前のヘッダーに値を設定します。 |
+| `hmac` | **HMAC 署名** | `hmacSecret` | リクエストボディの署名です。シークレットは 16 文字以上にしてください。 |
+
+配信時に自動で設定する次のヘッダーは、カスタムヘッダーとして指定できません。`Host`、`Content-Type`、`Content-Length`、`Content-Encoding`、`Transfer-Encoding`、`Connection`、`X-MoleSignal-Timestamp`、`X-MoleSignal-Sign`。
+
+配信には次のルールが適用されます。
+
+- 4 MiB を超えるバッチは複数のリクエストに分割します。4 MiB を超えるイベントは、単独のリクエストで送信します。
+- `2xx` ステータスはすべて配信成功として扱います。それ以外のステータスはすべて配信失敗として扱います。リダイレクトも配信失敗とし、リダイレクト先には接続しません。
+- リクエストは 30 秒でタイムアウトします。
+- MoleSignal はリクエストの送信前にホスト名を解決し、解決結果のアドレスにのみ接続します。クラウドメタデータサービスが応答する次のアドレスは、URL に直接含まれていても DNS の解決結果に含まれていても拒否します。`169.254.0.0/16`、`fe80::/10`、`fd00:ec2::254`、`100.100.100.200`。その他のプライベートアドレスは許可します。
+
+#### HMAC 署名を検証する
+
+`hmac` を使用すると、すべてのリクエストに 2 つのヘッダーを付与します。
+
+| ヘッダー | 内容 |
+|---|---|
+| `X-MoleSignal-Timestamp` | リクエスト時刻を Unix 時間の秒単位で表した値です。 |
+| `X-MoleSignal-Sign` | `sha256=<hex>` 形式の署名です。共有シークレットを使って `<timestamp>.<body>` の HMAC-SHA256 を計算した値です。 |
+
+リクエストを検証するには、タイムスタンプ、`.`、リクエストボディの生バイト列を順に連結し、同じシークレットで HMAC-SHA256 を計算します。計算結果と署名を定数時間で比較してください。傍受されたリクエストの再送を防ぐため、現在時刻より数分以上古いタイムスタンプは拒否してください。
+
+```python
+import hashlib
+import hmac
+import time
+
+
+def verify(secret: bytes, timestamp: str, signature: str, body: bytes, tolerance: int = 300) -> bool:
+    if abs(time.time() - int(timestamp)) > tolerance:
+        return False
+    signed = timestamp.encode() + b"." + body
+    expected = "sha256=" + hmac.new(secret, signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+```
+
+## AWS 認証
+
+S3 と CloudWatch Logs は、次の 5 つの方法のいずれかで AWS に認証します。
+
+| `auth` | UI | キー | 認証情報 |
+|---|---|---|---|
+| `access_key` | **アクセスキー** | `accessKey`, `secretKey` | IAM ユーザーの長期アクセスキーです。 |
+| `temporary_key` | **一時キー** | `accessKey`, `secretKey`, `sessionToken` | AWS STS が発行する有効期間の短いキーです。対応するセッショントークンと組み合わせた場合にのみ有効です。有効期限が切れる前に交換してください。 |
+| `node_role` | **ノード ID** | | MoleSignal が稼働するノードの ID です。キーは保存しません。 |
+| `assume_role` | **ロールの引き受け** | `roleArn`、オプションで `accessKey` と `secretKey` | 組織の外部 ID を使って AWS STS 経由で引き受けるロールです。 |
+| `web_identity` | **ウェブ ID** | `roleArn` | ノードのウェブ ID トークンを使って引き受けるロールです。 |
+
+`auth` を指定しない場合は、保存済みのキーに基づいて認証方式を決定します。アクセスキーがあれば `access_key`、`roleArn` があれば `assume_role`、どちらもなければ `node_role` として扱います。`roleArn` の形式は `arn:aws:iam::<account>:role/<name>` です。
+
+### ノード ID
+
+`node_role` は、AWS SDK がノード上で検出する ID を使用します。該当するのは、EKS のサービスアカウント用 IAM ロール（IRSA）または EKS Pod Identity、ECS タスクロール、EC2 インスタンスプロファイルです。コネクターは、`AWS_ACCESS_KEY_ID` など、ノードの環境変数に設定した静的キーを使用しません。
+
+<Warning>
+  ノード ID とそのウェブ ID トークンはデプロイメントに属します。デプロイメント内のすべての組織が `node_role` と `web_identity` を選択できるため、どの組織のコネクターも、ノード ID でアクセスできるリソースにアクセスでき、ノードのトークンを信頼するすべてのロールを引き受けられます。すべての組織に許可してよいアクセス権限のみを付与してください。
+</Warning>
+
+### ロールの引き受け
+
+`assume_role` は、ロールの有効期間が 1 時間のキーを AWS STS にリクエストし、有効期限の 5 分前に更新します。ロールの引き受けには、元の認証情報としてノード ID を使用します。AWS 上で稼働しないデプロイメントでは、**ノードの ID ではなくアクセスキーでロールを引き受ける**を選択し、IAM ユーザーのキーを入力してください。
+
+各組織は、組織固有の外部 ID `molesignal-<organization ID>` を使用してロールを引き受けます。この ID は変更できません。フォームの **外部 ID** に表示され、`GET /api/v1/connectors/aws-external-id` でも取得できます。他の組織が ARN を知っていてもロールを引き受けられないように、ロールの信頼ポリシーで外部 ID を必須にしてください。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "AWS": "<ARN of the node role or IAM user>" },
+      "Action": "sts:AssumeRole",
+      "Condition": { "StringEquals": { "sts:ExternalId": "molesignal-<organization ID>" } }
+    }
+  ]
+}
+```
+
+セッション名は `molesignal-<connector ID>` で、AWS CloudTrail にもこの名前で表示されます。リクエストは、コネクターの `region` に対応するリージョン別 STS エンドポイントに送信します。リージョンが空の場合は `us-east-1` を、中国のリージョンでは `amazonaws.com.cn` ドメインを使用します。
+
+### ウェブ ID
+
+`web_identity` は、ノードの `AWS_WEB_IDENTITY_TOKEN_FILE` が示すパスにあるウェブ ID トークンを使用してロールを引き受けます。たとえば、EKS が IRSA 用にマウントするサービスアカウントトークンを使用できます。コネクターで別のファイルを指定することはできません。ロールの信頼ポリシーでは、トークンを発行する OIDC プロバイダーを信頼する必要があります。ノードに `AWS_WEB_IDENTITY_TOKEN_FILE` が設定されていない場合、コネクターは認証情報を取得できません。
+
+コネクターの `region` に対応するリージョン別 STS エンドポイントで、トークンを認証情報と交換します。ノードの環境に `AWS_ENDPOINT_URL_STS` が設定されている場合は、そのエンドポイントを使用します。IRSA から取得するノード ID にも同じルールが適用されます。
+
+## 接続のテスト
+
+**接続をテスト**では、保存前にフォームの現在の設定を試します。シークレットを空欄にすると、保存済みの値を使用します。コネクターの種類ごとに、配信または取得が可能かを確認するために必要な最小限の操作を実行します。
+
+| 種類 | テスト |
+|---|---|
+| `s3` | プレフィックス配下にオブジェクト `.molesignal-connection-test` を書き込み、ポリシーで許可されている場合は削除します。 |
+| `kafka` | ブローカーからトピックのメタデータを読み取り、接続、TLS、認証、およびトピックの存在を確認します。メッセージは書き込みません。 |
+| `http` | テスト用とマークしたイベントを 1 件送信します。`"message": "MoleSignal connection test"` と `"molesignal_connection_test": true` を含みます。 |
+| `aws_cloudwatch_logs` | ロググループの直近 1 分間のイベントを最大 1 件読み取ります。ストリームには何も書き込まず、読み取り位置も変更しません。 |
+| `kafka_source` | `kafka` と同様に、ブローカーからトピックのメタデータを読み取ります。メッセージは読み取らず、読み取り位置も変更しません。 |
+| `s3_source` | プレフィックス配下のオブジェクトを 1 件一覧取得し、認証情報と `s3:ListBucket` 権限を確認します。オブジェクトの内容は読み取らず、読み取り位置も変更しません。 |
+
+テストは 25 秒でタイムアウトします。API では、`POST /api/v1/connectors/test` にテスト対象の `kind` と `configJson` を指定します。同じ種類の保存済みコネクターの `id` を指定すると、`***` はそのコネクターに保存されているシークレットを表します。使用できない設定には、保存時と同様に `400` を返します。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors/test \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "id": "<connector id>",
+        "kind": "kafka",
+        "configJson": {
+          "brokers": "b-1.example.com:9096",
+          "topic": "logs",
+          "tls": true,
+          "auth": "sasl_scram_sha_512",
+          "saslUsername": "molesignal",
+          "saslPassword": "***"
+        }
+      }'
+```
+
+```json
+{ "ok": true, "code": "ok", "detail": null, "elapsedMs": 412 }
+```
+
+`elapsedMs` はテストの所要時間です。テストに失敗すると、`code` に原因が入り、`detail` に接続先からのメッセージが最大 600 文字で入ります。
+
+| `code` | 意味 |
+|---|---|
+| `ok` | 接続に成功しました。 |
+| `invalid` | 設定が無効か、コネクターが接続先を持たないプッシュソースです。 |
+| `no_credentials` | AWS 認証情報を取得できませんでした。ノードに ID がないか、指定した種類の ID がありません。 |
+| `denied` | 接続先が認証情報を拒否したか、その認証情報に要求された操作の権限がありません。 |
+| `not_found` | バケット、トピック、ロググループ、またはアドレスが存在しません。 |
+| `tls` | TLS ハンドシェイクに失敗しました。証明書を信頼できないか、証明書が提示されませんでした。 |
+| `unreachable` | ホストの名前を解決できなかったか、ホストに接続できませんでした。 |
+| `timeout` | 制限時間内に応答がありませんでした。 |
+| `failed` | その他のエラーが発生しました。 |
+
+## API
+
+| エンドポイント | 権限 | 用途 |
+|---|---|---|
+| `GET /api/v1/connectors` | `pipelines.read` | 組織のコネクターを一覧取得します。 |
+| `POST /api/v1/connectors` | `pipelines.edit` | コネクターを作成します。`enabled` のデフォルト値は `true` です。 |
+| `GET /api/v1/connectors/{id}` | `pipelines.read` | コネクターを取得します。 |
+| `PUT /api/v1/connectors/{id}` | `pipelines.edit` | `name`、`kind`、`configJson`、`enabled` を置き換えます。すべて必須です。 |
+| `DELETE /api/v1/connectors/{id}` | `pipelines.edit` | コネクターを削除します。 |
+| `POST /api/v1/connectors/test` | `pipelines.edit` | 保存前に設定をテストします。 |
+| `GET /api/v1/connectors/aws-external-id` | `pipelines.read` | 組織の外部 ID を `externalId` として返します。 |
+
+コネクターの取得結果には、`id`、`name`、`kind`、シークレットをマスクした `configJson`、`secretKeys`、`enabled`、`lastRunAt`、`readState`、`createdAt`、`updatedAt` が含まれます。
+
+## 権限
+
+`pipelines.read` では、コネクターの一覧と詳細、および外部 ID を取得できます。`pipelines.edit` では、コネクターの作成、更新、削除、テストができます。テストでは保存済みのシークレットを使用してリクエスト元に代わって別のシステムに接続するため、`pipelines.edit` が必要です。プッシュレシーバーはプッシュトークンで認証し、通常のログイン用 JWT では代用できません。
+
+<Card title="取り込み API" icon="plug" href="/ja/api/intake/kinesis">
+  Amazon Data Firehose、Cloudflare、Heroku のプッシュレシーバー用エンドポイントの詳細です。
+</Card>

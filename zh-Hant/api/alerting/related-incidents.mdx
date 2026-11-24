@@ -1,0 +1,129 @@
+---
+title: "相似事件與近期變更"
+description: "列出與該事件相似的過往事件，以及在該事件觸發前後回報的部署、設定和開關變更。"
+"en_link": "/en-US/api/alerting/related-incidents"
+"zh-Hans_link": "/zh-Hans/api/alerting/related-incidents"
+"ja_link": "/ja/api/alerting/related-incidents"
+"ko_link": "/ko/api/alerting/related-incidents"
+"de_link": "/de/api/alerting/related-incidents"
+"es_link": "/es/api/alerting/related-incidents"
+"fr_link": "/fr/api/alerting/related-incidents"
+"pt-BR_link": "/pt-BR/api/alerting/related-incidents"
+---
+
+兩個呼叫都需要該事件的 `alerts.incidents.read` 權限。
+
+## 相似事件
+
+```http
+GET /api/v1/alerts/incidents/{id}/similar
+```
+
+從同一組織在事件觸發前 90 天內建立的事件中，找出與該事件最相似的事件，最多 5 筆。分數較高的排在前面，同分時較新的排在前面。排除併入該事件的事件，以及該事件併入的事件。分數為下列各項的總和，至少 2 分才會列出：
+
+| 依據 | `reasons` 中的值 | 分數 |
+|---|---|---|
+| 相同的警示指紋 | `fingerprint` | 5 |
+| 相同的規則（指紋不同時） | `rule` | 3 |
+| 涉及的服務有重疊 | `services` | 重疊度 × 2 |
+| 標籤相近：相同的鍵值組占雙方全部鍵值組的比例至少為 0.3 | `labels` | 比例 × 2 |
+| 標題相近：三字元字串相似度至少為 0.3，計算方式與 PostgreSQL `pg_trgm` 相同，中文字元也納入計算 | `title` | 相似度 × 2 |
+| 指派給同一個團隊 | `team` | 1 |
+
+重疊度為兩者的交集除以聯集。
+
+<RequestExample>
+```bash cURL
+curl http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/similar \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "incidents": [
+    {
+      "id": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+      "summary": "High error rate · checkout",
+      "severity": "critical",
+      "status": "resolved",
+      "createdAt": 1789400000000000,
+      "resolvedAt": 1789401800000000,
+      "resolvedBy": "<user-id>",
+      "score": 7.6,
+      "reasons": ["fingerprint", "services", "labels", "team"],
+      "notes": 2,
+      "rootCause": "Connection pool exhausted after the payments client stopped releasing connections."
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| 欄位 | 說明 |
+|---|---|
+| `score`、`reasons` | 分數與計分依據，請見上表。 |
+| `resolvedBy` | 解決事件的使用者；規則自行恢復或尚未恢復時為 `null`。 |
+| `notes` | 該事件的[備註](/zh-Hant/api/alerting/add-incident-note)筆數。 |
+| `rootCause` | 該事件的 [AI 根因](/zh-Hant/api/alerting/incident-rca)正文中第一句描述事件的文字（略過標題與空白行），最長 200 字；沒有分析時省略。 |
+
+## 最近變更
+
+```http
+GET /api/v1/alerts/incidents/{id}/changes
+```
+
+依時間先後列出事件觸發前 30 分鐘至觸發後 10 分鐘內，事件涉及的服務（受影響的服務和 `service` 標籤）及其下游服務[回報的變更](/zh-Hant/apm/deployments#從-ci-回報發佈)，最多 20 筆。從 APM 服務地圖取得下游服務，最多查詢事件的前 3 個服務；沒有服務地圖時，只查詢事件本身的服務。若事件的規則在觸發前 24 小時內有變更，也會列出一筆 `rule`。
+
+<RequestExample>
+```bash cURL
+curl http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/changes \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "from": 1789998200000000,
+  "to": 1790000600000000,
+  "changes": [
+    {
+      "kind": "deployment",
+      "at": 1789999100000000,
+      "service": "payments",
+      "downstream": true,
+      "version": "v2026.10.28",
+      "status": "succeeded",
+      "commit": "9f2c1e4",
+      "author": "dana",
+      "link": "https://ci.example.com/pipelines/4821"
+    },
+    {
+      "kind": "rule",
+      "at": 1789960000000000,
+      "downstream": false,
+      "ruleId": "3KEDBLvTYO6DnWi8H9S9MNLpPT7",
+      "ruleName": "Checkout error rate"
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| 欄位 | 說明 |
+|---|---|
+| `from`、`to` | 查詢的時間範圍，以 Unix 微秒表示。 |
+| `kind` | `deployment`、`configuration`、`feature_flag`，或 `rule`（事件的規則有變更）。 |
+| `downstream` | 變更屬於下游服務，而非事件本身的服務時為 `true`。 |
+| `version`、`status`、`commit`、`description`、`author` | 回報時附帶的內容；未附帶的欄位會省略。 |
+| `link` | 回報的管線網址；若無，則使用合併請求的網址。 |
+| `ruleId`、`ruleName` | `rule` 變更所涉及的規則。 |
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `403` | 權杖缺少 `alerts.incidents.read` 權限，或無權存取此事件。 |
+| `404` | 事件不存在。 |

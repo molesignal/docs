@@ -1,0 +1,86 @@
+---
+title: "エグザンプラーのクエリ"
+description: "Prometheus のリモート書き込みサンプルとともに保存されたエグザンプラーを、Prometheus HTTP API のレスポンス形式で取得します。"
+"en_link": "/en-US/api/query/exemplars"
+"zh-Hans_link": "/zh-Hans/api/query/exemplars"
+"zh-Hant_link": "/zh-Hant/api/query/exemplars"
+"ko_link": "/ko/api/query/exemplars"
+"de_link": "/de/api/query/exemplars"
+"es_link": "/es/api/query/exemplars"
+"fr_link": "/fr/api/query/exemplars"
+"pt-BR_link": "/pt-BR/api/query/exemplars"
+---
+
+```http
+GET  /api/v1/prometheus/api/v1/query_exemplars
+POST /api/v1/prometheus/api/v1/query_exemplars
+```
+
+PromQL 式が選択した系列のエグザンプラーを、Prometheus HTTP API の `query_exemplars` エンドポイントと同じレスポンス形式で返します。**メトリクス**ページは、このエンドポイントからエグザンプラーを取得します。呼び出しには、`metrics.read`、またはシステムスコープでは `sys.telemetry.read` が必要です。
+
+エグザンプラーは [Prometheus リモート書き込み](/ja/intake#prometheus-remote_write)で受信し、サンプルと一緒に保持します。OTLP メトリクスはエグザンプラーを含めずに保存します。
+
+`GET` ではクエリ文字列で、`POST` ではフォーム（`application/x-www-form-urlencoded`）でパラメーターを渡します。
+
+| パラメーター | 必須 | 説明 |
+|---|---|---|
+| `query` | はい | PromQL 式です。式内の各セレクターでメトリクス名を指定する必要があります。 |
+| `start` | はい | Unix エポックからの経過秒数（小数可）、または RFC 3339 形式の時刻です。 |
+| `end` | はい | `start` と同じ形式です。`start` 以降の時刻を指定します。 |
+
+式のうち、結果に影響するのはセレクターだけです。各セレクターは、指定されたメトリクスの系列のうち、ラベルのマッチ条件を満たすものを選びます。関数、演算子、範囲の長さは結果に影響しません。リモート書き込みの再試行などで同じエグザンプラーを 2 回送信しても、結果には 1 回だけ含まれます。エグザンプラーは最大 10,000 件まで返し、上限に達するとレスポンスに警告を含めます。リクエストはクエリと同様に、[アドミッション制御](/ja/configuration#クエリの受付制御)で処理枠が空くまで待機します。レスポンスはキャッシュしません。
+
+[フィールドマスキング](/ja/settings/data-security#フィールドマスキング)は、系列のラベルとエグザンプラーのラベルに適用されます。Prometheus のレスポンス形式ではマスキングした値を表現できないため、`value` または `_timestamp` にマスキングルールが適用されると、リクエストは失敗します。
+
+<RequestExample>
+```bash cURL
+curl -G http://localhost:5080/api/v1/prometheus/api/v1/query_exemplars \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'query=histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{service="checkout"}[5m]))' \
+  --data-urlencode "start=$(( $(date +%s) - 3600 ))" \
+  --data-urlencode "end=$(date +%s)"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "status": "success",
+  "data": [
+    {
+      "seriesLabels": {
+        "__name__": "http_request_duration_seconds_bucket",
+        "le": "0.5",
+        "service": "checkout"
+      },
+      "exemplars": [
+        {
+          "labels": { "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7" },
+          "value": 0.43,
+          "timestamp": 1790000000.123
+        }
+      ]
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| フィールド | 説明 |
+|---|---|
+| `data[].seriesLabels` | 系列のラベルです。メトリクス名は `__name__` に入ります。 |
+| `data[].exemplars[]` | 指定範囲内の系列のエグザンプラーです。古い順に並びます。 |
+| `labels` | エグザンプラーのラベルです。`trace_id` や `span_id` などが含まれます。 |
+| `value` | エグザンプラーが記録した値です。 |
+| `timestamp` | Unix エポックからの経過秒数です。小数部を含みます。 |
+| `warnings` | エグザンプラーの返却件数が上限の 10,000 件に達した場合にのみ含まれます。 |
+
+**エラー**
+
+| ステータス | 原因 |
+|---|---|
+| `400` | `query` が空か有効な PromQL ではない、メトリクス名の指定がないセレクターがある、時刻がどちらの形式にも一致しない、または `end` が `start` より前です。 |
+| `403` | トークンに `metrics.read` がないか、マスキングルールが `value` または `_timestamp` に適用されています。 |
+| `429` | [アドミッション制御](/ja/configuration#クエリの受付制御)がリクエストを拒否しました。 |
+
+これらのエラーは、Prometheus の形式ではなく、他のエンドポイントと同じ[エラーレスポンスの本文形式](/ja/api-reference#レスポンスとエラー)で返します。

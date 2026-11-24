@@ -1,0 +1,152 @@
+---
+title: "Connexion via un client de base de données"
+description: "Interrogez MoleSignal via Arrow Flight SQL avec DBeaver, JDBC ou ADBC."
+"en_link": "/en-US/query/database-clients"
+"zh-Hans_link": "/zh-Hans/query/database-clients"
+"zh-Hant_link": "/zh-Hant/query/database-clients"
+"ja_link": "/ja/query/database-clients"
+"ko_link": "/ko/query/database-clients"
+"de_link": "/de/query/database-clients"
+"es_link": "/es/query/database-clients"
+"pt-BR_link": "/pt-BR/query/database-clients"
+---
+
+MoleSignal expose un point de terminaison **Arrow Flight SQL** auquel les outils de base de données standard peuvent se connecter
+directement pour exécuter des requêtes SQL en lecture seule sur les données de télémétrie de l’organisation, sans code d’intégration HTTP. Les résultats
+transitent sous forme de lots d’enregistrements Arrow, nettement plus rapides à transférer que le JSON pour les grands ensembles de résultats.
+
+<Note>
+Flight SQL est un protocole basé sur gRPC. Les outils qui prennent uniquement en charge le protocole réseau PostgreSQL ou MySQL
+(`psql`, client en ligne de commande `mysql`, Navicat) ne peuvent pas se connecter. Utilisez plutôt DBeaver, le pilote JDBC Arrow Flight SQL
+ou un client ADBC.
+</Note>
+
+## Activer le point de terminaison
+
+Le service d’écoute est **désactivé par défaut**. Activez-le dans `config.toml`, puis redémarrez MoleSignal :
+
+```toml
+[flight_sql]
+enabled = true
+bind = "0.0.0.0"
+port = 5083
+# Default time window when the SQL carries no pruning hint (see below)
+default_lookback_hours = 24
+```
+
+Le port Flight SQL est distinct du port gRPC interne (5082). N’exposez que le port 5083 aux
+réseaux clients et gardez le port 5082 interne au cluster. Pour TLS, effectuez la terminaison sur un ingress compatible avec gRPC.
+
+## Authentification
+
+Flight SQL s’appuie sur le système d’authentification de MoleSignal. L’échange standard d’authentification de base accepte
+deux types d’identifiants :
+
+| | Nom d’utilisateur | Mot de passe | Usage recommandé |
+|---|---|---|---|
+| **Connexion au compte** | adresse e-mail du compte | mot de passe du compte | usage interactif (DBeaver, requêtes ponctuelles) |
+| **Jeton d’API** | valeur quelconque (utilisez `token`) | jeton `mspat-...` | automatisation, scripts, services de BI |
+
+La connexion au compte suit le processus d’authentification de l’interface web et émet un jeton de session (JWT) de courte durée.
+L’authentification par jeton d’API utilise directement le jeton fourni. Les clients peuvent aussi envoyer un en-tête d’autorisation Bearer
+au lieu d’utiliser l’authentification de base. Les deux méthodes limitent l’accès à une seule organisation et n’exposent
+que les flux et les données de cette organisation.
+
+**Choisir une organisation** (comptes rattachés à plusieurs organisations) : comme pour la connexion web, la
+première organisation est sélectionnée par défaut. Pour en sélectionner une autre, ajoutez `@<org>` au nom d’utilisateur, par exemple
+`alice@example.com@acme`, où `acme` correspond au nom, au slug ou à l’identifiant de l’organisation.
+
+<Warning>
+Les clients de base de données enregistrent les mots de passe dans les profils de connexion, les URL JDBC et les scripts. La
+surface d’exposition est donc bien plus grande qu’avec un jeton à portée limitée. **Utilisez les mots de passe de compte uniquement pour les sessions
+interactives. Utilisez toujours un jeton d’API `mspat-` pour l’automatisation**. Un jeton d’API peut être révoqué, peut avoir
+une date d’expiration et ne donne accès qu’à une seule organisation. Créez un jeton dans **Paramètres du compte → Jetons d’API** ou via
+[`POST /api/v1/me/api-tokens`](/fr/api/auth/issue-token).
+</Warning>
+
+Autres points à connaître :
+
+- **Comptes SSO** : les comptes qui utilisent exclusivement OIDC ou SAML n’ont pas de mot de passe local. La connexion au compte est donc impossible.
+  Utilisez plutôt un jeton d’API.
+- **Comptes avec authentification multifacteur** : les clients de base de données ne permettent pas de saisir le code. La
+  connexion échoue donc. Utilisez plutôt un jeton d’API. Consultez
+  [Authentification multifacteur](/fr/identity/mfa).
+- **Espaces de travail soumis à des exigences de connexion** : lorsqu’un espace de travail
+  [exige l’authentification multifacteur ou n’autorise que l’authentification unique](/fr/identity/sso#exigences-de-connexion),
+  le serveur refuse la connexion au compte et rejette la prochaine requête des clients déjà connectés. Utilisez plutôt
+  un jeton d’API.
+- **Trop de mots de passe incorrects** : la connexion au compte est soumise aux mêmes
+  [limites de connexion](/fr/settings/platform#limites-de-connexion) que la connexion web. Dès qu’une limite est atteinte, le serveur
+  renvoie `RESOURCE_EXHAUSTED`. DBeaver se reconnecte avec les identifiants enregistrés. Un ancien mot de passe peut donc
+  entraîner le blocage de l’adresse. Mettez à jour le mot de passe enregistré, puis attendez la fin du blocage.
+- **Expiration de la session** : le JWT émis à la connexion au compte expire après le délai défini par
+  `[auth].session_ttl_secs` sur le serveur. Les requêtes échouent alors avec `UNAUTHENTICATED`. DBeaver se reconnecte automatiquement avec
+  les identifiants enregistrés, sans interrompre l’usage interactif. Pour les scripts ADBC de longue durée,
+  utilisez plutôt un jeton d’API sans expiration.
+
+## DBeaver
+
+DBeaver Community n’inclut pas de pilote Flight SQL. Enregistrez le pilote JDBC Arrow Flight SQL
+une seule fois (environ une minute) :
+
+1. **Base de données → Gestionnaire de pilotes → Nouveau**
+2. Dans l’onglet **Bibliothèques**, cliquez sur **Ajouter un artefact** et collez
+   `org.apache.arrow:flight-sql-jdbc-driver:RELEASE`, puis cliquez sur **Télécharger/Mettre à jour**
+   (ou cliquez sur **Ajouter un fichier** et sélectionnez le fichier JAR du pilote téléchargé localement)
+3. Revenez à l’onglet **Paramètres** : Nom du pilote `Arrow Flight SQL`, Nom de la classe
+   `org.apache.arrow.driver.jdbc.ArrowFlightJdbcDriver`, Modèle d’URL
+   `jdbc:arrow-flight-sql://{host}:{port}/?useEncryption=false`
+4. **Nouvelle connexion** → sélectionnez le pilote qui vient d’être créé → Hôte : serveur MoleSignal, Port : `5083`
+5. Nom d’utilisateur : adresse e-mail du compte (éventuellement `email@org`), Mot de passe : mot de passe du compte, ou
+   Nom d’utilisateur `token` / Mot de passe `mspat-...`
+
+Le navigateur affiche un catalogue (`molesignal`), quatre schémas (`logs`, `metrics`, `traces`,
+`extend`) et les flux de l’organisation active sous forme de tables.
+
+## JDBC
+
+```text
+jdbc:arrow-flight-sql://molesignal.example.com:5083/?useEncryption=false&user=token&password=mspat-...
+```
+
+Artefact du pilote : `org.apache.arrow:flight-sql-jdbc-driver`.
+
+## Python (ADBC)
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+conn = flightsql.connect(
+    "grpc://molesignal.example.com:5083",
+    db_kwargs={"username": "token", "password": "mspat-..."},
+)
+cur = conn.cursor()
+cur.execute("SELECT level, count(*) AS n FROM logs.nginx GROUP BY level")
+print(cur.fetch_arrow_table())   # or fetchall() / .fetch_df()
+```
+
+## Écrire des requêtes
+
+- **Qualifiez les noms de table avec le type de flux** : `logs.nginx`, `metrics.cpu_usage`,
+  `traces.checkout`, `extend.lookup_table`. Un nom non qualifié utilise `logs` par défaut. Les noms
+  entièrement qualifiés qui incluent le catalogue (`molesignal.logs.nginx`, le format que DBeaver génère
+  lors de la consultation des tables) fonctionnent aussi.
+- **Lecture seule** : le serveur rejette `INSERT` / `UPDATE` / `DELETE` / DDL.
+- **Flux d’audit** : l’accès à `logs._audit` nécessite l’autorisation `audit.read`. Consultez [Flux d’audit](/fr/settings/data-security#flux-d’audit).
+- **Fenêtre temporelle** : Flight SQL n’a pas de paramètre de plage temporelle. Pour éliminer les partitions hors plage, le serveur examine
+  les `default_lookback_hours` dernières heures (24 h par défaut). Un filtre sur `_timestamp` dans
+  la clause `WHERE` s’applique toujours dans cette fenêtre. Pour interroger des données plus anciennes, augmentez
+  `default_lookback_hours` ou utilisez l’[API de requête HTTP](/fr/api/query/execute), qui accepte
+  une plage temporelle explicite.
+- Le serveur renvoie `_timestamp` sous forme de colonne d’horodatage avec une précision à la microseconde.
+
+## Limitations
+
+- Les requêtes préparées fonctionnent, mais **la liaison des paramètres n’est pas prise en charge**. Insérez directement les valeurs littérales.
+- Le moteur fonctionne en lecture seule et ne prend pas en charge les transactions.
+- Flight SQL ne prend pas en charge PromQL. Utilisez l’API HTTP pour PromQL.
+- Le schéma du résultat dans `FlightInfo` est vide. Les clients lisent le schéma dans le flux de données
+  (DBeaver et ADBC le font automatiquement).
+
+Les requêtes Flight SQL en cours d’exécution apparaissent dans `GET /api/v1/query/running`. Annulez-les avec
+`POST /api/v1/query/{id}/cancel`, comme pour toute requête HTTP.

@@ -1,0 +1,79 @@
+---
+title: "Enviar alertas"
+description: "Activa, confirma o resuelve alertas desde un sistema externo."
+"en_link": "/en-US/api/alerting/send-alerts"
+"zh-Hans_link": "/zh-Hans/api/alerting/send-alerts"
+"zh-Hant_link": "/zh-Hant/api/alerting/send-alerts"
+"ja_link": "/ja/api/alerting/send-alerts"
+"ko_link": "/ko/api/alerting/send-alerts"
+"de_link": "/de/api/alerting/send-alerts"
+"fr_link": "/fr/api/alerting/send-alerts"
+"pt-BR_link": "/pt-BR/api/alerting/send-alerts"
+---
+
+```http
+POST /api/v1/intake/alerts
+```
+
+Un sistema externo hace la solicitud con el token de una [fuente de alertas](/es/alerting/sources): en el encabezado `Authorization: Bearer <token>` o, si no puede configurar encabezados, mediante `?token=<token>` en la dirección. Todas las fuentes comparten esta dirección. El token identifica la fuente a la que pertenece la alerta, y el tipo de fuente determina el formato en que se interpreta el cuerpo. [Configura el sistema emisor](/es/alerting/sources#configura-el-emisor) describe el formato de cada emisor (una fuente de correo electrónico lee un mensaje sin procesar con `Content-Type: message/rfc822`). Esta página describe el cuerpo para el tipo **API**. El cuerpo no puede superar los 4 MiB.
+
+El cuerpo contiene un objeto de alerta o un arreglo de hasta 100 objetos. La API rechaza los campos desconocidos.
+
+| Campo | Tipo | Descripción |
+|---|---|---|
+| `action` | cadena | `trigger` (valor predeterminado), `acknowledge` o `resolve`. |
+| `dedupKey` | cadena | Clave de deduplicación dentro de la fuente, de hasta 255 caracteres. Cada clave admite como máximo un incidente activo a la vez. Es obligatoria para `acknowledge` y `resolve`. Si un `trigger` no incluye la clave, la API la calcula a partir de `summary` y `labels` y la devuelve en la respuesta. |
+| `summary` | cadena | Título del incidente, de hasta 1024 caracteres. Es obligatorio para `trigger`. |
+| `severity` | cadena | `critical`, `error`, `warning` o `info`. Si no especificas un valor, se aplica la gravedad predeterminada de la fuente. |
+| `priority` | cadena | Prioridad del incidente, de `P1` a `P9` (también de `1` a `9`). Si el valor queda fuera de los niveles de la organización, se aplica el nivel más bajo. Si no especificas un valor, el incidente queda sin prioridad. |
+| `urgency` | cadena | Urgencia del incidente. Usa la clave de uno de los niveles de la organización, como `high` o `low`. La API ignora las claves desconocidas. Si no especificas un valor, la política de escalamiento de la fuente determina la urgencia. En ese caso, una alerta sin `severity` tiene urgencia `high`. |
+| `labels` | objeto | Hasta 64 etiquetas. Las claves no pueden empezar con `alert.` ni `__molesignal`, ni ser `external.kind`. |
+| `annotations` | objeto | Anotaciones. Admiten hasta 64 en total, incluidos los enlaces. |
+| `links` | arreglo | Hasta 10 enlaces con el formato `{"name": "…", "url": "https://…"}`. La API los guarda como anotaciones usando `name` como clave. Si un enlace no tiene `name`, la API usa `link`. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/alerts \
+  -H "authorization: Bearer $SOURCE_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"dedupKey": "disk-full/web-1", "summary": "Disk almost full on web-1", "severity": "critical", "labels": {"host.name": "web-1"}, "links": [{"name": "Runbook", "url": "https://wiki.example.com/disk"}]}'
+```
+</RequestExample>
+
+La respuesta muestra el resultado de cada alerta en el mismo orden. Si la API pudo leer el cuerpo pero no encontró ninguna alerta que procesar, `message` explica por qué no tomó ninguna medida. Esto ocurre, por ejemplo, con un evento de prueba de PagerDuty.
+
+<ResponseExample>
+```json 200
+{
+  "alerts": [
+    {
+      "dedupKey": "disk-full/web-1",
+      "outcome": "opened",
+      "incidentId": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+      "reason": null
+    }
+  ],
+  "message": null
+}
+```
+</ResponseExample>
+
+| `outcome` | Significado |
+|---|---|
+| `opened` | Se abrió un incidente nuevo. |
+| `updated` | Cambió la gravedad del incidente activo o cambiaron las alertas de su grupo de notificaciones. |
+| `unchanged` | El incidente activo ya estaba en ese estado o alguien ya lo había confirmado. |
+| `acknowledged` | Se confirmó el incidente. |
+| `resolved` | Se resolvió el incidente, incluso si ya estaba confirmado. |
+| `ignored` | No hubo cambios. `reason` indica el motivo, por ejemplo, que no había ningún incidente activo o que el mensaje era anterior al último recibido. |
+
+**Errores**
+
+| Estado | Causa |
+|---|---|
+| `400` | La API no puede leer el cuerpo. `message` indica el motivo. |
+| `401` | Falta el token, el token no es válido o la fuente no existe. |
+| `403` | La organización está deshabilitada. |
+| `409` | La fuente está desactivada. |
+| `413` | El cuerpo supera los 4 MiB. |
+| `503` | La API no puede conectarse al clúster receptor de la fuente o no pudo procesar la solicitud por completo. Vuelve a intentarlo: el reintento no abrirá el mismo incidente dos veces. |

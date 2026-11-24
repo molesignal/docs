@@ -1,0 +1,59 @@
+---
+title: "編輯保留期限與設定"
+description: "設定資料流的資料保留時間，並修改資料流的設定。"
+"en_link": "/en-US/api/streams/edit-retention"
+"zh-Hans_link": "/zh-Hans/api/streams/edit-retention"
+"ja_link": "/ja/api/streams/edit-retention"
+"ko_link": "/ko/api/streams/edit-retention"
+"de_link": "/de/api/streams/edit-retention"
+"es_link": "/es/api/streams/edit-retention"
+"fr_link": "/fr/api/streams/edit-retention"
+"pt-BR_link": "/pt-BR/api/streams/edit-retention"
+---
+
+```http
+PUT /api/v1/streams/{id}/settings
+```
+
+更新資料串流的保留期限與設定時，只傳送需要修改的屬性。這項呼叫需要 `streams.configure` 權限。修改 `_audit` 資料串流還需要 `audit.read` 權限，若無此權限則傳回 `403`。修改 `_molesignal` 系統資料串流需要 `sys.telemetry.manage` 權限，且只能修改保留期限、欄位索引、擷取、遮罩與降取樣設定。
+
+**請求本文**
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `retentionDays` | integer 或 `null` | 1 到 3650 天。`null` 會清除明確設定的值，資料串流會沿用 **設定 → 資料保留** 中的平台預設值。超出範圍會傳回 `400`。 |
+| `settings` | object | 資料串流設定，請見下文。 |
+| `fields` | array | 欄位索引，請參閱[設定欄位索引](/zh-Hant/api/streams/edit-schema)。 |
+
+設定：
+
+| 設定 | 說明 |
+|---|---|
+| `description` | 顯示在網頁介面上的自由格式文字。 |
+| `queryable` | 設為 `false` 時，資料串流仍會接收並保留資料，但不會顯示在查詢選擇器中。查詢會失敗並傳回 `403`（`stream is not queryable`）。 |
+| `maxQueryRangeHours` | 單次 SQL 或 PromQL 查詢可涵蓋此資料串流的最大小時數，範圍為 1 到 87600。查詢的時間範圍超過上限時會傳回 `400`。`null` 表示不限制。 |
+| `fieldMasking` | 在資料串流層級覆寫全域[欄位遮罩](/zh-Hant/settings#資料安全)規則。 |
+| `indexPatterns` | 最多可設定 32 條規則，在欄位首次出現時依名稱選擇索引，例如 `[{ "pattern": "*_id", "indexType": "exact" }]`。`*` 比對任意字串，`?` 比對單一字元。依規則順序，套用第一條名稱相符且 `indexType` 適用於欄位資料類型的規則。已依欄位名稱設定的索引優先。模式長度須為 1 到 128 個字元，且不得重複。請參閱[新欄位的索引](/zh-Hant/streams#新欄位的索引)。 |
+| `dailyMerge` | 僅適用於日誌與追蹤。設為 `true`（預設）時，每天結束一小時後，若當天的檔案總大小不超過 `[compactor].target_size`，就合併成一個檔案，保留期限也會按天套用。設為 `false` 時，保留按小時產生的檔案。 |
+| `partitions` | 僅適用於日誌與追蹤。最多可設定兩個分片欄位，例如 `[{ "field": "service", "type": "hash", "buckets": 4 }, { "field": "pod", "type": "prefix" }]`：`hash` 依欄位值的雜湊分成 `buckets` 個分片（2 到 64），`prefix` 依欄位值的第一個字元分成 37 個分片。後續寫入的資料會依這些欄位分片。各欄位的分片數相乘不得超過 256，且兩個欄位不得相同。若欄位已定義在結構描述中，就必須是未加密的 `utf8` 欄位。空陣列（預設）表示不分片。請參閱[依欄位分片](/zh-Hant/streams#依欄位分片)。 |
+| `clustering` | 僅適用於日誌。`{ "fields": ["service", "level"], "interval": 60000000 }` 決定後續寫入的每個檔案中各資料列的順序：先依長度為 `interval` 微秒的時間區段排序，較新的區段在前；區段內先依 `fields` 的值排序，再依時間由新到舊排序。最多可設定兩個欄位，且不得相同。若欄位已定義在結構描述中，就必須是未加密的 `utf8`、`int64` 或 `bool` 欄位。`interval` 須介於 1 秒到 1 小時之間，且能整除 1 小時，預設為 1 分鐘。未指定欄位（預設）時，資料列會依時間排序。請參閱[依欄位叢集化](/zh-Hant/streams#依欄位叢集)。 |
+| `indexChangedAt` | 唯讀。伺服器會記錄最近一次變更既有欄位索引類型的時間。對於在此之前建立索引的檔案，背景作業會依新設定重建索引。 |
+| `downsample` | 僅適用於指標。`{ "afterDays": 7, "intervalSecs": 300 }` 會將超過 `afterDays` 天的樣本依每 `intervalSecs` 秒的時間區間彙總。同一時間序列在同一區間內的樣本會合併為一個資料點，數值取平均，增量計數取總和，接著刪除原始樣本。`afterDays` 的範圍為 0 到 3650，`0` 表示不降取樣（預設）。`intervalSecs` 不得小於 60，且須能整除一天的秒數。 |
+
+<RequestExample>
+```bash cURL
+curl -X PUT http://localhost:5080/api/v1/streams/$STREAM_ID/settings \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "retentionDays": 30,
+    "settings": { "description": "Application logs", "queryable": true }
+  }'
+```
+</RequestExample>
+
+回應會傳回更新後的資料串流。保留期限與降取樣設定決定 compactor 何時刪除或彙總資料。變更只會影響後續的清理作業，不會還原已刪除的檔案或樣本。
+
+未個別設定保留期限的資料串流會使用平台預設值。使用 `GET /api/v1/settings/stream_retention` 讀取預設值，使用 `PUT` 搭配相同的請求本文 `{ "retentionDays": 30 }` 修改預設值。兩者都需要系統範圍的 `sys.settings.retention.manage` 權限。`retentionDays` 必須是 1 到 3650 的整數。
+
+使用 `GET /api/v1/settings/stream_retention/preview?retentionDays=7` 估算縮短預設保留期限後會刪除哪些資料。所需權限與範圍相同。此呼叫只讀取檔案目錄，不讀取資料，因此回應會包含 `"estimated": true`。`rows`、`storedBytes` 和 `earliestAt` 分別表示僅因這次變更才會刪除的資料總列數、儲存位元組總數及最早時間。`streamCount` 是受影響的資料串流數量，`streams` 列出其中最大的 100 個資料串流及其所屬組織，`unavailableStreams` 是無法讀取目錄資訊的資料串流數量。估算不納入個別設定了保留期限的資料串流和資料集。若 `retentionDays` 大於或等於目前的預設值，各項皆為 0。工作階段重播和 Profile 封存也會依此設定清理，但不納入估算。

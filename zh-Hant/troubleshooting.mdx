@@ -1,0 +1,85 @@
+---
+title: "疑難排解"
+description: "常見的啟動失敗、請求遭拒、資料缺漏，以及查詢緩慢或改為非同步執行的原因與解決方法。"
+"en_link": "/en-US/troubleshooting"
+"zh-Hans_link": "/zh-Hans/troubleshooting"
+"ja_link": "/ja/troubleshooting"
+"ko_link": "/ko/troubleshooting"
+"de_link": "/de/troubleshooting"
+"es_link": "/es/troubleshooting"
+"fr_link": "/fr/troubleshooting"
+"pt-BR_link": "/pt-BR/troubleshooting"
+---
+
+請先查看處理程序的日誌：日誌會記錄啟動失敗的原因，遭拒絕的 HTTP 請求則會在回應主體中附上說明。日誌層級由 `[telemetry].log_level` 或 `RUST_LOG` 設定。
+
+## 啟動
+
+| 現象 | 原因 | 解決辦法 |
+|---|---|---|
+| `... password authentication failed for user` | DSN 中的使用者名稱或密碼有誤。 | 修正 `[meta_database].dsn`。 |
+| `... pool timed out while waiting for an open connection` | 節點無法連線至 PostgreSQL。 | 檢查主機、連接埠、防火牆及 `sslmode` 的要求。 |
+| `startup_ping put: ... SignatureDoesNotMatch` | 物件儲存拒絕了憑證。 | 檢查 `access_key` 與 `secret_key`，可透過 `MS_OBJECT_STORE_ACCESS_KEY` 與 `MS_OBJECT_STORE_SECRET_KEY` 設定。 |
+| `startup_ping put: ... NoSuchBucket` | 儲存貯體不存在。 | 建立儲存貯體，或修正 `[object_store].bucket`。 |
+| 反覆出現 `Encountered transport error`，隨後處理程序結束 | 無法連線至端點，或用戶端未收到憑證。 | 檢查 `endpoint`、DNS 與網路。憑證必須來自 `access_key` 與 `secret_key`。 |
+| `unknown field: found ...` | 採用嚴格檢查的設定區段中有拼字錯誤或不支援的鍵。 | 刪除或修正該鍵，請參閱[設定](/zh-Hant/configuration#如何載入設定)。 |
+| `MS_SELF_TELEMETRY_CLUSTER_TOKEN must be set when split-role self intake is enabled` | 啟用追蹤擷取或自我收集時，未配置 `intake` 角色的分角色節點在啟動時沒有共用權杖。 | 在每個節點上設定相同的權杖。追蹤擷取預設開啟，只關閉 `[telemetry.self_collect]` 並不足夠。 |
+| `open Probe CA key` | `MS_CIPHER_KEY` 與加密該資料庫的金鑰不一致。 | 還原原本的金鑰，請參閱[正式環境檢查清單](/zh-Hant/deployment/production-checklist)。 |
+| `migration ... was previously applied but is missing in the resolved migrations` 或 `... has been modified` | 執行檔與資料庫來自不相容的版本。 | 執行相容的版本，或還原備份，請參閱[升級](/zh-Hant/upgrade)。 |
+| `address already in use` | 其他處理程序已占用設定的連接埠。 | 變更連接埠。 |
+| `profiling.port and ... are both ...` | pprof 監聽程式與其他監聽程式使用相同的連接埠。 | 將 `[profiling].port` 改成其他監聽程式都未使用的連接埠。 |
+| 環境變數中的設定未生效 | 變數名稱含有句點、雙底線或拼字錯誤。 | 用單一底線連接路徑各段，例如 `MS_META_DATABASE_DSN`。 |
+
+## 登入
+
+| 現象 | 原因 | 解決辦法 |
+|---|---|---|
+| 使用 `admin@example.com` 搭配 `admin` 登入時遭拒 | 資料庫中已有使用者，系統不會再次建立 root 帳號；或 `root_email` 與 `root_password` 為空。 | 使用現有帳號登入。若要建立 root 帳號，請設定這兩項，再使用空白資料庫啟動。 |
+| 收不到密碼重設電子郵件 | 未設定 SMTP 或 `http.external_url`。系統會接受請求，但不會寄出郵件。 | 設定 `[notify.smtp].host` 與 `[http].external_url`。 |
+| 指令碼登入後傳送 `Authorization: Bearer`，卻收到 `401` | 登入只會為 Web 介面設定工作階段 Cookie，不會傳回權杖；此請求標頭僅接受 API 權杖。 | 為指令碼簽發 API 權杖，請參閱 [API 權杖](/zh-Hant/identity/tokens)。 |
+| Web 介面每天都要求重新登入 | 登入工作階段會在 `[auth].session_ttl_secs`（24 小時）後結束。 | 調高 `[auth].session_ttl_secs`。 |
+
+## 傳送資料
+
+| 現象 | 原因 | 解決辦法 |
+|---|---|---|
+| `401` | 缺少權杖、權杖無效，或請求標頭帶有登入工作階段的權杖。 | 傳送 `Authorization: Bearer <token>`，並使用預設的資料接收權杖或服務帳號權杖。 |
+| `403` | 權杖沒有 `logs.write` 權限，例如將 RUM 用戶端權杖傳送至資料接收路徑。 | 使用具備 `logs.write` 權限的權杖。 |
+| `413` | 請求主體超過端點上限：原生 JSON 接收端點為 16 MiB，其他端點為 2 MiB。 | 縮小批次，並將代理伺服器的限制設為不低於端點上限。 |
+| OTLP over HTTP 端點傳回 `400` | 傳送端壓縮了請求主體。 | 在 OpenTelemetry Collector 的匯出端設定 `compression: none`。 |
+| OTLP over HTTP 端點傳回 `404` | 匯出端的端點缺少 `/api` 基礎路徑，因此請求送到了 `/v1/logs`。 | 使用 `http://host:5080/api` 作為 OTLP 端點。 |
+| `429` 並帶有 `Retry-After` | 觸發 `router` 角色對該組織的速率限制。 | 降低傳送速率，或調高 `[router.rate_limit]`。 |
+| 原生 JSON 傳回 `rejected` 記錄 | 欄位值與資料流的結構描述不符，例如 `type mismatch on field level: expected Utf8, got Number`。回應會依索引列出原因。 | 傳送符合資料流現有欄位型別的值。 |
+| `400` 並顯示 `event #1 must be a JSON object` | 陣列中有不是 JSON 物件的元素，因此端點會拒絕整個請求。 | 傳送由物件組成的陣列。 |
+| Promtail 或 Grafana Alloy 無法推送 | Loki 端點只會解碼 JSON，但這些傳送端使用 snappy 壓縮的 protobuf。 | 改用 OpenTelemetry Collector、Vector 或 Fluent Bit 傳送。 |
+| 已收到記錄，但查不到 | 查詢使用了其他資料流名稱或類型，或查詢的時間範圍不涵蓋這些記錄。 | 檢查資料流名稱與訊號類型。若是時間戳記問題，請參閱下一節。 |
+
+## 資料缺失或異常
+
+- **時間戳記。** `_timestamp` 是自 Unix 紀元起算的微秒數。若以秒、毫秒或奈秒表示，事件就會落在錯誤的年份或遙遠的未來，查詢近期資料時便找不到這些事件。省略 `_timestamp` 時，系統會使用伺服器的接收時間。
+- **時間範圍。** 涵蓋較長時間範圍的查詢會轉為非同步工作。執行互動式查詢時，請使用有明確起訖時間的 `timeRange`，請參閱[查詢](/zh-Hant/query#時間範圍與非同步工作)。
+- **保留期限。** 系統會刪除超過資料流保留期限的資料。若未為資料流個別設定保留期限，系統會採用 **設定 → 資料保留** 中的平台預設值。
+- **訊號類型。** 資料流以名稱與類型共同識別，因此日誌、指標和追蹤這三種類型都可以各自有名為 `default` 的資料流。
+
+## 查詢
+
+| 現象 | 原因 | 解決辦法 |
+|---|---|---|
+| 回應為 `202`，並帶有 `jobId` 與 `monitor` 路徑 | 預估列數達到 `[querier].auto_async_threshold_rows`，系統會以非同步搜尋工作的方式執行查詢。預設設定下，這相當於約 13.9 小時或更長的時間範圍。 | 持續向 `monitor` 路徑發出請求，直到工作完成，再從該路徑下的 `/results` 取得結果；也可以縮小時間範圍，或傳送 `Prefer: respond-sync`。請參閱[查詢](/zh-Hant/query#時間範圍與非同步工作)。 |
+| Flight SQL 用戶端無法連線 | `[flight_sql]` 預設停用。 | 設定 `enabled = true`，開放 `5083` 連接埠，並使用 API 權杖進行驗證。 |
+
+## 維運
+
+| 現象 | 原因 | 解決辦法 |
+|---|---|---|
+| `GET /api/v1/healthz` 傳回 `503` | 無法連線至物件儲存，回應主體帶有 `reason`。 | 修復物件儲存的連線。 |
+| WAL 目錄持續增長 | 緩衝區寫入失敗，通常是因為無法連線至物件儲存。 | 修復物件儲存，intake 隨後會將積存的資料寫入儲存空間。 |
+| Intake 傳回 `429` 與 `intake buffer memory limit exceeded` | 處理程序的緩衝區記憶體用量超過 `[intake].max_buffer_memory_size`，通常是因為緩衝區持續寫入失敗。 | 查看 `intake flush failed` 日誌找出原因，並修復物件儲存或資料庫。確定無法發佈的資料列不再占用此額度（見下方兩列）。原生 JSON 接收端點會在此回應中附上 `Retry-After`，請依指定的時間重試。 |
+| 日誌出現 `dataset no longer exists; buffered rows discarded` | 資料流已刪除，或刪除後又重新建立，但原有的資料列仍在緩衝區中。由於這些資料列已無處可寫，intake 會捨棄這些資料列並釋放記憶體。計數器 `intake_flush_errors_total` 會依情況用 `stream_gone` 或 `dataset_gone` 這兩種 step 值之一記錄每次捨棄。 | 不需處理。若資料很重要，請重新傳送。 |
+| 寫入傳回 `503`，並帶有 `fenced by a newer writer epoch` | 另一個處理程序已用相同的 `[node].id` 發佈相同的資料集。遭隔離的處理程序無法發佈資料，會捨棄記憶體中的資料列並拒絕對該資料集的寫入，但 WAL 仍保留在磁碟上。計數器 `intake_flush_errors_total` 會以 `writer_fenced` 這個 step 值記錄隔離事件。 | 為每個處理程序設定唯一的 `[node].id`，並重新啟動遭隔離的處理程序。請參閱[分角色部署](/zh-Hant/deployment/role-based)。 |
+| 排程的 PDF 或 PNG 報告產生失敗 | 未安裝 Chrome，或無法透過 `[scheduled_reports.renderer].base_url` 存取 Web 介面。 | 使用內建 Chromium 的發行映像檔，並將 `base_url` 設為節點可存取的 Web 介面網址。 |
+| 資料接收程式碼片段顯示錯誤的主機 | 服務位於代理伺服器後方，且 `http.external_url` 為空。 | 將 `[http].external_url` 設為對外網址，再重新啟動。 |
+| 查詢傳回 `503` 與 `no querier node is available` | 沒有具備 `querier` 角色且近期送出心跳訊號的節點。 | 啟動 `querier` 節點，並確認 router 可連線至該節點的 `advertise_addr`。請參閱[分角色部署](/zh-Hant/deployment/role-based#叢集成員)。 |
+| 經由 router 寫入時傳回 `503` 與 `no intake node is available` | 沒有具備 `intake` 角色且近期送出心跳訊號的節點。 | 啟動 `intake` 節點，並檢查該節點的 `advertise_addr`。請參閱[分角色部署](/zh-Hant/deployment/role-based#叢集成員)。 |
+| 請求傳回 `503` 與 `no metadata database connection` | 節點等了 10 秒仍未取得 PostgreSQL 連線：PostgreSQL 過載或無法連線，或 `[meta_database].max_connections` 允許的連線已全部占用。 | 重試請求。若問題持續發生，請先檢查 PostgreSQL 的負載與連線狀態。若 PostgreSQL 仍有餘裕，可依負載調高 `[meta_database].max_connections`，但不得超過 PostgreSQL 的 `max_connections`。 |
+| 無法從主機存取 OTLP gRPC 連接埠 | Compose 檔案未對外開放 `4317` 連接埠。 | 新增 `4317:4317` 對應。 |

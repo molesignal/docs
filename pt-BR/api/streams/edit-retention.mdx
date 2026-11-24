@@ -1,0 +1,59 @@
+---
+title: "Editar retenção e configurações"
+description: "Defina por quanto tempo um fluxo armazena dados e altere suas configurações."
+"en_link": "/en-US/api/streams/edit-retention"
+"zh-Hans_link": "/zh-Hans/api/streams/edit-retention"
+"zh-Hant_link": "/zh-Hant/api/streams/edit-retention"
+"ja_link": "/ja/api/streams/edit-retention"
+"ko_link": "/ko/api/streams/edit-retention"
+"de_link": "/de/api/streams/edit-retention"
+"es_link": "/es/api/streams/edit-retention"
+"fr_link": "/fr/api/streams/edit-retention"
+---
+
+```http
+PUT /api/v1/streams/{id}/settings
+```
+
+Atualiza a retenção e as configurações de um stream. Envie apenas as propriedades que precisam mudar. A chamada exige `streams.configure` e, para o stream `_audit`, também exige `audit.read`. Sem essa permissão, a chamada retorna `403`. Nos streams de sistema `_molesignal`, a chamada exige `sys.telemetry.manage` e altera apenas a retenção, os índices de campos, a extração, o mascaramento e a redução de amostragem.
+
+**Corpo**
+
+| Campo | Tipo | Observações |
+|---|---|---|
+| `retentionDays` | inteiro ou `null` | De 1 a 3650 dias. `null` limpa o valor explícito, e o stream herda o padrão da plataforma em **Configurações → Retenção de dados**. Um valor fora desse intervalo faz a chamada retornar `400`. |
+| `settings` | objeto | Configurações do stream. Veja abaixo. |
+| `fields` | array | Índices de campos. Veja [Configurar índices de campos](/pt-BR/api/streams/edit-schema). |
+
+Configurações:
+
+| Configuração | Observações |
+|---|---|
+| `description` | Texto livre que aparece na interface web. |
+| `queryable` | `false` mantém o recebimento e a retenção de dados no stream, oculta o stream nos seletores de consulta e faz as consultas falharem com `403` (`stream is not queryable`). |
+| `maxQueryRangeHours` | Número máximo de horas que uma única consulta SQL ou PromQL ao stream pode abranger, de 1 a 87600. Uma consulta que excede esse intervalo retorna `400`. `null` remove o limite. |
+| `fieldMasking` | Regras de [mascaramento de campos](/pt-BR/settings#segurança-de-dados) do stream que substituem as regras globais. |
+| `indexPatterns` | Até 32 regras que indexam os campos quando aparecem pela primeira vez, como `[{ "pattern": "*_id", "indexType": "exact" }]`. `*` representa qualquer sequência de texto, e `?` representa um caractere. Um índice definido pelo nome do campo tem prioridade. Caso contrário, aplica-se a primeira regra da lista cujo padrão corresponde ao nome do campo e cujo `indexType` é compatível com o tipo de dado. Os padrões têm de 1 a 128 caracteres e devem ser distintos. Veja [Indexar novos campos](/pt-BR/streams#índice-de-novos-campos). |
+| `dailyMerge` | Apenas para logs e traces. `true`, o padrão, mescla os arquivos de um dia em um só, uma hora após o fim do dia, se o tamanho total não exceder `[compactor].target_size`. A retenção passa a valer por dia. `false` mantém os arquivos por hora. |
+| `partitions` | Apenas para logs e traces. Use até dois campos de particionamento, como `[{ "field": "service", "type": "hash", "buckets": 4 }, { "field": "pod", "type": "prefix" }]`: `hash` divide os dados pelo hash do valor em `buckets` fragmentos (de 2 a 64), e `prefix` os divide pelo primeiro caractere do valor em 37 fragmentos. A gravação de novos dados segue esse particionamento. O produto das quantidades de fragmentos não pode exceder 256, e os dois campos devem ser diferentes. Um campo que já existe no esquema deve ser do tipo `utf8` e não pode estar criptografado. A lista vazia, que é o padrão, desativa o particionamento. Veja [Particionar por campo](/pt-BR/streams#particionar-por-campo). |
+| `clustering` | Apenas para logs. `{ "fields": ["service", "level"], "interval": 60000000 }` ordena as linhas dentro de cada novo arquivo em fatias de tempo de `interval` microssegundos, das mais recentes para as mais antigas. Dentro de cada fatia, a ordenação usa primeiro os valores de `fields` e depois a data, da mais recente para a mais antiga. Use até dois campos distintos. Um campo que já existe no esquema deve ser do tipo `utf8`, `int64` ou `bool` e não pode estar criptografado. `interval` vai de um segundo a uma hora, deve dividir uma hora sem deixar resto e tem como padrão um minuto. Por padrão, sem campos, as linhas mantêm a ordem temporal. Veja [Agrupar por campo](/pt-BR/streams#agrupar-por-campo). |
+| `indexChangedAt` | Somente leitura. Indica quando o tipo de índice de um campo existente mudou pela última vez. O servidor define esse valor e reindexa em segundo plano os arquivos indexados antes desse momento. |
+| `downsample` | Apenas para métricas. `{ "afterDays": 7, "intervalSecs": 300 }` agrega amostras com mais de `afterDays` dias em intervalos de `intervalSecs` segundos. Em cada intervalo, as amostras de uma série viram um único ponto, com a média dos valores e a soma das contagens delta. O processo exclui as amostras originais. `afterDays` vai de 0 a 3650, e `0` desativa a redução de amostragem (padrão). `intervalSecs` deve ser de pelo menos 60 e dividir um dia sem deixar resto. |
+
+<RequestExample>
+```bash cURL
+curl -X PUT http://localhost:5080/api/v1/streams/$STREAM_ID/settings \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "retentionDays": 30,
+    "settings": { "description": "Application logs", "queryable": true }
+  }'
+```
+</RequestExample>
+
+A resposta contém o stream atualizado. A retenção e a redução de amostragem controlam quando o compactador remove ou agrega dados. Uma alteração afeta as limpezas futuras e nunca restaura arquivos ou amostras excluídos.
+
+Para consultar o padrão da plataforma para streams sem retenção própria, use `GET /api/v1/settings/stream_retention`. Para defini-lo, use `PUT` no mesmo caminho com o corpo `{ "retentionDays": 30 }`. Ambas as chamadas exigem `sys.settings.retention.manage` no escopo do sistema. `retentionDays` é um número inteiro de 1 a 3650.
+
+Use `GET /api/v1/settings/stream_retention/preview?retentionDays=7`, com a mesma permissão e o mesmo escopo, para estimar o que um padrão mais curto excluiria. A chamada lê apenas o catálogo de arquivos, sem acessar os dados, por isso a resposta inclui `"estimated": true`. `rows`, `storedBytes` e `earliestAt` resumem o que somente essa alteração removeria. `streamCount` informa quantos streams a alteração afetaria, `streams` lista os 100 maiores com os mesmos indicadores e a organização de cada um, e `unavailableStreams` conta os streams cujas entradas do catálogo a chamada não conseguiu ler. A estimativa não inclui streams nem conjuntos de dados com retenção própria. Se `retentionDays` for igual ou superior ao padrão atual, a chamada retorna zeros. As gravações de sessão e os arquivos de perfis seguem a mesma configuração, mas ficam fora da contagem.

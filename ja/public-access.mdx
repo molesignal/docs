@@ -1,0 +1,82 @@
+---
+title: "パブリックアクセス"
+description: "MoleSignal を内部ネットワークに配置したまま、外部コールバックと公開ページだけをインターネットに公開します。公開が必要なパス、エントリーポイントを構成する 2 つの方法、セキュリティ強化のチェックリストを紹介します。"
+"en_link": "/en-US/public-access"
+"zh-Hans_link": "/zh-Hans/public-access"
+"zh-Hant_link": "/zh-Hant/public-access"
+"ko_link": "/ko/public-access"
+"de_link": "/de/public-access"
+"es_link": "/es/public-access"
+"fr_link": "/fr/public-access"
+"pt-BR_link": "/pt-BR/public-access"
+---
+
+通常、MoleSignal は内部ネットワークで稼働し、オフィスネットワークまたは VPN 経由でアクセスします。一部の機能には、外部システムやインターネット上の利用者からの直接アクセスが必要です。たとえば、Datadog や PagerDuty からのアラート受信、Microsoft Teams からのメッセージコールバック、ステータスページの閲覧が該当します。MoleSignal 自体は内部リクエストと外部リクエストを区別せず、ネットワークのエントリーポイントで区別します。内部エントリーポイントは、従来どおりすべてのリクエストを転送します。公開エントリーポイントは、[以下の表](#公開アクセスが必要なパス)に記載されたパスのうち、使用中のものだけを転送し、それ以外のパスには 404 を返します。
+
+インターネットに公開するパスには、それぞれ固有の認証方式があります。アラートソースのトークン、プッシュトークン、共有リンク、プラットフォームが署名したトークンなどを使用します。ネットワークでのアクセス制限は、認証に次ぐ防御策です。インターネットからのスキャンやクレデンシャルスタッフィングは、サインインや管理用のエンドポイントに到達しません。
+
+## 公開アクセスが必要なパス
+
+使用する機能のパスだけを公開してください。表の各行は互いに独立しています。
+
+| 機能 | パス | メソッド | 呼び出し元 | 認証 |
+|---|---|---|---|---|
+| [外部アラート](/ja/alerting/sources) | `/api/v1/intake/alerts` | `POST` | Datadog、PagerDuty、Alibaba Cloud CloudMonitor、Tencent Cloud Observability Platform、Amazon SNS、およびインターネット上の Alertmanager、Grafana、Zabbix、メールシステム | ヘッダーまたは `?token=` に指定するアラートソースのトークン |
+| [ハートビートチェックイン](/ja/alerting/rules#ハートビートルール) | `/api/v1/intake/heartbeats/` で始まるパス | `GET`、`POST` | インターネット上の cron ジョブやバックアップスクリプト | URL 内のチェックイントークン |
+| [Jira チケットの Webhook](/ja/alerting/tickets#ステータス同期) | `/api/v1/public/tickets/jira/<connector ID>` | `POST` | Jira Cloud | コネクターの Webhook シークレットで署名した `X-Hub-Signature` |
+| [オンコールカレンダーの購読](/ja/alerting/on-call#カレンダーの購読) | `/api/v1/public/calendar/<token>.ics` | `GET` | Google Calendar や Outlook などのオンラインカレンダーサービス | URL 内の購読トークン。読み取りのたびに購読者の権限を再確認します |
+| [Teams の Mole Agent](/ja/im#teams-のセキュリティ) | `/api/v1/public/im/teams/` で始まるパス | `POST` | Microsoft Bot Framework | Bot Framework が署名したトークン |
+| [SMS と通話への応答](/ja/notification-channels#メッセージへの返信と通話での応答) | `/api/v1/public/notify/<connector ID>/replies`、`/api/v1/public/notify/<connector ID>/keypress` | `POST` | Twilio、Amazon SNS、Alibaba Cloud、Tencent Cloud、Huawei Cloud の SMS・音声通話サービス、および独自の SMS ゲートウェイ（Huawei Cloud のアドレスはコールバックトークンで終わります） | Twilio または SNS の署名、もしくは URL 内のコールバックトークン |
+| [WeCom アプリのボタン](/ja/im#wecom-アプリのボタン) | `/api/v1/public/notify/<connector ID>/wecom` | `GET`、`POST` | WeCom | コネクターのコールバックトークンでメッセージ署名を検証し、同じコネクターの EncodingAESKey で内容を復号します |
+| [Mattermost ボットのボタン](/ja/im#mattermost-ボットのボタン) | `/api/v1/public/notify/<connector ID>/mattermost` | `POST` | インターネット上の Mattermost サーバー | `?token=` に指定するコネクターのコールバックトークン |
+| [ワンタイムアクションリンク](/ja/notification-channels#1-回限りのアクションリンク) | `/notify/actions/` および `/api/v1/public/notify/actions/` で始まるパスと[ウェブファイル](#ウェブファイル) | `GET`、`POST` | スマートフォンなどでオフィスネットワークの外から通知内のリンクを開く利用者 | リンク内のワンタイムトークン |
+| [オートメーション API トリガー](/ja/automations) | `/api/v1/public/automations/<automation ID>/trigger` | `POST` | CI パイプラインなどの外部システム | オートメーション固有のトークン |
+| [プッシュソース](/ja/connectors) | `/api/v1/_kinesis_firehose`、`/api/v1/_cloudflare`、`/api/v1/_heroku` | `POST` | Amazon Data Firehose、Cloudflare Logpush、Heroku のログドレイン | コネクターのプッシュトークン |
+| [RUM](/ja/rum) | `/api/v1/rum/events`、`/api/v1/rum/replay` | `POST`、`OPTIONS` | インターネット上の利用者のブラウザーやアプリ | アプリケーションのクライアントトークン |
+| [ステータスページ](/ja/status-pages) | `/status/`、`/api/v1/public/status-pages/`、[ウェブファイル](#ウェブファイル) | `GET`、`POST` | ステータスページの閲覧者と購読者 | 公開ページは認証不要。非公開ページはアクセスリンクを使用します |
+| [リソース共有](/ja/resource-sharing) | `/s/`、`/shared`、`/api/v1/public/share`、[ウェブファイル](#ウェブファイル) | `GET`、`POST` | 共有リンクを持つ利用者 | 共有リンクと引き換えに発行する短時間有効なセッション |
+| [外形監視のプローブエージェント](/ja/synthetics#ロケーションとプローブエージェント) | `/api/v1/synthetics/artifacts/` | `PUT` | スクリーンショットなどの成果物をアップロードする外部ロケーションのプローブエージェント | タスクのリーストークン |
+
+MoleSignal は、アップロードされた成果物をオブジェクトストアに書き込む前に、リーストークン、サイズ、コンテンツのハッシュを検証します。プローブエージェントにオブジェクトストアの認証情報を渡さないため、オブジェクトストアをインターネットに公開する必要はありません。プローブエージェントは、登録用の `5084` と制御ストリーム用の `5085` の 2 つの gRPC ポートにも接続します。MoleSignal がこれらのポートで TLS を直接終端するため、レイヤー 4（TCP）でパススルーし、HTTP プロキシは経由できません。外部ロケーションのプローブエージェントがインターネット経由で接続する場合は、2 つのポートを個別にマッピングし、`probe.register_endpoint` と `probe.control_endpoint` にそれぞれの公開アドレスを設定してください。詳細は[設定](/ja/configuration)を参照してください。
+
+### ウェブファイル
+
+ステータスページ、共有リソース、ワンタイムアクションリンクの確認ページはウェブページです。そのため、公開エントリーポイントは、これらのページで使う静的ファイルも転送します。対象は `/assets/` 配下のファイルと、`/favicon.ico`、`/favicon.svg`、`/favicon-dark.ico`、`/favicon-dark.svg` です。ページ用のパス `/status/`、`/shared`、`/notify/actions/` と静的ファイルだけを公開すると、公開エントリーポイントはサインインページやその他すべてのページに 404 を返します。
+
+### ステータスページのカスタムドメイン
+
+ステータスページにカスタムドメインを使用する場合も、そのドメインを公開エントリーポイントに向けます。ページはドメインのルートを基準に配置します。対象は `/`、`/history`、`/uptime`、および `/incidents/` で始まるパスです。各ページは `/api/v1/public/status-pages/` で始まるエンドポイントからデータを取得します。そのドメインでは、これらのパスとウェブファイルだけを公開してください。証明書は公開エントリーポイントで管理するか、MoleSignal で発行します。詳細は[カスタムドメインと TLS](/ja/status-pages#カスタムドメインと-tls)を参照してください。
+
+## エントリーポイントを構成する 2 つの方法
+
+### スプリット DNS でエントリーポイントを分ける
+
+この方法を推奨します。内部 DNS は `molesignal.example.com` を内部エントリーポイントに解決し、公開 DNS は同じ名前を公開エントリーポイントに解決します。内部エントリーポイントはすべてのパスを転送し、公開エントリーポイントは表に記載されたパスだけを転送します。`http.external_url` にこの名前を設定してください。ページに表示する取り込み先アドレス、送信元に通知するコールバックアドレス、IM やメール内のリンクを両方のネットワークで使用でき、内部ネットワークからのアクセス方法も変わりません。
+
+### 単一のエントリーポイントで接続元を区別する
+
+単一のエントリーポイントを使用する場合は、表に記載されたパスをすべての接続元に公開し、それ以外のパスへのアクセスをオフィスネットワークと VPN のアドレス範囲に制限します。エントリーポイントで実際のクライアントアドレスを確認できるようにしてください。手前にロードバランサーがある場合は、PROXY プロトコルまたは `X-Forwarded-For` で元のアドレスを渡してください。
+
+## セキュリティ強化チェックリスト
+
+- **HTTPS のみを使用します。** 公開エントリーポイントは 443 番ポートでのみ待ち受け、パブリック CA が発行した証明書を使用します。Teams は HTTPS のアドレスにのみ送信します。
+- **エンドポイントごとにリクエストボディのサイズを制限します。** 外部アラートは 4 MiB、ハートビートのチェックインは 64 KiB、Jira チケットの Webhook は 1 MiB、RUM イベントは 5 MiB、セッションリプレイは 8 MiB、Probe Agent のアーティファクトは 10 MiB、ネイティブ JSON の取り込みは 16 MiB、その他の取り込みエンドポイントは 2 MiB です。これらの上限を超えると、MoleSignal は `413` を返します。公開エントリーポイントの上限は、これらの値を下回らないように設定してください。
+- **公開エントリーポイントでレート制限を設定します。** 送信元アドレスごとに、1 秒あたりのリクエスト数を制限してください。`standalone` ノードは取り込みにレート制限を適用しません。詳しくは、[レートとサイズの制限](/ja/security#レート制限とサイズ制限)を参照してください。
+- **アクセスログにクエリ文字列を記録しません。** Alibaba Cloud CloudMonitor は URL の `token` パラメーターでしかトークンを渡せないため、公開エントリーポイントではパスのみを記録します。ハートビートのチェックイン、オンコールカレンダーの購読、ワンタイムアクションリンク、Huawei Cloud のコールバックでは、パスにトークンが含まれます。これらのパスはプレフィックスだけを記録してください。[設定例](#設定例)では、`map` を使ってトークンを置き換えます。MoleSignal 自体のトレースにはルートのみを記録し、クエリ文字列は記録しません。
+- **MoleSignal が実際のクライアント IP アドレスを認識できるようにします。** `_sys` 組織で **設定 → クライアントIPの識別** を開き、転送チェーンを選択して、公開エントリーポイントのアドレスを信頼済みプロキシとして登録してください。詳しくは、[クライアントIPの識別](/ja/settings/platform#クライアントipの識別)を参照してください。RUM の位置情報の特定と[サインイン制限](/ja/settings/platform#サインイン制限)は、この設定に依存します。設定しないと、すべてのユーザーが公開エントリーポイントのアドレスからアクセスしたものとして扱われます。そのアドレスがプライベート IP の場合はサインイン制限の集計対象にならず、パブリック IP の場合は、あるユーザーが制限に達すると他のユーザーもサインインできなくなります。
+- **任意: 送信元アドレスでアクセスをさらに制限します。** 送信元サービスが送信 IP アドレスを公開している場合は、それらのアドレスからのアクセスのみを許可してください。Datadog はサイトごとの `ip-ranges.<site domain>` の `webhooks` セクション、PagerDuty は米国または EU のサービスリージョン別の一覧、Alibaba Cloud CloudMonitor はアラームコールバックのドキュメントを参照してください。Teams には Azure のサービスタグ `AzureBotService` を使用してください。これらのアドレスは変更されるため、許可リストを最新の状態に保ってください。トークンが引き続き主な防御手段です。
+- **公開前に動作を確認します。** インターネットからアクセスすると、`/` と `/api/v1/auth/signin` は `404` を返し、トークンなしの `POST /api/v1/intake/alerts` は `401` を返します。`401` は、リクエストが MoleSignal に到達したことを示します。内部ネットワークから `/` にアクセスすると、サインインページが開きます。
+
+## 設定例
+
+<CardGroup cols={3}>
+  <Card title="nginx" icon="server" href="/ja/public-access/nginx">
+    2 台のサーバーを使います。内部用はすべてのリクエストを転送し、公開用はコールバックと公開ページへのリクエストだけを転送します。
+  </Card>
+  <Card title="Kubernetes Ingress" icon="network-wired" href="/ja/public-access/ingress">
+    2 つの ingress-nginx コントローラーを使います。公開用には、公開するパスだけを指定します。
+  </Card>
+  <Card title="Gateway API" icon="route" href="/ja/public-access/gateway-api">
+    2 つの Gateway を使います。公開用の HTTPRoute は、パスとメソッドでリクエストを照合します。
+  </Card>
+</CardGroup>

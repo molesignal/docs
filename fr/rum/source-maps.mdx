@@ -1,0 +1,225 @@
+---
+title: "Source maps et symboles RUM"
+sidebarTitle: "Source maps et symboles"
+description: "Importez des source maps pour le navigateur, des symboles Flutter, des fichiers de mappage et des symboles natifs Android, ou des fichiers dSYM Apple pour reconstituer les traces de pile RUM."
+"en_link": "/en-US/rum/source-maps"
+"zh-Hans_link": "/zh-Hans/rum/source-maps"
+"zh-Hant_link": "/zh-Hant/rum/source-maps"
+"ja_link": "/ja/rum/source-maps"
+"ko_link": "/ko/rum/source-maps"
+"de_link": "/de/rum/source-maps"
+"es_link": "/es/rum/source-maps"
+"pt-BR_link": "/pt-BR/rum/source-maps"
+---
+
+MoleSignal utilise les artefacts de débogage pour restaurer les frames de pile JavaScript minifiées, les frames Dart ou Android obfusquées, ainsi que
+les frames natives Android ou iOS. Gérez tous les types d’artefacts via
+`/api/v1/debug-artifacts`.
+
+## Sélectionner un type d’artefact
+
+| Environnement d’exécution | `kind` | `platform` | Fichier |
+|---|---|---|---|
+| JavaScript dans le navigateur | `javascript_sourcemap` | `web` | Fichier `.map` externe |
+| Flutter Web | `javascript_sourcemap` | `flutter` | `main.dart.js.map` ou un autre fichier `.map` généré |
+| Flutter AOT sur Android ou iOS | `flutter_symbols` | `android` ou `ios` | Fichier `.symbols` généré par Flutter avec `--split-debug-info` |
+| Android R8 | `android_mapping` | `android` | Fichier `mapping.txt` de la version publiée |
+| Android NDK | `android_native_symbols` | `android` | Objet partagé ELF avec ses symboles |
+| Apple natif | `apple_dsym` | `ios` | Binaire DWARF dans le bundle `.dSYM` correspondant |
+
+Importez des fichiers bruts ou compressés avec gzip. La taille maximale à l’importation est de 50 MiB. Un artefact gzip ne doit pas
+dépasser 256 MiB après décompression.
+
+## Faire correspondre les identifiants du build
+
+MoleSignal sélectionne un artefact d’après les identifiants du build associés à l’erreur RUM :
+
+| Champ d’importation | Valeur RUM correspondante | Règle |
+|---|---|---|
+| `applicationId` | `application.id`, l’application associée au jeton client | Correspondance exacte requise |
+| `service` | `service` de l’événement | Correspondance exacte, sensible à la casse |
+| `release` | `version` de l’événement | Correspondance exacte, sensible à la casse |
+| `kind` | `artifact_kind` de la frame. Une frame qui ne renseigne pas ce champ mais contient `file` et `line` est une frame JavaScript | Sélectionnez un type dans le tableau des artefacts pris en charge |
+| `platform` | `os.name` de l’événement ou, à défaut, `source` | Utilisez `web`, `flutter`, `android` ou `ios` selon le tableau ci-dessus |
+| `architecture` | `device.architecture` de l’événement | Renseignez ce champ pour les artefacts mobiles et natifs, par exemple avec `arm64` ou `x86_64` |
+| `debugId` | `debug_id` de la frame, ou à défaut `build_id` de l’événement | Utilisez le même identifiant de build Flutter, le même Build ID ELF ou le même UUID Mach-O |
+| Nom du fichier | Module ou bundle chargé à l’exécution | Nommez les mappages de sources du navigateur `<deployed bundle basename>.map` |
+
+MoleSignal normalise les alias ABI courants. Par exemple, `arm64-v8a` et `aarch64` deviennent `arm64`, tandis que
+`amd64` et `x64` deviennent `x86_64`. MoleSignal compare les identifiants de débogage hexadécimaux et les UUID sans tenir compte de la casse, des accolades,
+des tirets ni du préfixe `0x`.
+
+<Warning>
+  Renseignez `applicationId`, `service`, `release`, `architecture` et `debugId` dans le même
+  pipeline de build que celui qui produit l’artefact. Des identifiants obsolètes ou ambigus laissent l’événement intact, mais
+  donnent un état de symbolication `missing` ou `partial`.
+</Warning>
+
+### Exemple pour le navigateur
+
+Attribuez des valeurs stables à `service` et `version` à chaque build :
+
+```ts
+import { init } from '@molesignal/browser-rum';
+
+init({
+  applicationId: 'checkout-web',
+  clientToken: 'mspat-your-client-token',
+  site: 'https://molesignal.example.com',
+  service: 'web-frontend',
+  version: '2026.08.04.1',
+});
+```
+
+Importez le mappage de sources avec les mêmes identifiants et le nom exact du bundle déployé :
+
+| Champ d’importation | Champ du SDK | Exemple |
+|---|---|---|
+| Identifiant de l’application | `applicationId` | `checkout-web` |
+| Service | `service` | `web-frontend` |
+| Version publiée | `version` | `2026.08.04.1` |
+| Fichier | Fichier `.map` généré | `app.8f312.js.map` |
+
+Si l’URL d’une frame en production se termine par `/assets/app.8f312.js`, importez `app.8f312.js.map`. Importez le mappage de sources de chaque
+fragment chargé à la demande, pas seulement celui du bundle principal.
+
+## Importer depuis l’interface
+
+<Steps>
+  <Step title="Activer les mappages de sources lors du build">
+    Générez des mappages de sources externes lors du build de production. Excluez ces mappages du déploiement public
+    si la politique de sécurité exige de garder le code source privé.
+  </Step>
+  <Step title="Ouvrir la page d’importation">
+    Accédez à **RUM → Paramètres RUM → Mappages de sources et symboles**, puis cliquez sur **Importer un artefact de débogage**.
+  </Step>
+  <Step title="Saisir les identifiants du build">
+    Sélectionnez le type d’artefact et la plateforme. Saisissez les valeurs exactes de l’application, du service et de la version publiée.
+    Renseignez l’architecture et l’identifiant de débogage pour les artefacts mobiles, puis sélectionnez le fichier généré.
+  </Step>
+  <Step title="Vérifier la symbolication">
+    Envoyez une erreur depuis la version publiée. Ouvrez **RUM → Explorateur**, sélectionnez **Erreurs**, puis ouvrez l’erreur. Vérifiez que
+    la pile affiche les emplacements d’origine dans le code source.
+  </Step>
+</Steps>
+
+## Préparer les artefacts de la version publiée
+
+<Tabs>
+  <Tab title="Web">
+    Générez des mappages de sources externes à partir du bundle exact déployé dans le navigateur. Gardez les fichiers `.map` privés
+    si la politique interdit d’exposer le code source.
+
+    Compilez Flutter Web en activant les mappages de sources :
+
+    ```bash
+    flutter build web \
+      --release \
+      --source-maps \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=javascript \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Importez `main.dart.js.map` avec `kind=javascript_sourcemap`, `platform=flutter` et
+    `architecture=javascript`.
+  </Tab>
+  <Tab title="Flutter Android">
+    Générez un fichier de symboles Flutter pour chaque ABI de production :
+
+    ```bash
+    flutter build apk \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/android-arm64 \
+      --target-platform=android-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Importez `app.android-arm64.symbols` avec `kind=flutter_symbols`, `platform=android`,
+    `architecture=arm64` et `debugId=${BUILD_ID}`.
+  </Tab>
+  <Tab title="Flutter iOS">
+    Générez les symboles Flutter AOT à partir du build de l’IPA de la version publiée :
+
+    ```bash
+    flutter build ipa \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/ios-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Importez `app.ios-arm64.symbols` avec `kind=flutter_symbols`, `platform=ios`,
+    `architecture=arm64` et `debugId=${BUILD_ID}`.
+  </Tab>
+  <Tab title="Android natif">
+    Conservez le fichier `app/build/outputs/mapping/release/mapping.txt` de chaque version publiée avec R8. Importez ce fichier avec
+    `kind=android_mapping` et `platform=android`.
+
+    Conservez un fichier ELF `.so` avec ses symboles pour chaque ABI NDK. Extrayez son Build ID à l’aide de la
+    chaîne d’outils de la plateforme, puis importez le fichier avec `kind=android_native_symbols`, `platform=android`, l’architecture
+    canonique et le même Build ID que celui transmis par la frame du plantage.
+  </Tab>
+  <Tab title="iOS natif">
+    Récupérez l’UUID dans le dSYM archivé, puis compressez le binaire DWARF si nécessaire :
+
+    ```bash
+    dwarfdump --uuid Checkout.app.dSYM
+    gzip -k Checkout.app.dSYM/Contents/Resources/DWARF/Checkout
+    ```
+
+    Importez le fichier DWARF ou `.gz` avec `kind=apple_dsym`, `platform=ios`, l’architecture
+    correspondante et l’UUID Mach-O normalisé comme valeur de `debugId`.
+  </Tab>
+</Tabs>
+
+## Importer depuis la CI
+
+Utilisez un jeton de gestion doté de l’autorisation `debug_artifacts.manage`. N’intégrez jamais ce jeton dans une application web ou
+mobile. N’utilisez jamais le jeton client public pour gérer les artefacts.
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${MOLESIGNAL_TOKEN}" \
+  -F "applicationId=${APPLICATION_ID}" \
+  -F "service=${SERVICE}" \
+  -F "release=${RELEASE_VERSION}" \
+  -F "kind=${ARTIFACT_KIND}" \
+  -F "platform=${PLATFORM}" \
+  -F "architecture=${ARCHITECTURE}" \
+  -F "debugId=${DEBUG_ID}" \
+  -F "file=@${ARTIFACT_PATH}" \
+  "${MOLESIGNAL_SITE}/api/v1/debug-artifacts"
+```
+
+Laissez `architecture` ou `debugId` vide uniquement pour configurer un artefact de secours. Des identifiants de build mobile
+exacts évitent les correspondances ambiguës.
+
+Listez les artefacts avec `GET /api/v1/debug-artifacts`. Filtrez par `applicationId`, `service`, `kind` ou
+`platform`. Supprimez un artefact avec `DELETE /api/v1/debug-artifacts/{id}`. La consultation de la liste requiert
+`debug_artifacts.read` ; l’importation et la suppression requièrent `debug_artifacts.manage`.
+
+## Liste de contrôle avant publication
+
+- Conservez les artefacts du binaire ou du bundle exact déployé.
+- Définissez une valeur de version immuable dans le SDK avant tout enregistrement d’erreur.
+- Faites correspondre l’application, le service, la version publiée, l’architecture et l’identifiant de débogage au build.
+- Importez les mappages de sources de tous les fragments web et les artefacts de chaque architecture mobile distribuée.
+- Conservez le jeton de gestion uniquement dans le pipeline de publication.
+- Déclenchez une erreur de test après le déploiement et vérifiez que MoleSignal a restauré les champs `original_*` des frames.
+- Importez les artefacts avant de mettre la version à disposition. Les frames restaurées déterminent le [problème](/fr/rum/errors#comment-les-erreurs-sont-regroupées-en-problèmes) auquel
+  l’erreur est rattachée : la même erreur est donc rattachée à des problèmes différents selon qu’elle arrive avant ou après son mappage de sources.
+
+<CardGroup cols={2}>
+  <Card title="SDK RUM pour navigateur" icon="code" href="/fr/rum/browser-sdk">
+    Configurez les identifiants de l’application web, du service et de la version publiée.
+  </Card>
+  <Card title="SDK RUM pour les applications Flutter" icon="mobile" href="/fr/rum/flutter-sdk">
+    Configurez les identifiants du build Flutter et la collecte des erreurs.
+  </Card>
+</CardGroup>

@@ -1,0 +1,95 @@
+---
+title: "Signaux de vie"
+description: "Envoyez le signal de vie d’une tâche planifiée à l’adresse de la règle, consultez le dernier signal reçu et réinitialisez l’adresse."
+"en_link": "/en-US/api/alerting/heartbeats"
+"zh-Hans_link": "/zh-Hans/api/alerting/heartbeats"
+"zh-Hant_link": "/zh-Hant/api/alerting/heartbeats"
+"ja_link": "/ja/api/alerting/heartbeats"
+"ko_link": "/ko/api/alerting/heartbeats"
+"de_link": "/de/api/alerting/heartbeats"
+"es_link": "/es/api/alerting/heartbeats"
+"pt-BR_link": "/pt-BR/api/alerting/heartbeats"
+---
+
+Une [règle de signal de vie](/fr/api/alerting/create-rule#règles-de-signal-de-vie) attend qu’une tâche envoie un signal après chaque
+exécution. Elle déclenche une alerte si aucun signal n’arrive dans le délai prévu, marge de tolérance comprise, ou si un signal indique un
+échec.
+
+| Méthode et chemin | Fonction | Autorisation |
+|---|---|---|
+| `GET`, `POST /api/v1/intake/heartbeats/{token}` | Envoie un signal sans authentification. | Le jeton dans l’adresse |
+| `GET /api/v1/alerts/rules/{id}/heartbeat` | Renvoie le dernier signal et l’échéance du prochain. | `alerts.rules.read` sur la règle |
+| `POST /api/v1/alerts/rules/{id}/heartbeat-token` | Réinitialise l’adresse d’envoi des signaux. | `alerts.rules.manage` sur la règle |
+
+## Envoyer un signal
+
+```http
+GET /api/v1/intake/heartbeats/{token}
+POST /api/v1/intake/heartbeats/{token}
+```
+
+MoleSignal fournit l’adresse lors du premier enregistrement de la règle de signal de vie. Consultez
+[Créer une règle](/fr/api/alerting/create-rule#règles-de-signal-de-vie). Envoyez une requête à cette adresse si la tâche réussit. Ajoutez
+`?status=fail` en cas d’échec pour que la règle déclenche une alerte sans attendre l’échéance. Le début du
+corps d’une requête `POST` (jusqu’à 1 000 caractères) sert de message pour le signal et apparaît dans l’annotation d’incident
+`heartbeat_message`. Si le corps dépasse 64 KiB, l’API renvoie `413`. Chaque signal déclenche une évaluation immédiate de la règle : un
+échec déclenche une alerte, tandis qu’un succès permet de résoudre un incident ouvert si la condition de rétablissement est remplie.
+
+<RequestExample>
+```bash cURL
+# The backup succeeded
+curl -fsS https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN
+
+# The backup failed: send its last lines of output
+tail -n 20 backup.log | curl -fsS -X POST --data-binary @- \
+  "https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN?status=fail"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "ok": true, "status": "fail" }
+```
+</ResponseExample>
+
+Seul `status=fail` indique un échec. Toute autre valeur, ou l’absence de valeur, indique un succès. Si le jeton est incorrect, si
+la règle a été supprimée ou si l’adresse a été réinitialisée, l’API renvoie `404`.
+
+## Consulter l’état des signaux
+
+```http
+GET /api/v1/alerts/rules/{id}/heartbeat
+```
+
+<ResponseExample>
+```json 200
+{
+  "lastCheckinAt": 1790000000000000,
+  "lastStatus": "ok",
+  "lastMessage": "",
+  "dueAt": 1790003900000000,
+  "alarming": false,
+  "issuedAt": 1789900000000000
+}
+```
+</ResponseExample>
+
+| Champ | Notes |
+|---|---|
+| `lastCheckinAt` | Horodatage Unix du dernier signal, en microsecondes. Vaut `null` avant le premier signal. |
+| `lastStatus`, `lastMessage` | Statut du dernier signal (`ok` ou `fail`) et message associé. |
+| `dueAt` | Échéance du prochain signal : heure du dernier signal (ou, à défaut, heure de création de l’adresse), plus le délai prévu et la marge de tolérance. |
+| `alarming` | Indique si la règle doit déclencher une alerte immédiatement : le dernier signal indique un échec ou l’échéance `dueAt` est dépassée. |
+| `issuedAt` | Date et heure de création ou de réinitialisation de l’adresse actuelle. |
+
+L’API renvoie `404` si la règle n’est pas une règle de signal de vie ou si elle n’a pas encore d’adresse.
+
+## Réinitialiser l’adresse d’envoi des signaux
+
+```http
+POST /api/v1/alerts/rules/{id}/heartbeat-token
+```
+
+L’API génère une nouvelle adresse. L’ancienne cesse de fonctionner immédiatement et MoleSignal conserve l’historique des signaux. L’API renvoie
+`{ "path": "...", "url": "..." }` et ne communique la nouvelle adresse qu’à ce moment-là. Le champ `url` vaut `null` si aucune adresse externe
+n’est configurée. MoleSignal consigne la réinitialisation dans le journal d’audit. L’API renvoie `400` si la règle n’est pas une règle de signal de vie.

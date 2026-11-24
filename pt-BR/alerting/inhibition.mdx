@@ -1,0 +1,112 @@
+---
+title: "Inibição"
+description: "Enquanto um incidente mais grave ou em uma dependência anterior estiver ativo, suprima as notificações dos incidentes de menor gravidade para que a equipe receba apenas o aviso mais relevante."
+"en_link": "/en-US/alerting/inhibition"
+"zh-Hans_link": "/zh-Hans/alerting/inhibition"
+"zh-Hant_link": "/zh-Hant/alerting/inhibition"
+"ja_link": "/ja/alerting/inhibition"
+"ko_link": "/ko/alerting/inhibition"
+"de_link": "/de/alerting/inhibition"
+"es_link": "/es/alerting/inhibition"
+"fr_link": "/fr/alerting/inhibition"
+---
+
+O banco de dados está fora do ar, e os dez serviços que dependem dele registram erros. A equipe de plantão precisa saber da falha no banco de dados; os outros alertas só fazem o telefone tocar. Uma regra de inibição faz exatamente isso: **enquanto um incidente de origem estiver ativo, o sistema retém as notificações dos incidentes-alvo que tiverem os mesmos valores para os rótulos especificados.**
+
+O sistema ainda abre e registra o incidente inibido e o exibe nas páginas. O sistema retém as notificações e não escala o incidente. Quando a origem se recupera, o sistema volta a notificar normalmente sobre os alvos que continuam abertos.
+
+Abra **Alertas → Inibição**. Para visualizar as regras, use `alerts.inhibitions.read`. Para criar, alterar ou excluir regras, use `alerts.inhibitions.manage`.
+
+## Inibição e silenciamentos
+
+| | Silenciamento | Inibição |
+|---|---|---|
+| Quando se aplica | Durante uma janela de tempo | Enquanto um incidente correspondente estiver ativo |
+| Quando usar | Manutenção programada, ruído conhecido | A sequência de alertas que uma única falha dispara |
+| Quem decide o que fica sem notificação | Uma pessoa, com antecedência, com base no horário | O sistema, com base nos incidentes ativos no momento |
+
+Ambos bloqueiam apenas as notificações e o escalonamento. Nenhum afeta o incidente em si, as [páginas de status](/pt-BR/status-pages) ou os [chamados](/pt-BR/alerting/tickets).
+
+## Crie uma regra
+
+Clique em **Nova regra de inibição**:
+
+| Configuração | Descrição |
+|---|---|
+| **Nome**, **Ativado** | Uma regra desativada não inibe nenhum incidente. |
+| **Severidade mínima** da origem, condições de rótulo | Define quais incidentes podem inibir outros. Sem critérios, qualquer incidente pode ser a origem, mas é obrigatório preencher **Estes rótulos devem corresponder**. |
+| **Severidade máxima** do alvo, condições de rótulo | Define quais incidentes podem ser inibidos. Sem critérios, qualquer incidente pode ser alvo. |
+| **Estes rótulos devem corresponder** | Separe os rótulos por vírgulas. A origem e o alvo devem ter cada rótulo com o mesmo valor. Se faltar um rótulo em qualquer lado, não há correspondência. Deixe o campo vazio para ignorar os rótulos, mas nesse caso especifique a origem para evitar que qualquer incidente iniba todos os outros. |
+| **O incidente de origem deve ser mais grave que o alvo** | Ativado por padrão: a severidade da origem deve ser maior que a do alvo. Assim, uma única regra permite que, no mesmo serviço, o incidente mais grave iniba o menos grave. Desative a opção para dependências: o banco de dados inibe os alertas dos serviços que dependem dele. |
+| **Tempo de espera do alvo (segundos)** | 60 por padrão, com mínimo de 15 e máximo de 600. Consulte [Dois intervalos de espera](#dois-intervalos-de-espera). |
+| **Duração da inibição após a recuperação (segundos)** | 120 por padrão, com máximo de 3600. |
+
+Escreva as condições de rótulo como nas [políticas de silenciamento](/pt-BR/alerting/silences): todas devem ser atendidas, e os operadores `=~` e `!~` aplicam expressões regulares ao valor inteiro. Além dos rótulos do incidente, o sistema reconhece outros três:
+
+- `service` e `host`: se o incidente não tiver o rótulo correspondente, o sistema usa o serviço ou host afetado;
+- `alert.rule_id`: o ID da regra ou da fonte do alerta que abriu o incidente, para definir que a regra A inibe os incidentes da regra B.
+
+Clique em **Executar** para aplicar a regra aos incidentes ativos no momento, mesmo sem salvá-la, e listar quais incidentes inibiriam quais alvos.
+
+## Regras comuns
+
+**No mesmo serviço, o incidente mais grave inibe o menos grave.** Uma nova regra começa assim:
+
+- Estes rótulos devem corresponder: `service`
+- O incidente de origem deve ser mais grave que o alvo: ativado
+
+**Se o banco de dados estiver fora do ar, não notifique sobre os serviços que dependem dele.** Independentemente da severidade:
+
+- Condição de rótulo da origem: `service` `=` `database`
+- Condição de rótulo do alvo: `tier` `=` `api`
+- Estes rótulos devem corresponder: `region` (somente na mesma região)
+- O incidente de origem deve ser mais grave que o alvo: desativado
+
+## Como o sistema decide
+
+A cada ciclo de envio de notificações de escalonamento (10 segundos por padrão), o sistema avalia a inibição e registra o resultado no incidente. Para garantir que **cada incidente inibido tenha uma origem que de fato notifique alguém**, o sistema aplica estas regras:
+
+- **Um incidente silenciado não pode ser a origem.** Como ele não gera notificações, inibir os demais deixaria a equipe sem aviso.
+- **Um incidente reconhecido continua sendo uma origem.** O reconhecimento indica que alguém já assumiu o incidente.
+- **Um incidente mesclado a outro não conta como origem nem como alvo.**
+- **O sistema nunca inibe um incidente aberto manualmente**, mas ele pode inibir outros.
+- **A inibição funciona em cadeia.** Se A inibe B e B inibe C, apenas A gera notificações.
+- **Se dois incidentes se inibem mutuamente, apenas um gera notificações.** Se uma regra diz que A inibe B e outra diz que B inibe A, o sistema notifica normalmente sobre o mais grave. Em caso de empate, notifica sobre o que abriu primeiro.
+
+## Dois intervalos de espera
+
+**O alvo espera.** Os alertas sobre os sintomas costumam chegar antes dos alertas sobre a causa: a taxa de erros ultrapassa o limite primeiro, e a regra do banco de dados só roda no próximo ciclo de avaliação. Quando um incidente que pode ser inibido é aberto, o sistema adia as notificações pelo **Tempo de espera do alvo**. Se uma origem surgir nesse intervalo, ela inibe o alvo. Caso contrário, o sistema notifica normalmente. Mesmo com o valor 0, o sistema aguarda 15 segundos: o próximo ciclo de envio decide se o incidente deve ser inibido, e a primeira notificação não pode sair antes disso.
+
+Só os incidentes que podem ser inibidos aguardam. Se a origem precisar ser mais grave que o alvo, os incidentes de maior severidade não aguardam. Incidentes sem os rótulos exigidos também não aguardam.
+
+**A inibição continua após a recuperação.** Quando a causa é resolvida, os sintomas costumam desaparecer logo depois, sem necessidade de acionar a equipe de plantão. Após a recuperação da origem, o sistema mantém os alvos inibidos pelo tempo configurado, ou por mais tempo se surgir outra origem. Ao fim da inibição, o sistema só envia notificações retidas para os incidentes que ainda estiverem abertos.
+
+## O que acontece com as notificações
+
+| Notificação | Durante a inibição | Após o fim da inibição |
+|---|---|---|
+| Disparo e escalonamento | O sistema não envia as notificações e mantém o escalonamento no nível atual. | Para incidentes ainda abertos e não reconhecidos, o sistema envia a notificação de disparo e retoma o escalonamento. O prazo para reconhecimento do nível atual começa nesse momento. Se o incidente tiver sido reconhecido ou resolvido nesse intervalo, o sistema não envia essas notificações. |
+| Etapas posteriores da sequência de notificação de uma pessoa e prazo de reconhecimento de uma política | O sistema não envia. | O sistema envia se o incidente ainda não tiver sido reconhecido. |
+| Reconhecimento e resolução | O sistema só envia se já tiver enviado a notificação de disparo. | O sistema envia normalmente. |
+
+## Nas páginas
+
+- **Lista de incidentes**: a linha de resumo mostra **Inibidos** para os incidentes sob inibição, e a visualização **Inibidos** aparece enquanto houver incidentes nessa condição.
+- **Página do incidente**: mostra o incidente e a regra que causam a inibição, com um link para a origem. Se o incidente ainda estiver aguardando, a página mostra até quando. Clique em **Notificar normalmente** ao lado do aviso para liberar o incidente. O sistema envia as notificações retidas imediatamente e não volta a inibir esse incidente. Para liberar o incidente, use `alerts.incidents.update`. O sistema registra a ação na linha do tempo e no log de auditoria.
+- **Linha do tempo**: o sistema registra o início e o fim da inibição, seja pela recuperação da origem, pela alteração ou exclusão da regra ou pela liberação manual do incidente.
+- **Lista de regras**: a regra mostra **Em disparo (inibido)** quando todos os seus incidentes estão sob inibição.
+- **Página de inibição**: cada regra mostra quantos incidentes inibe no momento. Ao excluir uma regra com incidentes inibidos, a página avisa que o sistema enviará as notificações imediatamente.
+
+Escalonar imediatamente, reatribuir um incidente ou adicionar responsáveis pela resposta são ações manuais para acionar alguém e também encerram a inibição do incidente. Ao reatribuir ou adicionar responsáveis, o sistema notifica apenas as pessoas selecionadas, sem acionar também as da etapa atual da política.
+
+## Vários clusters
+
+As regras de inibição são sincronizadas pela [federação de clusters](/pt-BR/settings/data-plane#federação-de-clusters), e cada cluster decide com base nos próprios incidentes. Um incidente em um cluster não inibe incidentes em outro.
+
+## API de inibição
+
+| Ação | Endpoint |
+|---|---|
+| Gerenciar regras de inibição | [`/api/v1/alerts/inhibit-rules`](/pt-BR/api/alerting/inhibit-rules) |
+| Visualizar o efeito de uma regra | [`POST /api/v1/alerts/inhibit-rules/preview`](/pt-BR/api/alerting/inhibit-rules#prévia) |
+| Liberar um incidente | [`POST /api/v1/alerts/incidents/{id}/inhibition/lift`](/pt-BR/api/alerting/inhibit-rules#liberar-um-incidente) |

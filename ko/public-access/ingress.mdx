@@ -1,0 +1,235 @@
+---
+title: "Kubernetes Ingress"
+description: "ingress-nginx 컨트롤러 두 개로 내부용 및 공개용 진입점을 구성합니다. 내부용 Ingress는 모든 경로의 요청을 전달하고, 공개용 Ingress에는 외부 콜백과 공개 페이지 경로만 지정합니다."
+"en_link": "/en-US/public-access/ingress"
+"zh-Hans_link": "/zh-Hans/public-access/ingress"
+"zh-Hant_link": "/zh-Hant/public-access/ingress"
+"ja_link": "/ja/public-access/ingress"
+"de_link": "/de/public-access/ingress"
+"es_link": "/es/public-access/ingress"
+"fr_link": "/fr/public-access/ingress"
+"pt-BR_link": "/pt-BR/public-access/ingress"
+---
+
+아래 구성은 [공개 액세스](/ko/public-access)의 권장 방식을 따릅니다. 클러스터에서 ingress-nginx 컨트롤러 두 개를 실행합니다. 하나는 내부 로드 밸런서 뒤에, 다른 하나는 공용 로드 밸런서 뒤에 배치합니다. 동일한 이름 `molesignal.example.com`은 내부 DNS와 공용 DNS에서 각각 해당 로드 밸런서의 주소로 확인됩니다. MoleSignal의 Service는 `molesignal` 네임스페이스에 있는 `molesignal`이며 포트는 `5080`입니다. 역할 분리 배포에서는 라우터의 Service를 대신 사용합니다.
+
+## 컨트롤러 두 개
+
+두 컨트롤러에는 서로 다른 IngressClass와 `controllerValue`가 필요합니다. 그렇지 않으면 각 컨트롤러가 다른 컨트롤러의 Ingress까지 처리합니다. 내부 컨트롤러의 Service에는 클라우드 제공업체의 내부 로드 밸런서 어노테이션을 지정합니다.
+
+```yaml
+# ingress-internal-values.yaml
+controller:
+  ingressClassResource:
+    name: nginx-internal
+    controllerValue: k8s.io/ingress-nginx-internal
+  ingressClass: nginx-internal
+  electionID: ingress-nginx-internal-leader
+  service:
+    annotations:
+      # Per cloud provider, for example Alibaba Cloud ACK:
+      service.beta.kubernetes.io/alibaba-cloud-loadbalancer-address-type: intranet
+```
+
+공용 컨트롤러는 클라이언트의 소스 주소를 보존하고 경로만 로그에 기록합니다. 쿼리 문자열은 기록하지 않습니다. 하트비트, 캘린더, 작업 링크, Huawei Cloud 콜백 경로에는 토큰이 포함되므로 경로의 접두사만 기록합니다.
+
+```yaml
+# ingress-public-values.yaml
+controller:
+  ingressClassResource:
+    name: nginx-public
+    controllerValue: k8s.io/ingress-nginx-public
+  ingressClass: nginx-public
+  electionID: ingress-nginx-public-leader
+  service:
+    externalTrafficPolicy: Local
+  config:
+    http-snippet: |
+      map $uri $molesignal_log_uri {
+          ~^(/api/v1/(?:intake/heartbeats|public/calendar|public/notify/actions)/)  $1<token>;
+          ~^(/notify/actions/)                                                      $1<token>;
+          ~^(/api/v1/public/notify/[^/]+/(?:replies|keypress)/)                     $1<token>;
+          default                                                                   $uri;
+      }
+    log-format-upstream: '$remote_addr [$time_local] "$request_method $molesignal_log_uri $server_protocol" $status $body_bytes_sent "$http_user_agent" $request_time'
+```
+
+각 컨트롤러를 설치합니다.
+
+```bash
+helm upgrade --install ingress-internal ingress-nginx --repo https://kubernetes.github.io/ingress-nginx --namespace ingress-internal --create-namespace -f ingress-internal-values.yaml
+```
+
+```bash
+helm upgrade --install ingress-public ingress-nginx --repo https://kubernetes.github.io/ingress-nginx --namespace ingress-public --create-namespace -f ingress-public-values.yaml
+```
+
+## 내부 Ingress
+
+내부 Ingress는 모든 경로를 전달합니다. 실시간 쿼리는 응답을 스트리밍하므로 버퍼링을 끄고 타임아웃을 길게 설정합니다.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-internal
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: nginx-internal
+  tls:
+    - hosts: [molesignal.example.com]
+      secretName: molesignal-tls
+  rules:
+    - host: molesignal.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: molesignal
+                port:
+                  number: 5080
+```
+
+## 공용 Ingress
+
+공용 Ingress에는 공개할 경로만 나열합니다. 컨트롤러의 기본 백엔드는 목록에 없는 모든 경로에 404로 응답합니다. 사용 중인 경로만 남겨 둡니다.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-public
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+spec:
+  ingressClassName: nginx-public
+  tls:
+    - hosts: [molesignal.example.com]
+      secretName: molesignal-tls
+  rules:
+    - host: molesignal.example.com
+      http:
+        paths:
+          # External alerts
+          - { path: /api/v1/intake/alerts, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Heartbeat check-ins, the Jira ticket webhook, on-call calendar subscriptions
+          - { path: /api/v1/intake/heartbeats, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/tickets/jira, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/calendar, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Mole Agent in Teams, automation API triggers, replies to texts and calls, WeCom and Mattermost buttons, the API of one-time action links
+          - { path: /api/v1/public/im/teams, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/automations, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/notify, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Push sources
+          - { path: /api/v1/_kinesis_firehose, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/_cloudflare, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/_heroku, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # RUM
+          - { path: /api/v1/rum/events, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/rum/replay, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Synthetics Probe Agent artifact uploads
+          - { path: /api/v1/synthetics/artifacts, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Status pages
+          - { path: /status, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/status-pages, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Resource sharing
+          - { path: /s, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /shared, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/share, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # The confirm pages of one-time action links
+          - { path: /notify/actions, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Web files of status pages, shared resources and action link pages
+          - { path: /assets, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+```
+
+`Prefix`는 경로 세그먼트 단위로 일치 여부를 판단합니다. `/s`는 `/s/<share token>`과 일치하지만 `/shared`와는 일치하지 않습니다. `/api/v1/public/share`는 `/api/v1/public/share/query`와 일치합니다.
+
+Ingress는 메서드별로 요청을 필터링할 수 없으므로 MoleSignal이 필터링합니다. 위의 각 경로는 해당 경로에서 사용하는 메서드만 허용하고 나머지 메서드에는 `405` 또는 `404`로 응답합니다. 어노테이션은 Ingress 객체 전체에 적용됩니다. 일부 경로에 별도의 요청 본문 크기 제한이나 허용 소스 주소를 지정하려면 해당 경로를 다른 Ingress로 옮깁니다. 예를 들어 Azure 서비스 태그 `AzureBotService`의 주소 범위에서만 Teams 콜백에 접근하도록 허용할 수 있습니다.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-public-teams
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/whitelist-source-range: "203.0.113.0/24,198.51.100.0/24"
+spec:
+  ingressClassName: nginx-public
+  tls:
+    - hosts: [molesignal.example.com]
+      secretName: molesignal-tls
+  rules:
+    - host: molesignal.example.com
+      http:
+        paths:
+          - { path: /api/v1/public/im/teams, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+```
+
+옮긴 경로는 `molesignal-public`에서 제거합니다. 각 경로는 하나의 Ingress에만 지정합니다.
+
+## 상태 페이지의 사용자 지정 도메인
+
+상태 페이지에서 `status.example.org`를 사용하는 경우, 공용 컨트롤러에 해당 도메인용 규칙을 추가해 상태 페이지의 루트 경로, 엔드포인트, 웹 파일만 공개합니다.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-status-domain
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+spec:
+  ingressClassName: nginx-public
+  tls:
+    - hosts: [status.example.org]
+      secretName: status-example-org-tls
+  rules:
+    - host: status.example.org
+      http:
+        paths:
+          - { path: /, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /history, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /uptime, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /incidents, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/status-pages, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /assets, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+```
+
+## 확인
+
+각 컨트롤러가 자신에게 할당된 Ingress를 처리하는지, 각 Ingress에 해당 로드 밸런서의 주소가 지정되어 있는지 확인합니다.
+
+```bash
+kubectl -n molesignal get ingress
+```
+
+인터넷에서 로그인 엔드포인트에 요청하면 `404`로 응답하고, 토큰 없이 알림 수신 엔드포인트에 요청하면 `401`로 응답합니다.
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://molesignal.example.com/api/v1/auth/signin
+```
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://molesignal.example.com/api/v1/intake/alerts
+```
+
+마지막으로 `_sys` 조직의 **설정 → 클라이언트 IP 식별**에서 공용 컨트롤러의 Pod 네트워크를 신뢰할 수 있는 프록시로 등록합니다. 자세한 내용은 [클라이언트 IP 식별](/ko/settings/platform#클라이언트-ip-식별)을 참조합니다.

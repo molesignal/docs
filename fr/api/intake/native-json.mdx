@@ -1,0 +1,86 @@
+---
+title: "Ingestion JSON native"
+description: "Envoyez des enregistrements au format JSON vers un flux."
+"en_link": "/en-US/api/intake/native-json"
+"zh-Hans_link": "/zh-Hans/api/intake/native-json"
+"zh-Hant_link": "/zh-Hant/api/intake/native-json"
+"ja_link": "/ja/api/intake/native-json"
+"ko_link": "/ko/api/intake/native-json"
+"de_link": "/de/api/intake/native-json"
+"es_link": "/es/api/intake/native-json"
+"pt-BR_link": "/pt-BR/api/intake/native-json"
+---
+
+```http
+POST /api/v1/intake/{type}/{stream}
+```
+
+Envoie un objet d’enregistrement ou un tableau d’enregistrements à un flux. La première écriture crée le flux, puis le schéma évolue à mesure que de nouveaux champs apparaissent. L’appel nécessite l’autorisation correspondant au signal : `logs.write`, `metrics.write` ou `traces.write`. Utilisez le jeton d’ingestion par défaut ou un jeton de compte de service doté d’un rôle autorisant l’écriture.
+
+**Paramètres de chemin**
+
+| Paramètre | Type | Remarques |
+|---|---|---|
+| `type` | chaîne | `logs`, `metrics` ou `traces`. Toute autre valeur renvoie `404`. |
+| `stream` | chaîne | Nom du flux composé de lettres, de chiffres et des caractères `_`, `-` et `.`. Un [flux de plateforme](/fr/streams#flux-de-la-plateforme), comme `_molesignal` ou `_audit`, renvoie `403`. |
+
+**Corps**
+
+Un objet JSON ou un tableau d’objets JSON. Chaque élément doit être un objet. Le corps de la requête ne peut pas dépasser 16 MiB. Si la requête contient l’en-tête `Content-Encoding: gzip`, le serveur décompresse le corps. La limite de 16 MiB s’applique aussi après décompression.
+
+| Champ | Remarques |
+|---|---|
+| `_timestamp` | Horodatage de l’événement en microsecondes depuis l’époque Unix. En l’absence de ce champ, le serveur utilise l’heure de réception. |
+| `metric_name` | Pour `metrics`, indique la métrique à laquelle appartient l’enregistrement. Un flux de métriques regroupe les métriques d’une seule source. Sans `metric_name`, l’enregistrement appartient à la métrique qui porte le nom du flux. |
+| tout autre champ | Le flux stocke ce champ. Tout enregistrement ultérieur doit respecter le type déjà défini pour ce champ dans le flux. |
+
+**Écriture de traces**
+
+Le flux `traces` stocke les spans à leur arrivée. Ces spans ne passent pas par l’[échantillonnage en fin de trace](/fr/configuration#capture-des-traces-et-échantillonnage-en-fin-de-trace) et ne produisent pas les résumés qu’utilise la liste des traces. Pour accéder à toutes les fonctionnalités de traçage, envoyez les spans via [OTLP](/fr/api/intake/otlp).
+
+| Emplacement | Traitement de ces spans |
+|---|---|
+| L’onglet **Traces** de la page **Traces** et son histogramme | Non affichés. |
+| L’outil `list_traces` de Mole Agent et **Traces associées** dans **RUM** | Introuvables. |
+| **APM** | Non comptabilisés. |
+| L’onglet **Spans** et l’**Analyse détaillée RED** de la page **Traces**, ainsi que les détails d’une trace ouverte par son ID | Disponibles. |
+| **Graphe des services** | Comptabilisés. |
+
+Lorsqu’une organisation dispose de plusieurs flux de traces, la liste des traces et Mole Agent consultent un seul flux et privilégient un flux qui contient des résumés. Un flux alimenté uniquement via ce point de terminaison ne masque donc pas un flux alimenté via OTLP.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/logs/app \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "accepted": 1, "rejected": 0, "errors": [] }
+```
+</ResponseExample>
+
+Le serveur rejette uniquement l’enregistrement qui ne respecte pas le schéma et accepte le reste du lot :
+
+```json
+{
+  "accepted": 1,
+  "rejected": 1,
+  "errors": [
+    { "index": 0, "reason": "type mismatch on field `level`: expected Utf8, got Number" }
+  ]
+}
+```
+
+**Erreurs**
+
+| Statut | Cause |
+|---|---|
+| `400` | Nom de flux non valide, JSON non valide ou élément du tableau qui n’est pas un objet (`event #1 must be a JSON object`). |
+| `401` | Jeton manquant ou non valide. |
+| `403` | Le jeton ne dispose pas de l’autorisation requise ou le flux est un flux de plateforme. |
+| `413` | Le corps dépasse 16 MiB, avant ou après décompression. |
+| `429` | Le routeur applique sa limite de débit ou les tampons d’ingestion du nœud sont pleins (`intake buffer memory limit exceeded`). La réponse contient l’en-tête `Retry-After`. |

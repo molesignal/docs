@@ -1,0 +1,86 @@
+---
+title: "查詢 Exemplar"
+description: "依照 Prometheus HTTP API 的回應格式，讀取隨 Prometheus remote write 樣本儲存的 Exemplar。"
+"en_link": "/en-US/api/query/exemplars"
+"zh-Hans_link": "/zh-Hans/api/query/exemplars"
+"ja_link": "/ja/api/query/exemplars"
+"ko_link": "/ko/api/query/exemplars"
+"de_link": "/de/api/query/exemplars"
+"es_link": "/es/api/query/exemplars"
+"fr_link": "/fr/api/query/exemplars"
+"pt-BR_link": "/pt-BR/api/query/exemplars"
+---
+
+```http
+GET  /api/v1/prometheus/api/v1/query_exemplars
+POST /api/v1/prometheus/api/v1/query_exemplars
+```
+
+傳回 PromQL 運算式所選時間序列的 Exemplar，回應格式與 Prometheus HTTP API 的 `query_exemplars` 端點相同。**指標**頁面會從這個端點讀取圖表上的 Exemplar。此呼叫需要 `metrics.read` 權限，在系統範圍內則需要 `sys.telemetry.read` 權限。
+
+Exemplar 來自 [Prometheus remote write](/zh-Hant/intake#prometheus-remote_write)，並與樣本一併儲存。儲存 OTLP 指標時不包含 Exemplar。
+
+`GET` 透過查詢字串傳遞參數，`POST` 則透過表單（`application/x-www-form-urlencoded`）傳遞參數：
+
+| 參數 | 必填 | 說明 |
+|---|---|---|
+| `query` | 是 | PromQL 運算式，其中每個選擇器都必須明確指定指標名稱。 |
+| `start` | 是 | 自 Unix 紀元起算的秒數（可含小數）或 RFC 3339 時間。 |
+| `end` | 是 | 格式同上，不得早於 `start`。 |
+
+只有運算式中的選擇器會影響結果：每個選擇器都會從指定的指標中選出符合標籤比對條件的時間序列。函式、運算子和範圍長度都不影響結果。重複傳送的 Exemplar（例如 remote write 重試時）只會傳回一次。結果最多包含 10,000 個 Exemplar，達到上限時會停止擷取並附上警告。這類請求和查詢一樣，必須等到[准入控制](/zh-Hant/configuration#准入控制)有空位才會執行，且一律不快取結果。
+
+[欄位遮罩](/zh-Hant/settings/data-security#欄位遮罩)適用於時間序列標籤和 Exemplar 標籤。如果遮罩規則涵蓋 `value` 或 `_timestamp`，請求就會失敗，因為 Prometheus 的格式無法表示套用遮罩後的值。
+
+<RequestExample>
+```bash cURL
+curl -G http://localhost:5080/api/v1/prometheus/api/v1/query_exemplars \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'query=histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{service="checkout"}[5m]))' \
+  --data-urlencode "start=$(( $(date +%s) - 3600 ))" \
+  --data-urlencode "end=$(date +%s)"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "status": "success",
+  "data": [
+    {
+      "seriesLabels": {
+        "__name__": "http_request_duration_seconds_bucket",
+        "le": "0.5",
+        "service": "checkout"
+      },
+      "exemplars": [
+        {
+          "labels": { "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7" },
+          "value": 0.43,
+          "timestamp": 1790000000.123
+        }
+      ]
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| 欄位 | 說明 |
+|---|---|
+| `data[].seriesLabels` | 時間序列的標籤，指標名稱位於 `__name__` 中。 |
+| `data[].exemplars[]` | 此時間序列在指定時間範圍內的 Exemplar，依時間從早到晚排列。 |
+| `labels` | Exemplar 的標籤，例如 `trace_id` 和 `span_id`。 |
+| `value` | Exemplar 記錄的觀測值。 |
+| `timestamp` | 自 Unix 紀元起算的秒數，可含小數。 |
+| `warnings` | 僅在結果達到 10,000 個 Exemplar 的上限時出現。 |
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | `query` 為空值或不是有效的 PromQL、某個選擇器未指定指標名稱、時間不符合上述任一格式，或 `end` 早於 `start`。 |
+| `403` | 權杖缺少 `metrics.read` 權限，或遮罩規則涵蓋 `value` 或 `_timestamp`。 |
+| `429` | [准入控制](/zh-Hant/configuration#准入控制)拒絕請求。 |
+
+這些錯誤使用與其他端點相同的[錯誤回應本文](/zh-Hant/api-reference#回應與錯誤)，而非 Prometheus 的格式。

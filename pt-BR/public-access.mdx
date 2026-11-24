@@ -1,0 +1,82 @@
+---
+title: "Acesso público"
+description: "Mantenha o MoleSignal na rede interna e exponha à internet apenas callbacks externos e páginas públicas. Veja quais caminhos liberar, conheça duas formas de configurar os pontos de entrada e siga uma lista de verificação de segurança."
+"en_link": "/en-US/public-access"
+"zh-Hans_link": "/zh-Hans/public-access"
+"zh-Hant_link": "/zh-Hant/public-access"
+"ja_link": "/ja/public-access"
+"ko_link": "/ko/public-access"
+"de_link": "/de/public-access"
+"es_link": "/es/public-access"
+"fr_link": "/fr/public-access"
+---
+
+Em geral, o MoleSignal roda em uma rede interna, acessível pela rede do escritório ou por uma VPN. Alguns recursos precisam aceitar acesso direto de sistemas externos ou de pessoas na internet. É o caso dos alertas enviados pelo Datadog ou PagerDuty, dos callbacks de mensagens do Microsoft Teams e das visitas a páginas de status. O MoleSignal não distingue solicitações internas de públicas: os pontos de entrada da rede fazem essa distinção. O ponto de entrada interno continua encaminhando todas as solicitações. O ponto de entrada público encaminha apenas os caminhos em uso da [tabela abaixo](#caminhos-que-precisam-de-acesso-público) e retorna 404 para todos os outros.
+
+Cada caminho aberto à internet tem sua própria autenticação: o token de uma fonte de alertas, um token de push, um link de compartilhamento ou um token assinado por uma plataforma. A restrição de rede é a segunda linha de defesa: varreduras e ataques de preenchimento de credenciais pela internet nunca chegam aos endpoints de login e gerenciamento.
+
+## Caminhos que precisam de acesso público
+
+Abra apenas os recursos em uso. As linhas são independentes entre si.
+
+| Recurso | Caminho | Métodos | Origem da solicitação | Autenticação |
+|---|---|---|---|---|
+| [Alertas externos](/pt-BR/alerting/sources) | `/api/v1/intake/alerts` | `POST` | Datadog, PagerDuty, Alibaba Cloud CloudMonitor, Tencent Cloud Observability Platform, Amazon SNS e instâncias de Alertmanager, Grafana ou Zabbix ou um sistema de e-mail na internet | Token da fonte de alertas, em um cabeçalho ou em `?token=` |
+| [Check-ins de heartbeat](/pt-BR/alerting/rules#regras-de-heartbeat) | Caminhos que começam com `/api/v1/intake/heartbeats/` | `GET`, `POST` | Tarefas do cron e scripts de backup na internet | Token de check-in na URL |
+| [Webhook de chamados do Jira](/pt-BR/alerting/tickets#sincronização-de-status) | `/api/v1/public/tickets/jira/<connector ID>` | `POST` | Jira Cloud | `X-Hub-Signature`, com assinatura gerada com o segredo do webhook do conector |
+| [Assinaturas de calendários de plantão](/pt-BR/alerting/on-call#assinaturas-de-calendário) | `/api/v1/public/calendar/<token>.ics` | `GET` | Serviços de calendário online, como Google Calendar e Outlook | Token de assinatura na URL; a cada leitura, o MoleSignal verifica novamente as permissões do assinante |
+| [Mole Agent no Teams](/pt-BR/im#segurança-para-teams) | Caminhos que começam com `/api/v1/public/im/teams/` | `POST` | Microsoft Bot Framework | Token assinado pelo Bot Framework |
+| [Respostas a SMS e chamadas](/pt-BR/notification-channels#respostas-a-mensagens-de-texto-e-chamadas) | `/api/v1/public/notify/<connector ID>/replies`, `/api/v1/public/notify/<connector ID>/keypress` | `POST` | Twilio, Amazon SNS, serviços de SMS e voz da Alibaba Cloud, Tencent Cloud e Huawei Cloud, ou um gateway de SMS próprio (o endereço da Huawei Cloud termina com o token de callback) | Assinatura da Twilio ou do SNS, ou token de callback na URL |
+| [Botões de um app do WeCom](/pt-BR/im#botões-de-um-app-do-wecom) | `/api/v1/public/notify/<connector ID>/wecom` | `GET`, `POST` | WeCom | O MoleSignal verifica a assinatura da mensagem com o token de callback do conector e descriptografa o conteúdo com a EncodingAESKey do conector |
+| [Botões de um bot do Mattermost](/pt-BR/im#botões-de-um-bot-do-mattermost) | `/api/v1/public/notify/<connector ID>/mattermost` | `POST` | Servidor Mattermost na internet | Token de callback do conector em `?token=` |
+| [Links de ação de uso único](/pt-BR/notification-channels#links-de-ação-de-uso-único) | Caminhos que começam com `/notify/actions/` e `/api/v1/public/notify/actions/`, além dos [arquivos web](#arquivos-web) | `GET`, `POST` | Usuários que abrem links de notificações fora da rede do escritório, por exemplo, no celular | Token de uso único no link |
+| [Gatilhos de automação via API](/pt-BR/automations) | `/api/v1/public/automations/<automation ID>/trigger` | `POST` | Sistemas externos, como pipelines de CI | Token da própria automação |
+| [Fontes push](/pt-BR/connectors) | `/api/v1/_kinesis_firehose`, `/api/v1/_cloudflare`, `/api/v1/_heroku` | `POST` | Amazon Data Firehose, Cloudflare Logpush e encaminhadores de logs do Heroku | Token de push do conector |
+| [RUM](/pt-BR/rum) | `/api/v1/rum/events`, `/api/v1/rum/replay` | `POST`, `OPTIONS` | Navegadores e apps de usuários na internet | Token de cliente da aplicação |
+| [Páginas de status](/pt-BR/status-pages) | `/status/`, `/api/v1/public/status-pages/` e os [arquivos web](#arquivos-web) | `GET`, `POST` | Visitantes e assinantes da página de status | Nenhuma autenticação para páginas públicas; link de acesso para páginas privadas |
+| [Compartilhamento de recursos](/pt-BR/resource-sharing) | `/s/`, `/shared`, `/api/v1/public/share` e os [arquivos web](#arquivos-web) | `GET`, `POST` | Qualquer pessoa com um link de compartilhamento | Sessão de curta duração obtida em troca do link de compartilhamento |
+| [Agentes de sondagem do monitoramento sintético](/pt-BR/synthetics#locais-e-agentes-de-sondagem) | `/api/v1/synthetics/artifacts/` | `PUT` | Agentes de sondagem em locais externos que enviam capturas de tela e outros artefatos | Token de concessão da tarefa |
+
+O MoleSignal verifica o token de concessão, o tamanho e o hash do conteúdo de cada artefato enviado antes de gravá-lo no armazenamento de objetos. Os agentes de sondagem nunca recebem credenciais do armazenamento de objetos, que permanece inacessível pela internet. Os agentes de sondagem também se conectam a duas portas gRPC: `5084` para o registro e `5085` para o fluxo de controle. O próprio MoleSignal termina o TLS nessas portas. Por isso, encaminhe o tráfego na camada 4 (TCP), sem passar por um proxy HTTP. Quando agentes de sondagem em locais externos se conectarem pela internet, mapeie as duas portas separadamente e configure `probe.register_endpoint` e `probe.control_endpoint` com os endereços públicos. Consulte [Configuração](/pt-BR/configuration).
+
+### Arquivos web
+
+Páginas de status, recursos compartilhados e páginas de confirmação de links de ação de uso único são páginas web. Por isso, o ponto de entrada público também encaminha solicitações para os arquivos estáticos correspondentes: arquivos em `/assets/`, `/favicon.ico` e `/favicon.svg`, `/favicon-dark.ico` e `/favicon-dark.svg`. Se apenas os caminhos de página `/status/`, `/shared` e `/notify/actions/` e os arquivos estáticos estiverem abertos, o ponto de entrada público continuará retornando 404 para a página de login e todas as outras páginas.
+
+### Domínios personalizados de páginas de status
+
+Se a página de status tiver um domínio próprio, aponte esse domínio também para o ponto de entrada público. As páginas ficam na raiz do domínio: `/`, `/history`, `/uptime` e os caminhos que começam com `/incidents/`. Os dados vêm de endpoints que começam com `/api/v1/public/status-pages/`. Abra apenas esses caminhos e os arquivos web para esse domínio. Gerencie o certificado no ponto de entrada público ou deixe o MoleSignal emiti-lo. Consulte [Domínio personalizado e TLS](/pt-BR/status-pages#domínio-personalizado-e-tls).
+
+## Duas formas de configurar os pontos de entrada
+
+### DNS dividido para separar os pontos de entrada
+
+Use esta opção de preferência. O DNS interno resolve `molesignal.example.com` para o ponto de entrada interno, e o DNS público resolve o mesmo nome para o ponto de entrada público. O ponto de entrada interno encaminha solicitações para todos os caminhos; o público encaminha apenas para os caminhos da tabela. Configure `http.external_url` com esse nome. Assim, os endereços de ingestão exibidos nas páginas, os endereços de callback fornecidos aos remetentes e os links de mensagens instantâneas e e-mails funcionam nas duas redes, sem alterar o acesso pela rede interna.
+
+### Um único ponto de entrada que distingue as origens
+
+Com um único ponto de entrada, permita acesso aos caminhos da tabela de qualquer origem e restrinja todos os demais caminhos aos intervalos de endereços da rede do escritório e da VPN. O ponto de entrada precisa receber o endereço real do cliente. Se houver um balanceador de carga na frente dele, encaminhe o endereço original com o protocolo PROXY ou com `X-Forwarded-For`.
+
+## Checklist de reforço de segurança
+
+- **Somente HTTPS.** O ponto de entrada público escuta apenas na porta 443, com um certificado de uma CA pública. O Teams só envia para endereços HTTPS.
+- **Limites do corpo da requisição por endpoint.** Alertas externos: 4 MiB; check-ins de heartbeat: 64 KiB; webhook de chamados do Jira: 1 MiB; eventos de RUM: 5 MiB; reprodução de sessões: 8 MiB; artefatos do Probe Agent: 10 MiB; ingestão nativa de JSON: 16 MiB; outros endpoints de ingestão: 2 MiB. O MoleSignal responde com `413` acima desses limites. Não configure limites menores no ponto de entrada.
+- **Limites de taxa no ponto de entrada público.** Limite o número de requisições por segundo por endereço de origem. Um nó `standalone` não aplica limites de taxa à ingestão. Consulte [Limites de taxa e tamanho](/pt-BR/security#limites-de-taxa-e-tamanho).
+- **Sem strings de consulta nos logs de acesso.** O Alibaba Cloud CloudMonitor só pode enviar o token no parâmetro `token` da URL, por isso o ponto de entrada público registra apenas os caminhos. Check-ins de heartbeat, assinaturas de calendários de plantão, links de ação de uso único e callbacks da Huawei Cloud incluem o token no caminho. Registre apenas o prefixo desses caminhos. Os [exemplos de configuração](#exemplos-de-configuração) substituem o token com um `map`. Os traces do MoleSignal registram as rotas, nunca as strings de consulta.
+- **Endereços reais dos clientes no MoleSignal.** Na organização `_sys`, abra **Configurações → Identificação do IP do cliente**, selecione a cadeia de endereços encaminhados e cadastre os endereços do ponto de entrada público como proxies confiáveis. Consulte [Identificação do IP do cliente](/pt-BR/settings/platform#identificação-do-ip-do-cliente). A geolocalização de RUM e os [limites de login](/pt-BR/settings/platform#limites-de-login) dependem dessa configuração. Sem ela, todos os usuários aparecem com o endereço do ponto de entrada: se for privado, as tentativas não entram na contagem; se for público, as tentativas de um usuário podem bloquear o acesso de outros.
+- **Opcional: restrinja por endereço de origem.** Se o remetente publicar os endereços de saída, permita apenas esses endereços. Consulte a seção `webhooks` de `ip-ranges.<site domain>` para cada site do Datadog, a lista da região do serviço (EUA ou UE) para o PagerDuty, a documentação de callbacks de alarmes para o Alibaba Cloud CloudMonitor e a tag de serviço `AzureBotService` do Azure para o Teams. Mantenha as listas atualizadas, pois os endereços mudam. Os tokens continuam sendo a principal defesa.
+- **Verifique antes de colocar em produção.** Pela internet, `/` e `/api/v1/auth/signin` retornam `404`. Já `POST /api/v1/intake/alerts` sem token retorna `401`, o que confirma que a requisição chegou ao MoleSignal. Pela rede interna, `/` abre a página de login.
+
+## Exemplos de configuração
+
+<CardGroup cols={3}>
+  <Card title="nginx" icon="server" href="/pt-BR/public-access/nginx">
+    Dois servidores: o interno encaminha tudo, e o público encaminha apenas callbacks e páginas públicas.
+  </Card>
+  <Card title="Kubernetes Ingress" icon="network-wired" href="/pt-BR/public-access/ingress">
+    Dois controladores ingress-nginx: o público lista apenas os caminhos que devem ficar acessíveis.
+  </Card>
+  <Card title="Gateway API" icon="route" href="/pt-BR/public-access/gateway-api">
+    Dois Gateways: o HTTPRoute do Gateway público seleciona as requisições por caminho e método.
+  </Card>
+</CardGroup>

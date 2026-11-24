@@ -1,0 +1,124 @@
+---
+title: "Créer une politique d’escalade"
+description: "Définissez l’ordre des étapes de notification pour les incidents."
+"en_link": "/en-US/api/alerting/create-escalation"
+"zh-Hans_link": "/zh-Hans/api/alerting/create-escalation"
+"zh-Hant_link": "/zh-Hant/api/alerting/create-escalation"
+"ja_link": "/ja/api/alerting/create-escalation"
+"ko_link": "/ko/api/alerting/create-escalation"
+"de_link": "/de/api/alerting/create-escalation"
+"es_link": "/es/api/alerting/create-escalation"
+"pt-BR_link": "/pt-BR/api/alerting/create-escalation"
+---
+
+```http
+POST /api/v1/alerts/escalations
+```
+
+Crée une politique d’escalade. Une politique définit une suite d’étapes dans un ordre précis. Chaque étape notifie ses destinataires et attend un accusé de réception. L’appel nécessite l’autorisation `alerts.escalations.manage`.
+
+## Fonctionnement de l’escalade
+
+1. Le rôle `alert` vérifie les incidents actifs à l’intervalle défini par `[alert].dispatch_interval_secs`, soit 10 secondes par défaut. Seuls les incidents au statut `open` passent à l’étape suivante. L’accusé de réception d’un incident arrête l’escalade.
+2. Une étape qui spécifie `minSeverity` s’applique uniquement aux incidents dont la gravité atteint ou dépasse ce seuil. L’escalade ignore les étapes non applicables.
+3. Chaque cible de l’étape en cours reçoit un événement de notification. Les [canaux de notification](/fr/notification-channels) déterminent le mode d’envoi du message. Le champ `assignees` de l’incident prend pour valeur les utilisateurs désignés par l’étape : les cibles `user` et l’utilisateur d’astreinte de chaque cible `schedule`. Une étape qui cible uniquement des équipes conserve les affectations précédentes.
+4. Sans accusé de réception à l’expiration du délai `ackTimeoutSecs`, l’étape applicable suivante démarre.
+5. Lorsque le délai de la dernière étape applicable expire, une politique dont `repeat` vaut `true` reprend à la première étape jusqu’à atteindre `maxLoops` passages.
+6. Si `ackRetriggerSecs` est défini et qu’un incident au statut `acknowledged` reste non résolu pendant ce délai après l’accusé de réception, l’incident repasse au statut `open` : le système notifie les utilisateurs affectés ou, à défaut, les destinataires de l’étape en cours, avec `escalation.reason` défini sur `ack_timeout`. Le délai d’accusé de réception de l’étape en cours repart de zéro et l’escalade se poursuit normalement. Ce délai ne s’applique pas aux incidents mis en veille.
+
+Une règle sélectionne une politique à l’aide de `escalationPolicyId`. En l’absence de ce champ, la règle utilise `default`, un alias qui désigne la politique de l’organisation nommée `default`, sans distinction de casse. Au démarrage de l’escalade, l’incident enregistre l’identifiant réel de cette politique. Renommer la politique par la suite ne réaffecte donc pas un incident ouvert à une autre politique. Si l’organisation ne dispose d’aucune politique nommée `default`, les incidents de cette règle ne font jamais l’objet d’une escalade, mais les politiques de notification reçoivent tout de même l’événement déclenché. Créez une politique nommée `default` ou indiquez un identifiant de politique dans la règle.
+
+**Corps**
+
+| Champ | Type | Obligatoire | Notes |
+|---|---|---|---|
+| `name` | chaîne | Oui | Ne doit pas être vide. |
+| `steps` | tableau | Non | Tableau vide par défaut. Une politique sans étape n’envoie aucune notification. |
+| `repeat` | booléen | Non | Valeur par défaut : `false`. Détermine si l’escalade reprend après la dernière étape. |
+| `maxLoops` | entier | Non | Valeur par défaut : `1`. Nombre total de passages par les étapes lorsque `repeat` vaut `true`. Toute valeur inférieure à 1 devient 1. |
+| `ackRetriggerSecs` | entier | Non | Délai pendant lequel un incident peut rester non résolu après l’accusé de réception avant l’envoi d’une nouvelle notification, de 300 à 86400 secondes. Valeur par défaut : `null` (aucune nouvelle notification). |
+| `urgencyRule` | objet | Non | Détermine l’urgence d’un incident qui n’en indique aucune. Par défaut, `{"mode": "by_severity"}` associe chaque gravité au niveau défini par l’organisation (élevé pour `critical` et `error`, faible pour `warning` et `info`, sauf modification). Autres options : `{"mode": "always", "urgency": "high"}` ou `{"mode": "support_hours", "hours": {"timezone": "Asia/Shanghai", "ranges": [{"weekdayMask": 62, "start": "09:00", "end": "18:00"}], "calendar": {"calendarId": "<id>", "holidays": "exclude"}}, "inside": "high", "outside": "low", "raiseAtStart": true}`. Le niveau `inside` s’applique pendant les heures d’assistance et le niveau `outside` en dehors, avec `high` et `low` comme valeurs par défaut. Avec `raiseAtStart`, au début des heures d’assistance, le système relève au niveau `inside` les incidents de niveau inférieur restés sans accusé de réception et renvoie les notifications à partir de la première étape. Une urgence correspond à la clé de l’un des [niveaux](/fr/alerting/on-call#niveaux-d’urgence-et-de-priorité) de l’organisation. Le bit 0 de `weekdayMask` correspond au dimanche. Le champ `calendar` est facultatif, avec `exclude` ou `only` pour `holidays` (voir [Calendriers des jours fériés](/fr/alerting/on-call#calendriers-des-jours-fériés)). Voir [Urgence](/fr/alerting/on-call#urgence). |
+| `escalateLowUrgency` | booléen | Non | Valeur par défaut : `false`. Pour les incidents dont le niveau ne prévoit pas d’escalade, le système notifie uniquement les destinataires de la première étape, sans passer aux suivantes ni recommencer. Avec `true`, l’escalade suit normalement cette politique. |
+
+Une étape comporte les champs suivants :
+
+| Champ | Type | Obligatoire | Notes |
+|---|---|---|---|
+| `targets` | tableau | Oui | Destinataires de l’étape. Le système les notifie tous en même temps. |
+| `ackTimeoutSecs` | entier | Non | Nombre de secondes à attendre avant de passer à l’étape suivante en l’absence d’accusé de réception. Si ce champ est absent, le système utilise `[alert].default_ack_timeout_secs` (300 par défaut) et enregistre cette valeur avec l’étape. |
+| `minSeverity` | chaîne | Non | `info`, `warning`, `error` ou `critical`. L’étape s’applique aux incidents dont la gravité atteint ou dépasse ce seuil. Omettez ce champ pour appliquer l’étape à tous les incidents. |
+
+Une cible désigne ses destinataires à l’aide de `kind` :
+
+| `kind` | Champ supplémentaire | Destinataires |
+|---|---|---|
+| `user` | `userId` | Un utilisateur. |
+| `team` | `teamId` | Les membres d’une équipe. |
+| `schedule` | `scheduleId` | L’utilisateur d’astreinte selon un planning d’astreinte. |
+
+L’appel ne vérifie pas l’existence de l’utilisateur, de l’équipe ou du planning d’astreinte référencé.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/escalations \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "Primary operations",
+    "steps": [
+      { "targets": [{ "kind": "user", "userId": "<user-id>" }],
+        "ackTimeoutSecs": 300 },
+      { "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+        "ackTimeoutSecs": 900,
+        "minSeverity": "critical" }
+    ],
+    "repeat": true,
+    "maxLoops": 2,
+    "ackRetriggerSecs": 3600
+  }'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KED3sy8RBNYIdLayGZN0bp2IIY",
+  "orgId": "<organization-id>",
+  "name": "Primary operations",
+  "steps": [
+    {
+      "targets": [{ "kind": "user", "userId": "<user-id>" }],
+      "ackTimeoutSecs": 300,
+      "minSeverity": null
+    },
+    {
+      "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+      "ackTimeoutSecs": 900,
+      "minSeverity": "critical"
+    }
+  ],
+  "repeat": true,
+  "maxLoops": 2,
+  "ackRetriggerSecs": 3600
+}
+```
+</ResponseExample>
+
+**Erreurs**
+
+| Statut | Cause |
+|---|---|
+| `400` | `name` est vide ou `ackRetriggerSecs` n’est pas compris entre 300 et 86400. |
+| `403` | Le jeton ne dispose pas de l’autorisation `alerts.escalations.manage`. |
+| `422` | Un champ est manquant ou non valide, par exemple si `kind` contient une valeur autre que `user`, `team` ou `schedule`, ou si `minSeverity` contient une valeur inconnue. La réponse est en texte brut. |
+
+## Autres routes de gestion des politiques
+
+| Opération | Point de terminaison | Autorisation |
+|---|---|---|
+| Lister | `GET /api/v1/alerts/escalations` | `alerts.escalations.read` |
+| Récupérer | `GET /api/v1/alerts/escalations/{id}` | `alerts.escalations.read` |
+| Remplacer | `PUT /api/v1/alerts/escalations/{id}` | `alerts.escalations.manage` |
+| Supprimer | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.escalations.delete` |
+
+`PUT` accepte le même corps que l’appel de création et remplace la politique. `DELETE` renvoie `deleted` en texte brut, ou `404` si l’identifiant est inconnu. La suppression d’une politique ne vérifie pas les règles qui la référencent. Ces règles ne déclenchent plus d’escalade.

@@ -1,0 +1,110 @@
+---
+title: "Claves de cifrado"
+description: "Enumera, crea, rota y elimina las claves de cifrado de campos de una organización."
+"en_link": "/en-US/api/admin/cipher-keys"
+"zh-Hans_link": "/zh-Hans/api/admin/cipher-keys"
+"zh-Hant_link": "/zh-Hant/api/admin/cipher-keys"
+"ja_link": "/ja/api/admin/cipher-keys"
+"ko_link": "/ko/api/admin/cipher-keys"
+"de_link": "/de/api/admin/cipher-keys"
+"fr_link": "/fr/api/admin/cipher-keys"
+"pt-BR_link": "/pt-BR/api/admin/cipher-keys"
+---
+
+Las claves de cifrado cifran los campos que los flujos marcan como cifrados. Cada clave es una clave AES-256-GCM de 32 bytes. MoleSignal protege el material de la clave con la clave raíz de `MS_CIPHER_KEY` y nunca devuelve ese material. Consulta [Seguridad](/es/security#cifrado-a-nivel-de-campo).
+
+Los nuevos valores cifrados siempre usan la versión más reciente de la clave predeterminada `__field_default__`. MoleSignal crea esta clave la primera vez que un flujo la necesita. Las demás claves con nombre y las versiones anteriores de cada clave siguen permitiendo descifrar los valores que se escribieron con ellas.
+
+| Operación | Punto de conexión | Permiso |
+|---|---|---|
+| Listar claves | `GET /api/v1/cipher_keys` | `org.cipher_keys.read` |
+| Obtener una clave | `GET /api/v1/cipher_keys/{name}` | `org.cipher_keys.read` |
+| Crear una clave | `POST /api/v1/cipher_keys` | `org.cipher_keys.manage` |
+| Rotar una clave | `POST /api/v1/cipher_keys/{name}/rotate` | `org.cipher_keys.rotate` |
+| Eliminar una clave | `DELETE /api/v1/cipher_keys/{name}` | `org.cipher_keys.manage` |
+| Rotar la clave predeterminada | `POST /api/v1/field_encryption/rotate` | `org.cipher_keys.rotate` |
+
+## Metadatos de las claves
+
+Las llamadas para listar, obtener, crear y rotar claves devuelven los metadatos de sus versiones. La llamada para listar devuelve todas las versiones de cada clave, empezando por la más reciente para cada nombre.
+
+```json
+{
+  "id": "3KEZizkQsvBwoWQihNO6OdxRiSf",
+  "name": "payments-key",
+  "alg": "aes-256-gcm",
+  "version": 1,
+  "createdAt": 1790000000000000,
+  "rotatedAt": null
+}
+```
+
+`rotatedAt` es `null` si la clave nunca se ha rotado. La llamada para obtener una clave devuelve su versión más reciente.
+
+## Crear una clave
+
+```http
+POST /api/v1/cipher_keys
+```
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `name` | cadena | Sí | El nombre de la clave. Si el nombre ya existe, la llamada devuelve `409` y el mensaje indica qué llamada usar para rotar la clave. |
+| `keyMaterialB64` | cadena | Sí | 32 bytes aleatorios en base64 estándar con relleno. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/cipher_keys \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"name\": \"payments-key\", \"key_material_b64\": \"$(openssl rand -base64 32)\"}"
+```
+</RequestExample>
+
+La respuesta contiene los metadatos de la clave que aparecen arriba.
+
+## Rotar una clave
+
+```http
+POST /api/v1/cipher_keys/{name}/rotate
+```
+
+El cuerpo contiene `keyMaterialB64`, al igual que en la llamada para crear una clave. La llamada agrega una versión con el nuevo material y conserva las versiones anteriores para el descifrado. Si el nombre no existe, la llamada devuelve `404`. Crea primero la clave con la llamada de creación.
+
+## Eliminar una clave
+
+```http
+DELETE /api/v1/cipher_keys/{name}
+```
+
+La llamada elimina todas las versiones de la clave indicada y devuelve `{"deleted": true}`. Si el nombre no existe, devuelve `404`. La llamada no comprueba si los datos almacenados aún dependen de la clave.
+
+<Warning>
+  No puedes volver a descifrar los valores cifrados con una clave eliminada. Antes de eliminar una clave,
+  revisa qué campos cifrados dependen de ella.
+</Warning>
+
+## Rotar la clave predeterminada
+
+```http
+POST /api/v1/field_encryption/rotate
+```
+
+La llamada genera nuevo material de clave en el servidor, agrega una versión de `__field_default__` y actualiza de inmediato la caché de descifrado. Las nuevas escrituras usan la nueva versión y los valores existentes siguen siendo legibles. Si la organización aún no tiene una clave predeterminada, la llamada la crea como versión 1. El cuerpo está vacío y la respuesta contiene el identificador y la versión de la nueva clave:
+
+```json
+{
+  "keyId": "3KEZj3uxMx5OOFX6NiYv3VFnfmD",
+  "version": 2
+}
+```
+
+**Errores**
+
+| Estado | Causa |
+|---|---|
+| `400` | `keyMaterialB64` no es base64 válido o no produce exactamente 32 bytes al decodificarse (`key_material must be 32 bytes, got 5`). |
+| `403` | El token no tiene el permiso que requiere la llamada. |
+| `404` | La llamada para obtener, rotar o eliminar la clave no encontró ninguna con ese nombre. |
+| `409` | Ya existe una clave con ese nombre. |
+| `422` | Falta un campo obligatorio. La respuesta está en texto sin formato. |

@@ -1,0 +1,156 @@
+---
+title: "Logsuche"
+description: "Listen Sie die Einträge eines Log-Streams seitenweise auf, zählen Sie sie im Zeitverlauf und rufen Sie eine Beschreibung der Werte eines Feldes ab."
+"en_link": "/en-US/api/web/logs"
+"zh-Hans_link": "/zh-Hans/api/web/logs"
+"zh-Hant_link": "/zh-Hant/api/web/logs"
+"ja_link": "/ja/api/web/logs"
+"ko_link": "/ko/api/web/logs"
+"es_link": "/es/api/web/logs"
+"fr_link": "/fr/api/web/logs"
+"pt-BR_link": "/pt-BR/api/web/logs"
+---
+
+Diese Aufrufe lesen einen Log-Stream der Organisation auf dieselbe Weise wie die Seite **Logs**. Wenn der Stream nicht existiert, gibt der Aufruf ein leeres Ergebnis zurück. Alle Aufrufe erfordern `logs.read` oder im Systembereich `sys.telemetry.read`.
+
+Jeder Aufruf akzeptiert `POST` mit einem JSON-Body oder `GET` mit denselben Feldern im Query-String: `filters` und `freeText` als JSON-Listen in Textform und `where` als JSON-Objekt in Textform. Senden Sie Abfragen, die für eine URL zu lang sind, per `POST`.
+
+## Welche Datensätze ein Aufruf findet
+
+Ein Aufruf findet die Datensätze des Streams, die im Zeitfenster liegen und alle folgenden Bedingungen erfüllen:
+
+| Feld | Typ | Hinweise |
+|---|---|---|
+| `filters` | Liste | Filter, die alle zutreffen müssen. Zusammen mit den Filtern in `where` sind höchstens 32 zulässig. |
+| `freeText` | Liste | Wörter oder Wortgruppen, nach denen die Abfrage im Feld `message` sucht, jeweils bis zu 512 Bytes. Bei einem kleingeschriebenen Wort aus Buchstaben und Ziffern mit bis zu 40 Bytes ignoriert die Suche die Groß- und Kleinschreibung. Anderen Text gleicht sie exakt ab. Zusammen mit den Suchtexten in `where` sind höchstens 8 zulässig. |
+| `where` | Objekt | Ein Bedingungsbaum für Alternativen: ein Filter, `{"text": "..."}`, `{"and": [...]}` oder `{"or": [...]}`. |
+| `expression` | Zeichenfolge | Eine Feldabfrage in der Syntax der Seite **Logs**. Senden Sie entweder `expression` oder `filters`, `freeText` und `where`. |
+
+Ein Filter ist ein Objekt mit `field`, `op`, `value` und `quoted`. Geben Sie den Feldnamen so an, wie er im Stream lautet.
+
+| Operator | Felder | Treffer |
+|---|---|---|
+| `=`, `!=` | Beliebiges skalares Feld | Der angegebene Wert bzw. alle anderen Werte. Bei einem leeren Vergleichswert prüft der Operator, ob das Feld überhaupt einen Wert hat: `=` findet Datensätze ohne Wert. |
+| `>`, `>=`, `<`, `<=` | Zahlen und Zeitstempel | Werte, die den Vergleich erfüllen. |
+| `contains` | Text | Der Wert an einer beliebigen Stelle im Feld. |
+| `match` | Beliebiges Feld | Der Wert als Teilzeichenfolge, unabhängig von der Groß- und Kleinschreibung. Ein leerer Wert liefert keine Treffer. |
+| `match_text` | Text mit Volltextindex | Volltextsuche mit Wörtern, Wortgruppen und Platzhaltern. Für ein Feld ohne Volltextindex gibt der Aufruf `400` zurück. |
+
+`eq`, `ne` und `like` sind Aliasse für `=`, `!=` und `contains`. `quoted` ist `true`, wenn der Wert in Anführungszeichen steht. Das gilt nur für Wörter, nie für Zahlen. JSON-Felder lassen sich hier nicht filtern. Fragen Sie diese Felder mit SQL ab.
+
+`expression` akzeptiert Abfragetext im Format der Seite **Logs**: Vergleiche, `MATCH(field, 'text')` und `MATCH_TEXT(field, 'words')`, Suchwörter, Wortgruppen in Anführungszeichen, `AND` und `OR` unabhängig von der Groß- und Kleinschreibung sowie Klammern. `AND` hat Vorrang vor `OR`. Der Server übersetzt den Ausdruck in `filters`, `freeText` und `where`, wie sie die Seite sendet, und prüft diese Felder wie oben beschrieben. Der Text darf höchstens 8 KiB umfassen und Klammern bis zu 32 Ebenen tief verschachteln. Kann der Server einen Teil nicht auswerten, etwa eine nicht geschlossene Klammer oder einen Vergleich ohne Vergleichswert, gibt er `400` zurück und nennt den betreffenden Teil.
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/logs" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'stream=app' \
+  --data-urlencode "expression=level = 'error' AND (service.name = 'checkout' OR timeout)"
+```
+
+## Datensätze auflisten
+
+```http
+POST /api/v1/web/logs
+GET  /api/v1/web/logs
+```
+
+Gibt die passenden Datensätze mit Cursor-Paginierung zurück, die neuesten zuerst.
+
+| Feld | Typ | Hinweise |
+|---|---|---|
+| `stream` | Zeichenfolge | Pflichtfeld. Der Log-Stream. |
+| `from`, `to` | Ganzzahl | Das Zeitfenster in Mikrosekunden. Standardmäßig umfasst es die letzten 24 Stunden bis jetzt. `to` muss größer als `from` sein. |
+| `filters`, `freeText`, `where`, `expression` | | Auswahlkriterien für die Datensätze. |
+| `limit` | Ganzzahl | Seitengröße. Standardwert: `20`. Der Aufruf begrenzt den Wert auf den Bereich von 1 bis 5000. |
+| `cursor` | Zeichenfolge | Der `nextCursor` oder `previousCursor` einer vorherigen Seite. Der Cursor übernimmt das Zeitfenster und die Auswahlkriterien der ersten Seite. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/web/logs \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"stream":"app","expression":"level = '\''error'\''","limit":2}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    { "_timestamp": 1790000000000000, "level": "error", "message": "db pool exhausted", "trace_id": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "nextCursor": "eyJ2IjoxLC...",
+  "previousCursor": null,
+  "hasMore": true
+}
+```
+</ResponseExample>
+
+Jedes Element enthält die Felder eines Datensatzes. `_timestamp` ist in Mikrosekunden angegeben. Wenn eine Anfrage mit `cursor` einen anderen Stream, ein anderes Zeitfenster, einen anderen Wert für `limit` oder andere Auswahlkriterien angibt, gibt der Aufruf `400` zurück.
+
+## Datensätze im Zeitverlauf zählen
+
+```http
+POST /api/v1/web/logs/histogram
+GET  /api/v1/web/logs/histogram
+```
+
+Zählt die passenden Datensätze pro Zeitintervall.
+
+| Feld | Typ | Hinweise |
+|---|---|---|
+| `stream` | Zeichenfolge | Pflichtfeld. |
+| `from`, `to` | Ganzzahl | Pflichtfelder. Das Zeitfenster in Mikrosekunden. |
+| `filters`, `freeText`, `where`, `expression` | | Auswahlkriterien für die Datensätze. |
+| `bucketTime` | Ganzzahl | Dauer eines Intervalls in Mikrosekunden. Mindestens `1000`. |
+| `originTime` | Ganzzahl | Beginn des ersten Intervalls. Darf nicht nach `from` liegen. |
+
+Eine Anfrage umfasst höchstens 512 Intervalle von `originTime` bis `to`.
+
+```json
+{
+  "bucketTime": 60000000,
+  "originTime": 1790000100000000,
+  "buckets": [{ "startTime": 1790000100000000, "total": 120, "errors": 4 }],
+  "split": true
+}
+```
+
+`buckets` listet die Intervalle mit mindestens einem Datensatz auf, die ältesten zuerst. `errors` zählt die Datensätze mit der Log-Stufe `ERROR` aus `level` oder `body_level`. `split` ist `false`, wenn der Stream keines der beiden Felder enthält oder der Lesezugriff die Log-Stufe maskiert. `errors` ist dann `0`. Wenn die Anzahl nicht verfügbar ist, gibt der Aufruf `200` mit leeren `buckets` und einem Grund in `unavailable` zurück: `time_budget`, `busy` oder `scan_limit`, wie bei der [Trace-Zählung](/de/api/web/trace#traces-im-zeitverlauf-zählen).
+
+## Feld beschreiben
+
+```http
+POST /api/v1/web/logs/field-stats
+GET  /api/v1/web/logs/field-stats
+```
+
+Beschreibt die Werte eines Felds in den passenden Datensätzen.
+
+| Feld | Typ | Hinweise |
+|---|---|---|
+| `stream` | Zeichenfolge | Pflichtfeld. |
+| `from`, `to` | Ganzzahl | Das Zeitfenster in Mikrosekunden. |
+| `filters`, `freeText`, `where`, `expression` | | Auswahlkriterien für die Datensätze. |
+| `field` | Zeichenfolge | Pflichtfeld. Der Feldname im Stream. |
+
+```json
+{
+  "kind": "text",
+  "total": 1840,
+  "present": 1840,
+  "distinct": 3,
+  "distinctExact": true,
+  "top": [{ "value": "info", "count": 1500 }, { "value": "warn", "count": 300 }, { "value": "error", "count": 40 }],
+  "topSkipped": false
+}
+```
+
+`kind` ist `number`, `time`, `text` oder `bool`. `total` zählt alle passenden Datensätze, `present` nur die mit einem Wert. `top` listet die häufigsten Werte in absteigender Reihenfolge ihrer Häufigkeit auf. `topSkipped` ist `true`, wenn fast jeder Wert unterschiedlich ist und die Liste deshalb keine Werte enthält. `range` gibt den kleinsten und den größten Wert als Text an. Bei einem numerischen Feld enthält die Antwort zusätzlich `spread` und `bars`. `trend` zählt die häufigsten Werte im Zeitfenster. Das Feld fehlt, wenn kein Wert häufiger als die übrigen vorkommt.
+
+## Fehler
+
+| Status | Ursache |
+|---|---|
+| `400` | Ein Parameter ist ungültig: `stream` fehlt, `to` ist nicht größer als `from`, ein Filter nennt ein unbekanntes Feld oder verwendet einen für den Feldtyp unzulässigen Operator, die Listen oder der Bedingungsbaum überschreiten ihre Grenzwerte, `expression` steht zusammen mit `filters`, `freeText` oder `where` oder enthält einen Teil, den der Server nicht auswerten kann, der Cursor passt nicht zur Abfrage oder ein Histogrammparameter fehlt oder deckt mehr als 512 Intervalle ab. |
+| `403` | Dem Token fehlt `logs.read`. |

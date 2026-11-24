@@ -1,0 +1,94 @@
+---
+title: "Copias de seguridad y restauración"
+description: "Qué respaldar, cómo mantener la coherencia entre PostgreSQL y el almacenamiento de objetos y cómo restaurar un despliegue de MoleSignal."
+"en_link": "/en-US/backup-restore"
+"zh-Hans_link": "/zh-Hans/backup-restore"
+"zh-Hant_link": "/zh-Hant/backup-restore"
+"ja_link": "/ja/backup-restore"
+"ko_link": "/ko/backup-restore"
+"de_link": "/de/backup-restore"
+"fr_link": "/fr/backup-restore"
+"pt-BR_link": "/pt-BR/backup-restore"
+---
+
+MoleSignal guarda el estado en PostgreSQL, en el almacenamiento de objetos y en la configuración y los secretos. Los nodos solo guardan cachés en sus discos. Haz una copia de seguridad de cada elemento y ensaya una restauración antes de depender de las copias.
+
+## Qué incluir en las copias de seguridad
+
+| Estado | Contenido | Copia de seguridad |
+|---|---|---|
+| PostgreSQL | Usuarios, organizaciones, tokens, flujos, paneles, reglas de alerta y el catálogo de archivos que vincula los flujos con los objetos | Obligatoria |
+| Almacenamiento de objetos | Archivos de datos Parquet, índices de búsqueda, blobs de perfiles y objetos del registro de escritura anticipada (WAL) correspondientes a registros aún no transferidos al almacenamiento de objetos (`wal/v1/`) | Obligatoria |
+| `MS_CIPHER_KEY` | Clave raíz de los secretos en PostgreSQL | Obligatoria. Guárdala por separado de la copia de seguridad de la base de datos. |
+| Configuración | `config.toml`, las variables de entorno y `MS_AUTH_JWT_SECRET_OVERRIDE` si está en uso | Obligatoria |
+| Directorio de ACME (`[http.tls].key_storage_dir`) | Clave de la cuenta de ACME y claves de dominio | Opcional. Puedes volver a emitir los certificados. |
+| Directorio de caché (`[cache.object].root`) | Copia local de rangos de objetos remotos | No hagas una copia de seguridad. |
+
+## Mantén la coherencia entre la base de datos y los objetos
+
+El catálogo de archivos de PostgreSQL hace referencia a los objetos del bucket. Al transferir los datos, MoleSignal primero carga el objeto y luego lo registra en el catálogo. Durante la compactación y la retención, MoleSignal elimina primero la referencia del catálogo. Después, el recolector de basura elimina el objeto una vez transcurrido `[storage.gc].grace_period_secs` (3600 segundos de forma predeterminada).
+
+Sigue este orden para obtener una copia de seguridad coherente:
+
+1. Haz una copia de seguridad de PostgreSQL.
+2. Copia el bucket inmediatamente después. Termina antes de que venza el período de gracia.
+
+Si la copia termina dentro del período de gracia, contiene todos los objetos a los que hace referencia la copia de seguridad de la base de datos. Si tarda más, aumenta `grace_period_secs` antes de hacer la copia de seguridad o activa el control de versiones del bucket y restaura las versiones de los objetos que estaban vigentes en el momento de la copia de seguridad de la base de datos.
+
+## Haz una copia de seguridad de PostgreSQL
+
+Usa las funciones de copia de seguridad del servicio de PostgreSQL, como las instantáneas programadas con recuperación a un momento determinado. Si administras la base de datos, usa un volcado lógico para las implementaciones pequeñas:
+
+```bash
+pg_dump --format=custom --file=molesignal.dump "postgres://molesignal@db.internal:5432/molesignal"
+```
+
+## Haz una copia de seguridad del almacenamiento de objetos
+
+Usa la replicación de buckets o el control de versiones del proveedor. También puedes programar una copia a un segundo bucket:
+
+```bash
+aws s3 sync s3://molesignal s3://molesignal-backup
+```
+
+Para un servicio compatible con S3, como RustFS, agrega `--endpoint-url`. Usa credenciales sin permiso para eliminar objetos del bucket de respaldo.
+
+## Restaura los datos
+
+<Steps>
+  <Step title="Detén todos los nodos">
+    Detén todos los procesos de MoleSignal para impedir escrituras mientras reemplazas los datos.
+  </Step>
+  <Step title="Restaura PostgreSQL">
+    Restaura la copia de seguridad en una base de datos vacía:
+
+    ```bash
+    pg_restore --no-owner --dbname "postgres://molesignal@db.internal:5432/molesignal" molesignal.dump
+    ```
+  </Step>
+  <Step title="Restaura los objetos">
+    Copia el respaldo al bucket que usan los nodos. Restaura el bucket al estado que tenía en el momento de la copia de seguridad de la base de datos o en un momento posterior.
+
+    El reconciliador pone en cola como huérfanos los objetos a los que el catálogo restaurado no hace referencia. El recolector de basura los elimina una vez transcurrido `[storage.reconciler].orphan_grace_secs` (24 horas de forma predeterminada). Si aún puedes necesitar objetos más recientes, cópialos primero a otra ubicación.
+  </Step>
+  <Step title="Restaura los secretos y la configuración">
+    Proporciona la configuración y la misma `MS_CIPHER_KEY` que usaba la implementación respaldada. Un nodo con una clave distinta no puede descifrar los secretos almacenados y no arranca. Muestra un error como `open Probe CA key`.
+  </Step>
+  <Step title="Deja que la ingesta se haga cargo del WAL">
+    Al restaurar el bucket también recuperas los objetos del WAL. Una vez que los nodos están en funcionamiento, un nodo de ingesta publica el WAL de cada proceso de escritura que figura en la base de datos restaurada, cuando vence su concesión. El nodo de ingesta no publica los objetos del WAL de los procesos de escritura que se registraron después de la copia de seguridad de la base de datos.
+  </Step>
+  <Step title="Inicia y verifica">
+    Inicia los nodos y espera a que `GET /api/v1/healthz` devuelva `200`. Inicia sesión, abre un flujo y ejecuta una consulta sobre el intervalo restaurado.
+
+    Busca en `/metrics` la métrica `storage_reconciler_issues_total` con `reason="missing"`. Esas entradas indican que el catálogo hace referencia a objetos que no están en el bucket.
+  </Step>
+</Steps>
+
+## Escenarios de falla
+
+| Pérdida | Efecto | Recuperación |
+|---|---|---|
+| Disco local de un nodo | No se pierde ningún dato cuya recepción se haya confirmado. Los nodos reconstruyen las cachés. | Reemplaza el nodo. Otro nodo de ingesta publica su WAL una vez transcurrido `[wal].lease_secs`. Consulta [Durabilidad y toma de control](/es/architecture#durabilidad-y-recuperación). |
+| PostgreSQL | Pierdes todos los metadatos y no puedes acceder a los objetos. | Restaura la copia de seguridad más reciente. No puedes recuperar los datos escritos después de esa copia porque sus objetos no tienen una entrada en el catálogo. |
+| Bucket | Las consultas sobre el intervalo perdido fallan. | Restaura el bucket. Las entradas del catálogo sin objetos aparecen como `missing` en `/metrics`. |
+| `MS_CIPHER_KEY` | Los nodos no pueden descifrar los secretos almacenados y no arrancan. | Restaura la clave desde el gestor de secretos. Sin la clave, no puedes recuperar las columnas cifradas. |

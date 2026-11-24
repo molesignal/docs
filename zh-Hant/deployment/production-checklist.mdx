@@ -1,0 +1,117 @@
+---
+title: "正式環境檢查清單"
+description: "在 MoleSignal 儲存實際資料之前，需要更換的設定與完成的檢查：金鑰、儲存、網路、持久性與維運。"
+"en_link": "/en-US/deployment/production-checklist"
+"zh-Hans_link": "/zh-Hans/deployment/production-checklist"
+"ja_link": "/ja/deployment/production-checklist"
+"ko_link": "/ko/deployment/production-checklist"
+"de_link": "/de/deployment/production-checklist"
+"es_link": "/es/deployment/production-checklist"
+"fr_link": "/fr/deployment/production-checklist"
+"pt-BR_link": "/pt-BR/deployment/production-checklist"
+---
+
+Compose 沙箱與範例檔案 `conf/config.toml` 以快速上手為優先。部署並儲存實際資料前，請逐項完成本頁的檢查。
+
+## 取代沙箱預設值
+
+| 項目 | 沙箱預設值 | 正式環境 |
+|---|---|---|
+| root 帳號 | `admin@example.com`，密碼為 `admin` | 首次啟動前，在 `[auth]` 中設定唯一的電子郵件地址與高強度密碼。 |
+| `MS_CIPHER_KEY` | 未設定（全零開發金鑰），或使用 Compose 檔案中固定的開發金鑰 | 儲存在金鑰管理系統中的 32 位元組隨機金鑰。 |
+| PostgreSQL 憑證 | `molesignal` / `molesignal` | 使用專用的資料庫與使用者帳號，並由系統產生密碼。 |
+| 物件儲存憑證 | `rustfsadmin` / `rustfsadmin` | 使用僅能存取該儲存貯體的專用存取金鑰。 |
+| 物件儲存後端 | 容器磁碟區中的 RustFS | 支援持久儲存的 `s3`、`azure` 或 `gcs`。 |
+| `[http].external_url` | 空白 | 對外的 HTTPS 位址。 |
+| TLS | 關閉 | 使用終止 TLS 的代理伺服器，或啟用 `[http.tls]`。 |
+| 映像檔標籤 | `latest` | 固定的版本標籤，例如 `26.1.0.0`。 |
+
+## 檢查清單
+
+<Steps>
+  <Step title="準備 PostgreSQL 與物件儲存">
+    使用 PostgreSQL 17 並啟用自動備份，為 MoleSignal 建立專用的資料庫與使用者帳號。
+
+    確保 `[meta_database].max_connections` 乘以節點數後，仍低於 PostgreSQL 的 `max_connections` 上限。
+
+    在與節點相同的區域建立私有儲存貯體。不要新增會讓物件到期的生命週期規則。MoleSignal 會自行執行保留策略並刪除物件。
+  </Step>
+  <Step title="產生並保管加密金鑰">
+    `MS_CIPHER_KEY` 是 MoleSignal 儲存在 PostgreSQL 中的密文所用的根金鑰，涵蓋 API 權杖、分享連結、遠端叢集權杖、通知連接器憑證、管線連接器憑證、Mole Agent 服務供應商金鑰、合成監控金鑰及組織欄位金鑰。只需產生一次：
+
+    ```bash
+    openssl rand -base64 32
+    ```
+
+    將此值儲存在金鑰管理系統中，並讓每個節點使用同一個值。請將金鑰與資料庫分開備份。若只還原資料庫而沒有這把金鑰，就無法讀取這些密文。
+
+    <Warning>
+      不要直接替換金鑰，否則將無法讀取以舊金鑰加密的資料。輪替金鑰時，先停止所有寫入，將新值匯出為 `MS_CIPHER_KEY`，再使用舊金鑰執行離線指令：
+
+      ```bash
+      molesignal --config /etc/molesignal/config.toml rewrap-kek --old-key "<旧密钥，base64>"
+      ```
+
+      指令會重新加密所有受影響的欄位，並逐一輸出各資料表已處理的資料列數。確認資料列數無誤後，再停用舊金鑰。
+    </Warning>
+
+    若部署曾在未設定 `MS_CIPHER_KEY` 的情況下啟動，就會使用全零開發金鑰。若要改用正式金鑰，請將 `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=` 傳入 `--old-key`。
+  </Step>
+  <Step title="保護 root 帳號">
+    首次使用空白資料庫啟動時，MoleSignal 會依據 `[auth].root_email` 與 `[auth].root_password` 建立 root 帳號。請在首次啟動前設定這兩項。之後修改 `root_password` 不會變更現有帳號的密碼。
+
+    重設密碼與 **帳號設定 → 安全性與登入 → 變更密碼** 都透過電子郵件完成，因此必須設定 `[notify.smtp]` 與 `[http].external_url`。缺少任一項就不會傳送任何郵件，請在使用這些功能前完成設定。
+
+    每次啟動時，電子郵件地址與 `root_email` 相符的帳號都會成為平台管理員。請確保 `root_email` 始終指向現有的使用者帳號。
+  </Step>
+  <Step title="不要將金鑰放進程式碼儲存庫">
+    透過環境變數或金鑰管理系統傳入資料庫 DSN、物件儲存金鑰和 `MS_CIPHER_KEY`。使用 `MS_META_DATABASE_DSN`、`MS_OBJECT_STORE_ACCESS_KEY` 與 `MS_OBJECT_STORE_SECRET_KEY`，並將 `config.toml` 中對應的設定鍵留空。
+
+    可以使用 `MS_AUTH_JWT_SECRET_OVERRIDE` 固定 JWT 簽署金鑰，否則 MoleSignal 會在首次啟動時於 PostgreSQL 中產生一把金鑰。使用 `POST /api/v1/auth/jwt/rotate` 輪替金鑰，此端點需要 `sys.signing_keys.rotate` 權限。以已停用的金鑰簽發的權杖在 24 小時內仍然有效。
+  </Step>
+  <Step title="只開放必要的連接埠">
+    | 連接埠 | 開放範圍 |
+    |---|---|
+    | `5080` | 對外開放，置於 TLS 後方。 |
+    | `4317` | 僅在終止 TLS 的代理伺服器後方對外開放。 |
+    | `5082` | 僅在私有網路內開放。此連接埠承載未經驗證的節點間流量。 |
+    | `5083` | 選用；有 SQL 用戶端需要連線時才開放，並置於 TLS 後方。 |
+    | `5084`、`5085` | 僅在 Probe Agent 於節點外執行時需要。 |
+
+    將 `[http].external_url` 設為對外位址。資料匯入程式碼片段、密碼重設郵件、狀態頁網域與 [通行金鑰](/zh-Hant/identity/mfa#執行個體的要求) 都會使用此位址。
+  </Step>
+  <Step title="終止 TLS 並設定代理伺服器">
+    在反向代理伺服器上終止 TLS，或啟用 `[http.tls]` 透過 ACME 自動取得憑證。
+
+    將代理伺服器的請求本文大小上限設為至少 16 MiB，因為原生 JSON 匯入接受的請求本文上限就是 16 MiB。針對 `/api/v1/query/stream` 關閉回應緩衝，並允許長時間讀取。專案隨附的 nginx 參考設定將此路徑的逾時時間設為 600 秒。
+
+    將 `/metrics` 限制為僅供內部存取。只有傳送端需要時，才對外開放資料匯入路徑 `/api/v1/_bulk`、`/api/v1/_kinesis_firehose`、`/api/v1/_cloudflare` 與 `/api/v1/_heroku`。
+  </Step>
+  <Step title="為節點遺失預作準備">
+    預寫日誌（WAL）儲存在物件儲存中。系統會等到 WAL 物件寫入後才確認寫入，因此節點不需要持久磁碟區。節點消失後，其他 intake 節點會在等待 `[wal].lease_secs`（預設 15 秒）再加上最多一個 `[wal].takeover_interval_secs` 後，接管該節點的 WAL。接管前，無法查詢該節點已確認但尚未刷寫的記錄。單一節點重新啟動後，會接管自身先前的 WAL。每次寫入都必須等待一次物件寫入完成，因此物件儲存的延遲會計入每次寫入的延遲。請參閱[持久性與接管](/zh-Hant/architecture#持久性與接管)。
+
+    讓程序在結束前有時間處理完待處理的資料：將編排系統的終止寬限時間設為大於 `[node].drain_timeout_secs`（預設 30 秒）。
+  </Step>
+  <Step title="設定保留期限">
+    預設保留期限為 30 天，可在 `_sys` 組織的 **設定 → 資料保留** 中修改。若未為資料流個別設定保留期限，系統會刪除超過此期限的資料。請在資料累積前延長此期限，或為各資料流個別設定保留期限。請參閱[資料流](/zh-Hant/streams)。
+  </Step>
+  <Step title="規劃 alert 與 compactor 角色">
+    `alert` 與 `compactor` 角色都可以執行多個執行個體，由各節點分工。`alert` 節點依規則、報告、管線與連接器分工，只能執行一份的任務則由一個主節點負責；`compactor` 節點依資料流與組織分工。為每個節點設定唯一的 `[node].id`，並維持時鐘同步。`standalone` 節點已包含這兩個角色。除非必須拆分角色，否則請使用 `standalone`。拆分前請閱讀[依角色部署](/zh-Hant/deployment/role-based)。
+  </Step>
+  <Step title="監控部署">
+    使用 Prometheus 擷取 `/metrics`。探測 `GET /api/v1/healthz`：此端點對外開放，在無法連線至物件儲存時會傳回 `503`。容器映像檔已將這項檢查設為 `HEALTHCHECK`。
+
+    保持 `[telemetry.self_collect]` 啟用，讓服務記錄自身的指標、追蹤與效能剖析資料，並依據這些指標建立警示規則。請參閱[自身可觀測性](/zh-Hant/self-observability)。
+  </Step>
+  <Step title="規劃備份與升級">
+    依照[備份與還原](/zh-Hant/backup-restore)備份 PostgreSQL、物件儲存和加密金鑰，並在需要依賴備份前演練一次還原。首次變更版本前，請閱讀[升級](/zh-Hant/upgrade)。
+  </Step>
+</Steps>
+
+## 上線前驗證
+
+- 從對外位址存取 `GET /api/v1/healthz` 時，會傳回 `200`。
+- 啟動日誌中有 `object_store_credentials_source`，且未出現 `MS_CIPHER_KEY missing`。
+- 查詢結果中可看到使用服務帳號權杖傳送的測試記錄。
+- 使用預設帳號 `admin@example.com` 和密碼 `admin` 無法登入。
+- 能將最新的 PostgreSQL 備份成功還原至暫存資料庫。

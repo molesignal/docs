@@ -1,0 +1,126 @@
+---
+title: "Abfrage ausführen"
+description: "Führen Sie SQL- oder PromQL-Abfragen für die Streams einer Organisation aus."
+"en_link": "/en-US/api/query/execute"
+"zh-Hans_link": "/zh-Hans/api/query/execute"
+"zh-Hant_link": "/zh-Hant/api/query/execute"
+"ja_link": "/ja/api/query/execute"
+"ko_link": "/ko/api/query/execute"
+"es_link": "/es/api/query/execute"
+"fr_link": "/fr/api/query/execute"
+"pt-BR_link": "/pt-BR/api/query/execute"
+---
+
+```http
+POST /api/v1/query
+GET  /api/v1/query
+```
+
+Der Aufruf führt eine Abfrage aus und gibt die Zeilen zurück. Bei einer umfangreichen Abfrage startet er stattdessen einen asynchronen Suchjob. Der Aufruf erfordert `streams.query`, für Systemtelemetrie hingegen `sys.telemetry.read`.
+
+**Anfragetext**
+
+| Feld | Typ | Erforderlich | Hinweise |
+|---|---|---|---|
+| `orgId` | string | Ja | Das Feld ist erforderlich, der Wert spielt jedoch keine Rolle. Es gilt die Organisation aus der Authentifizierung. |
+| `language` | string | Ja | `sql` oder `promql`. |
+| `statement` | string | Ja | Der Abfragetext. |
+| `timeRange` | object | Ja | `{ "start": <microseconds>, "end": <microseconds> }`. |
+| `stream` | object | Für SQL | `{ "name": "app", "streamType": "logs" }` gibt die primäre Tabelle an. Beide Felder sind erforderlich. Als Typ sind `logs`, `metrics`, `traces`, `profiles` oder `extend` zulässig. |
+| `limit` | integer | Nein | Maximale Zeilenzahl. Bei einer PromQL-Zeitraumabfrage wählt der Server in jeder Zeitreihe Werte in gleichmäßigen Abständen aus, um das Limit einzuhalten. |
+| `step` | integer | Nein | Nur für PromQL. Schrittweite einer Zeitraumabfrage in Mikrosekunden. Mit `step` liefert PromQL pro Zeitreihe einen Wert je Schritt von `start` bis `end`, ohne `step` nur den Wert bei `end`. Eine Zeitreihe darf höchstens 11.000 Schritte umfassen. Bei einer kleineren Schrittweite antwortet der Server mit `400`, wenn die Schrittzahl das Limit überschreitet. |
+
+**Abfrageparameter bei GET**
+
+`GET /api/v1/query` nimmt dieselbe Abfrage als URL-Abfrageparameter entgegen. So lässt sich die URL einer Leseabfrage
+kopieren und erneut öffnen. Der Aufruf antwortet wie `POST`, berücksichtigt dieselben Header und erfordert
+dieselbe Berechtigung. Senden Sie einen für die URL zu langen Abfragetext per `POST`: Ein Proxy vor dem
+Server kann eine Anfragezeile mit mehr als 8 KB ablehnen.
+
+| Parameter | Erforderlich | Hinweise |
+|---|---|---|
+| `language` | Ja | `sql` oder `promql`. |
+| `statement` | Ja | Der URL-kodierte Abfragetext. |
+| `start`, `end` | Ja | Der Zeitraum in Mikrosekunden. |
+| `stream`, `streamType` | Für SQL | Geben Sie die primäre Tabelle und ihren Typ gemeinsam an. |
+| `limit` | Nein | Maximale Zeilenzahl. |
+| `step` | Nein | Schrittweite einer PromQL-Zeitraumabfrage in Mikrosekunden. |
+
+**Header und Abfrageparameter**
+
+| Name | Wirkung |
+|---|---|
+| `Prefer: respond-async` | Erstellt einen Suchjob und gibt `202` zurück. Abfragen von `_audit` laufen trotzdem direkt in der Anfrage. |
+| `Prefer: respond-sync` | Führt die Abfrage auch bei einem langen Zeitraum direkt in der Anfrage aus. |
+| `Accept: application/x-ndjson` | Streamt pro Zeile ein JSON-Objekt und anschließend einen `{"__meta__": ...}`-Datensatz. |
+| `?clusters=local,remote` | Bezieht Remote-Cluster in eine föderierte Suche ein. |
+
+<RequestExample>
+```bash cURL
+NOW=$(date +%s)000000
+
+curl -X POST http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"timeRange\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
+       \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+```
+
+```bash cURL (GET)
+NOW=$(date +%s)000000
+
+curl -G http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'language=promql' \
+  --data-urlencode 'statement=sum(rate(http_requests_total[5m]))' \
+  --data-urlencode "start=$((NOW-3600000000))" \
+  --data-urlencode "end=$NOW" \
+  --data-urlencode 'step=60000000'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "columns": ["level", "n"],
+  "rows": [["error", 12], ["info", 40]],
+  "scannedRows": 10432,
+  "tookMs": 18
+}
+```
+</ResponseExample>
+
+Eine PromQL-Antwort enthält eine Zeile pro Wert. Eine Zeitraumabfrage liefert die Spalten `_timestamp` (Mikrosekunden), `value` und je eine Spalte pro Label sowie eine Zeile pro Zeitreihe und Schritt. Eine Abfrage ohne `step` liefert `value` und die Labelspalten sowie eine Zeile pro Zeitreihe.
+
+```json
+{
+  "columns": ["_timestamp", "value", "service.name"],
+  "rows": [[1761638400000000, 0.42, "checkout"], [1761638460000000, 0.40, "checkout"]],
+  "scannedRows": 2,
+  "tookMs": 6
+}
+```
+
+Erreicht die geschätzte Zeilenzahl einer Abfrage den Schwellenwert `[querier].auto_async_threshold_rows`, antwortet der Server mit `202`:
+
+```json
+{
+  "jobId": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+Unter [Abfragen](/de/query#zeitbereiche-und-asynchrone-jobs) finden Sie die Schwellenwerte und die Job-Endpunkte.
+
+**Fehler**
+
+| Status | Ursache |
+|---|---|
+| `400` | Der Server kann keinen Ausführungsplan erstellen, der `stream`-Hinweis für SQL fehlt (`query.stream hint is required`), `step` ist bei PromQL nicht positiv oder ergibt mehr als 11.000 Schritte für eine Zeitreihe, oder die Abfrage würde mehr Zeilen lesen, als `[querier].max_scan_rows` zulässt. Bei `GET` gibt der Server auch dann `400` zurück, wenn ein Pflichtparameter fehlt oder `stream` ohne `streamType` vorliegt. |
+| `503` | In einem Cluster mit getrennten Rollen ist kein `querier`-Knoten verfügbar (`no querier node is available`). |
+| `403` | Der Stream existiert in der Organisation nicht (`stream not found: <name>`), dem Token fehlt `streams.query` oder die Abfrage liest `_audit` und dem Token fehlt `audit.read`. |
+| `422` | Ein Feld im Anfragetext fehlt oder hat den falschen Typ, zum Beispiel `orgId` oder `streamType`. Die Antwort enthält unformatierten Text. |
+| `429` | Die Abfragen der Arbeitsgruppe lasten den Knoten aus, und diese Abfrage hat [`[search.admission].max_wait_secs`](/de/configuration#zulassungssteuerung) lang vergeblich auf einen freien Platz gewartet. Der Server gibt diesen Status auch zurück, wenn die Arbeitsgruppe ihr clusterweites Limit erreicht hat. |

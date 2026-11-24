@@ -1,0 +1,403 @@
+---
+title: "狀態頁 Webhook 訂閱"
+description: "讓 HTTPS 端點訂閱公開狀態頁：確認流程、請求格式、Payload 欄位、重試與取消訂閱。"
+"en_link": "/en-US/status-pages/webhooks"
+"zh-Hans_link": "/zh-Hans/status-pages/webhooks"
+"ja_link": "/ja/status-pages/webhooks"
+"ko_link": "/ko/status-pages/webhooks"
+"de_link": "/de/status-pages/webhooks"
+"es_link": "/es/status-pages/webhooks"
+"fr_link": "/fr/status-pages/webhooks"
+"pt-BR_link": "/pt-BR/status-pages/webhooks"
+---
+
+Webhook 訂閱會將公開狀態頁每次發布的變更，以 JSON `POST` 請求傳送到 HTTPS 端點。可用來將服務狀態同步到聊天群組、工單系統或內部狀態看板。
+
+元件、事件、維護與訂閱者管理檢視的說明，請參閱[狀態頁](/zh-Hant/status-pages)。
+
+## 訂閱如何生效
+
+<Steps>
+  <Step title="登記端點">
+    在公開頁面或透過 API 提交端點 URL。訂閱一開始處於待確認狀態。
+  </Step>
+  <Step title="接收確認請求">
+    MoleSignal 向端點傳送一次 `status_page_subscription_confirmation` 請求。端點必須傳回 2xx 狀態碼，否則登記失敗。
+  </Step>
+  <Step title="用 Token 確認">
+    開啟請求中的 `confirmUrl`，或將 `token` 傳送到確認介面。訂閱隨即生效。
+  </Step>
+  <Step title="接收更新">
+    確認後發布的每次變更都會以一個請求傳送。確認前發布的變更不會補送。
+  </Step>
+</Steps>
+
+## 端點要求
+
+| 要求 | 規則 |
+|---|---|
+| 頁面可見性 | 僅支援公開狀態頁。私人狀態頁僅接受已驗證的電子郵件訂閱。 |
+| 通訊協定 | 僅支援 `https`。 |
+| 憑證 | URL 不得包含使用者名稱或密碼。 |
+| 主機 | 拒絕 `localhost`、`*.localhost` 與 `*.local`。主機必須解析為公用 IP 位址，不接受私有、迴路、連結本機、電信業者級 NAT 與文件保留的位址範圍。 |
+| 長度 | 3 至 2048 個字元，不得包含控制字元。 |
+| 回應 | 在 10 秒內傳回任意 2xx 狀態碼。不跟隨重新導向，因此將 3xx 回應視為失敗。 |
+
+每次傳送前，MoleSignal 都會重新解析主機，並再次套用相同的位址規則。
+
+## 訂閱
+
+在公開頁面選取**訂閱**，將**接收方式**設為 **Webhook**，填入端點 URL，再選取**寄送確認郵件**。
+
+透過 API 訂閱時，將請求傳送到提供該狀態頁的來源站台：
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<slug>/subscriptions" \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "webhook", "target": "https://hooks.example.com/status"}'
+```
+
+若只要接收部分元件的更新，請加入 `componentIds`，填入各元件的 `id`（請參閱公開頁面 API `GET /api/v1/public/status-pages/<slug>` 列出的元件）。省略此欄位或傳入空陣列，即表示訂閱整個頁面。無法選取群組，請填入群組內的元件。
+
+此呼叫不需驗證身分。登記成功時會傳回 `202 Accepted`：
+
+```json
+{
+  "accepted": true,
+  "confirmationRequired": true
+}
+```
+
+| 情況 | 結果 |
+|---|---|
+| 新端點 | 傳送確認請求。 |
+| 已生效的端點 | 傳回 `202`，並傳送一次 `status_page_subscription_manage` 請求。已選取的元件與 Token 維持不變。 |
+| 10 分鐘內已收到確認請求的端點 | 傳回 `202`，不再傳送確認請求。 |
+| 超過 10 分鐘後，待確認或已取消訂閱的端點 | 重新傳送含有新 Token 的確認請求。先前的 Token 隨即失效。 |
+| 確認請求未收到 2xx 回應 | 呼叫失敗，傳回 `503` 與錯誤碼 `unavailable`。修正端點後重新登記。 |
+| URL 不符合端點要求 | 呼叫失敗，傳回 `400` 與錯誤碼 `invalid_argument`。 |
+| 頁面已有 10,000 名待確認或已生效的訂閱者 | 呼叫失敗，傳回 `429` 與錯誤碼 `resource_exhausted`。 |
+
+<Note>
+  系統依據 `http.external_url` 產生訂閱連結；如果頁面的自訂網域已生效，則依據該網域產生。`http.external_url` 為空時，登記會失敗並傳回 `503`。
+</Note>
+
+## 請求格式
+
+傳送到端點的每個請求都採用相同的格式。
+
+| 屬性 | 值 |
+|---|---|
+| 方法 | `POST` |
+| `Content-Type` | `application/json` |
+| `User-Agent` | `MoleSignal-Status-Page/1.0` |
+| 請求主體 | 一個 JSON 物件，由 `type` 欄位標示 Payload 類型。 |
+| 逾時 | 10 秒 |
+| 成功判定 | 任意 2xx 狀態碼。忽略回應主體。 |
+
+請求不含簽章標頭。若要確認請求是否可信，可在登記的 URL 路徑或查詢字串中加入難以猜測的值，並拒絕未包含該值的請求。管理檢視只顯示 Webhook 目標的通訊協定與主機，例如 `https://hooks.example.com/***`。
+
+依 `type` 分派處理。忽略未知欄位與未知的 `type` 值，這樣即使 Payload 新增欄位，端點也能正常運作。
+
+## 確認請求
+
+每次登記時，MoleSignal 都會傳送一次下列 Payload：
+
+```json
+{
+  "type": "status_page_subscription_confirmation",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "confirmUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=confirm&subscriptionToken=<token>",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>",
+  "components": ["公共 API"],
+  "token": "<token>"
+}
+```
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `type` | string | 固定為 `status_page_subscription_confirmation`。 |
+| `pageName` | string | 狀態頁名稱。 |
+| `pageSlug` | string | 狀態頁 Slug。用於下文的 API 路徑。 |
+| `confirmUrl` | string | 在瀏覽器中開啟即可確認訂閱的頁面網址。 |
+| `manageUrl` | string | **管理訂閱**的頁面網址，可在該頁面修改訂閱的元件。 |
+| `unsubscribeUrl` | string | 在瀏覽器中開啟即可取消訂閱的頁面網址。 |
+| `components` | array of strings | 訂閱的元件名稱。訂閱整個頁面時為空陣列。 |
+| `token` | string | 訂閱 Token。用於確認訂閱，之後也可用來取消訂閱。 |
+
+開啟 `confirmUrl`，或傳送 Token 來確認訂閱：
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/confirm" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+確認成功時會傳回 `200 OK`：
+
+```json
+{
+  "accepted": true,
+  "confirmationRequired": false
+}
+```
+
+如果 Token 不存在、已由後續登記取代，或已用於取消訂閱，則傳回 `400` 與錯誤碼 `invalid_argument`。
+
+<Warning>
+  請妥善保管 Token。更新 Payload 不會再包含 Token，而這是端點擁有者取消訂閱的唯一憑證。
+</Warning>
+
+## 管理訂閱請求
+
+再次登記已生效的端點時，MoleSignal 會傳送管理訂閱的連結，而不是新的確認請求。每 10 分鐘最多傳送一次：
+
+```json
+{
+  "type": "status_page_subscription_manage",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>",
+  "components": [],
+  "token": "<token>"
+}
+```
+
+欄位與確認請求相同，但不含 `confirmUrl`。
+
+## 更新 Payload
+
+所有時間戳記均為整數，表示自 Unix 紀元起算的微秒數（UTC）。元件名稱、事件標題與訊息保留頁面團隊撰寫的原文，不另行翻譯。
+
+若訂閱時選取了元件，只會收到涉及其中任一元件的更新。發布更新時若關閉**通知訂閱者**，就不會傳送任何請求。每個更新 Payload 也包含該訂閱的連結：
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `manageUrl` | string | **管理訂閱**的頁面網址。 |
+| `unsubscribeUrl` | string | 取消訂閱的頁面網址。 |
+
+### 事件與維護更新
+
+每次發布事件或維護更新時，MoleSignal 都會傳送一次 `incident_update`。排定的維護使用同一種 Payload，`incidentKind` 為 `maintenance`。草稿不會觸發任何請求。
+
+| 對象 | 何時傳送請求 | `status` |
+|---|---|---|
+| 事件 | 發布事件時。 | 發布時選取的狀態，通常為 `investigating`。 |
+| 事件 | 發布之後的每則更新時。 | `investigating`、`identified`、`in_progress` 或 `monitoring`。 |
+| 事件 | 解決事件時。 | `resolved` |
+| 維護 | 發布維護時。 | 通常為 `scheduled`。 |
+| 維護 | 修改已排定維護的標題、排程時間、元件或訊息時。 | `scheduled` |
+| 維護 | 維護開始時：到達排定的開始時間後自動開始，或由團隊標記為已開始。 | `in_progress` |
+| 維護 | 團隊完成或取消維護時。 | `completed` 或 `cancelled` |
+
+事件更新：
+
+```json
+{
+  "type": "incident_update",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "incidentKind": "incident",
+  "title": "公共 API 错误率升高",
+  "impact": "major",
+  "status": "identified",
+  "message": "边缘代理的一次配置变更导致部分请求被拒绝，正在回滚该变更。",
+  "occurredAt": 1779529680000000,
+  "nextUpdateAt": 1779531480000000,
+  "startedAt": 1779529260000000,
+  "endedAt": null,
+  "componentNames": ["公共 API", "Web 控制台"]
+}
+```
+
+維護公告：
+
+```json
+{
+  "type": "incident_update",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "incidentKind": "maintenance",
+  "title": "欧洲区域数据库升级",
+  "impact": "maintenance",
+  "status": "scheduled",
+  "message": "欧洲区域的主数据库将于 5 月 25 日 10:00 至 10:30（UTC）升级。切换期间写入可能延迟数秒。",
+  "occurredAt": 1779443280000000,
+  "nextUpdateAt": null,
+  "startedAt": 1779703200000000,
+  "endedAt": null,
+  "componentNames": ["欧洲区域"]
+}
+```
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `type` | string | 固定為 `incident_update`。 |
+| `pageName` | string | 狀態頁名稱。 |
+| `pageSlug` | string | 狀態頁 Slug。 |
+| `incidentId` | string | 事件或維護的識別碼。同一事件的所有更新皆使用相同的識別碼。 |
+| `incidentKind` | string | `incident` 表示非預期事件，`maintenance` 表示排定的維護。 |
+| `title` | string | 發布這則更新時的事件或維護標題。 |
+| `impact` | string | 事件為 `minor`、`major` 或 `critical`。排定的維護為 `maintenance`。 |
+| `status` | string | 這則更新所設定的狀態。請參閱下表。 |
+| `message` | string | 更新內文。 |
+| `occurredAt` | integer | 這則更新的發布時間。 |
+| `nextUpdateAt` | integer 或 null | 這則更新承諾的下次更新時間。未承諾時為 `null`。 |
+| `startedAt` | integer | 維護的排定開始時間；事件的開始時間。 |
+| `endedAt` | integer 或 null | 事件解決的時間，或維護完成、取消的時間。在此之前為 `null`。 |
+| `componentNames` | array of strings | 頁面上顯示的受影響元件名稱，依頁面順序排列。不列出已隱藏或已封存的元件。沒有可列出的元件時為空陣列。 |
+
+| `incidentKind` | `status` 值 | 結束狀態 |
+|---|---|---|
+| `incident` | `investigating`、`identified`、`in_progress`、`monitoring`、`resolved` | `resolved` |
+| `maintenance` | `scheduled`、`in_progress`、`completed`、`cancelled` | `completed` 或 `cancelled` |
+
+維護的每則更新中，`startedAt` 都是排定的開始時間。團隊變更排程時，這個值也會隨之變更。維護開始後，這個值仍是排定時間；實際開始時間是 `in_progress` 那則更新的 `occurredAt`。維護沒有排定的結束時間，因此在維護完成或取消前，`endedAt` 為 `null`。
+
+<Note>
+  啟用到時自動開始功能時（預設啟用），MoleSignal 會在排定的開始時間發布 `in_progress` 更新，並以 `incident_update` 傳送。停用此功能後，到達排定的開始時間時不會傳送請求。系統會等到團隊發布下一則更新時，再傳送下一次請求。
+</Note>
+
+### 維護提醒
+
+排定的維護開始前，MoleSignal 會傳送 `maintenance_reminder`。可個別設定每項維護要提前多久提醒，預設為 60 分鐘。提醒不算更新，不會出現在維護的時間軸上。
+
+```json
+{
+  "type": "maintenance_reminder",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "title": "欧洲区域数据库升级",
+  "occurredAt": 1779699600000000,
+  "startedAt": 1779703200000000,
+  "componentNames": ["欧洲区域"]
+}
+```
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `type` | string | 固定為 `maintenance_reminder`。 |
+| `pageName` | string | 狀態頁名稱。 |
+| `pageSlug` | string | 狀態頁 Slug。 |
+| `incidentId` | string | 維護的識別碼，與該維護的 `incident_update` Payload 中的識別碼相同。 |
+| `title` | string | 傳送提醒時的維護標題。 |
+| `occurredAt` | integer | 提醒的傳送時間。 |
+| `startedAt` | integer | 維護的排定開始時間。 |
+| `componentNames` | array of strings | 頁面上顯示的受影響元件名稱，依頁面順序排列。不列出已隱藏或已封存的元件。 |
+
+每個排定的開始時間只會傳送一次提醒，因此維護改期後，系統會在新的開始時間前再次提醒。如果維護在提醒時間過後才發布或改期、提前提醒時間設為 `0`，或維護已不再處於 `scheduled` 狀態，系統就不會傳送提醒。
+
+### 元件狀態變更
+
+頁面上顯示的元件狀態變更時，MoleSignal 會傳送 `component_status_changed`。建立元件時，不會為初始狀態傳送請求。已隱藏或已封存的元件也不會觸發請求。
+
+```json
+{
+  "type": "component_status_changed",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "componentId": "2xZqD1hWk9TfM5vBn7QsR3yLgUe",
+  "componentName": "公共 API",
+  "status": "degraded_performance",
+  "occurredAt": 1779529440000000
+}
+```
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `type` | string | 固定為 `component_status_changed`。 |
+| `pageName` | string | 狀態頁名稱。 |
+| `pageSlug` | string | 狀態頁 Slug。 |
+| `componentId` | string | 元件識別碼。元件重新命名後仍維持不變。 |
+| `componentName` | string | 狀態變更時的元件名稱。 |
+| `status` | string | 新狀態：`operational`、`degraded_performance`、`partial_outage`、`major_outage` 或 `maintenance`。 |
+| `occurredAt` | integer | 新狀態開始生效的時間。 |
+
+MoleSignal 不會針對受事件影響的元件傳送 `component_status_changed`。`incident_update` Payload 會在 `componentNames` 中列出這些元件。
+
+<Note>
+  發布變更時，已隱藏的元件不會出現在傳送給訂閱者的內容中。這些元件的狀態變更不會觸發請求，`incident_update` 的 `componentNames` 也不會列出這些元件。如果事件或維護只影響已隱藏的元件，系統仍會傳送請求，但 `componentNames` 為空陣列。隱藏或重新顯示元件的操作本身不會觸發請求。
+</Note>
+
+### 事件事後檢討
+
+發布已解決事件的事後檢討或其修訂版本時，只要啟用**通知訂閱者**，MoleSignal 就會傳送 `postmortem_published`。
+
+```json
+{
+  "type": "postmortem_published",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "title": "公共 API 错误率升高",
+  "impact": "major",
+  "revision": false,
+  "occurredAt": 1779616080000000,
+  "startedAt": 1779529260000000,
+  "endedAt": 1779533520000000,
+  "componentNames": ["公共 API"],
+  "postmortem": "## 发生了什么\n\n边缘代理的一次配置变更拒绝了部分请求。",
+  "incidentUrl": "https://status.example.com/status/acme-cloud/incidents/2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>"
+}
+```
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `type` | string | 固定為 `postmortem_published`。 |
+| `incidentId` | string | 事件的識別碼，與該事件的 `incident_update` Payload 中的識別碼相同。 |
+| `title` | string | 事件標題。 |
+| `impact` | string | `minor`、`major` 或 `critical`。 |
+| `revision` | boolean | 以修訂後的內容取代已發布的內容時為 `true`。 |
+| `occurredAt` | integer | 事後檢討的發布時間。 |
+| `postmortem` | string | 事後檢討的 Markdown 原文。 |
+| `incidentUrl` | string | 公開頁面上該事件的網址。 |
+
+`pageName`、`pageSlug`、`startedAt`、`endedAt` 與 `componentNames` 的意義與 `incident_update` 相同。
+
+## 傳送與重試
+
+| 行為 | 說明 |
+|---|---|
+| 延遲 | 變更發生後，通常會在 30 秒內開始傳送。 |
+| 嘗試次數 | 每則更新最多嘗試傳送 5 次。 |
+| 重試間隔 | 每次失敗後依序等候 1 分鐘、5 分鐘、30 分鐘、2 小時。 |
+| 失敗判定 | 10 秒內未傳回 2xx 狀態碼，包括傳回重新導向回應。 |
+| 停止重試 | 第 5 次嘗試失敗後，系統會將該次傳送標記為失敗，不再重試。 |
+| 傳送保證 | 至少一次。同一請求可能送達多次，也可能不按順序送達。 |
+
+重試時會傳送相同的請求主體。Payload 不含傳送識別碼，請將 `type`、`incidentId` 或 `componentId` 搭配 `occurredAt` 去除重複項目。同一事件的多則更新依 `occurredAt` 排序。
+
+取消訂閱、封存頁面或將頁面改為私人後，系統不再將該端點的新更新加入佇列。
+
+頁面管理者可在**狀態頁 → 訂閱者 → 傳送記錄**中查看每次傳送的嘗試次數、狀態與最後一次錯誤。已送達與已失敗的記錄會在頁面的傳送記錄保留期限屆滿後清除：30、60、90、180 或 365 天。
+
+## 取消訂閱
+
+開啟確認請求中的 `unsubscribeUrl`，或傳送 Token：
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/unsubscribe" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+呼叫會傳回 `200 OK` 與 `"accepted": true`。系統會取消仍待傳送至該端點的通知。
+
+具備 `status_pages.subscribers.manage` 權限的使用者也可以在**狀態頁 → 訂閱者**中移除訂閱者，或為待確認的訂閱者選擇**重新傳送確認**。重新傳送時，系統會簽發新的 Token。
+
+<CardGroup cols={2}>
+  <Card title="狀態頁" icon="signal" href="/zh-Hant/status-pages">
+    建立頁面、發布事件與維護公告，並管理訂閱者。
+  </Card>
+  <Card title="Webhook 通知連接器" icon="webhook" href="/zh-Hant/notification-channels/webhooks">
+    將警示通知傳送至 Slack、飛書或通用 Webhook。
+  </Card>
+</CardGroup>

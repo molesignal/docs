@@ -1,0 +1,355 @@
+---
+title: "SDK RUM pour navigateur"
+sidebarTitle: "SDK pour navigateur"
+description: "Installez et configurez le SDK RUM de MoleSignal pour navigateur, identifiez les utilisateurs, ajoutez des événements personnalisés et vérifiez que la première session est bien collectée."
+"en_link": "/en-US/rum/browser-sdk"
+"zh-Hans_link": "/zh-Hans/rum/browser-sdk"
+"zh-Hant_link": "/zh-Hant/rum/browser-sdk"
+"ja_link": "/ja/rum/browser-sdk"
+"ko_link": "/ko/rum/browser-sdk"
+"de_link": "/de/rum/browser-sdk"
+"es_link": "/es/rum/browser-sdk"
+"pt-BR_link": "/pt-BR/rum/browser-sdk"
+---
+
+Le SDK RUM pour navigateur de MoleSignal collecte les pages vues, les interactions utilisateur, les erreurs frontend, les Web Vitals, les
+ressources réseau, les tâches longues, les [logs](/fr/rum/logs) et le contexte de corrélation des traces, puis envoie ces données sous forme d’[événements RUM](/fr/rum/events).
+
+## Prérequis
+
+- l’URL du déploiement MoleSignal ;
+- une [application RUM](/fr/rum/applications), par exemple `checkout-web` ;
+- le jeton client de l’application ;
+- Node 24 ou une version ultérieure pour l’installation depuis npm.
+
+<Warning>
+  Le code exécuté dans le navigateur contient `clientToken`, que les utilisateurs peuvent consulter. N’utilisez jamais de jeton de propriétaire, d’administrateur
+  ou de jeton personnel. Utilisez le jeton client associé à l’application. Tous les jetons commencent par `mspat-` :
+  le SDK ne peut donc pas les distinguer.
+</Warning>
+
+## Accéder à l’application et à son jeton
+
+Ouvrez **RUM → Applications**, cliquez sur **Créer une application**, puis choisissez la plateforme **Navigateur**. L’application s’ouvre et affiche son
+jeton client. **Ouvrir le guide de configuration** affiche le point de terminaison, le jeton et un extrait de code qui contient déjà l’identifiant. Dans
+**Source de données**, **RUM web** donne accès au même guide. Récupérez aussi le jeton via
+l’[API](/fr/api/auth/rum-token).
+
+## Installer et initialiser le SDK
+
+<Steps>
+  <Step title="Installer le paquet">
+    ```bash
+    npm install @molesignal/browser-rum
+    ```
+  </Step>
+  <Step title="Initialiser le SDK une seule fois">
+    ```ts
+    import { init } from '@molesignal/browser-rum';
+
+    const rum = init({
+      applicationId: 'checkout-web',
+      clientToken: 'mspat-your-client-token',
+      site: 'https://molesignal.example.com',
+      service: 'web-frontend',
+      env: 'production',
+      version: 'v1.4.0',
+      sessionSampleRate: 100,
+      trackUserInteractions: true,
+    });
+    ```
+
+    `init` renvoie le client. `initRum` est l’ancien nom de la même fonction. `molesignalRum` expose la même API sous forme de
+    singleton : `molesignalRum.init(...)` et `molesignalRum.setUser(...)`. Le SDK conserve les appels à `molesignalRum` effectués avant `init`,
+    puis `init` les rejoue.
+
+    Initialisez le SDK avant le montage du routeur de l’application pour capturer la première page vue.
+    Importez et initialisez le paquet sans risque lors du rendu côté serveur : l’instrumentation du navigateur
+    démarre uniquement si les API du navigateur sont disponibles.
+  </Step>
+  <Step title="Vérifier la première session">
+    Ouvrez **RUM → Explorateur** et sélectionnez une plage horaire qui inclut l’heure actuelle. Vérifiez que
+    la session s’affiche, puis ouvrez-la pour consulter ses vues, ses requêtes et ses erreurs.
+  </Step>
+</Steps>
+
+La valeur de `site` peut être une origine MoleSignal ou se terminer par `/api`, `/api/v1` ou `/api/v1/rum`. Le SDK envoie les événements à
+`POST /api/v1/rum/events` et les segments de replay à `POST /api/v1/rum/replay`. Le SDK transmet `applicationId` dans le champ `application.id`,
+et MoleSignal rejette les événements dont le champ `application.id` ne correspond pas à l’application associée au jeton.
+
+## Charger le SDK avec une balise script
+
+`dist/molesignal-rum.js` est un bundle autonome qui inclut rrweb et web-vitals et définit la variable globale
+`MoleSignalRum`. Chargez-le de façon asynchrone avec cet extrait de code. Les fonctions de rappel passées à `onReady` ne s’exécutent qu’après le chargement du script :
+
+```html
+<script>
+  (function (w, d, s, u, n) {
+    w[n] = w[n] || { q: [], onReady: function (callback) { w[n].q.push(callback); } };
+    var script = d.createElement(s);
+    script.async = 1;
+    script.src = u;
+    d.head.appendChild(script);
+  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.4.0/dist/molesignal-rum.js', 'MoleSignalRum');
+
+  MoleSignalRum.onReady(function () {
+    MoleSignalRum.init({
+      applicationId: 'checkout-web',
+      clientToken: 'mspat-your-client-token',
+      site: 'https://molesignal.example.com',
+      service: 'web-frontend',
+      env: 'production',
+      version: 'v1.4.0',
+    });
+  });
+</script>
+```
+
+Pour le charger de façon synchrone, incluez le fichier dans une balise `<script src>`, puis appelez `MoleSignalRum.init(...)`.
+
+## Vues et sessions
+
+Une vue correspond à une page vue ou à une route. Le SDK envoie la vue dès son démarrage, puis augmente `view.revision` et la renvoie à
+chaque changement (au maximum toutes les trois secondes). Il la renvoie toutes les cinq minutes tant qu’elle reste ouverte, puis une dernière fois à sa
+fin : lors d’un changement de route, à la fin de la session, ou lorsque le navigateur masque ou décharge la page. Le SDK détecte les changements de route via
+l’API History et `popstate`. Définissez `trackViewsManually: true` et appelez `startView` pour nommer les vues et choisir quand elles commencent.
+
+Le SDK n’envoie aucun événement de session : MoleSignal déduit les sessions à partir des vues. Le cookie
+`_msrum_s_<applicationId>` conserve la session, que partagent tous les onglets de l’application. La session se termine après 15 minutes d’inactivité ou au bout de quatre
+heures. La prochaine activité utilisateur ouvre une nouvelle session. L’échantillonnage s’applique une fois par session ; consultez [Échantillonnage des données](/fr/rum/sampling). Définissez
+`trackSessionAcrossSubdomains: true` ou `sessionCookieDomain: '.example.com'` pour partager la session entre les sous-domaines.
+`stopSession()` met fin à la session dans tous les onglets. Sans cookies, chaque page conserve sa session en mémoire.
+
+## Identifier les utilisateurs et ajouter du contexte
+
+Renseignez l’utilisateur dès l’initialisation si possible pour associer la bonne identité à la première session.
+
+```ts
+const rum = init({
+  applicationId: 'checkout-web',
+  clientToken: 'mspat-your-client-token',
+  site: 'https://molesignal.example.com',
+  user: { id: currentUser.id, plan: currentUser.plan },
+  globalContext: { region: 'eu-west-1' },
+});
+
+rum.setUser({ id: 'user-42', name: 'Ada', email: 'ada@example.com' });
+rum.setUserProperty('plan', 'enterprise');
+rum.setAccount({ id: 'acme' });
+rum.setGlobalContextProperty('checkout_step', 'payment');
+```
+
+`setUser` exige au moins une des clés `id`, `name` et `email`. Le SDK conserve les autres clés comme propriétés. Sans utilisateur défini, le SDK crée
+un identifiant anonyme stable dans `localStorage`. Définissez `trackAnonymousUser: false` si la politique de confidentialité interdit
+les identifiants anonymes persistants. Le SDK ajoute le contexte défini par les fonctions de configuration à chaque événement ultérieur. Il fusionne le contexte global, celui de la vue
+et celui de l’appel, dans cet ordre. En cas de conflit, la dernière valeur l’emporte.
+
+## Consentement au suivi
+
+```ts
+const rum = init({ /* … */ trackingConsent: 'not-granted' });
+
+rum.setTrackingConsent('granted');
+```
+
+Sans consentement, le SDK ne crée ni cookie, ni identifiant anonyme, ni identifiant d’onglet. Il n’installe aucune
+instrumentation et n’envoie rien. Le retrait du consentement arrête l’instrumentation et efface les identifiants du SDK ainsi que sa
+file d’attente persistante.
+
+## Ajouter des actions, des erreurs, des mesures de durée et des indicateurs personnalisés
+
+```ts
+rum.addAction('Checkout submitted', { cart_size: 3 });
+
+try {
+  await submitOrder();
+} catch (error) {
+  rum.addError(error, { component: 'CheckoutForm' });
+}
+
+// Views: with trackViewsManually, or to name a route.
+rum.startView({ name: 'Order confirmation', context: { step: 3 } });
+rum.setViewName('Order confirmation (3DS)');
+
+// Custom timings and feature flags belong to the current view.
+rum.addTiming('cart_ready');
+rum.addFeatureFlagEvaluation('new_checkout', true);
+
+// Durations.
+const vital = rum.startDurationVital('checkout_form_ready', { description: 'form is usable' });
+rum.stopDurationVital(vital);
+
+// The page is ready when the application says so: this replaces the loading time of the view.
+rum.setViewLoadingTime();
+
+// Logs.
+rum.logger.warn('cart is stale', { age_ms: 90000 });
+
+await rum.flush();
+```
+
+Appelez `rum.flush()` avant une navigation ou un arrêt contrôlé pour attendre l’envoi des événements en attente. Appelez `rum.stop()` pour retirer
+l’instrumentation et vider la file d’attente du client. Les [règles d’alerte](/fr/rum/alerts#métriques-mesurées-par-l’application) peuvent surveiller les mesures de durée et
+les indicateurs personnalisés. Les [feature flags](/fr/rum/feature-flags) ont une page dédiée. Le SDK envoie les [logs](/fr/rum/logs) au flux `rum_logs`.
+
+## Obtenir un lien vers le replay d’une session
+
+`getSessionReplayLink()` renvoie l’adresse de la session en cours dans MoleSignal pour joindre le lien à un ticket d’assistance ou à un rapport
+d’erreur. La fonction renvoie `undefined` si le SDK n’a pas encore démarré, si la session ne fait pas partie de l’échantillon ou en l’absence de consentement. La
+fonction construit l’adresse à partir de `appUrl`, qui prend par défaut la valeur de `site`. Définissez `appUrl` si l’URL d’accès à MoleSignal diffère de celle à laquelle le SDK envoie les données.
+
+```ts
+ticket.replay = molesignalRum.getSessionReplayLink();
+```
+
+Pour ouvrir le lien, connectez-vous avec la permission `rum.replay.read`.
+
+## React
+
+`@molesignal/browser-rum/react` transforme les routes d’un routeur en vues du SDK, les nomme selon leurs motifs
+(`/orders/:id` et non `/orders/42`) et signale les exceptions levées dans l’arborescence de composants. React est une dépendance paire facultative.
+
+```tsx
+import { init } from '@molesignal/browser-rum';
+import { reactPlugin, RumErrorBoundary, trackReactRouter } from '@molesignal/browser-rum/react';
+
+init({ /* … */ plugins: [reactPlugin()] });
+trackReactRouter(router); // a router of createBrowserRouter; trackTanStackRouter for TanStack Router
+
+root.render(
+  <RumErrorBoundary fallback={<Oops />}>
+    <RouterProvider router={router} />
+  </RumErrorBoundary>,
+);
+```
+
+## Configuration à distance
+
+Avec `remoteConfiguration: true`, le SDK lit les [paramètres du SDK pour l’application](/fr/rum/applications#configuration-à-distance-du-sdk)
+avant de démarrer. Modifiez ainsi les taux d’échantillonnage et le niveau de confidentialité sans publier de nouvelle version de la page.
+
+## Paramètres par défaut de la collecte automatique
+
+| Données | Option | Valeur par défaut |
+|---|---|---|
+| Pages vues | `trackViewsManually` | Suivi automatique via l’API History (`false`) |
+| Fetch, XHR et temps de chargement des ressources | `trackResources` | `true` |
+| Frames d’animation longues et tâches longues | `trackLongTasks` | `true` |
+| Web Vitals de la vue | `trackWebVitals` | `true` |
+| Clics | `trackUserInteractions` | `false` |
+| Profondeur de défilement dans la vue | `trackScroll` | `true` |
+| Clics de frustration, sans effet et avec erreur | `trackFrustrations` | Identique au suivi des interactions |
+| Erreurs d’exécution, rejets non gérés et échecs de requêtes | Intégré | Activé |
+| `console.error` | `trackConsoleErrors` | `false` |
+| Messages de la console sous forme de [logs](/fr/rum/logs) | `forwardConsoleLogs` | `[]` |
+| Erreurs internes du SDK sous forme de logs | `trackSdkErrors` | `true` |
+| En-têtes des requêtes et des réponses | `trackResourceHeaders` | `[]` |
+| Restauration d’une page depuis le cache de navigation arrière/avant | `trackBfcacheViews` | `false` |
+| Replay de session du DOM | `sessionReplaySampleRate` | `0` |
+
+Le SDK identifie les sessions issues d’un test ; consultez [Trafic de test](/fr/rum/test-traffic). Les ressources, les erreurs et les tâches longues qui démarrent pendant le traitement d’un clic portent son `action.id` et entrent dans son décompte. Une requête qui
+échoue produit une erreur de source `network` qui contient la requête en échec dans `error.resource`. FCP, LCP et FID décrivent le chargement de la page.
+Le SDK les rapporte sur la vue initiale. `web-vitals` mesure INP et CLS une fois par chargement de page. Le SDK rattache
+chaque mesure à la vue où s’est produit l’interaction ou le décalage de mise en page qui a déterminé sa valeur.
+
+## Associer les requêtes du navigateur aux traces
+
+Pour les URL autorisées pour le traçage, les intégrations fetch et XMLHttpRequest conservent l’en-tête W3C `traceparent` existant ou en injectent un nouveau, puis
+lisent le contexte de trace dans la requête, dans la réponse ou dans une entrée `Server-Timing` nommée `traceparent`. Les intégrations enregistrent les identifiants de trace et de span
+dans `resource.trace_id` et `resource.span_id`. MoleSignal peut ainsi associer une requête du navigateur aux traces du backend. Par défaut,
+les intégrations injectent et lisent le contexte de trace uniquement pour les requêtes de même origine. Pour les API d’une autre origine, exposez les en-têtes de réponse et autorisez
+explicitement l’origine :
+
+```http
+Access-Control-Expose-Headers: traceparent, server-timing
+```
+
+```ts
+allowedTracingUrls: [
+  'https://api.example.com',
+  /^https:\/\/edge-\w+\.example\.com\//,
+]
+```
+
+## Configuration
+
+| Option | Valeur par défaut | Rôle |
+|---|---|---|
+| `applicationId` | obligatoire | Identifiant de l’application, transmis dans `application.id` |
+| `clientToken` | obligatoire | Jeton client associé à l’application (`mspat-<36>`) |
+| `site` | obligatoire | Origine de MoleSignal ou URL de base se terminant par `/api`, `/api/v1` ou `/api/v1/rum` |
+| `service` | `applicationId` | Valeur du champ `service` des événements |
+| `env`, `version` | non défini | Dimensions du déploiement. La recherche des source maps nécessite `version` |
+| `debugId` | non défini | Identifiant de débogage du build, transmis dans `debug_id` pour les frames de pile d’erreur |
+| `user`, `account`, `globalContext` | non défini | Identité initiale et attributs personnalisés |
+| `trackingConsent` | `granted` | Lance ou retarde tout suivi et toute création d’identifiants |
+| `sessionSampleRate` | `100` | Pourcentage de sessions collectées |
+| `sessionReplaySampleRate` | `0` | Pourcentage de sessions collectées pour lesquelles la relecture est enregistrée |
+| `sessionInactivityTimeout` | `900000` | Durée d’inactivité au-delà de laquelle la session prend fin, en millisecondes |
+| `maxSessionDuration` | `14400000` | Durée maximale d’une session, en millisecondes |
+| `defaultPrivacyLevel` | `mask` | `mask`, `mask-user-input` ou `allow` : détermine quelles données affichées sur la page ou saisies dans ses champs sont transmises. Consultez [Confidentialité](/fr/rum/privacy) |
+| `trackUrlQueryString` | `false` | Conserve les chaînes de requête dans les URL transmises |
+| `excludedUrls` | `[]` | Exclut des requêtes selon leur URL, à l’aide d’une chaîne, d’une expression régulière ou d’une fonction de rappel |
+| `allowedTracingUrls` | même origine | Requêtes qui reçoivent et fournissent un contexte de trace |
+| `traceSampleRate` | `100` | Pourcentage des traces initiées par les requêtes que le backend est invité à conserver (indicateur d’échantillonnage W3C). Les autres requêtes continuent de transmettre un contexte de trace et restent ainsi associées à leur identifiant de trace |
+| `trackResourceHeaders` | `[]` | En-têtes des requêtes fetch ou XHR à conserver, par nom ou par expression régulière. Le SDK ne conserve jamais les données d’authentification |
+| `forwardConsoleLogs` | `[]` | Méthodes de la console qui génèrent aussi des logs : `'all'` ou une sélection parmi `debug`, `log`, `info`, `warn` et `error` |
+| `trackSdkErrors` | `true` | Consigne les erreurs du SDK dans les logs de l’application, à raison de quelques entrées par chargement de page |
+| `trackScroll` | `true` | Enregistre la profondeur de défilement atteinte pour chaque vue |
+| `compressIntakeRequests` | `false` | Compresse avec gzip les requêtes d’envoi d’événements si le navigateur le permet |
+| `remoteConfiguration` | `false` | Charge les [paramètres de l’application](/fr/rum/applications#configuration-à-distance-du-sdk) avant le démarrage |
+| `appUrl` | `site` | URL d’accès à MoleSignal utilisée par `getSessionReplayLink` |
+| `plugins` | `[]` | Extensions du SDK, par exemple `reactPlugin()` |
+| `enablePersistentQueue` | `true` | Récupère dans IndexedDB les données de télémétrie non envoyées après un rechargement |
+| `flushInterval`, `batchSize` | `5000`, `50` | Intervalle d’envoi et nombre d’événements par requête. Chaque lot contient au maximum 100 événements |
+| `maxQueueSize` | `1000` | Nombre d’événements conservés hors ligne |
+| `beforeSend` | non défini | Permet d’inspecter, de modifier ou d’ignorer un événement |
+| `onError` | non défini | Reçoit les diagnostics du SDK : échecs d’envoi et événements rejetés |
+| `transport` | fetch du navigateur | Permet d’envoyer les événements via un proxy personnalisé |
+
+`beforeSend(event, { kind })` reçoit l’objet de l’événement, structuré selon le [format des événements](/fr/rum/events). Renvoyez `false` pour ignorer l’événement ;
+le SDK ne permet pas d’ignorer un événement `view`, car les compteurs deviendraient incohérents.
+
+## Envoi des événements
+
+Le SDK met les événements en file d’attente, les envoie par lots et les conserve dans IndexedDB jusqu’à ce que le serveur les accepte. Il réessaie avec un délai d’attente
+exponentiel après une erreur réseau ou une réponse `408`, `425`, `429` ou `5xx`, et respecte `Retry-After`. Si MoleSignal **rejette** des événements, le SDK
+les signale via `onError` sans les renvoyer. Pour toute autre réponse `4xx`, il abandonne le lot. Quand la file est pleine, le SDK supprime d’abord les ressources, puis les tâches
+longues, les enregistrements de session, les métriques Web Vitals, les actions, les erreurs et enfin les vues. Quand la page se ferme, le SDK envoie en priorité les événements les plus importants dans une seule
+requête `keepalive`. Les onglets de la même application partagent la file d’attente sans envoyer deux fois les mêmes événements.
+
+## Mise à niveau depuis la version 0.2
+
+- `defaultPrivacyLevel: 'allow'` affiche désormais le texte saisi dans les champs, sauf dans ceux des mots de passe, des adresses e-mail, des numéros de téléphone, des cartes de paiement ou
+  des codes à usage unique. `mask-user-input` reprend le comportement précédent de `allow` : sélectionnez cette valeur pour continuer à masquer le texte saisi.
+- Le SDK signale aussi les clics en dehors des éléments interactifs.
+
+## Mise à niveau depuis la version 0.1
+
+La version 0.2 fait passer le SDK au format d’événements RUM, sans mode de compatibilité.
+
+- Le SDK envoie les événements uniquement à `POST /api/v1/rum/events`. Les points de terminaison des sessions, des actions et des erreurs n’existent plus. Les fonctions `transport`
+  personnalisées reçoivent `kind: 'events' | 'replay'`.
+- Le SDK envoie des vues, pas des sessions. Les ressources, les tâches longues et les vues de page constituent des événements distincts. Le SDK indique les clics de frustration et les clics sans effet
+  dans le champ `action.frustration.type` de l’événement de clic.
+- `beforeSend` reçoit des objets conformes au format des événements. `context.kind` indique le type d’événement.
+- Un cookie partagé entre les onglets stocke la session. Le délai d’inactivité par défaut est de 15 minutes.
+- Le serveur identifie le navigateur, le système d’exploitation et l’appareil à partir de l’en-tête `User-Agent`.
+- Créez d’abord l’application. MoleSignal ne délivre de jeton que pour une application existante.
+
+## Étapes suivantes
+
+<CardGroup cols={2}>
+  <Card title="Échantillonnage des données" icon="sliders" href="/fr/rum/sampling">
+    Réglez séparément le volume des sessions et celui des enregistrements de session.
+  </Card>
+  <Card title="Confidentialité" icon="shield" href="/fr/rum/privacy">
+    Conservez les données sensibles sur l’appareil de l’utilisateur.
+  </Card>
+  <Card title="Relecture de session" icon="video" href="/fr/rum/session-replay">
+    Enregistrez et rejouez les modifications du DOM en toute sécurité.
+  </Card>
+  <Card title="Source maps et symboles" icon="file-code" href="/fr/rum/source-maps">
+    Restaurez les traces de pile du navigateur issues de code minifié et découvrez le processus unifié de gestion des artefacts.
+  </Card>
+</CardGroup>

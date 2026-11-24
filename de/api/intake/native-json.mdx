@@ -1,0 +1,86 @@
+---
+title: "Native JSON-Datenannahme"
+description: "Senden Sie Datensätze per POST als JSON an einen Stream."
+"en_link": "/en-US/api/intake/native-json"
+"zh-Hans_link": "/zh-Hans/api/intake/native-json"
+"zh-Hant_link": "/zh-Hant/api/intake/native-json"
+"ja_link": "/ja/api/intake/native-json"
+"ko_link": "/ko/api/intake/native-json"
+"es_link": "/es/api/intake/native-json"
+"fr_link": "/fr/api/intake/native-json"
+"pt-BR_link": "/pt-BR/api/intake/native-json"
+---
+
+```http
+POST /api/v1/intake/{type}/{stream}
+```
+
+Sendet ein einzelnes Datensatzobjekt oder ein Array von Datensätzen an einen Stream. Beim ersten Schreibvorgang legt MoleSignal den Stream an und erweitert das Schema, sobald neue Felder hinzukommen. Der Aufruf erfordert die Schreibberechtigung für das jeweilige Signal: `logs.write`, `metrics.write` oder `traces.write`. Verwenden Sie das Standard-Intake-Token oder ein Token eines Dienstkontos mit Schreibrolle.
+
+**Pfadparameter**
+
+| Parameter | Typ | Hinweise |
+|---|---|---|
+| `type` | string | `logs`, `metrics` oder `traces`. Bei anderen Werten antwortet der Server mit `404`. |
+| `stream` | string | Streamname aus Buchstaben, Ziffern, `_`, `-` und `.`. Bei einem [Plattform-Stream](/de/streams#plattform-streams) wie `_molesignal` oder `_audit` antwortet der Server mit `403`. |
+
+**Anfragetext**
+
+Ein JSON-Objekt oder ein Array aus JSON-Objekten. Jedes Array-Element muss ein Objekt sein. Der Anfragetext darf höchstens 16 MiB groß sein. Der Server dekomprimiert Anfragetexte mit `Content-Encoding: gzip`. Auch nach der Dekomprimierung gilt das Limit von 16 MiB.
+
+| Feld | Hinweise |
+|---|---|
+| `_timestamp` | Ereigniszeit in Mikrosekunden seit der Unix-Epoche. Fehlt das Feld, verwendet der Server den Empfangszeitpunkt. |
+| `metric_name` | Bei `metrics` die Metrik, zu der der Datensatz gehört. Ein Metrik-Stream enthält die Metriken einer Quelle. Fehlt `metric_name`, gehört der Datensatz zur Metrik, die denselben Namen wie der Stream hat. |
+| jedes andere Feld | MoleSignal speichert das Feld im Stream. In späteren Datensätzen muss das Feld denselben Typ haben wie im Stream. |
+
+**Traces schreiben**
+
+MoleSignal speichert Spans, die an `traces` gesendet werden, direkt bei Eingang. Dabei wendet MoleSignal kein [Tail-Sampling](/de/configuration#trace-erfassung-und-tail-sampling) an und erstellt keine Trace-Zusammenfassungen für die Trace-Liste. Senden Sie Spans über [OTLP](/de/api/intake/otlp), um alle Trace-Funktionen zu nutzen.
+
+| Bereich | Verhalten für diese Spans |
+|---|---|
+| Der Tab **Traces** auf der Seite **Traces** und das zugehörige Histogramm | Keine Anzeige. |
+| Das Tool `list_traces` von Mole Agent und **Zugehörige Traces** in **RUM** | Keine Treffer. |
+| **APM** | Keine Berücksichtigung in der Zählung. |
+| Der Tab **Spans** und die **RED-Detailansicht** auf der Seite **Traces** sowie die Detailansicht eines über seine ID geöffneten Traces | Verfügbar. |
+| **Service-Graph** | Berücksichtigung in der Zählung. |
+
+Wenn eine Organisation mehrere Trace-Streams hat, greifen die Trace-Liste und Mole Agent auf einen dieser Streams zu und bevorzugen einen Stream mit Zusammenfassungen. Ein Stream, der nur Daten über diesen Endpunkt erhält, verdrängt deshalb keinen Stream mit Daten aus OTLP.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/logs/app \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "accepted": 1, "rejected": 0, "errors": [] }
+```
+</ResponseExample>
+
+Wenn ein Datensatz nicht zum Schema passt, lehnt der Server nur diesen Datensatz ab und akzeptiert die übrigen Datensätze im Batch:
+
+```json
+{
+  "accepted": 1,
+  "rejected": 1,
+  "errors": [
+    { "index": 0, "reason": "type mismatch on field `level`: expected Utf8, got Number" }
+  ]
+}
+```
+
+**Fehler**
+
+| Status | Ursache |
+|---|---|
+| `400` | Ungültiger Streamname, ungültiges JSON oder ein Array-Element, das kein Objekt ist (`event #1 must be a JSON object`). |
+| `401` | Fehlendes oder ungültiges Token. |
+| `403` | Dem Token fehlt die erforderliche Berechtigung oder der Stream ist ein Plattform-Stream. |
+| `413` | Der Anfragetext überschreitet vor oder nach der Dekomprimierung 16 MiB. |
+| `429` | Das Ratenlimit des Routers greift oder die Intake-Puffer des Knotens sind voll (`intake buffer memory limit exceeded`). Die Antwort enthält den Header `Retry-After`. |

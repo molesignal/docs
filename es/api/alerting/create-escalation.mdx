@@ -1,0 +1,124 @@
+---
+title: "Crear una política de escalamiento"
+description: "Define los pasos de notificación de incidentes y su orden."
+"en_link": "/en-US/api/alerting/create-escalation"
+"zh-Hans_link": "/zh-Hans/api/alerting/create-escalation"
+"zh-Hant_link": "/zh-Hant/api/alerting/create-escalation"
+"ja_link": "/ja/api/alerting/create-escalation"
+"ko_link": "/ko/api/alerting/create-escalation"
+"de_link": "/de/api/alerting/create-escalation"
+"fr_link": "/fr/api/alerting/create-escalation"
+"pt-BR_link": "/pt-BR/api/alerting/create-escalation"
+---
+
+```http
+POST /api/v1/alerts/escalations
+```
+
+Crea una política de escalamiento. Una política enumera los pasos en orden. Cada paso notifica a sus destinatarios y espera una confirmación. La llamada requiere `alerts.escalations.manage`.
+
+## Cómo funciona el escalamiento
+
+1. El rol `alert` revisa los incidentes activos cada `[alert].dispatch_interval_secs`, 10 segundos de forma predeterminada. Solo avanzan los incidentes con estado `open`. Confirmar un incidente detiene el escalamiento.
+2. Un paso con `minSeverity` solo se aplica a incidentes con esa gravedad o una superior. El sistema omite los pasos que no se aplican.
+3. Cada destinatario del paso actual recibe un evento de notificación. Los [canales de notificación](/es/notification-channels) determinan cómo se entrega el mensaje. El campo `assignees` del incidente pasa a contener los usuarios que el paso indica directamente: los destinatarios de tipo `user` y el usuario de guardia de cada destinatario de tipo `schedule`. Un paso que solo notifica a equipos conserva los usuarios asignados anteriormente.
+4. Si transcurre el plazo `ackTimeoutSecs` sin confirmación, comienza el siguiente paso aplicable.
+5. Si vence el plazo del último paso aplicable y la política tiene `repeat` en `true`, la política vuelve al primer paso hasta completar `maxLoops` ciclos.
+6. Si configuras `ackRetriggerSecs` y un incidente en estado `acknowledged` sigue sin resolverse después de ese plazo desde su confirmación, vuelve a `open`. El sistema notifica a los usuarios asignados o, si no hay ninguno, vuelve a notificar a los destinatarios del paso actual, con `escalation.reason` en `ack_timeout`. El plazo de confirmación del paso actual vuelve a empezar y el escalamiento continúa normalmente. Este plazo no se aplica a los incidentes pospuestos.
+
+Una regla elige una política mediante `escalationPolicyId`. Si no lo especifica, usa `default`, un alias de la política de la organización cuyo nombre es `default`. La comparación no distingue entre mayúsculas y minúsculas. Cuando comienza el escalamiento, el incidente guarda el ID real de esa política. Si cambias el nombre de la política más adelante, el incidente abierto no pasa a otra política. Si la organización no tiene una política llamada `default`, los incidentes de esa regla no escalan, aunque el evento activado sí llega a las políticas de notificación. Crea una política llamada `default` o indica el ID de una política en la regla.
+
+**Cuerpo**
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `name` | cadena | Sí | No puede estar vacío. |
+| `steps` | arreglo | No | Vacío de forma predeterminada. Una política sin pasos no notifica a nadie. |
+| `repeat` | booleano | No | Valor predeterminado: `false`. Vuelve al primer paso después del último. |
+| `maxLoops` | entero | No | Valor predeterminado: `1`. Número total de ciclos por los pasos cuando `repeat` es `true`. Si el valor es menor que 1, el sistema usa 1. |
+| `ackRetriggerSecs` | entero | No | Tiempo que un incidente confirmado puede seguir sin resolverse antes de que el sistema vuelva a notificarlo: de 300 a 86400 segundos. Valor predeterminado: `null`, sin volver a notificar. |
+| `urgencyRule` | objeto | No | Define la urgencia de un incidente que aún no tiene una. El valor predeterminado es `{"mode": "by_severity"}`, que asigna a cada gravedad el nivel que definió la organización (urgencia alta para crítica y error, y baja para advertencia e información, salvo que cambies la configuración). También admite `{"mode": "always", "urgency": "high"}` o `{"mode": "support_hours", "hours": {"timezone": "Asia/Shanghai", "ranges": [{"weekdayMask": 62, "start": "09:00", "end": "18:00"}], "calendar": {"calendarId": "<id>", "holidays": "exclude"}}, "inside": "high", "outside": "low", "raiseAtStart": true}`. Usa `inside` dentro del horario de soporte y `outside` fuera de ese horario, con `high` y `low` como valores predeterminados, respectivamente. Con `raiseAtStart`, al comenzar el horario de soporte, el sistema eleva al nivel de `inside` los incidentes sin confirmar que tengan una urgencia menor y vuelve a notificarlos desde el primer paso. El valor de urgencia es la clave de uno de los [niveles](/es/alerting/on-call#niveles-de-urgencia-y-prioridad) de la organización. El bit 0 de `weekdayMask` corresponde al domingo. `calendar` es opcional y admite `exclude` u `only` en `holidays` (consulta [Calendarios de días festivos](/es/alerting/on-call#calendarios-de-días-festivos)). Consulta [Urgencia](/es/alerting/on-call#urgencia). |
+| `escalateLowUrgency` | booleano | No | `false` de forma predeterminada: para los incidentes de un nivel que no admite escalamiento, el sistema solo notifica a los destinatarios del primer paso, sin avanzar ni repetir el paso. Con `true`, estos incidentes escalan normalmente según esta política. |
+
+Cada paso tiene estos campos:
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `targets` | arreglo | Sí | Destinatarios del paso. El sistema notifica a todos al mismo tiempo. |
+| `ackTimeoutSecs` | entero | No | Segundos de espera para recibir una confirmación antes de pasar al siguiente paso. Si omites el campo, el sistema guarda con el paso el valor de `[alert].default_ack_timeout_secs` (300 de forma predeterminada). |
+| `minSeverity` | cadena | No | `info`, `warning`, `error` o `critical`. El paso se aplica a los incidentes con esta gravedad o una superior. Omite el campo para aplicar el paso a todos los incidentes. |
+
+El campo `kind` determina a quién se notifica:
+
+| `kind` | Campo adicional | Destinatarios |
+|---|---|---|
+| `user` | `userId` | Un usuario. |
+| `team` | `teamId` | Los miembros de un equipo. |
+| `schedule` | `scheduleId` | El usuario de guardia según el calendario de guardias. |
+
+La llamada no comprueba que existan el usuario, el equipo o el calendario indicados.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/escalations \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "Primary operations",
+    "steps": [
+      { "targets": [{ "kind": "user", "userId": "<user-id>" }],
+        "ackTimeoutSecs": 300 },
+      { "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+        "ackTimeoutSecs": 900,
+        "minSeverity": "critical" }
+    ],
+    "repeat": true,
+    "maxLoops": 2,
+    "ackRetriggerSecs": 3600
+  }'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KED3sy8RBNYIdLayGZN0bp2IIY",
+  "orgId": "<organization-id>",
+  "name": "Primary operations",
+  "steps": [
+    {
+      "targets": [{ "kind": "user", "userId": "<user-id>" }],
+      "ackTimeoutSecs": 300,
+      "minSeverity": null
+    },
+    {
+      "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+      "ackTimeoutSecs": 900,
+      "minSeverity": "critical"
+    }
+  ],
+  "repeat": true,
+  "maxLoops": 2,
+  "ackRetriggerSecs": 3600
+}
+```
+</ResponseExample>
+
+**Errores**
+
+| Estado | Causa |
+|---|---|
+| `400` | `name` está vacío o `ackRetriggerSecs` está fuera del intervalo de 300 a 86400. |
+| `403` | El token no tiene el permiso `alerts.escalations.manage`. |
+| `422` | Falta un campo o su valor no es válido. Por ejemplo, el campo `kind` de un destinatario tiene un valor distinto de `user`, `team` o `schedule`, o `minSeverity` tiene un valor desconocido. La respuesta es texto sin formato. |
+
+## Otras rutas de políticas
+
+| Operación | Endpoint | Permiso |
+|---|---|---|
+| Listar | `GET /api/v1/alerts/escalations` | `alerts.escalations.read` |
+| Obtener | `GET /api/v1/alerts/escalations/{id}` | `alerts.escalations.read` |
+| Reemplazar | `PUT /api/v1/alerts/escalations/{id}` | `alerts.escalations.manage` |
+| Eliminar | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.escalations.delete` |
+
+`PUT` usa el mismo cuerpo que la llamada de creación y reemplaza la política. `DELETE` devuelve `deleted` como texto sin formato o `404` si no reconoce el ID. Al eliminar una política, el sistema no comprueba qué reglas la usan. Los incidentes de esas reglas dejan de escalar.

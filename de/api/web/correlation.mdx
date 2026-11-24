@@ -1,0 +1,81 @@
+---
+title: "API für signalübergreifende Korrelation"
+sidebarTitle: "Signalübergreifende Korrelation"
+description: "Ermitteln Sie beim Wechsel zwischen Signalen die Filter, den Zeitraum und die vorausgefüllte Abfrage."
+"en_link": "/en-US/api/web/correlation"
+"zh-Hans_link": "/zh-Hans/api/web/correlation"
+"zh-Hant_link": "/zh-Hant/api/web/correlation"
+"ja_link": "/ja/api/web/correlation"
+"ko_link": "/ko/api/web/correlation"
+"es_link": "/es/api/web/correlation"
+"fr_link": "/fr/api/web/correlation"
+"pt-BR_link": "/pt-BR/api/web/correlation"
+---
+
+```http
+GET /api/v1/web/correlation/{fromKind}/{toKind}?ctx=<base64url-json>
+```
+
+Berechnet die Filter, den Zeitraum und die vorausgefüllte Abfrage, die die Weboberfläche beim Wechsel zwischen Signalen verwendet, zum Beispiel von einem Trace zu den zugehörigen Logs. Der Aufruf erfordert `traces.read` oder im System-Scope `sys.telemetry.read`.
+
+**Parameter**
+
+| Parameter | In | Erforderlich | Hinweise |
+|---|---|---|---|
+| `fromKind` | path | Ja | Das Quellsignal für den Wechsel: `trace`, `metric`, `log` oder `host`. |
+| `toKind` | path | Ja | Das Zielsignal für den Wechsel: `trace`, `metric`, `log` oder `host`. |
+| `ctx` | query | Ja | Ein JSON-Objekt, das das Quellsignal beschreibt, als base64url ohne Padding codiert. |
+
+Das `ctx`-Objekt akzeptiert folgende optionale Schlüssel:
+
+| Schlüssel | Typ | Hinweise |
+|---|---|---|
+| `trace_id` | string | Der Trace des Quellsignals. |
+| `service` | string | Der Name eines Dienstes. |
+| `services` | array | Namen von Diensten. |
+| `host` | string | Ein Hostname. |
+| `time_range` | object | `{ "from": "<RFC 3339>", "to": "<RFC 3339>" }`. Standardmäßig gilt die letzte Minute. |
+
+## Unterstützte Signalwechsel
+
+| Von → nach | Filter | Vorausgefüllte Abfrage |
+|---|---|---|
+| `trace` → `log` | `service` aus `services` und `trace_id` | Keine. |
+| `trace` → `metric` | `service` aus `services` | `promql`: `rate(http_requests_total{service="<first service>"}[1m])` |
+| `trace` → `host` | `host` aus `host` | Keine. |
+| `metric` → `trace` | `service` aus `services` und ein `peer_service`, den der Service-Graph für den ersten Dienst meldet | Keine. |
+| `metric` → `log` | `service` aus `services` | Keine. |
+| `log` → `trace` | `trace_id` und `service` | Keine. |
+| `log` → `metric` | `service` aus `services` oder `service` | `promql`: `rate(log_records_total{service="<service>"}[1m])` |
+| `host` → `trace` | `host.name` aus `host` | Keine. |
+
+Ein Filter für einen einzelnen Dienst verwendet den Operator `eq`, ein Filter für mehrere Dienste `in`. Bei allen anderen Kombinationen, auch bei einem unbekannten Signaltyp, gibt der Aufruf `200` mit dem Zeitraum und ohne Filter zurück.
+
+<RequestExample>
+```bash cURL
+CTX=$(printf '%s' '{"trace_id":"0af7651916cd43dd8448eb211c80319c","services":["checkout","payments"],"time_range":{"from":"2026-10-04T10:00:00Z","to":"2026-10-04T10:05:00Z"}}' | base64 | tr -d '\n=' | tr '+/' '-_')
+
+curl "http://localhost:5080/api/v1/web/correlation/trace/log?ctx=$CTX" \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "timeRange": { "from": "2026-10-04T10:00:00Z", "to": "2026-10-04T10:05:00Z" },
+  "filters": [
+    { "field": "service", "op": "in", "value": ["checkout", "payments"] },
+    { "field": "trace_id", "op": "eq", "value": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "prefill": {}
+}
+```
+</ResponseExample>
+
+**Fehler**
+
+| Status | Ursache |
+|---|---|
+| `400` | `ctx` fehlt, ist kein gültiges base64url oder ergibt beim Decodieren kein JSON. Fehlt `ctx`, enthält die Antwort Klartext. In den anderen Fällen gibt der Aufruf `invalid_argument` mit der Meldung `invalid ctx base64: ...` oder `invalid ctx json: ...` zurück. |
+| `403` | Dem Token fehlt die Berechtigung `traces.read`. |

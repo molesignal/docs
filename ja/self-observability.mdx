@@ -1,0 +1,151 @@
+---
+title: "MoleSignal 自体の可観測性"
+description: "MoleSignal 自体のログ、メトリクス、トレース、プロファイル、稼働状態、各ノードの診断情報を使って、MoleSignal の稼働を監視します。"
+"en_link": "/en-US/self-observability"
+"zh-Hans_link": "/zh-Hans/self-observability"
+"zh-Hant_link": "/zh-Hant/self-observability"
+"ko_link": "/ko/self-observability"
+"de_link": "/de/self-observability"
+"es_link": "/es/self-observability"
+"fr_link": "/fr/self-observability"
+"pt-BR_link": "/pt-BR/self-observability"
+---
+
+プロセスログは、設定したコンソールまたはファイルにのみ出力します。MoleSignal は、プラットフォームのメトリクス、トレース、プロファイルを、保護された `_sys` 組織に書き込みます。保存する各シグナルには、対応するストリームタイプと、厳密に `_molesignal` という名前のストリームを使用します。
+
+| シグナル | タイプ付きストリーム | 内容 |
+|---|---|---|
+| メトリクス | `metrics/_molesignal` | カウンター、ゲージ、ヒストグラム、サマリーです。 |
+| トレース | `traces/_molesignal` | テールサンプリング後の正規形式の完了済みスパンです。 |
+| プロファイル | `profiles/_molesignal` | オブジェクトストレージ内の pprof BLOB にひも付けたプロファイルのメタデータです。 |
+
+これらのストリームは、`sys.telemetry.read` を持つシステムスコープからのみクエリできます。
+
+## 自己テレメトリの収集を有効にする
+
+```toml
+[telemetry.self_collect]
+enabled = true
+metrics_enabled = true
+metrics_interval_secs = 15
+queue_capacity = 8192
+batch_max_events = 256
+batch_max_delay_ms = 1000
+flush_timeout_secs = 5
+profile_kinds = ["cpu"]
+profile_interval_secs = 600
+profile_duration_secs = 10
+```
+
+保存先をテナント組織に変更することはできません。公開取り込み、ストリーム変更操作、パイプラインでは、`_molesignal` を作成、上書き、削除できません。
+
+ストリームの作成時には、リテンションを 7 日間に設定します。リテンションとメトリクスストリームのダウンサンプリングは、`_sys` 組織にあるストリームの **リテンション** タブで変更してください。設定値は再起動後も保持します。
+
+ロールを分離したデプロイでは、Intake 以外のノードが自己テレメトリを正常な Intake ノードに転送します。すべてのロールに同じ `MS_SELF_TELEMETRY_CLUSTER_TOKEN` を設定してください。
+
+## バックエンドの分散トレーシング
+
+MoleSignal は、HTTP、gRPC、Flight SQL、データベース、オブジェクトストレージ、取り込み、クエリ、バックグラウンドワーカー、Agent の各ステージを計装します。
+
+スパンは OpenTelemetry Semantic Conventions 1.43.0 に準拠します。標準属性には標準の名前を使用し、MoleSignal が追加する属性名は `molesignal.` で始まります。各スパンはバージョンを `semantic_conventions_version` に記録します。
+
+受信した W3C コンテキストは検証し、必要に応じて置き換えます。外部のバゲージは組織へのアクセスを認可しません。機密性の高いリクエストボディ、SQL の値、認証情報、プロンプト、モデルの出力、ツールの引数はスパンに含めません。
+
+SQL スパンには、ステートメントの値を `?` に置き換えて生成した鍵付きフィンガープリントを `molesignal.db.query.fingerprint` に格納できます。オブジェクトストレージのスパンには、オブジェクトキーの鍵付きフィンガープリントを `molesignal.object.key_fingerprint` に格納できます。これにより、ステートメントやオブジェクトキー自体を保存せずに、同じステートメントや同じオブジェクトのスパンをグループ化できます。フィンガープリントを書き込むのは、 [`MS_TRACE_FINGERPRINT_KEY`](/ja/configuration#環境変数) に 16 bytes 以上の値を設定している間だけです。
+
+テールサンプラーは、次の優先順でトレースを保持するかどうかを判定します。
+
+1. デプロイ時またはランタイムでの無効化
+2. 信頼済みのデバッグ指定による強制保持
+3. エラー
+4. 低速なトレース
+5. ポリシールール（定義順）
+6. 通常のサンプリング比率による決定論的な判定
+
+サンプラーと自己テレメトリの取り込み・エクスポートキューには上限があり、障害時も業務トラフィックを遮断しません。固定カーディナリティのコンポーネントメトリクスは `/metrics` で、詳細なヘルス情報は `GET /api/v1/system/telemetry` で確認してください。
+
+## ノードローカルの pprof
+
+診断リスナーはデフォルトで無効です。
+
+```toml
+[profiling]
+enabled = true
+bind = "127.0.0.1"
+port = 5086
+allow_remote = false
+```
+
+同じ設定キーは、`MS_PROFILING_ENABLED`、`MS_PROFILING_BIND`、`MS_PROFILING_PORT`、 `MS_PROFILING_ALLOW_REMOTE` でも設定できます。`bind` には `localhost` のようなホスト名ではなく、IP アドレスを指定してください。ポートには、ノードで実行しないロールのリスナーも含め、ほかの有効なリスナーと異なるポートを指定してください。ポートが重複すると、起動時にプロセスが停止します。[pprof](/ja/configuration#pprof) を参照してください。
+
+プロファイルを取得します。
+
+```bash
+curl --fail --output cpu.pb.gz \
+  'http://127.0.0.1:5086/debug/pprof/profile?seconds=30'
+
+curl --fail --output heap.pb.gz \
+  'http://127.0.0.1:5086/debug/pprof/heap'
+```
+
+リスナーはループバックにバインドしたまま、SSH トンネルを使用してください。リモートに公開するには、 `allow_remote = true`、ネットワークアクセス制御、リスナーの手前での TLS、管理者権限を持つ Bearer 認証情報が必要です。
+
+## ヘルスチェックとロールアウト
+
+- `/api/v1/healthz` は公開エンドポイントで、プロセスの稼働状態と依存先のヘルス状態を報告します。コンテナとロードバランサーのプローブに使用してください。
+- `/api/v1/readyz` は、ノードの起動後にトラフィックを受け付ける準備ができているかを報告します。Bearer トークンが必要です。
+- `/metrics` は、テナントラベルを付けずに Prometheus メトリクスを公開します。
+- `X-Request-Id` と `X-Trace-Id` は、リクエストを保持済みのトレースに関連付けます。
+
+分散トレーシングを新たに導入する場合は、まず `telemetry.trace.force_disabled = true` を設定してください。システムリソースとプライバシーを検証し、カナリア環境で有効にしてから、永続化されたランタイムポリシーの適用範囲を広げてください。
+
+## コンポーネントのメトリクス
+
+各ノードは、以下のメトリクスを `/metrics` で公開します。ラベルの値は固定リストから選ばれ、組織名、トレース、ルート、オブジェクトキーを示す値は含まれません。`_sys` 組織では、組み込みダッシュボード **MoleSignal Self Telemetry & Runtime** と **MoleSignal Tracing & APM** でこれらのメトリクスをグラフで確認できます。
+
+### セルフテレメトリとメタデータデータベース
+
+| メトリクス | ラベル | 意味 |
+|---|---|---|
+| `self_telemetry_accepted_total` | `signal` | `_molesignal` ストリーム向けに受け付けたレコード数です。 |
+| `self_telemetry_dropped_total` | `signal`, `reason` | `_molesignal` ストリームに届く前に破棄したレコード数です。`reason` は `queue_full`、`queue_closed`、`trace_candidate_queue`、`delivery_failed`、`flush_timeout`、`persistence_failed` のいずれかです。スケジュール済みのプロファイルを取得できなかった場合は、`capture_busy`、`unavailable`、`invalid_duration`、`capture_failed` のいずれかです。 |
+| `self_telemetry_batches_total` | `signal`, `outcome` | バッチの送信回数です。`outcome` は `success` または `error` です。 |
+| `self_telemetry_retries_total` | `signal`, `reason` | `intake` ロールを持たないノードがバッチを取り込みノードに転送する際の再試行回数です。理由は `no_intake`、`connect`、`push` のいずれかです。 |
+| `self_telemetry_queue_depth`, `self_telemetry_queue_capacity` | `signal` | トレースキューで待機中のスパン数と、キューの容量 `queue_capacity` です。キューを持つのは `traces` だけです。 |
+| `self_telemetry_last_success_unixtime` | `signal` | 最後にバッチの送信に成功した時刻を、Unix エポックからの経過秒数で示します。 |
+| `self_telemetry_profile_available` | `kind` | 現在のプラットフォームでこのビルドが `cpu` または `heap` プロファイルを取得できる場合は `1`、それ以外は `0` です。 |
+| `db_pool_connections` | `pool`, `state` | メタデータデータベースの接続プール（`pool="meta"`）の接続数です。`total`、`idle`、`checked_out` と、設定済みの `min`、`max` を示します。 |
+| `db_pool_acquire_duration_seconds` | `pool` | プールから接続を取得するまでの待機時間です。取得後のステートメントの実行時間は含みません。 |
+
+`signal` は `metrics`、`traces`、`profiles` のいずれかです。レコードの破棄でプロセスが止まることはありませんが、 `_molesignal` ストリームにはデータの欠損が生じます。
+
+### APM プロジェクション
+
+プロジェクションはトレース候補を所有するノードで実行し、ロールアップは `alert` ロールのノードで実行します。 [APM](/ja/configuration#apm) を参照してください。
+
+| メトリクス | ラベル | 意味 |
+|---|---|---|
+| `molesignal_apm_facts_total` | `result` | プロジェクションに到達したスパンの処理結果別の件数です。結果は `accepted`、`duplicate_skip`、`late_kept`、`late_dropped`、`queue_full`、`stopped`、`cardinality_rejected`、`extract_failed`、`flush_failed` のいずれかです。`flush_failed` はスパン数ではなく、書き込みの失敗回数を数えます。 |
+| `molesignal_apm_cardinality_total` | `reason` | [カーディナリティ制限](/ja/apm/settings#カーディナリティの上限)を超えたスパン数を、`service_rejected` や `transaction_overflow` など、制限の種類別に示します。拒否したサービスのスパンは集計しません。それ以外の制限を超えた場合は、スパン名を **その他** として集計するか、詳細を省きます。 |
+| `molesignal_apm_queue` | `resource` | プロジェクションキューで待機中のスパン数（`depth`）と、キューの容量（`capacity`、`[apm].queue_capacity`）です。 |
+| `molesignal_apm_flushes_total` | `result` | 集計データの PostgreSQL への書き込み回数です。結果は `success` または `failure` です。 |
+| `molesignal_apm_flush_duration_seconds` | | 1 回の書き込みにかかった時間です。 |
+| `molesignal_apm_rollups_total` | `result` | 分単位の集計を時間単位にまとめるロールアップの実行回数です。結果は `success` または `failure` です。 |
+| `molesignal_apm_rollup_rows_total` | `kind` | ロールアップが読み取った行数（`source`）、書き込んだ行数（`rollup`）、保持期間を過ぎて削除した行数（`deleted`）です。 |
+| `molesignal_apm_lag_seconds` | `stage` | `projection` では、プロジェクションが最後に取り込んだスパンの経過時間です。`rollup` では、遅延データを受け付ける猶予時間（`[apm].late_grace_secs`）です。 |
+| `molesignal_apm_health` | `component` | `projector`、`repository`、`rollup` の各コンポーネントが正常な場合は `1`、劣化している場合は `0` です。 |
+| `molesignal_apm_api_duration_seconds` | `endpoint` | APM API リクエストへの応答時間です。`overview` や `services` などのエンドポイント別に示します。 |
+
+次の場合にアラートを設定します。
+
+- `molesignal_apm_queue{resource="depth"}` が `capacity` の 80% を超えた状態が続く場合。
+- `result` が `queue_full`、`cardinality_rejected`、 `flush_failed` のいずれかで `molesignal_apm_facts_total` が増加する場合。これらによるデータの欠損は、[データ品質の通知](/ja/apm#データ品質の通知を確認する)で部分的なデータとして報告します。
+- `molesignal_apm_lag_seconds{stage="projection"}` が 120（1 分バケット 2 個分）を超えた状態が続く場合。
+- `molesignal_apm_health` が `0` の場合。
+- `molesignal_apm_api_duration_seconds{endpoint="overview"}` の P95 が 0.5 秒を超えた状態が続く場合。
+
+APM が劣化しても、`/api/v1/healthz` や `/api/v1/readyz` のチェックは失敗しません。`GET /api/v1/apm/health` では、組織ごとにプロジェクションの状態を確認できます。[APM API](/ja/api/apm) を参照してください。
+
+<Card title="設定" icon="sliders" href="/ja/configuration">
+  テレメトリ、トレーシング、エクスポーター、プロファイリングのすべての設定を確認します。
+</Card>

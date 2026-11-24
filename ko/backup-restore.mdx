@@ -1,0 +1,94 @@
+---
+title: "백업 및 복원"
+description: "백업 대상, PostgreSQL과 오브젝트 스토리지 간 일관성을 유지하는 방법, MoleSignal 배포 환경을 복원하는 방법을 설명합니다."
+"en_link": "/en-US/backup-restore"
+"zh-Hans_link": "/zh-Hans/backup-restore"
+"zh-Hant_link": "/zh-Hant/backup-restore"
+"ja_link": "/ja/backup-restore"
+"de_link": "/de/backup-restore"
+"es_link": "/es/backup-restore"
+"fr_link": "/fr/backup-restore"
+"pt-BR_link": "/pt-BR/backup-restore"
+---
+
+MoleSignal은 PostgreSQL, 오브젝트 스토리지, 구성 및 시크릿에 상태를 저장합니다. 노드는 로컬 디스크에 캐시만 저장합니다. 각 항목을 백업하고, 백업에 의존하기 전에 복원을 연습합니다.
+
+## 백업 대상
+
+| 상태 | 저장 내용 | 백업 |
+|---|---|---|
+| PostgreSQL | 사용자, 조직, 토큰, 스트림, 대시보드, 알림 규칙, 스트림과 오브젝트를 매핑하는 파일 카탈로그 | 필수 |
+| 오브젝트 스토리지 | Parquet 데이터 파일, 검색 인덱스, 프로파일 블롭, 아직 플러시하지 않은 레코드의 미리 쓰기 로그(WAL) 오브젝트(`wal/v1/`) | 필수 |
+| `MS_CIPHER_KEY` | PostgreSQL에 저장된 시크릿의 루트 키 | 필수. 데이터베이스 백업과 별도로 보관합니다. |
+| 구성 | `config.toml`, 환경 변수, 그리고 사용하는 경우 `MS_AUTH_JWT_SECRET_OVERRIDE` | 필수 |
+| ACME 디렉터리(`[http.tls].key_storage_dir`) | ACME 계정 키와 도메인 키 | 선택 사항. 인증서는 다시 발급할 수 있습니다. |
+| 캐시 디렉터리(`[cache.object].root`) | 원격 오브젝트 범위의 로컬 복사본 | 백업하지 않습니다. |
+
+## 데이터베이스와 오브젝트의 일관성 유지
+
+PostgreSQL의 파일 카탈로그는 버킷의 오브젝트를 참조합니다. 플러시할 때는 오브젝트를 먼저 업로드하고, 그다음 카탈로그에 기록합니다. 컴팩션과 보존 정책 처리는 먼저 카탈로그에서 참조를 제거합니다. 가비지 컬렉터는 `[storage.gc].grace_period_secs`(기본값 3600초)가 지난 후 오브젝트를 삭제합니다.
+
+일관성 있는 백업을 만들려면 다음 순서를 따릅니다.
+
+1. PostgreSQL을 백업합니다.
+2. 직후에 버킷을 복사하고 유예 기간 내에 완료합니다.
+
+유예 기간 내에 완료한 복사본에는 데이터베이스 백업이 참조하는 모든 오브젝트가 포함됩니다. 복사에 더 오래 걸리면 백업 전에 `grace_period_secs` 값을 늘리거나, 버킷 버전 관리를 활성화하고 데이터베이스를 백업한 시점의 오브젝트를 복원합니다.
+
+## PostgreSQL 백업
+
+특정 시점 복구를 지원하는 예약 스냅샷 등 PostgreSQL 서비스의 백업 기능을 사용합니다. 직접 관리하는 소규모 데이터베이스 배포에서는 논리 덤프를 사용할 수 있습니다.
+
+```bash
+pg_dump --format=custom --file=molesignal.dump "postgres://molesignal@db.internal:5432/molesignal"
+```
+
+## 오브젝트 스토리지 백업
+
+서비스 공급자가 제공하는 버킷 복제 또는 버전 관리 기능을 사용합니다. 예약 작업으로 별도 버킷에 복사할 수도 있습니다.
+
+```bash
+aws s3 sync s3://molesignal s3://molesignal-backup
+```
+
+RustFS와 같은 S3 호환 서비스를 사용하는 경우 `--endpoint-url`을 추가합니다. 백업 버킷에서 오브젝트를 삭제할 권한이 없는 자격 증명으로 백업합니다.
+
+## 복원
+
+<Steps>
+  <Step title="모든 노드 중지">
+    데이터를 교체하는 동안 쓰기 작업이 발생하지 않도록 모든 MoleSignal 프로세스를 중지합니다.
+  </Step>
+  <Step title="PostgreSQL 복원">
+    빈 데이터베이스에 백업을 복원합니다.
+
+    ```bash
+    pg_restore --no-owner --dbname "postgres://molesignal@db.internal:5432/molesignal" molesignal.dump
+    ```
+  </Step>
+  <Step title="오브젝트 복원">
+    노드가 사용하는 버킷에 백업을 복사합니다. 데이터베이스 백업 시점 또는 그 이후 시점의 버킷 상태를 복원합니다.
+
+    정합성 조정기는 복원된 카탈로그가 참조하지 않는 오브젝트를 고아 오브젝트로 분류해 대기열에 추가합니다. 가비지 컬렉터는 `[storage.reconciler].orphan_grace_secs`(기본값 24시간)가 지난 후 해당 오브젝트를 삭제합니다. 이후에 생성된 오브젝트가 여전히 필요할 수 있다면 먼저 다른 위치에 복사합니다.
+  </Step>
+  <Step title="시크릿 및 구성 복원">
+    백업한 배포에서 사용한 구성과 동일한 `MS_CIPHER_KEY`를 제공합니다. 다른 키를 사용하는 노드는 저장된 시크릿을 복호화하지 못해 `open Probe CA key`와 같은 오류를 반환하고 시작하지 못합니다.
+  </Step>
+  <Step title="수집 노드가 WAL을 인계받도록 대기">
+    버킷을 복원하면 WAL 오브젝트도 함께 복원됩니다. 노드가 실행되면 수집 노드는 복원된 데이터베이스에 등록된 각 라이터의 리스가 만료된 후 해당 라이터의 WAL을 게시합니다. 데이터베이스 백업 이후에 등록된 라이터의 WAL 오브젝트는 게시하지 않습니다.
+  </Step>
+  <Step title="시작 및 확인">
+    노드를 시작하고 `GET /api/v1/healthz`가 `200`을 반환할 때까지 기다립니다. 로그인하고 스트림을 연 다음 복원된 범위에 대해 쿼리를 실행합니다.
+
+    `/metrics`에서 `reason="missing"`인 `storage_reconciler_issues_total` 메트릭을 확인합니다. 이 항목이 있으면 카탈로그가 버킷에 없는 오브젝트를 참조한다는 뜻입니다.
+  </Step>
+</Steps>
+
+## 장애 시나리오
+
+| 손실 항목 | 영향 | 복구 |
+|---|---|---|
+| 노드의 로컬 디스크 | 수신 확인을 마친 데이터는 손실되지 않습니다. 캐시는 다시 생성됩니다. | 노드를 교체합니다. `[wal].lease_secs`가 지나면 다른 수집 노드가 해당 노드의 WAL을 게시합니다. [내구성 및 인계](/ko/architecture#내구성-및-인계)를 참조합니다. |
+| PostgreSQL | 모든 메타데이터가 손실되고 오브젝트에 액세스할 수 없습니다. | 최신 백업을 복원합니다. 백업 이후에 기록한 데이터는 해당 오브젝트의 카탈로그 항목이 없으므로 복구할 수 없습니다. |
+| 버킷 | 손실된 범위에 대한 쿼리가 실패합니다. | 버킷을 복원합니다. 대응하는 오브젝트가 없는 카탈로그 항목은 `/metrics`에서 `missing`으로 표시됩니다. |
+| `MS_CIPHER_KEY` | 저장된 시크릿을 복호화할 수 없어 노드가 시작하지 못합니다. | 시크릿 관리자에서 키를 복원합니다. 키가 없으면 암호화된 열을 복구할 수 없습니다. |

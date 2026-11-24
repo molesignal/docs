@@ -1,0 +1,151 @@
+---
+title: "自身可觀測性"
+description: "維運 MoleSignal 時，可查看其記錄、指標、追蹤、效能剖析與健康狀態，並在節點本機進行診斷。"
+"en_link": "/en-US/self-observability"
+"zh-Hans_link": "/zh-Hans/self-observability"
+"ja_link": "/ja/self-observability"
+"ko_link": "/ko/self-observability"
+"de_link": "/de/self-observability"
+"es_link": "/es/self-observability"
+"fr_link": "/fr/self-observability"
+"pt-BR_link": "/pt-BR/self-observability"
+---
+
+程序日誌會保留在設定的終端機或日誌檔案中。MoleSignal 會將自身的指標、追蹤和效能剖析寫入受保護的 `_sys` 組織。每類已儲存的訊號都使用確切名稱 `_molesignal`，並以資料串流類型區分。
+
+| 訊號 | 資料串流（含類型） | 內容 |
+|---|---|---|
+| 指標 | `metrics/_molesignal` | 計數器、儀表、直方圖與摘要。 |
+| 追蹤 | `traces/_molesignal` | 尾端取樣後完成的標準 Span。 |
+| 效能剖析 | `profiles/_molesignal` | 與物件儲存中的 pprof 檔案相關聯的剖析中繼資料。 |
+
+只有具備 `sys.telemetry.read` 權限的系統層級工作階段才能查詢這些資料串流。
+
+## 啟用自身遙測收集
+
+```toml
+[telemetry.self_collect]
+enabled = true
+metrics_enabled = true
+metrics_interval_secs = 15
+queue_capacity = 8192
+batch_max_events = 256
+batch_max_delay_ms = 1000
+flush_timeout_secs = 5
+profile_kinds = ["cpu"]
+profile_interval_secs = 600
+profile_duration_secs = 10
+```
+
+無法將目標組織變更為租用戶組織。公開收集、資料串流修改和處理管線都無法建立、覆寫或刪除 `_molesignal`。
+
+這些資料串流建立時的保留期限為 7 天。在 `_sys` 組織中，開啟該資料串流的 **保留原則** 索引標籤，即可修改保留期限。指標資料串流也可在此設定降採樣。這些設定在重新啟動後仍會保留。
+
+在角色分開部署的環境中，非 intake 節點會將自身遙測轉送至運作正常的 Intake 節點。請在所有角色上設定相同的 `MS_SELF_TELEMETRY_CLUSTER_TOKEN`。
+
+## 後端分散式追蹤
+
+MoleSignal 會為 HTTP、gRPC、Flight SQL、資料庫、物件儲存、收集、查詢、背景 Worker 與 Agent 階段建立追蹤。
+
+這些 Span 遵循 OpenTelemetry 語意慣例 1.43.0：標準屬性沿用標準名稱，MoleSignal 自行新增的屬性以 `molesignal.` 開頭。每個 Span 都會在 `semantic_conventions_version` 中記錄這個版本。
+
+MoleSignal 會驗證傳入的 W3C 內容，並取代無效的內容。外部 Baggage 無法授予組織存取權。Span 不會記錄敏感的請求本文、SQL 值、憑證、提示詞、模型輸出和工具參數。
+
+SQL 的 Span 可包含 `molesignal.db.query.fingerprint`，也就是將值替換為 `?` 後，使用金鑰產生的陳述式指紋。物件儲存的 Span 可包含 `molesignal.object.key_fingerprint`，也就是使用金鑰產生的物件鍵指紋。如此一來，無須儲存陳述式和物件鍵，也能將同一陳述式或同一物件的 Span 歸為一組。只有 [`MS_TRACE_FINGERPRINT_KEY`](/zh-Hant/configuration#環境變數) 至少有 16 個位元組時，才會寫入這些指紋。
+
+尾端取樣器依下列優先順序判定是否保留追蹤：
+
+1. 部署或執行階段停用；
+2. 可信任的偵錯強制保留；
+3. 錯誤；
+4. 緩慢的追蹤；
+5. 依序套用原則規則；
+6. 依一般取樣率進行確定性取樣。
+
+取樣器與平台遙測的收集和匯出佇列都有容量上限，即使發生故障也不會阻擋應用程式流量。`/metrics` 提供固定基數的指標，`GET /api/v1/system/telemetry` 提供詳細的健康狀態。
+
+## 節點本機 pprof
+
+診斷接聽程式預設停用：
+
+```toml
+[profiling]
+enabled = true
+bind = "127.0.0.1"
+port = 5086
+allow_remote = false
+```
+
+也可使用 `MS_PROFILING_ENABLED`、`MS_PROFILING_BIND`、`MS_PROFILING_PORT` 和 `MS_PROFILING_ALLOW_REMOTE` 設定相同的鍵。`bind` 只接受 IP 位址，不接受 `localhost` 之類的主機名稱。連接埠不得與其他已啟用的接聽程式重複，即使本節點未執行該接聽程式所屬的角色也一樣。若有重複，程序會在啟動時結束。請參閱 [pprof](/zh-Hant/configuration#pprof)。
+
+收集效能剖析資料：
+
+```bash
+curl --fail --output cpu.pb.gz \
+  'http://127.0.0.1:5086/debug/pprof/profile?seconds=30'
+
+curl --fail --output heap.pb.gz \
+  'http://127.0.0.1:5086/debug/pprof/heap'
+```
+
+請讓接聽程式僅繫結至回送位址，並透過 SSH 通道存取。若要開放遠端存取，必須設定 `allow_remote = true`、實施網路存取控制、在接聽程式前端部署 TLS，並使用具管理權限的 Bearer 憑證。
+
+## 健康狀態與上線
+
+- `/api/v1/healthz` 是公開端點，回報存活狀態和相依服務的健康狀態，供容器與負載平衡器的探查使用。
+- `/api/v1/readyz` 回報節點啟動後是否已準備好接收流量，需要 Bearer 權杖。
+- `/metrics` 提供不含租用戶標籤的 Prometheus 指標。
+- `X-Request-Id` 和 `X-Trace-Id` 可將請求與已保留的追蹤建立關聯。
+
+首次上線分散式追蹤時，請先設定 `telemetry.trace.force_disabled = true`，確認系統資源與隱私，再於少數節點上試行，最後逐步擴大持續啟用的範圍。
+
+## 元件指標
+
+每個節點都會透過 `/metrics` 提供下列指標。標籤的值僅限固定清單，不包含組織、追蹤、路由或物件鍵。`_sys` 組織中的內建儀表板 **MoleSignal Self Telemetry & Runtime** 和 **MoleSignal Tracing & APM** 會以圖表呈現這些指標。
+
+### 自身遙測與中繼資料庫
+
+| 指標 | 標籤 | 說明 |
+|---|---|---|
+| `self_telemetry_accepted_total` | `signal` | 接收後準備寫入 `_molesignal` 資料串流的記錄筆數。 |
+| `self_telemetry_dropped_total` | `signal`、`reason` | 寫入 `_molesignal` 資料串流的過程中捨棄的記錄筆數。`reason` 為 `queue_full`、`queue_closed`、`trace_candidate_queue`、`delivery_failed`、`flush_timeout` 或 `persistence_failed`；未能收集排程的效能剖析資料時，則為 `capture_busy`、`unavailable`、`invalid_duration` 或 `capture_failed`。 |
+| `self_telemetry_batches_total` | `signal`、`outcome` | 傳送的批次數，`outcome` 為 `success` 或 `error`。 |
+| `self_telemetry_retries_total` | `signal`、`reason` | 未配置 `intake` 角色的節點將批次轉送至 intake 節點時的重試次數，`reason` 為 `no_intake`、`connect` 或 `push`。 |
+| `self_telemetry_queue_depth`、`self_telemetry_queue_capacity` | `signal` | 在追蹤佇列中等待的 Span 數量，以及佇列容量 `queue_capacity`。只有 `traces` 有佇列。 |
+| `self_telemetry_last_success_unixtime` | `signal` | 最近一次批次成功的時間，以自 Unix 紀元起算的秒數表示。 |
+| `self_telemetry_profile_available` | `kind` | 目前的建置版本可在此平台收集 `cpu` 或 `heap` 剖析資料時為 `1`，否則為 `0`。 |
+| `db_pool_connections` | `pool`、`state` | 中繼資料庫連線集區（`pool="meta"`）的連線數：`total`、`idle`、`checked_out`，以及設定的 `min` 和 `max`。 |
+| `db_pool_acquire_duration_seconds` | `pool` | 從連線集區取得連線的等待時間，不含後續執行陳述式的時間。 |
+
+`signal` 為 `metrics`、`traces` 或 `profiles`。捨棄記錄不會阻塞程序，只會使 `_molesignal` 資料串流缺少資料。
+
+### APM 投影
+
+投影在持有候選追蹤的節點上執行，彙總則由 `alert` 角色執行。請參閱 [APM](/zh-Hant/configuration#apm)。
+
+| 指標 | 標籤 | 說明 |
+|---|---|---|
+| `molesignal_apm_facts_total` | `result` | 依結果統計進入投影的 Span：`accepted`、`duplicate_skip`、`late_kept`、`late_dropped`、`queue_full`、`stopped`、`cardinality_rejected`、`extract_failed` 或 `flush_failed`。`flush_failed` 計算寫入失敗的次數，而非 Span 數量。 |
+| `molesignal_apm_cardinality_total` | `reason` | 依觸及的[基數上限](/zh-Hant/apm/settings#基數上限)統計超出上限的 Span 數量，例如 `service_rejected` 或 `transaction_overflow`。遭拒絕的服務所含的 Span 完全不計入；超過其他上限時，將名稱歸入**其他**，或不再保留明細。 |
+| `molesignal_apm_queue` | `resource` | 在投影佇列中等待的 Span 數量（`depth`）和佇列容量（`capacity`，即 `[apm].queue_capacity`）。 |
+| `molesignal_apm_flushes_total` | `result` | 將彙總資料寫入 PostgreSQL 的次數，結果為 `success` 或 `failure`。 |
+| `molesignal_apm_flush_duration_seconds` | | 單次寫入所需的時間。 |
+| `molesignal_apm_rollups_total` | `result` | 將每分鐘彙總資料整併為每小時彙總資料的執行次數，結果為 `success` 或 `failure`。 |
+| `molesignal_apm_rollup_rows_total` | `kind` | 彙總時讀取（`source`）、寫入（`rollup`）及因超過保留期限而刪除（`deleted`）的資料列數。 |
+| `molesignal_apm_lag_seconds` | `stage` | `projection` 為投影最近處理的 Span 距今的時間；`rollup` 為仍接受延遲到達資料的時間 `[apm].late_grace_secs`。 |
+| `molesignal_apm_health` | `component` | `projector`、`repository` 或 `rollup` 正常時為 `1`，降級時為 `0`。 |
+| `molesignal_apm_api_duration_seconds` | `endpoint` | 回應 APM API 請求所需的時間，依端點區分，例如 `overview` 或 `services`。 |
+
+發生下列情況時發出警示：
+
+- `molesignal_apm_queue{resource="depth"}` 持續高於 `capacity` 的 80%；
+- `molesignal_apm_facts_total` 中 `result` 為 `queue_full`、`cardinality_rejected` 或 `flush_failed` 的計數持續增加。這些情況都會造成資料缺漏，[資料品質提示](/zh-Hant/apm#閱讀資料品質提示)會顯示為部分資料；
+- `molesignal_apm_lag_seconds{stage="projection"}` 持續高於 120 秒，相當於兩個一分鐘區間；
+- `molesignal_apm_health` 為 `0`；
+- `molesignal_apm_api_duration_seconds{endpoint="overview"}` 的 P95 持續高於 0.5 秒。
+
+APM 降級不會導致 `/api/v1/healthz` 或 `/api/v1/readyz` 失敗。`GET /api/v1/apm/health` 會顯示個別組織的投影狀態，請參閱 [APM API](/zh-Hant/api/apm)。
+
+<Card title="設定" icon="sliders" href="/zh-Hant/configuration">
+  查看所有遙測、追蹤、匯出器與效能剖析設定。
+</Card>

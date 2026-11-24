@@ -1,0 +1,109 @@
+---
+title: "データベースクライアントから接続"
+description: "DBeaver、JDBC、ADBC から Arrow Flight SQL 経由で MoleSignal にクエリを実行します。"
+"en_link": "/en-US/query/database-clients"
+"zh-Hans_link": "/zh-Hans/query/database-clients"
+"zh-Hant_link": "/zh-Hant/query/database-clients"
+"ko_link": "/ko/query/database-clients"
+"de_link": "/de/query/database-clients"
+"es_link": "/es/query/database-clients"
+"fr_link": "/fr/query/database-clients"
+"pt-BR_link": "/pt-BR/query/database-clients"
+---
+
+MoleSignal は **Arrow Flight SQL** エンドポイントを公開します。標準のデータベースツールから直接接続して、組織のテレメトリに対して読み取り専用の SQL を実行できます。HTTP 接続用の追加コードは不要です。クエリ結果は Arrow のレコードバッチとして転送されるため、結果セットが大きい場合は JSON より大幅に高速です。
+
+<Note>
+Flight SQL は gRPC ベースのプロトコルです。PostgreSQL または MySQL のワイヤープロトコルにしか対応していないツール（`psql`、`mysql` CLI、Navicat）は接続できません。代わりに DBeaver、Arrow Flight SQL JDBC ドライバー、または任意の ADBC クライアントを使用してください。
+</Note>
+
+## エンドポイントの有効化
+
+リスナーは**デフォルトで無効**です。`config.toml` でリスナーを有効にして再起動します。
+
+```toml
+[flight_sql]
+enabled = true
+bind = "0.0.0.0"
+port = 5083
+# Default time window when the SQL carries no pruning hint (see below)
+default_lookback_hours = 24
+```
+
+Flight SQL のポートは内部 gRPC ポート（5082）とは別です。クライアントネットワークには 5083 のみを公開し、5082 はクラスター内に限定してください。TLS は gRPC 対応の Ingress で終端します。
+
+## 認証
+
+Flight SQL は MoleSignal の既存の認証システムを使用します。標準の Basic 認証ハンドシェイクでは、次の 2 種類の認証情報を受け付けます。
+
+| | ユーザー名 | パスワード | 適した用途 |
+|---|---|---|---|
+| **アカウントログイン** | アカウントのメールアドレス | アカウントのパスワード | 対話的な操作（DBeaver、アドホッククエリ） |
+| **API トークン** | 任意（`token` を使用） | `mspat-...` トークン | 自動化、スクリプト、BI サービス |
+
+アカウントログインでは、Web UI と同じ認証フローを使用し、有効期間の短いセッショントークン（JWT）を発行します。 API トークン認証では、指定されたトークンをそのまま使用します。Basic 認証の代わりに Bearer 認証ヘッダーを送信するクライアントも接続できます。どちらの方法でもアクセスは 1 つの組織に限定され、その組織のストリームとデータにのみアクセスできます。
+
+**組織の選択**（複数の組織に所属するアカウント）：デフォルトでは、Web ログインと同じく、最初の組織が選択されます。別の組織を選択するには、ユーザー名の末尾に `@<org>` を追加します。たとえば、 `alice@example.com@acme` の `acme` には、組織名、スラッグ、または ID を指定します。
+
+<Warning>
+データベースクライアントはパスワードを接続プロファイル、JDBC URL、スクリプトに保存します。このため、アクセス範囲を限定したトークンよりも漏えいのリスクが大幅に高くなります。**アカウントのパスワードは対話セッションでのみ使用してください。自動化には必ず `mspat-` API トークンを使用してください**。API トークンは失効させることができ、有効期限を設定できます。アクセスは 1 つの組織に限定されます。トークンは **アカウント設定 → API トークン** または [`POST /api/v1/me/api-tokens`](/ja/api/auth/issue-token) で作成します。
+</Warning>
+
+その他の注意事項は以下のとおりです。
+
+- **SSO アカウント**：OIDC/SAML のみを使用するアカウントにはローカルパスワードがないため、アカウントログインは利用できません。代わりに API トークンを使用してください。
+- **多要素認証を使用するアカウント**：データベースクライアントでは認証コードを入力できないため、ハンドシェイクが拒否されます。代わりに API トークンを使用してください。詳しくは、 [多要素認証](/ja/identity/mfa)を参照してください。
+- **サインイン要件があるワークスペース**：ワークスペースが [多要素認証を必須にするか、シングルサインオンのみを許可している場合](/ja/identity/sso#サインイン要件)、アカウントログインは拒否され、接続済みのクライアントも次のリクエストから利用できなくなります。代わりに API トークンを使用してください。
+- **パスワードの入力ミスが多すぎる場合**：アカウントログインには、Web サインインと同じ [サインイン制限](/ja/settings/platform#サインイン制限)が適用されます。上限に達すると、ハンドシェイクは `RESOURCE_EXHAUSTED` を返します。DBeaver は保存済みの認証情報で再接続するため、古いパスワードが保存されていると接続元アドレスがロックされます。保存済みのパスワードを更新し、ロックの解除を待ってください。
+- **セッションの有効期限**：アカウントログインで発行された JWT は、サーバーの `[auth].session_ttl_secs` で設定した時間が経過すると失効します。それ以降のリクエストは `UNAUTHENTICATED` で失敗します。DBeaver は保存済みの認証情報を使って通知せずに再接続するため、対話的な操作には影響しません。長時間実行する ADBC スクリプトでは、代わりに有効期限のない API トークンを使用してください。
+
+## DBeaver
+
+DBeaver Community には Flight SQL ドライバーが同梱されていません。Arrow Flight SQL JDBC ドライバーを初回のみ登録します（所要時間は約 1 分です）。
+
+1. **データベース → ドライバーマネージャー → 新規**
+2. **ライブラリ**タブで **アーティファクトを追加**をクリックし、 `org.apache.arrow:flight-sql-jdbc-driver:RELEASE` を貼り付けてから **ダウンロード/更新**をクリックします（または **ファイルを追加**でダウンロード済みのドライバーの JAR ファイルを選択します）。
+3. **設定**に戻り、ドライバー名に `Arrow Flight SQL`、クラス名に `org.apache.arrow.driver.jdbc.ArrowFlightJdbcDriver`、URL テンプレートに `jdbc:arrow-flight-sql://{host}:{port}/?useEncryption=false` を入力します。
+4. **新規接続** → 作成したドライバーを選択 → ホスト：MoleSignal サーバー、ポート：`5083`
+5. ユーザー名にアカウントのメールアドレス（必要に応じて `email@org`）、パスワードにアカウントのパスワードを入力するか、ユーザー名に `token`、パスワードに `mspat-...` を入力します。
+
+ナビゲーターには、1 つのカタログ（`molesignal`）と 4 つのスキーマ（`logs`、`metrics`、`traces`、 `extend`）が表示されます。選択中の組織のストリームはテーブルとして表示されます。
+
+## JDBC
+
+```text
+jdbc:arrow-flight-sql://molesignal.example.com:5083/?useEncryption=false&user=token&password=mspat-...
+```
+
+ドライバーのアーティファクト：`org.apache.arrow:flight-sql-jdbc-driver`。
+
+## Python（ADBC）
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+conn = flightsql.connect(
+    "grpc://molesignal.example.com:5083",
+    db_kwargs={"username": "token", "password": "mspat-..."},
+)
+cur = conn.cursor()
+cur.execute("SELECT level, count(*) AS n FROM logs.nginx GROUP BY level")
+print(cur.fetch_arrow_table())   # or fetchall() / .fetch_df()
+```
+
+## クエリの記述
+
+- **テーブル名にストリームタイプを付けます**：`logs.nginx`、`metrics.cpu_usage`、 `traces.checkout`、`extend.lookup_table`。ストリームタイプを省略した場合は `logs` が使われます。カタログを含む完全修飾名（`molesignal.logs.nginx`。DBeaver がテーブルの参照時に生成する形式）も使用できます。
+- **読み取り専用**：`INSERT` / `UPDATE` / `DELETE` / DDL は実行できません。
+- **監査ストリーム**：`logs._audit` には `audit.read` が必要です。[監査ストリーム](/ja/settings/data-security#監査ストリーム)を参照してください。
+- **時間範囲**：Flight SQL には時間範囲のパラメーターがないため、サーバーはパーティションプルーニングでスキャン対象を直近 `default_lookback_hours`（デフォルトは 24h）に絞ります。`WHERE` 句の `_timestamp` フィルターは、この時間範囲内で適用されます。さらに過去のデータをクエリするには、 `default_lookback_hours` を増やすか、時間範囲を明示的に指定できる [HTTP クエリ API](/ja/api/query/execute) を使用してください。
+- `_timestamp` はマイクロ秒精度のタイムスタンプ列として返されます。
+
+## 制限事項
+
+- プリペアドステートメントは使用できますが、**パラメーターバインディングには対応していません**。代わりにリテラルをクエリに直接記述してください。
+- トランザクションには対応していません（読み取り専用エンジン）。
+- Flight SQL では PromQL を使用できません。PromQL には HTTP API を使用してください。
+- `FlightInfo` の結果スキーマは空です。クライアントはデータストリームからスキーマを読み取ります（DBeaver と ADBC はこの処理を自動で行います）。
+
+実行中の Flight SQL クエリは `GET /api/v1/query/running` に表示されます。HTTP クエリと同様に、 `POST /api/v1/query/{id}/cancel` でキャンセルできます。

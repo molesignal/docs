@@ -1,0 +1,201 @@
+---
+title: "RUM Source Maps 與 Symbols"
+sidebarTitle: "Source Maps 與 Symbols"
+description: "上傳瀏覽器 Source Map、Flutter Symbols、Android Mapping 與原生符號，或 Apple dSYM，以還原 RUM 堆疊。"
+"en_link": "/en-US/rum/source-maps"
+"zh-Hans_link": "/zh-Hans/rum/source-maps"
+"ja_link": "/ja/rum/source-maps"
+"ko_link": "/ko/rum/source-maps"
+"de_link": "/de/rum/source-maps"
+"es_link": "/es/rum/source-maps"
+"fr_link": "/fr/rum/source-maps"
+"pt-BR_link": "/pt-BR/rum/source-maps"
+---
+
+MoleSignal 使用偵錯檔案還原壓縮後的 JavaScript、混淆後的 Dart 或 Android，以及 Android、iOS 的原生堆疊影格。所有偵錯檔案統一透過 `/api/v1/debug-artifacts` 管理。
+
+## 選擇偵錯檔案類型
+
+| 執行環境 | `kind` | `platform` | 檔案 |
+|---|---|---|---|
+| 瀏覽器 JavaScript | `javascript_sourcemap` | `web` | 外部 `.map` 檔案 |
+| Flutter Web | `javascript_sourcemap` | `flutter` | `main.dart.js.map` 或其他產生的 `.map` |
+| Flutter Android 或 iOS AOT | `flutter_symbols` | `android` 或 `ios` | Flutter `--split-debug-info` 產生的 `.symbols` |
+| Android R8 | `android_mapping` | `android` | Release `mapping.txt` |
+| Android NDK | `android_native_symbols` | `android` | 未移除符號的 ELF 動態程式庫 |
+| Apple 原生 | `apple_dsym` | `ios` | 相符 `.dSYM` 套件內的 DWARF 二進位檔 |
+
+支援原始檔案與 gzip 壓縮檔。上傳檔案上限為 50 MiB；gzip 解壓縮後的大小上限為 256 MiB。
+
+## 比對建置識別資訊
+
+MoleSignal 根據 RUM 錯誤的建置識別資訊選擇偵錯檔案：
+
+| 上傳欄位 | 對應的 RUM 值 | 規則 |
+|---|---|---|
+| `applicationId` | `application.id`，即 Client Token 綁定的應用程式 | 必須完全相同 |
+| `service` | 事件的 `service` | 必須完全相同，並區分大小寫 |
+| `release` | 事件的 `version` | 必須完全相同，並區分大小寫 |
+| `kind` | 影格的 `artifact_kind`。若影格沒有 `artifact_kind`，但有 `file` 和 `line`，即為 JavaScript 影格 | 從支援的偵錯檔案類型表中選擇 |
+| `platform` | 事件的 `os.name`，若無此值則使用事件的 `source` | 依上表使用 `web`、`flutter`、`android` 或 `ios` |
+| `architecture` | 事件的 `device.architecture` | 行動裝置與原生偵錯檔案應填寫此欄位，例如 `arm64` 或 `x86_64` |
+| `debugId` | 優先使用影格的 `debug_id`，若無此值則使用事件的 `build_id` | 使用相同的 Flutter Build ID、ELF Build ID 或 Mach-O UUID |
+| 檔名 | 執行階段的模組或 Bundle | 瀏覽器的 Source Map 必須使用 `<已部署 Bundle 文件名>.map` |
+
+系統會自動正規化常見的 ABI 別名。例如，將 `arm64-v8a` 與 `aarch64` 轉換為 `arm64`，將 `amd64` 與 `x64` 轉換為 `x86_64`。比對十六進位 Debug ID 與 UUID 時，系統會忽略大小寫、大括號、連字號和開頭的 `0x`。
+
+<Warning>
+  `applicationId`、`service`、`release`、`architecture` 與 `debugId` 必須和偵錯檔案來自同一條建置管線。識別資訊過期或有歧義時，系統仍會保留錯誤事件，但符號化狀態會是 `missing` 或 `partial`。
+</Warning>
+
+### 瀏覽器範例
+
+每次建置時，為 `service` 和 `version` 設定固定值：
+
+```ts
+import { init } from '@molesignal/browser-rum';
+
+init({
+  applicationId: 'checkout-web',
+  clientToken: 'mspat-your-client-token',
+  site: 'https://molesignal.example.com',
+  service: 'web-frontend',
+  version: '2026.08.04.1',
+});
+```
+
+上傳 Source Map 時，使用相同的識別資訊和實際部署的 Bundle 檔名：
+
+| 上傳欄位 | SDK 欄位 | 範例 |
+|---|---|---|
+| 應用程式 ID | `applicationId` | `checkout-web` |
+| 服務 | `service` | `web-frontend` |
+| 版本 | `version` | `2026.08.04.1` |
+| 檔案 | 產生的 `.map` 檔案 | `app.8f312.js.map` |
+
+已部署的影格 URL 以 `/assets/app.8f312.js` 結尾時，請上傳 `app.8f312.js.map`。請上傳所有隨需載入的 Chunk 的 Source Map，不要只上傳主 Bundle 的 Source Map。
+
+## 在頁面上傳
+
+<Steps>
+  <Step title="在建置時啟用 Source Map">
+    在正式環境建置時產生外部 Source Map。如果安全政策要求原始碼不得公開，請勿將 Source Map 部署到公開網路。
+  </Step>
+  <Step title="開啟上傳頁面">
+    前往 **使用者體驗 → RUM 設定 → Source Maps 與 Symbols**，然後點選 **上傳偵錯檔案**。
+  </Step>
+  <Step title="填寫建置識別資訊">
+    選擇偵錯檔案類型與平台，填寫完全相同的應用程式、服務和版本。上傳行動裝置的偵錯檔案時，也要填寫架構與 Debug ID，再選擇產生的檔案。
+  </Step>
+  <Step title="驗證符號化">
+    從該版本送出一筆錯誤，開啟 **使用者體驗 → 探索**，選擇 **錯誤**，再開啟該筆錯誤，確認堆疊已顯示原始碼位置。
+  </Step>
+</Steps>
+
+## 準備 Release 偵錯檔案
+
+<Tabs>
+  <Tab title="Web">
+    使用實際部署的瀏覽器 Bundle 產生外部 Source Map。原始碼不得公開時，只將 `.map` 檔案保存在私有發佈管線中。
+
+    建置 Flutter Web 時啟用 Source Map：
+
+    ```bash
+    flutter build web \
+      --release \
+      --source-maps \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=javascript \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    上傳 `main.dart.js.map` 時，使用 `kind=javascript_sourcemap`、`platform=flutter` 與 `architecture=javascript`。
+  </Tab>
+  <Tab title="Flutter Android">
+    為每個正式環境使用的 ABI 產生獨立的 Flutter Symbols：
+
+    ```bash
+    flutter build apk \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/android-arm64 \
+      --target-platform=android-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    上傳 `app.android-arm64.symbols` 時，使用 `kind=flutter_symbols`、`platform=android`、`architecture=arm64` 與 `debugId=${BUILD_ID}`。
+  </Tab>
+  <Tab title="Flutter iOS">
+    從 Release IPA 建置產生 Flutter AOT Symbols：
+
+    ```bash
+    flutter build ipa \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/ios-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    上傳 `app.ios-arm64.symbols` 時，使用 `kind=flutter_symbols`、`platform=ios`、`architecture=arm64` 與 `debugId=${BUILD_ID}`。
+  </Tab>
+  <Tab title="Android 原生">
+    保留每個 R8 Release 的 `app/build/outputs/mapping/release/mapping.txt`，並使用 `kind=android_mapping`、`platform=android` 上傳。
+
+    為每個 NDK ABI 保留未移除符號的 ELF `.so`。使用平台工具鏈擷取 Build ID，再使用 `kind=android_native_symbols`、`platform=android`、正規化後的架構，以及當機影格回報的相同 Build ID 上傳。
+  </Tab>
+  <Tab title="iOS 原生">
+    讀取封存的 dSYM 的 UUID，並視需要壓縮 DWARF 二進位檔：
+
+    ```bash
+    dwarfdump --uuid Checkout.app.dSYM
+    gzip -k Checkout.app.dSYM/Contents/Resources/DWARF/Checkout
+    ```
+
+    上傳 DWARF 檔案或 `.gz` 時，使用 `kind=apple_dsym`、`platform=ios` 和相符的架構，並將正規化後的 Mach-O UUID 寫入 `debugId`。
+  </Tab>
+</Tabs>
+
+## 從 CI 上傳
+
+使用具備 `debug_artifacts.manage` 權限的管理 Token。請勿將該 Token 寫入瀏覽器或行動應用程式，也不要使用公開的 Client Token 管理偵錯檔案。
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${MOLESIGNAL_TOKEN}" \
+  -F "applicationId=${APPLICATION_ID}" \
+  -F "service=${SERVICE}" \
+  -F "release=${RELEASE_VERSION}" \
+  -F "kind=${ARTIFACT_KIND}" \
+  -F "platform=${PLATFORM}" \
+  -F "architecture=${ARCHITECTURE}" \
+  -F "debugId=${DEBUG_ID}" \
+  -F "file=@${ARTIFACT_PATH}" \
+  "${MOLESIGNAL_SITE}/api/v1/debug-artifacts"
+```
+
+只有在需要建立通用的備用偵錯檔案時，才將 `architecture` 或 `debugId` 留空。行動應用程式應使用精確的建置識別資訊，以免比對時出現歧義。
+
+透過 `GET /api/v1/debug-artifacts` 列出偵錯檔案，可依 `applicationId`、`service`、`kind` 或 `platform` 篩選。透過 `DELETE /api/v1/debug-artifacts/{id}` 刪除單一偵錯檔案。列出偵錯檔案需要 `debug_artifacts.read` 權限，上傳與刪除則需要 `debug_artifacts.manage` 權限。
+
+## 發佈檢查清單
+
+- 保留由實際部署的二進位檔或 Bundle 產生的偵錯檔案。
+- 在 SDK 可能記錄任何錯誤之前，先設定不可變更的 SDK 版本。
+- 確保應用程式、服務、版本、架構與 Debug ID 都和目前的建置一致。
+- 上傳所有 Web Chunk 的 Source Map，以及所有已發佈的行動裝置架構對應的偵錯檔案。
+- 只在發佈管線中保存管理 Token。
+- 部署後送出一筆受控的錯誤，並確認堆疊影格已產生還原後的 `original_*` 欄位。
+- 在向使用者發佈版本前上傳偵錯檔案。還原後的影格會決定錯誤歸入哪個 [問題](/zh-Hant/rum/errors#錯誤如何歸入-issue)，因此同一個錯誤若在上傳 Source Map 前後各回報一次，會歸入兩個不同的問題。
+
+<CardGroup cols={2}>
+  <Card title="瀏覽器 RUM SDK" icon="code" href="/zh-Hant/rum/browser-sdk">
+    設定瀏覽器應用程式、服務與版本識別資訊。
+  </Card>
+  <Card title="Flutter 應用程式 RUM SDK" icon="mobile" href="/zh-Hant/rum/flutter-sdk">
+    設定 Flutter 建置識別資訊與錯誤收集。
+  </Card>
+</CardGroup>

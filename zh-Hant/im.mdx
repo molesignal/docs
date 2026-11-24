@@ -1,0 +1,419 @@
+---
+title: "在 IM 中使用 Mole Agent"
+sidebarTitle: "IM"
+description: "在飛書、Slack、釘釘、企業微信、Google Chat、Microsoft Teams 和 Telegram 中向 Mole Agent 提問：在群組中 @ 它，或傳送私訊給它。"
+"en_link": "/en-US/im"
+"zh-Hans_link": "/zh-Hans/im"
+"ja_link": "/ja/im"
+"ko_link": "/ko/im"
+"de_link": "/de/im"
+"es_link": "/es/im"
+"fr_link": "/fr/im"
+"pt-BR_link": "/pt-BR/im"
+---
+
+Mole Agent 透過通知設定中的連接器，在飛書、Slack、釘釘、企業微信、Google Chat、Microsoft Teams 和 Telegram 中回答問題。在群組中 @ 機器人，或直接私訊機器人。處理問題時，飛書、Slack 和 Telegram 會在提問的訊息上加上表情符號；企業微信、Google Chat 和 Teams 則會先回覆「正在查」，完成後直接將原訊息換成答案。答案會附上該對話在 MoleSignal 中的連結。
+
+這些對話與一般的 Mole Agent 對話相同：可以在 MoleSignal 中查看並繼續提問，會計入組織的每日預算，回答也會和其他回答一樣評分。請參閱[品質](/zh-Hant/quality)。
+
+## 如何接收訊息
+
+| 平台 | 連接器 | 接收訊息的方式 |
+|---|---|---|
+| 飛書 | 飛書 App（`lark_app`） | 飛書的長連線 |
+| Slack | Slack App（`slack_app`） | Socket Mode |
+| 釘釘 | 釘釘 App（`dingtalk_app`） | Stream 模式 |
+| 企業微信 | 企業微信智慧機器人（`wecom_bot`） | 智慧機器人的長連線 |
+| Google Chat | Google Chat App（`google_chat_app`） | 從 Cloud Pub/Sub 訂閱提取訊息 |
+| Telegram | Telegram 機器人（`telegram_bot`） | 透過長輪詢從 Telegram Bot API 取得訊息 |
+| Microsoft Teams | Microsoft Teams 機器人（`teams_app`） | Bot Framework 將訊息傳送到 MoleSignal 的公開回呼網址 |
+
+除了 Teams，每個連接器都由一台 MoleSignal 伺服器主動對外連線以接收訊息，因此 MoleSignal 不必開放公網存取。Teams 需要可從公網存取的 HTTPS 回呼網址，請先閱讀 [Teams 的安全措施](#teams-的安全措施)。各平台需要準備的網址、帳號和權限，請參閱[外部條件](#外部條件)。
+
+## 開始之前
+
+- 啟用整合需要 `agent.im.manage`，提問需要 `agent.use`。
+- 在**設定 → 通知 → 連接器**中備妥對應平台的連接器（見上表）：Slack App 需要填寫 Bot Token 和 App-Level Token，Google Chat App 需要填寫 Pub/Sub 訂閱。請參閱[通知管道](/zh-Hant/notification-channels)。
+- 若要讓使用者自行綁定帳號，並讓回覆附上對話連結，請在 MoleSignal 中設定對外網址 `http.external_url`。Teams 要求使用 HTTPS 網址，回呼網址會以該網址為基底。請參閱[設定](/zh-Hant/configuration)。
+
+## 在平台上設定
+
+### 飛書
+
+<Steps>
+  <Step title="透過長連線接收事件">
+    在飛書開發者後台開啟應用程式，進入**事件與回呼**，選擇**使用長連線接收事件**。
+  </Step>
+  <Step title="訂閱訊息">
+    新增**接收訊息**事件（`im.message.receive_v1`）。
+  </Step>
+  <Step title="透過長連線接收回呼">
+    在**事件與回呼 → 回呼設定**中選擇**使用長連線接收回呼**，並新增**卡片回傳互動**回呼（`card.action.trigger`）。告警卡片上的按鈕需要這項設定，請參閱[告警卡片](#告警卡片)。
+  </Step>
+  <Step title="開啟權限">
+    允許應用程式讀取使用者私訊機器人的訊息及群組中 @ 機器人的訊息、以應用程式身分傳送訊息，以及為訊息加上表情符號回應。若要在討論串中不必 @ 機器人就能繼續提問，請另外開啟讀取群組中所有訊息的權限。
+  </Step>
+  <Step title="發布">
+    發布一個應用程式版本，並將機器人加入需要回答問題的群組。
+  </Step>
+</Steps>
+
+若使用 Lark，請在連接器中將**平台**設為 **Lark**。
+
+### Slack
+
+<Steps>
+  <Step title="產生 App-Level Token">
+    在 **Basic Information → App-Level Tokens** 中產生具有 `connections:write` 權限範圍的權杖，並填入連接器的 **App-Level Token**（以 `xapp-` 開頭）。
+  </Step>
+  <Step title="啟用 Socket Mode">
+    在 **Socket Mode** 中啟用此模式。
+  </Step>
+  <Step title="啟用互動功能">
+    在 **Interactivity & Shortcuts** 中啟用 **Interactivity**。使用 Socket Mode 時不必填寫 Request URL。告警卡片上的按鈕需要這項設定，請參閱[告警卡片](#告警卡片)。
+  </Step>
+  <Step title="訂閱事件">
+    在 **Event Subscriptions → Subscribe to bot events** 中新增 `app_mention` 和 `message.im`。若要在討論串中不必 @ 機器人就能繼續提問，請另外新增 `message.channels` 和 `message.groups`。
+  </Step>
+  <Step title="新增機器人權限">
+    在 **OAuth & Permissions** 中新增 `app_mentions:read`、`chat:write`、`im:history` 和 `reactions:write`；討論串中的回覆還需要 `channels:history` 和 `groups:history`。在 **App Home** 中允許使用者傳送訊息給應用程式。重新安裝應用程式，並邀請機器人加入需要回答問題的頻道。
+  </Step>
+</Steps>
+
+### 釘釘
+
+<Steps>
+  <Step title="透過 Stream 模式接收機器人訊息">
+    在釘釘開發者後台開啟應用程式的機器人，將訊息接收模式設為 **Stream 模式**。
+  </Step>
+  <Step title="發布">
+    發布機器人，並將機器人加入需要回答問題的群組。
+  </Step>
+</Steps>
+
+連接器的 **Client ID** 和 **Client Secret** 就是應用程式的憑證。若未另外填寫機器人的 RobotCode，系統會使用 Client ID。
+
+### 企業微信
+
+企業微信使用智慧機器人回答問題：透過 API 模式的長連線接收訊息，並透過同一條連線回覆。
+
+<Steps>
+  <Step title="建立智慧機器人">
+    在企業微信的管理後台或用戶端建立智慧機器人，將建立方式設為 **API 模式**，訊息接收方式設為**長連線**。記下機器人的 **Bot ID** 和長連線專用的 **Secret**。
+  </Step>
+  <Step title="新增連接器">
+    在**設定 → 通知 → 連接器**新增**企業微信智慧機器人**連接器，填入 **Bot ID** 和**長連線 Secret**。長連線網址固定為 `wss://openws.work.weixin.qq.com`。
+  </Step>
+  <Step title="加入群組">
+    將機器人加入需要回答問題的群組，或讓使用者直接私訊機器人。
+  </Step>
+</Steps>
+
+- 每個機器人同一時間只能維持一條長連線。如果其他地方使用同一個 Bot ID 連線（例如另一套 MoleSignal 或測試環境），MoleSignal 的連線就會中斷，狀態會顯示**無法連線**及原因。請為每個環境使用不同的機器人。
+- 長連線和 URL 回呼只能擇一使用。將機器人改為使用 URL 回呼後，長連線就會中斷。
+- 如果機器人的建立者是企業的超級管理員，訊息中的成員 userid 會以明文呈現，否則會加密。加密後的 userid 不便由管理員手動綁定，請讓使用者透過 Mole Agent 傳送的一次性連結自行綁定。
+- 啟用後，機器人也會傳送通知：通知策略和個人通知方式都可選用此連接器。私訊會傳到成員的 userid，群組訊息會傳到群組的 chatid。機器人只能傳送訊息到曾與機器人互動的對話：曾私訊機器人的使用者，或曾有人 @ 機器人的群組。告警通知是附有按鈕的範本卡片，請參閱[告警卡片](#告警卡片)。
+
+### Google Chat
+
+Google Chat App 會將訊息傳送到 Cloud Pub/Sub 主題，MoleSignal 再從該主題的訂閱提取訊息，不需要公開網址。
+
+<Steps>
+  <Step title="準備服務帳號">
+    在 Google Cloud 專案中啟用 **Google Chat API** 和 **Cloud Pub/Sub API**，並在同一個專案中建立服務帳號及其 JSON 金鑰。將金鑰填入連接器的**服務帳號金鑰**：Chat 應用程式使用這個服務帳號的身分傳送訊息，也使用這個帳號從訂閱提取訊息。
+  </Step>
+  <Step title="建立主題和訂閱">
+    在 Pub/Sub 中建立主題（例如 `mole-chat`），並為該主題建立 **Pull** 訂閱（例如 `mole-chat-sub`）。在該訂閱上，將 **Pub/Sub Subscriber**（`roles/pubsub.subscriber`）角色授予這個服務帳號。
+  </Step>
+  <Step title="允許 Chat 將訊息傳送到主題">
+    在主題上，將 **Pub/Sub Publisher**（`roles/pubsub.publisher`）角色授予 `chat-api-push@system.gserviceaccount.com`。如果 Chat 應用程式是 Google Workspace 外掛程式，請改為授予連線設定中顯示的服務帳號。
+  </Step>
+  <Step title="設定 Chat 應用程式">
+    在 **Google Chat API → Configuration** 中設定應用程式名稱和頭像，啟用 **Receive 1:1 messages** 和 **Join spaces and group conversations**。在 **Connection settings** 中選擇 **Cloud Pub/Sub** 並填入主題的完整名稱 `projects/<项目>/topics/mole-chat`，再於 **Visibility** 中選擇可使用此應用程式的使用者和群組。
+  </Step>
+  <Step title="填寫訂閱">
+    在連接器的 **Pub/Sub 訂閱**中填入 `projects/<项目>/subscriptions/mole-chat-sub`。
+  </Step>
+</Steps>
+
+- 訂閱的確認期限可保留預設的 10 秒：MoleSignal 會在提取訊息後立即確認。
+- 在聊天室和群組對話中，應用程式只會收到 @ 應用程式的訊息。在討論串中繼續提問時，也要 @ 應用程式。私訊則會收到每一則訊息。
+
+### Telegram
+
+機器人透過長輪詢（`getUpdates`）從 Telegram Bot API 取得訊息，不需要公開網址。
+
+<Steps>
+  <Step title="建立機器人">
+    在 Telegram 中私訊 **@BotFather**，傳送 `/newbot`，為機器人設定名稱和使用者名稱，並複製取得的 Token（格式類似 `123456789:AAE…`）。
+  </Step>
+  <Step title="新增連接器">
+    在**設定 → 通知 → 連接器**新增 **Telegram 機器人**連接器，並將 Token 填入 **Bot Token**。
+  </Step>
+  <Step title="讓機器人收到 @ 提及">
+    Telegram 預設啟用隱私模式（Privacy mode）。群組中的機器人只能收到傳給機器人的指令和回覆，收不到一般的 @ 提及。若要在群組中 @ Mole Agent 提問，請傳送 `/setprivacy` 給 @BotFather，再選擇 **Disable**，或將機器人設為群組管理員。
+  </Step>
+  <Step title="加入群組">
+    將機器人加入需要回答問題的群組。
+  </Step>
+</Steps>
+
+- 在群組中，Mole Agent 會回應 @ 機器人的訊息、指令（`/new@<机器人>` 或 `/new`），以及對機器人回答的回覆。回覆告警通知時也要 @ 機器人；群組中討論告警的訊息不會傳給 Mole Agent。私訊中的每一則訊息都會傳給 Mole Agent。
+- 私訊機器人時，系統會將第一則 `/start` 指令視為 `/help` 處理。尚未綁定帳號的使用者傳送這個指令時，會收到綁定連結。
+- Telegram 機器人只能私訊曾開啟與機器人的私訊對話並點選「開始」（Start）的使用者。如果其他使用者尚未綁定帳號，Mole Agent 會在群組中傳送一則只有該使用者看得到的訊息，附上綁定連結。如果無法傳送這則訊息，Mole Agent 會請該使用者先私訊機器人。請參閱[綁定帳號](#綁定帳號)。
+- Telegram 同一時間只會將同一個機器人的訊息交給一個接收端。MoleSignal 連線時會移除機器人上已設定的 Webhook。如果另一個程式也在輪詢同一個機器人，Telegram 會拒絕其中一方（HTTP 409），狀態會顯示**無法連線**及原因。請為每個環境使用不同的機器人。
+
+### Microsoft Teams
+
+Bot Framework 會將 Teams 訊息傳送到 MoleSignal 的公開回呼網址。Teams 是唯一需要從公網存取 MoleSignal 的平台。啟用前，請按照 [Teams 的安全措施](#teams-的安全措施)準備好對外網址。
+
+<Steps>
+  <Step title="準備 Azure Bot">
+    在 Azure 入口網站建立 **Azure Bot**（或使用現有的 Bot），類型選擇 **Single Tenant**。在該 Bot 的 Microsoft Entra 應用程式註冊中建立用戶端密碼。在連接器中填入**應用程式 ID**、**用戶端密碼**和**租用戶 ID**。
+  </Step>
+  <Step title="新增 Teams 管道">
+    在 Azure Bot 的 **Channels** 中新增 **Microsoft Teams**。
+  </Step>
+  <Step title="啟用並複製回呼網址">
+    開啟 **Mole Agent → 設定 → IM 整合**，啟用此連接器，並複製其**回呼網址**：`https://<对外地址>/api/v1/public/im/teams/<连接器 ID>/messages`。
+  </Step>
+  <Step title="填寫訊息端點">
+    在 Azure Bot 的 **Configuration** 中，將 **Messaging endpoint** 設為這個回呼網址。
+  </Step>
+  <Step title="發布 Teams 應用程式">
+    建立 Teams 應用程式套件，在資訊清單的 `bots` 中填入此 Bot 的應用程式 ID，並將 `personal`、`team` 和 `groupChat` 納入範圍。在 Teams 系統管理中心或開發人員入口網站上傳套件，再為需要使用的使用者、團隊和群組聊天安裝應用程式。
+  </Step>
+</Steps>
+
+- 在頻道和群組聊天中，機器人只會收到 @ 機器人的訊息。在貼文下方繼續提問時，也要 @ 機器人。私訊則會收到每一則訊息。
+- 支援 Azure 公用雲端和美國政府雲端（GCC、GCC High、DoD）的 Bot Framework，請在連接器的**雲端環境**中選擇。
+
+## Teams 的安全措施
+
+Teams 的回呼網址可從公開網路存取。MoleSignal 會執行下列檢查：
+
+- **每個要求都會驗證 Bot Framework 的權杖。** 這個網址不接受 MoleSignal 登入，只接受 Bot Framework 簽署的 JWT：簽署金鑰來自 `login.botframework.com` 的 OpenID 中繼資料（快取 24 小時）；`iss` 為 `https://api.botframework.com`；GCC High 和 DoD 改用 `login.botframework.azure.us` 和 `https://api.botframework.us`；`aud` 為此 Bot 的應用程式 ID；`exp` 和 `nbf` 容許 5 分鐘的誤差；簽署金鑰必須獲授權用於 Teams 頻道（`msteams`）；權杖中的 `serviceUrl` 必須與訊息中的值相符。驗證失敗時，傳回 401 或 403，不處理訊息。
+- **只將回覆傳送給 Bot Framework。** MoleSignal 只會將 Bot 的權杖傳送至 Bot Framework 的服務網址（`smba.trafficmanager.net`、`*.botframework.com`、`*.teams.microsoft.com`、`*.teams.microsoft.us`），或連接器中設定的服務網址。若訊息中的網址不符，就拒收訊息。
+- **只接收所屬租用戶的訊息。** 若在連接器的租用戶欄位填入租用戶 ID（GUID），MoleSignal 就不處理其他租用戶傳來的訊息。填入網域名稱或 `botframework.com` 時則不限制。
+- **回呼網址只適用於已啟用的連接器。** 若未在 **IM 整合**中啟用連接器，或已停用或刪除連接器，回呼網址就會傳回 404。網址只包含連接器 ID，不含金鑰。
+- **限制要求本文大小。** 直接拒絕超過 256 KiB 的要求。
+
+部署時也請採取下列措施：
+
+1. **只對公開網路開放回呼路徑。** 使用反向代理伺服器或閘道，只轉送 `POST /api/v1/public/im/teams/`，登入頁面和其他 API 仍只能從內部網路存取。以 nginx 為例：
+
+   ```nginx
+   server {
+     listen 443 ssl;
+     server_name molesignal.example.com;
+     # ssl_certificate 与 ssl_certificate_key …
+     client_max_body_size 256k;
+
+     location /api/v1/public/im/teams/ {
+       limit_except POST { deny all; }
+       proxy_pass http://molesignal.internal:8080;
+       proxy_set_header Host $host;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+       proxy_set_header X-Forwarded-Proto https;
+     }
+
+     location / {
+       return 404;
+     }
+   }
+   ```
+
+   如果員工也透過這個對外網址存取 MoleSignal，請在閘道上將其他路徑的存取範圍限制在公司網路或 VPN，只對公開網路開放回呼路徑。如需 nginx、Kubernetes Ingress 和 Gateway API 的完整設定，請參閱[公開網路存取](/zh-Hant/public-access)。
+2. **使用 HTTPS。** 將 `http.external_url` 設為 HTTPS 網址。Teams 不會將訊息傳送至 HTTP 網址。TLS 可以在代理伺服器上終止，憑證須由公開信任的 CA 簽發。
+3. **選用：依來源限制存取。** 可以在防火牆或閘道上只允許 Azure 服務標籤 `AzureBotService` 中的位址存取回呼路徑。這些位址會變動，請依 Azure 公布的清單更新。權杖驗證仍是主要防線。
+4. **妥善保管用戶端密碼。** MoleSignal 會將用戶端密碼與連接器一起加密儲存，API 不會傳回密碼。請定期輪替密碼，並在輪替後更新連接器中的設定。Bot 的應用程式註冊只應授予必要的權限。
+5. **留意異常。** MoleSignal 會在日誌和追蹤中記錄回呼要求與權杖驗證失敗事件。可在 **IM 整合**中查看各連接器最近一次收到訊息的時間。
+
+## 外部條件
+
+各平台在 MoleSignal 之外所需的準備事項：
+
+| 平台 | MoleSignal 輸出連線須存取的位址 | 輸入連線 | 平台上的準備事項 |
+|---|---|---|---|
+| 飛書 | `open.feishu.cn`（Lark 為 `open.larksuite.com`）及平台提供的持續連線位址 | 無 | 企業自建應用程式、透過持續連線接收事件、訊息事件、透過持續連線接收回呼、權限、已發布的版本 |
+| Slack | `slack.com`、Socket Mode 的 WebSocket 位址及警示卡片使用的 `hooks.slack.com`；GovSlack 改用 `slack-gov.com` 和 `hooks.slack-gov.com` | 無 | App-Level Token、Socket Mode、互動功能、事件訂閱、Bot 權限 |
+| 釘釘 | `api.dingtalk.com`、`oapi.dingtalk.com` 和 Stream 的 WebSocket 位址 | 無 | 企業內部應用程式的機器人、Stream 模式；警示卡片的按鈕另需互動卡片範本和卡片權限 |
+| 企業微信 | `openws.work.weixin.qq.com`（WebSocket，443） | 無 | API 模式、使用持續連線的智慧機器人，以及該機器人的 Bot ID 與 Secret |
+| Google Chat | `oauth2.googleapis.com`、`pubsub.googleapis.com`、`chat.googleapis.com` | 無 | Chat API 與 Pub/Sub API、服務帳號與 JSON 金鑰、主題與提取訂閱、訂閱者與發布者兩種角色、Chat 應用程式設定 |
+| Telegram | `api.telegram.org`（443） | 無 | 透過 @BotFather 建立的機器人及其權杖 |
+| Microsoft Teams | `login.microsoftonline.com`、`login.botframework.com` 和連接器的服務網址（全球版為 `smba.trafficmanager.net`）；GCC High 和 DoD 改用 `login.microsoftonline.us`、`login.botframework.azure.us` | Bot Framework 存取 `https://<对外地址>/api/v1/public/im/teams/…`（443） | Azure Bot、用戶端密碼、Teams 頻道、訊息端點、Teams 應用程式套件 |
+
+- 請在防火牆或輸出代理伺服器上允許連線至上表所列的輸出位址。WebSocket 持續連線（飛書、Slack、釘釘、企業微信）會直接連線至平台，不經過 HTTP 代理伺服器。
+- Teams 的輸入連線需要公開 DNS、由公開信任的 CA 簽發的憑證，以及只轉送回呼路徑的反向代理伺服器。請參閱 [Teams 的安全措施](#teams-的安全措施)。
+- 自行綁定帳號和使用回覆中的聊天連結，都需要設定 `http.external_url`。
+
+## 啟用
+
+開啟 **Mole Agent → 設定 → IM 整合**，即可查看所有能在 IM 中回答的連接器：
+
+| 欄位 | 說明 |
+|---|---|
+| **連接器** | 連接器、所屬平台，以及最近一次收到訊息的時間。Teams 連接器下方會顯示可複製的回呼網址。 |
+| **狀態** | **已連線**及連線身分、**連線中**、**等待伺服器連線**、**無法連線**及原因、**未啟用**，或連接器缺少的設定，例如 Slack 的 App-Level Token 或 Google Chat 的 Pub/Sub 訂閱。Teams 不使用持續連線：**已連線**表示 Bot 的認證資訊有效，訊息由 Bot Framework 傳送。 |
+| **群組中的新話題** | 群組中新開的話題會記錄在**提問者的私人聊天**或指定團隊中。只有提問者是該團隊的成員時，才會記錄為團隊聊天。 |
+| **啟用** | 決定此連接器是否在 IM 中回答。Teams 連接器只有在 `http.external_url` 為 HTTPS 網址時才能啟用。 |
+
+若連接器已在 IM 中提供回答，請先在這裡停用，再到通知設定中刪除。
+
+## 綁定帳號
+
+Mole Agent 會以 IM 帳號對應的 MoleSignal 使用者身分回答，並使用該使用者的權限。Mole Agent 會透過同一個連接器上已啟用且已驗證的通知方式辨識帳號：
+
+| 平台 | 帳號 |
+|---|---|
+| 飛書 | `open_id`、`user_id` 或 `union_id` |
+| Slack | 成員 ID |
+| 釘釘 | userId |
+| 企業微信 | 智慧機器人看到的 userid |
+| Google Chat | 使用者（`users/123…`）或電子郵件地址 |
+| Telegram | 數字使用者 ID |
+| Microsoft Teams | Teams 使用者 ID（`29:…`）或 Microsoft Entra 物件 ID |
+
+如果一個帳號對應到多位使用者，Mole Agent 不會回答。
+
+- **自行綁定**：尚未綁定的提問者提出問題時，Mole Agent 會私下傳送一次性連結：在私人聊天中直接傳送，在 Slack 中則傳送只有提問者看得到的訊息。登入 MoleSignal 後開啟連結並選取**綁定**，即可將該帳號新增為提問者已驗證的通知方式。連結只能使用一次，有效期限為 15 分鐘。在企業微信、Google Chat 和 Telegram 中，Mole Agent 只能私下傳給曾與機器人私聊的提問者；在 Teams 中，則只能傳給已安裝此 Bot 的提問者。若無法傳送，Mole Agent 會在原處請提問者先開啟私人聊天，再於私人聊天中提供連結。Telegram 會先嘗試在群組中傳送只有提問者看得到的訊息。
+- **管理員綁定**：在**設定 → 通知 → 使用者路由**中為成員綁定並驗證此帳號。請參閱[通知管道](/zh-Hant/notification-channels#繫結使用者通知方式)。
+
+## 提問
+
+在群組中使用 @ 提及機器人；在私人聊天中直接輸入問題。執行 `/new` 前，私人聊天會沿用同一個聊天工作階段。
+
+| 平台 | 群組中的單一聊天工作階段 |
+|---|---|
+| 飛書、Slack | 以一個話題為單位，回覆會發在該話題中 |
+| Google Chat 聊天室 | 以一個話題為單位，回覆會發在該話題中；追問時須使用 @ 提及應用程式 |
+| Microsoft Teams 頻道 | 以一篇貼文為單位，回覆會發在該貼文下方；追問時須使用 @ 提及 Bot |
+| 釘釘、企業微信、Google Chat 群組聊天、Teams 群組聊天 | 沒有話題：每位提問者在各群組中的提問各自形成一個私人聊天 |
+| Telegram 群組 | 每位提問者各有一個聊天工作階段；在論壇話題（Topic）中則依話題區分。回覆會引用提問訊息 |
+
+| 指令 | 功能 |
+|---|---|
+| `/help` | 說明如何提問，並列出這些指令。 |
+| `/new` | 在此開始新的聊天工作階段。 |
+| `/scope` | 顯示此話題屬於哪位使用者或哪個團隊。 |
+| `/scope <团队>` | 改在指定團隊的新聊天中繼續。團隊成員都可以查看和追問。 |
+| `/scope 我` | 改在新的私人聊天中繼續。 |
+| `/feedback 👍` 或 `/feedback 👎`，後方可加上說明 | 評價話題中的最新回答。 |
+
+其他指令，例如 `/rca INC-12` 或技能指令，用法與在 MoleSignal 中相同。
+
+### 話題中的聊天歸屬
+
+只有開啟私人聊天的提問者可以繼續追問；團隊聊天則開放該團隊的所有成員追問。在群組中開啟新話題時，如果提問者是連接器所設定團隊的成員，Mole Agent 就會將話題記錄為該團隊的聊天，否則記錄為提問者的私人聊天。`/scope` 會將話題切換到新的聊天工作階段，先前的訊息會留在原本的聊天中。
+
+## 回答時
+
+- 在 IM 中無法回答 Mole Agent 的問題或確認變更。Mole Agent 會做出合理的假設並說明，略過需要確認的步驟，並在回覆中指出略過的步驟。若要繼續執行這些步驟，請透過連結開啟 MoleSignal 中的聊天。
+- 每次回答最多耗時 15 分鐘。企業微信的「正在查」是串流訊息，必須在 10 分鐘內結束。若回答在 9 分鐘後才完成，Mole Agent 會另發一則訊息。
+- 回覆會分段呈現，例如可能原因、證據和後續步驟，並使用提問者的介面語言。
+- 群組中的所有成員都能看到回覆，但 Mole Agent 只會依提問者的權限查詢資料。若不希望其他成員看到回覆，請在私人聊天中提問。
+- 組織當日的預算用完時，Mole Agent 會說明情況，並停止回答。
+
+## 告警卡片
+
+本節說明告警通知，而非與 Mole Agent 的對話：透過下列連接器傳送的告警通知會顯示為帶有按鈕的卡片。直接在卡片上即可確認、解決或暫緩告警，不必開啟 MoleSignal。
+
+| 連接器 | 卡片顯示按鈕的條件 |
+|---|---|
+| 飛書 App、Slack App、企業微信智慧機器人、Google Chat App、Microsoft Teams 機器人、Telegram 機器人 | 連接器已啟用 IM 接入，請參閱[啟用](#啟用) |
+| 釘釘 App | 已啟用 IM 接入，且連接器已填入**互動卡片範本 ID**，請參閱[釘釘的互動卡片](#釘釘的互動卡片) |
+| 企業微信 App | 不必啟用 IM 接入：應用程式已設定**接收訊息**，請參閱[企業微信 App 的按鈕](#企業微信-app-的按鈕)。只有傳送給成員的通知有按鈕 |
+| Mattermost 機器人 | 不必啟用 IM 接入：已設定 `http.external_url`，且 Mattermost 伺服器可存取該網址，請參閱 [Mattermost 機器人的按鈕](#mattermost-機器人的按鈕) |
+
+群組機器人（各平台的 Webhook 連接器）無法接收按鈕點擊事件，因此傳送的告警通知沒有這些按鈕：即時通訊範本啟用**以卡片傳送**時，會傳送不含按鈕的卡片，否則會傳送純文字。請參閱[即時通訊範本的卡片](/zh-Hant/notification-channels#即時通訊範本的卡片)。透過不支援按鈕的連接器傳送給個人的告警通知，會改附[一次性處理連結](/zh-Hant/notification-channels#一次性處理連結)。
+
+| 按鈕 | 功能 |
+|---|---|
+| **確認** | 接手告警，效果與在 MoleSignal 中確認相同：停止升級，並將點選按鈕的人員設為負責人。 |
+| **解決** | 結束告警。 |
+| **暫緩 1 小時** | 一小時內不再傳送通知：先確認等待確認的告警，時間一到就將告警改回等待確認，並再次通知負責人。請參閱[處理事件](/zh-Hant/alerting/incidents#處理事件)。 |
+| **全部確認** | 只會出現在[合併通知](/zh-Hant/notification-channels#合併通知)傳送的單則訊息中：確認訊息內所有仍在等待確認的告警，最多 20 個。Telegram 卡片沒有這個按鈕，只保留**在 MoleSignal 中檢視**。 |
+| **在 MoleSignal 中檢視** | 開啟該告警事件的詳細資料頁面；合併訊息則會開啟告警事件清單。必須設定 `http.external_url`。 |
+
+- 卡片顯示哪些按鈕，取決於傳送通知時的告警狀態：等待確認的告警顯示確認、解決和暫緩 1 小時，已確認的告警顯示解決和暫緩 1 小時，恢復通知不含按鈕。
+- 點選按鈕時，系統會以 IM 帳號綁定的 MoleSignal 使用者身分執行操作，該使用者必須具備 `alerts.incidents.acknowledge` 權限。尚未綁定的帳號會以私訊收到一次性綁定連結，流程與提問時相同，請參閱[綁定帳號](#綁定帳號)。如果 Telegram 機器人無法傳送私訊，就會在群組中傳送一則只有點選者看得到的訊息，內含連結。若仍無法傳送，點選按鈕會開啟與機器人的私人對話，機器人隨後會在該對話中傳送連結。企業微信 App 會改傳一則訊息，Mattermost 機器人則會改傳一則只有點選者看得到的訊息，提醒先在個人設定中將該帳號新增為通知方式。若帳號對應到多位使用者，系統不會執行操作。
+- 點選後，卡片會更新為告警的目前狀態：系統會依原通知策略的範本重新產生內容，標明確認或解決告警的人員，只保留仍可使用的按鈕。群組內所有成員都會看到同一張卡片。告警處理完畢且沒有可用按鈕時，企業微信卡片會保留一個點選後無反應的 ✓，因為企業微信的範本卡片至少需要一個按鈕。
+- 飛書和 Telegram 會向點選者顯示提示，說明操作是否成功；Telegram 發生問題時，會顯示須手動關閉的提示視窗。其他平台會在操作失敗時向點選者說明原因：Slack、Google Chat 和 Mattermost 會傳送一則只有點選者看得到的訊息，Teams 會向點選者顯示一行提示，釘釘和企業微信則會傳送私訊。
+- 按鈕文字使用通知接收者的介面語言；傳送到群組的卡片使用組織的預設語言。
+
+### 釘釘的互動卡片
+
+釘釘卡片的外觀由互動卡片範本決定。MoleSignal 只填入範本中的變數，按鈕點擊事件則透過 Stream 連線傳回。
+
+<Steps>
+  <Step title="建立範本">
+    在釘釘開發者後台的**卡片平台**建立**訊息卡片**範本，並將範本與此應用程式建立關聯。
+  </Step>
+  <Step title="新增變數">
+    新增下列文字變數：`title`、`content`、`note`、`footer`、`open_text`、`open_url`，以及每項操作的 `*_text` 和 `*_value`。操作包括 `acknowledge`、`resolve`、`snooze`、`acknowledge_all`，[核准卡片](#核准卡片)還需要 `approve` 和 `reject`。
+  </Step>
+  <Step title="配置元件">
+    將標題綁定至 `title`、Markdown 內文綁定至 `content`，兩行小字則分別綁定至 `note`（確認或解決告警的人員）和 `footer`（範本的頁尾）。為每項操作配置一個按鈕：將文字綁定至 `*_text`，只在 `*_text` 不為空時顯示；將點擊動作設為**回傳請求**，並將回傳參數 `value` 綁定至 `*_value`。再新增一個按鈕，將文字綁定至 `open_text`，並設定點選後開啟 `open_url`。這個按鈕也只在 `open_text` 不為空時顯示。
+  </Step>
+  <Step title="發布並填入 ID">
+    儲存並發布範本，將**範本 ID** 填入連接器的**互動卡片範本 ID**。應用程式必須具備互動卡片的寫入權限（`Card.Instance.Write`）。
+  </Step>
+</Steps>
+
+- 私人對話中的卡片會傳送給應用程式可見範圍內的成員。若要傳送卡片到群組，機器人必須已加入該群組。
+- 未填入範本 ID 時，告警通知仍會以 ActionCard 或 Markdown 傳送，不含按鈕。
+
+### 企業微信 App 的按鈕
+
+企業微信 App（`wecom_app`）不是 Mole Agent 的機器人，不必啟用 IM 接入：將應用程式的**接收訊息**回呼指向 MoleSignal 後，傳送給成員的告警通知就會以帶有按鈕的範本卡片呈現。傳送到應用程式群組聊天的通知沒有按鈕，因為企業微信不會將範本卡片傳送到應用程式群組聊天。
+
+<Steps>
+  <Step title="啟用 API 接收">
+    在企業微信管理後台開啟此應用程式，在**接收訊息**中選擇**設定 API 接收**，隨機產生 **Token** 和 **EncodingAESKey**。
+  </Step>
+  <Step title="填入連接器">
+    將產生的值分別填入連接器的**接收訊息 Token** 和 **EncodingAESKey**，然後儲存。
+  </Step>
+  <Step title="填入回呼網址">
+    複製連接器的**回呼網址** `https://<对外地址>/api/v1/public/notify/<连接器 ID>/wecom`，貼到**接收訊息**的 URL 欄位，然後儲存。企業微信會立即向這個網址傳送請求以進行驗證。
+  </Step>
+</Steps>
+
+- 回呼網址必須使用企業主體已完成備案的網域，且企業微信必須能從公用網路存取此路徑。
+- 系統一律拒絕簽章不正確的請求，並使用 EncodingAESKey 解密內容。系統不處理不屬於該企業的內容。
+- 系統會依照此連接器上已驗證的通知方式（成員 UserID）辨識點選按鈕的人員。
+
+### Mattermost 機器人的按鈕
+
+Mattermost 機器人（`mattermost_bot`）不是 Mole Agent 的機器人，不必啟用 IM 接入：設定 `http.external_url` 後，機器人傳送的告警通知會顯示確認、解決和暫緩 1 小時按鈕。按鈕回呼 MoleSignal 的網址為 `https://<对外地址>/api/v1/public/notify/<连接器 ID>/mattermost?token=…`，其中包含連接器的回呼 Token。Mattermost 不會將此網址傳送給用戶端。
+
+- Mattermost 伺服器會發出回呼，因此必須能存取對外網址。除非系統主控台的 **Environment → Developer → Allow untrusted internal connections to**（`ServiceSettings.AllowedUntrustedInternalConnections`）已列入該主機，否則 Mattermost 不會存取私人位址或內部網路位址。若 MoleSignal 位於內部網路，請將 `http.external_url` 的主機加入清單。
+- 系統會依照此連接器上已啟用且已驗證的通知方式辨識點選者：Mattermost 使用者名稱（可加 `@`，也可省略）或使用者 ID。若無法辨識點選者，系統會傳送一則只有點選者看得到的訊息，提醒先將該帳號新增為通知方式。
+- 回呼 Token 不正確時會傳回 401；停用連接器後會傳回 404。
+- Webhook（`mattermost_webhook`）傳送的訊息沒有按鈕：因為無法辨識點選者，所以只保留告警連結。
+
+## 核准卡片
+
+當 Mole Agent 提議需要核准的操作，或有成員針對事件發起修復動作時，系統會將核准請求作為 **Mole Agent 等待核准**事件，透過內建通知策略**待核准：通知有權核准的人員**傳送給具備 `agent.approve` 權限的成員，最多 20 人，不含發起人。各成員會依個人設定的通知方式接收通知。符合[預先核准](/zh-Hant/alerting/remediation#預先核准)條件的請求會直接執行，不會傳送通知。
+
+透過支援告警卡片按鈕的連接器（請參閱[告警卡片](#告警卡片)）傳送通知時，卡片會顯示下列按鈕：
+
+| 按鈕 | 功能 |
+|---|---|
+| **核准** | 核准此請求。達到所需的核准人數後立即執行，效果與在 Mole Agent 的核准頁面上核准相同。 |
+| **駁回** | 駁回此請求，系統不會執行。 |
+| **在 MoleSignal 中檢視** | 開啟 Mole Agent 的核准頁面。必須設定 `http.external_url`。 |
+
+- 點選按鈕時，系統會以 IM 帳號綁定的 MoleSignal 使用者身分執行操作，且只採用此連接器上已驗證的通知方式辨識身分。該使用者必須具備 `agent.approve` 權限。發起人不能核准自行發起的請求。尚未綁定的帳號會以私訊收到一次性綁定連結，流程與告警卡片相同。
+- 點選後，卡片會改為顯示不含按鈕的請求，並標明由誰核准或駁回，以及是否已執行。點選者會收到操作是否成功的提示。
+- 如果請求已在其他地方處理，或同一位成員已審核過該請求，再次點選不會變更請求。卡片會顯示請求的目前狀態。
+- 釘釘的卡片範本包含 `approve_*` 和 `reject_*` 變數時，才會顯示這兩個按鈕。請參閱[釘釘的互動卡片](#釘釘的互動卡片)。
+
+## 限制
+
+- Mole Agent 會讀取文字訊息和富文字訊息中的文字。在企業微信中，也會讀取由語音轉換而成的文字。Mole Agent 會忽略圖片和檔案。
+- 若與連接器連線的伺服器停止運作，另一台伺服器會在約一分鐘內接手。這段期間的提問，只有在平台重新投遞時，才會在重新連線後收到回覆。Teams 不受影響：收到回呼的任何一台伺服器都能處理。
+- 企業微信的回覆只能由與機器人連線的伺服器傳送。其他伺服器產生的回覆會交由該伺服器傳送，通常會在幾秒內送達。
+- 企業微信限制每個對話每分鐘 30 則、每小時 1000 則訊息。
+- Telegram 每則訊息最多 4096 個字元，較長的回覆會拆成多則訊息傳送。
+- 在 MoleSignal 或另一張卡片上確認或解決告警後，已傳送的告警卡片不會自動更新。再次點選卡片上的按鈕時，系統會提示告警已確認或解決，並將卡片更新為目前狀態。

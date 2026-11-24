@@ -1,0 +1,181 @@
+---
+title: "Observabilidad interna"
+description: "Supervisa MoleSignal con sus propios registros, métricas, trazas, perfiles, indicadores de estado y diagnósticos locales de cada nodo."
+"en_link": "/en-US/self-observability"
+"zh-Hans_link": "/zh-Hans/self-observability"
+"zh-Hant_link": "/zh-Hant/self-observability"
+"ja_link": "/ja/self-observability"
+"ko_link": "/ko/self-observability"
+"de_link": "/de/self-observability"
+"fr_link": "/fr/self-observability"
+"pt-BR_link": "/pt-BR/self-observability"
+---
+
+Los registros del proceso permanecen en la salida configurada, ya sea la consola o un archivo. MoleSignal almacena las métricas,
+las trazas y los perfiles de la plataforma en la organización protegida `_sys`. Cada señal almacenada usa el nombre exacto de
+flujo `_molesignal` con el tipo de flujo correspondiente.
+
+| Señal | Flujo con tipo | Contenido |
+|---|---|---|
+| Métricas | `metrics/_molesignal` | Contadores, medidores, histogramas y resúmenes. |
+| Trazas | `traces/_molesignal` | Spans canónicos completados tras el muestreo al final de la traza. |
+| Perfiles | `profiles/_molesignal` | Metadatos de perfiles vinculados a blobs pprof en el almacenamiento de objetos. |
+
+Solo el ámbito del sistema con el permiso `sys.telemetry.read` permite consultar estos flujos.
+
+## Habilita la recopilación de telemetría propia
+
+```toml
+[telemetry.self_collect]
+enabled = true
+metrics_enabled = true
+metrics_interval_secs = 15
+queue_capacity = 8192
+batch_max_events = 256
+batch_max_delay_ms = 1000
+flush_timeout_secs = 5
+profile_kinds = ["cpu"]
+profile_interval_secs = 600
+profile_duration_secs = 10
+```
+
+No puedes cambiar el destino a una organización de un inquilino. La ingesta pública, las operaciones de modificación de flujos y
+los pipelines no pueden crear, sobrescribir ni eliminar `_molesignal`.
+
+Los flujos tienen una retención inicial de 7 días. Cambia la retención y la reducción de resolución del flujo de métricas
+en la pestaña **Retención** del flujo, en la organización `_sys`. Los valores se conservan tras un reinicio.
+
+En los despliegues con roles separados, los nodos que no realizan la ingesta reenvían la telemetría propia a un nodo de ingesta operativo. Configura el
+mismo `MS_SELF_TELEMETRY_CLUSTER_TOKEN` en todos los roles.
+
+## Rastreo distribuido del backend
+
+MoleSignal instrumenta las etapas de HTTP, gRPC, Flight SQL, bases de datos, almacenamiento de objetos, ingesta, consultas,
+procesos en segundo plano y Mole Agent.
+
+Los spans siguen las convenciones semánticas de OpenTelemetry 1.43.0. Los atributos estándar conservan sus nombres
+estándar, y los atributos que agrega MoleSignal empiezan con `molesignal.`. Cada span registra la
+versión en `semantic_conventions_version`.
+
+MoleSignal valida o reemplaza el contexto W3C entrante. El baggage externo no concede acceso a una organización.
+MoleSignal excluye de los spans los cuerpos de solicitudes que contienen datos sensibles, los valores SQL, las credenciales, los prompts, las salidas del modelo y
+los argumentos de herramientas.
+
+Un span de SQL puede incluir `molesignal.db.query.fingerprint`, una huella de la sentencia calculada con una clave y con sus
+valores reemplazados por `?`. Un span de almacenamiento de objetos puede incluir `molesignal.object.key_fingerprint`, una huella
+de la clave del objeto calculada con una clave. Así puedes agrupar los spans de una misma sentencia o de un mismo objeto sin
+almacenar la sentencia ni la clave del objeto. MoleSignal solo registra las huellas mientras
+[`MS_TRACE_FINGERPRINT_KEY`](/es/configuration#variables-de-entorno) contenga al menos 16 bytes.
+
+El muestreador al final de la traza aplica estos criterios de retención en orden de prioridad:
+
+1. desactivación en el despliegue o en tiempo de ejecución;
+2. retención forzada por depuración de confianza;
+3. errores;
+4. trazas lentas;
+5. reglas de política en el orden definido;
+6. proporción de muestreo normal determinista.
+
+El muestreador y las colas de ingesta y exportación de telemetría propia tienen límites y dejan pasar el tráfico de negocio si fallan. Revisa
+las métricas de cardinalidad fija de los componentes en `/metrics` y el estado detallado en
+`GET /api/v1/system/telemetry`.
+
+## pprof local al nodo
+
+La interfaz de diagnóstico está deshabilitada de forma predeterminada:
+
+```toml
+[profiling]
+enabled = true
+bind = "127.0.0.1"
+port = 5086
+allow_remote = false
+```
+
+Configura las mismas claves con `MS_PROFILING_ENABLED`, `MS_PROFILING_BIND`, `MS_PROFILING_PORT` y
+`MS_PROFILING_ALLOW_REMOTE`. `bind` acepta una dirección IP, no un nombre de host como `localhost`. El puerto
+debe ser distinto de los puertos de las demás interfaces de escucha habilitadas, incluidas las de los roles que el nodo
+no ejecuta. De lo contrario, el proceso se detiene durante el inicio. Consulta [pprof](/es/configuration#pprof).
+
+Captura perfiles:
+
+```bash
+curl --fail --output cpu.pb.gz \
+  'http://127.0.0.1:5086/debug/pprof/profile?seconds=30'
+
+curl --fail --output heap.pb.gz \
+  'http://127.0.0.1:5086/debug/pprof/heap'
+```
+
+Limita la escucha a la interfaz de bucle local y usa un túnel SSH. El acceso remoto requiere
+`allow_remote = true`, controles de red, TLS delante de la interfaz de escucha y una credencial
+de portador con permisos administrativos.
+
+## Estado y despliegue gradual
+
+- `/api/v1/healthz` es público e indica si el proceso está activo y si sus dependencias funcionan correctamente. Úsalo para las sondas de contenedores y balanceadores de carga.
+- `/api/v1/readyz` indica si el nodo está listo para recibir tráfico una vez que se inicia. Requiere un token de portador.
+- `/metrics` expone métricas de Prometheus sin etiquetas de inquilino.
+- `X-Request-Id` y `X-Trace-Id` correlacionan las solicitudes con las trazas retenidas.
+
+Para un nuevo despliegue de rastreo distribuido, empieza con `telemetry.trace.force_disabled = true`, valida
+los recursos del sistema y la privacidad, habilita un despliegue canario y luego amplía la política persistente de tiempo de ejecución.
+
+## Métricas de los componentes
+
+Cada nodo expone las siguientes métricas en `/metrics`. Sus etiquetas toman valores de listas fijas y
+nunca identifican una organización, una traza, una ruta ni una clave de objeto. En la organización `_sys`, los
+dashboards integrados **Telemetría interna y entorno de ejecución de MoleSignal** y **Trazas y APM de MoleSignal** muestran
+estas métricas.
+
+### Telemetría interna y base de datos de metadatos
+
+| Métrica | Etiquetas | Significado |
+|---|---|---|
+| `self_telemetry_accepted_total` | `signal` | Registros aceptados para los flujos `_molesignal`. |
+| `self_telemetry_dropped_total` | `signal`, `reason` | Registros descartados antes de llegar a los flujos `_molesignal`. `reason` toma el valor `queue_full`, `queue_closed`, `trace_candidate_queue`, `delivery_failed`, `flush_timeout` o `persistence_failed`. Si no se capturó un perfil programado, toma el valor `capture_busy`, `unavailable`, `invalid_duration` o `capture_failed`. |
+| `self_telemetry_batches_total` | `signal`, `outcome` | Lotes enviados, con `success` o `error` en `outcome`. |
+| `self_telemetry_retries_total` | `signal`, `reason` | Reintentos de envío de un lote que un nodo sin el rol `intake` reenvía a un nodo de ingesta: `no_intake`, `connect` o `push`. |
+| `self_telemetry_queue_depth`, `self_telemetry_queue_capacity` | `signal` | Cantidad de spans en espera en la cola de trazas y capacidad de la cola, `queue_capacity`. Solo `traces` tiene una cola. |
+| `self_telemetry_last_success_unixtime` | `signal` | Momento en que se completó correctamente el último lote, en segundos desde la época Unix. |
+| `self_telemetry_profile_available` | `kind` | `1` si la compilación puede capturar el perfil `cpu` o `heap` en esta plataforma; `0` en caso contrario. |
+| `db_pool_connections` | `pool`, `state` | Conexiones del grupo de conexiones de la base de datos de metadatos, `pool="meta"`: `total`, `idle`, `checked_out` y los valores configurados de `min` y `max`. |
+| `db_pool_acquire_duration_seconds` | `pool` | Tiempo de espera para obtener una conexión del grupo, sin incluir el tiempo de ejecución posterior de la sentencia. |
+
+`signal` toma el valor `metrics`, `traces` o `profiles`. Los descartes nunca bloquean el proceso, pero dejan vacíos en
+los flujos `_molesignal`.
+
+### Proyección de APM
+
+Los nodos que tienen asignadas las trazas candidatas ejecutan la proyección, y los nodos con el rol `alert` ejecutan la consolidación. Consulta
+[APM](/es/configuration#apm).
+
+| Métrica | Etiquetas | Significado |
+|---|---|---|
+| `molesignal_apm_facts_total` | `result` | Spans que llegaron a la proyección, por resultado: `accepted`, `duplicate_skip`, `late_kept`, `late_dropped`, `queue_full`, `stopped`, `cardinality_rejected`, `extract_failed` o `flush_failed`. `flush_failed` cuenta las escrituras fallidas, no los spans. |
+| `molesignal_apm_cardinality_total` | `reason` | Spans que superaron un [límite de cardinalidad](/es/apm/settings#límites-de-cardinalidad), por límite, como `service_rejected` o `transaction_overflow`. La métrica no cuenta los spans de servicios rechazados. Si un span supera otro límite, su nombre se agrupa en **Otros** o pierde nivel de detalle. |
+| `molesignal_apm_queue` | `resource` | Cantidad de spans en espera en la cola de proyección (`depth`) y capacidad de la cola (`capacity`, `[apm].queue_capacity`). |
+| `molesignal_apm_flushes_total` | `result` | Escrituras de los agregados en PostgreSQL: `success` o `failure`. |
+| `molesignal_apm_flush_duration_seconds` | | Duración de una escritura. |
+| `molesignal_apm_rollups_total` | `result` | Ejecuciones de la consolidación de agregados por minuto en agregados por hora: `success` o `failure`. |
+| `molesignal_apm_rollup_rows_total` | `kind` | Filas que la consolidación leyó (`source`), escribió (`rollup`) y eliminó al vencer su período de retención (`deleted`). |
+| `molesignal_apm_lag_seconds` | `stage` | Para `projection`, antigüedad del último span que recibió la proyección. Para `rollup`, período durante el cual la consolidación aún acepta datos tardíos, `[apm].late_grace_secs`. |
+| `molesignal_apm_health` | `component` | `1` mientras `projector`, `repository` o `rollup` funciona con normalidad; `0` mientras el componente está degradado. |
+| `molesignal_apm_api_duration_seconds` | `endpoint` | Tiempo de respuesta a una solicitud a la API de APM, por endpoint, como `overview` o `services`. |
+
+Configura una alerta cuando:
+
+- `molesignal_apm_queue{resource="depth"}` se mantenga por encima del 80% de `capacity`;
+- `molesignal_apm_facts_total` aumente con `queue_full`, `cardinality_rejected` o
+  `flush_failed` en `result`. Estos resultados dejan vacíos que los [avisos de calidad de los datos](/es/apm#consulta-los-avisos-sobre-la-calidad-de-los-datos)
+  señalan como datos parciales;
+- `molesignal_apm_lag_seconds{stage="projection"}` se mantenga por encima de 120, el equivalente a dos intervalos de un minuto;
+- `molesignal_apm_health` sea `0`;
+- el P95 de `molesignal_apm_api_duration_seconds{endpoint="overview"}` se mantenga por encima de 0,5 segundos.
+
+Un estado degradado de APM nunca hace que fallen `/api/v1/healthz` ni `/api/v1/readyz`. `GET /api/v1/apm/health` muestra el
+estado de la proyección de una organización. Consulta [API de APM](/es/api/apm).
+
+<Card title="Configuración" icon="sliders" href="/es/configuration">
+  Revisa todas las opciones de configuración de telemetría, trazas, exportadores y generación de perfiles.
+</Card>

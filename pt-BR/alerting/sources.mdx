@@ -1,0 +1,329 @@
+---
+title: "Alertas externos"
+description: "Receba alertas do Alertmanager, Grafana, Datadog, PagerDuty, Zabbix, de monitores em nuvem, por e-mail ou de sistemas próprios. Abra incidentes a partir desses alertas, escalone-os e envie notificações."
+"en_link": "/en-US/alerting/sources"
+"zh-Hans_link": "/zh-Hans/alerting/sources"
+"zh-Hant_link": "/zh-Hant/alerting/sources"
+"ja_link": "/ja/alerting/sources"
+"ko_link": "/ko/alerting/sources"
+"de_link": "/de/alerting/sources"
+"es_link": "/es/alerting/sources"
+"fr_link": "/fr/alerting/sources"
+---
+
+Uma fonte de alertas transforma os alertas enviados por outro sistema em [incidentes](/pt-BR/alerting/incidents). Esses incidentes acionam o plantão por meio de uma [política de escalonamento](/pt-BR/alerting/on-call#políticas-de-escalonamento) e enviam notificações por meio de [políticas de notificação](/pt-BR/notification-channels), assim como os incidentes gerados por regras. O MoleSignal resolve os incidentes quando a fonte informa que a condição voltou ao normal. Abra **Alertas → Origens**. Para consultar fontes, é necessário ter a permissão `alerts.sources.read`. Para criar, editar ou excluir fontes ou substituir tokens, é necessário ter a permissão `alerts.sources.manage`.
+
+## Tipos de fonte
+
+O tipo da fonte determina o formato usado para interpretar o corpo da requisição.
+
+| Tipo | Remetente | Um incidente por |
+|---|---|---|
+| **API** | Scripts, CI e sistemas internos que chamam a API do MoleSignal | Chave de deduplicação |
+| **Alertmanager** | Receptor de webhook do Prometheus Alertmanager | Grupo de notificações |
+| **Grafana** | Ponto de contato do tipo webhook do Grafana Alerting | Grupo de notificações |
+| **Datadog** | Integração Webhooks do Datadog | Monitor ou, no caso de monitores com alertas múltiplos, cada grupo |
+| **PagerDuty** | Assinatura de webhook V3 do PagerDuty | Incidente do PagerDuty |
+| **Alibaba Cloud CloudMonitor** | Callbacks de alarmes por limite e canais de envio por push de assinaturas de eventos | Objeto de uma regra de alarme ou evento do sistema |
+| **Tencent Cloud Observability Platform** | Callbacks de API de um modelo de notificação | Métrica ou evento de um objeto abrangido por uma política. Se a política tiver níveis, um por nível |
+| **Amazon CloudWatch** | Alarmes enviados a um tópico do SNS pela assinatura HTTPS do tópico | Alarme |
+| **Zabbix** | Tipo de mídia webhook do Zabbix | Problema |
+| **E-mail** | Caixa de correio IMAP ou mensagens em formato bruto de um sistema de e-mail já em operação | Sequência de e-mails com o mesmo assunto |
+
+Use o tipo **Alertmanager** para sistemas compatíveis com o formato de webhook do Alertmanager, como o Alertmanager do Thanos, do Cortex ou do Mimir.
+
+## Crie uma fonte
+
+1. Abra **Alertas → Origens** e clique em **Nova fonte de alertas**.
+2. Escolha o **Tipo** e informe um **Nome**.
+3. Escolha a **Política de escalonamento**. A opção padrão é **Por roteamento (padrão)**, como no editor de regras. O [roteamento de alertas](/pt-BR/alerting/routing) seleciona a equipe e a política de escalonamento com base nas regras de roteamento, na equipe responsável pelo serviço e no rótulo de equipe. Se esses critérios não definirem uma política, o roteamento usa a [política padrão](/pt-BR/alerting/on-call#política-padrão), chamada `default`. Ao selecionar uma política específica, os incidentes usam essa política e o roteamento determina apenas a equipe. Com **Sem escalonamento, apenas políticas de notificação**, o MoleSignal ainda abre incidentes e envia notificações, mas não aciona o plantão por meio de uma política de escalonamento.
+4. Escolha a **Gravidade padrão**. O MoleSignal usa esse valor quando o alerta não informa a gravidade.
+5. Adicione **Rótulos adicionais**, se necessário, como `team=payments`. A fonte adiciona esses rótulos a todos os incidentes que abre. Se o alerta já contiver um rótulo com a mesma chave, o valor do alerta prevalece.
+6. Clique em **Criar**. A página da fonte abre com uma caixa de diálogo que mostra o token e a configuração com o token já preenchido. Como o Alibaba Cloud CloudMonitor só precisa do endereço de recebimento, a caixa de diálogo mostra o endereço com o token incluído.
+
+<Warning>
+  O MoleSignal só exibe o token ao criar a fonte ou substituir o token. Após fechar a caixa de diálogo, apenas o prefixo que começa com `mspat-` fica visível. Se perder o token, clique em **Substituir token** para obter um novo. O token anterior deixa de funcionar imediatamente.
+</Warning>
+
+## Endereço de recebimento e token
+
+Todas as fontes compartilham o mesmo endereço de recebimento. O token identifica a fonte do alerta:
+
+```text
+https://<molesignal-host>/api/v1/intake/alerts
+```
+
+O token tem o formato `mspat-<36>`, igual ao de um token de API, mas serve apenas para receber alertas. Um token de API não permite receber alertas. O remetente inclui o token em um cabeçalho:
+
+```text
+Authorization: Bearer <token>
+```
+
+Quando não for possível definir cabeçalhos (Alibaba Cloud CloudMonitor, Tencent Cloud Observability Platform e Amazon CloudWatch via SNS), inclua o token no endereço: `https://<molesignal-host>/api/v1/intake/alerts?token=<token>`.
+
+O remetente precisa conseguir acessar esse endereço. Se houver um firewall na frente do MoleSignal, permita conexões dos endereços IP de saída do site ou da região do remetente. O Datadog lista esses endereços por site na seção `webhooks` de `ip-ranges`. O PagerDuty publica os endereços das regiões de serviço dos EUA e da UE. O Alibaba Cloud CloudMonitor lista os intervalos de IP usados no envio por push na documentação de callbacks de alarmes. Se o MoleSignal estiver em uma rede interna, consulte [Acesso público](/pt-BR/public-access) para expor apenas esse endereço à internet.
+
+## Configure o remetente
+
+Na página da origem, **Recebimento** mostra o endereço de recebimento, o token e as instruções de configuração em três etapas para cada tipo de origem. Substitua `<TOKEN>` pelo token da origem. Assim que a origem recebe a primeira solicitação, as três etapas aparecem como concluídas.
+
+### API
+
+```bash
+curl -X POST https://<molesignal-host>/api/v1/intake/alerts \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"dedupKey": "disk-full/web-1", "summary": "Disk almost full on web-1", "severity": "critical", "labels": {"host.name": "web-1"}}'
+```
+
+Use `trigger` (padrão), `acknowledge` ou `resolve` em `action`. Use a mesma `dedupKey` para confirmar o recebimento ou resolver o mesmo alerta. A página [Enviar alertas](/pt-BR/api/alerting/send-alerts) descreve todos os campos.
+
+### Alertmanager
+
+Adicione um receptor a `alertmanager.yml` e encaminhe os alertas para ele:
+
+```yaml
+route:
+  receiver: molesignal
+receivers:
+  - name: molesignal
+    webhook_configs:
+      - url: https://<molesignal-host>/api/v1/intake/alerts
+        send_resolved: true
+        http_config:
+          authorization:
+            credentials: <token>
+```
+
+Mantenha `send_resolved` como `true`. Caso contrário, o Alertmanager não envia as notificações de recuperação. Configure o mesmo `--web.external-url` em todas as réplicas de um cluster do Alertmanager. A URL externa faz parte da chave de deduplicação, o que impede que grupos com o mesmo nome em instâncias do Alertmanager de várias regiões sejam mesclados em um único incidente, mesmo quando usam o mesmo roteamento.
+
+### Grafana
+
+1. No Grafana, abra **Alertas → Pontos de contato** e clique em **Adicionar ponto de contato**.
+2. Defina **Integração** como **Webhook** e informe o endereço de recebimento em **URL**.
+3. Em **Configurações opcionais do webhook**, defina **Esquema do cabeçalho de autenticação** como `Bearer` e informe o token em **Credenciais do cabeçalho de autenticação**.
+4. Deixe **Desativar mensagem de resolução** desmarcada, salve e use o ponto de contato em uma política de notificação.
+
+Com provisionamento por arquivo:
+
+```yaml
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: molesignal
+    receivers:
+      - uid: molesignal
+        type: webhook
+        settings:
+          url: https://<molesignal-host>/api/v1/intake/alerts
+          httpMethod: POST
+          authorization_scheme: Bearer
+          authorization_credentials: <token>
+```
+
+### Datadog
+
+1. No Datadog, abra **Integrações → Webhooks** e adicione um webhook com o nome `molesignal`, por exemplo.
+2. Informe o endereço de recebimento em **URL** e defina **Cabeçalhos personalizados** como `{"Authorization": "Bearer <token>"}`. Deixe **Codificar como formulário** desmarcada.
+3. Defina **Payload** com o modelo abaixo. Os nomes dos campos são do MoleSignal e os valores são variáveis do Datadog. O MoleSignal recusa solicitações que não usam esse modelo.
+
+```json
+{
+  "alert_id": "$ALERT_ID",
+  "alert_cycle_key": "$ALERT_CYCLE_KEY",
+  "transition": "$ALERT_TRANSITION",
+  "alert_type": "$ALERT_TYPE",
+  "priority": "$ALERT_PRIORITY",
+  "title": "$ALERT_TITLE",
+  "event_title": "$EVENT_TITLE",
+  "message": "$TEXT_ONLY_MSG",
+  "scope": "$ALERT_SCOPE",
+  "tags": "$TAGS",
+  "hostname": "$HOSTNAME",
+  "link": "$LINK",
+  "snapshot": "$SNAPSHOT",
+  "query": "$ALERT_QUERY",
+  "org_id": "$ORG_ID",
+  "last_updated": "$LAST_UPDATED"
+}
+```
+
+4. Mencione `@webhook-molesignal` na mensagem de notificação de um monitor.
+
+Todos os sites do Datadog (`datadoghq.com`, `datadoghq.eu`, `us3`, `us5`, `ap1` e os demais) podem enviar alertas à mesma origem. O MoleSignal identifica o site pelo domínio de `$LINK` e inclui o site e o ID da organização na chave de deduplicação.
+
+### PagerDuty
+
+1. No PagerDuty, abra **Integrações → Webhooks genéricos (v3)** e clique em **Novo webhook**.
+2. Informe o endereço de recebimento em **URL do webhook** e escolha o **Tipo de escopo**: conta, serviço ou equipe.
+3. Em **Assinatura de eventos**, selecione `incident.triggered`, `incident.acknowledged`, `incident.resolved`, `incident.reopened` e `incident.priority_updated`.
+4. Adicione o cabeçalho personalizado `Authorization` com o valor `Bearer <token>`.
+
+Contas das regiões de serviço dos EUA e da UE podem enviar alertas à mesma origem. O MoleSignal inclui o domínio da conta (`<subdomain>.pagerduty.com` ou `<subdomain>.eu.pagerduty.com`) na chave de deduplicação e registra o domínio no rótulo `pagerduty.region`.
+
+### Alibaba Cloud CloudMonitor
+
+Adicione o token ao endereço de recebimento:
+
+```text
+https://<molesignal-host>/api/v1/intake/alerts?token=<token>
+```
+
+- **Alarmes de limite**: informe esse endereço como o **callback do alarme** em uma regra de alarme. O CloudMonitor envia o callback via POST com codificação de formulário. O MoleSignal também aceita JSON.
+- **Eventos do sistema**: em **Central de eventos → Assinatura de eventos → Canais de envio**, crie um canal com o tipo de destino **Webhook**, o método de solicitação **POST** e o formato de dados **JSON**. Informe esse endereço e use o canal em uma política de assinatura.
+
+O CloudMonitor aguarda 5 segundos pela resposta ao callback de um evento do sistema e faz 3 novas tentativas. O MoleSignal aguarda no máximo 3 segundos ao encaminhar uma solicitação ao [cluster receptor](#vários-clusters). Se esse tempo acabar, retorna `503` para que o CloudMonitor tente novamente. Os sites chinês e internacional e todas as regiões usam o mesmo formato. O MoleSignal registra a região no rótulo `aliyun.region` e inclui o `userId` da conta na chave de deduplicação.
+
+### Tencent Cloud Observability Platform
+
+No Tencent Cloud Observability Platform (anteriormente Cloud Monitor), edite ou crie um modelo em **Gerenciamento de alarmes → Modelos de notificação**. Informe o endereço de recebimento em **Callback de API** e vincule o modelo às políticas de alarme. Como o callback da Tencent Cloud não permite configurar cabeçalhos, inclua o token no endereço. Proteja o endereço como uma credencial: o callback não tem assinatura, e o endereço identifica a origem. A integração aceita alarmes de métricas e de eventos e recebe tanto acionamentos quanto recuperações.
+
+- **Deduplicação**: alarmes com a mesma conta, política de alarme, nome de métrica ou evento e objeto geram um único alerta. Uma política com níveis gera um incidente por nível. Cada incidente se recupera de forma independente, como na Tencent Cloud.
+- **Gravidade**: em `alarmLevel`, Serious (`Serious`) corresponde a crítico, Severe (`Warn`) a erro e Reminder (`Remind`) a informativo. Uma política sem níveis usa a gravidade padrão da origem.
+- **Eventos sem estado** (quando `alarmStatus` é `5`) abrem incidentes sem recuperação automática. Resolva esses incidentes manualmente.
+- **Horários** no callback não incluem fuso horário. O MoleSignal interpreta esses valores no horário de Pequim.
+
+### Amazon CloudWatch
+
+Os alarmes do CloudWatch não fazem solicitações diretas a endereços externos. Use o SNS:
+
+1. Nas notificações do alarme, envie tanto a transição para **Em alarme** (`ALARM`) quanto o retorno a **OK** para o mesmo tópico do SNS. Sem `OK`, os incidentes não são resolvidos automaticamente. Para alertas de ausência de dados, envie também **Dados insuficientes** (`INSUFFICIENT_DATA`).
+2. Adicione uma assinatura HTTPS ao tópico. Use como endpoint o endereço de recebimento com o token:
+
+   ```bash
+   aws sns subscribe \
+     --topic-arn <ARN of the topic> \
+     --protocol https \
+     --notification-endpoint 'https://<molesignal-host>/api/v1/intake/alerts?token=<token>'
+   ```
+
+3. A assinatura é confirmada automaticamente: o MoleSignal verifica a assinatura digital da mensagem de confirmação e depois acessa o `SubscribeURL` da mensagem.
+
+O MoleSignal verifica a assinatura digital de cada mensagem do SNS. Mantenha **Entrega de mensagens brutas** desativada. Se a opção estiver ativada, o MoleSignal recusa as mensagens e informa o motivo na seção Recebidos recentemente da página da origem. O certificado de assinatura vem de `sns.<region>.amazonaws.com`. Garanta que o nó que recebe a solicitação consiga acessar esse endereço.
+
+Os alarmes do CloudWatch não têm gravidade. Os incidentes usam a gravidade padrão da origem. O ARN do alarme é a chave de deduplicação, inclusive para alarmes compostos. O MoleSignal inclui a descrição do alarme e o motivo da mudança de estado nas anotações. A região, a conta, o namespace, a métrica e as dimensões ficam nos rótulos, o que permite usar um rótulo como `aws.region` para definir o roteamento.
+
+### Zabbix
+
+Compatível com o Zabbix 6.0 ou posterior. O Zabbix não tem um formato próprio de solicitação: o script de um tipo de mídia envia a solicitação. A página da origem e a caixa de diálogo de criação disponibilizam um tipo de mídia com o endereço e o token já preenchidos:
+
+1. Salve o tipo de mídia em YAML e importe o arquivo em **Alertas → Tipos de mídia → Importar**. Confira o parâmetro `token`.
+2. Defina a macro global `{$ZABBIX.URL}` como o endereço da interface do Zabbix. O MoleSignal inclui esse endereço na chave de deduplicação. Assim, uma única origem pode receber alertas de vários servidores Zabbix, e os incidentes incluem links para o Zabbix. A integração também funciona sem essa macro.
+3. Atribua essa mídia a um usuário. Informe qualquer valor em **Enviar para**. O script não usa esse campo.
+4. Adicione uma ação de trigger e encaminhe todas as **Operações**, **Operações de recuperação** e **Operações de atualização** para esse usuário. Sem operações de recuperação, os incidentes não são resolvidos automaticamente.
+
+O botão **Teste** do tipo de mídia exige valores reais. Se o Zabbix não expandir as macros (`{EVENT.ID}` chega sem alteração), o MoleSignal retorna `400` e orienta a usar o tipo de mídia da documentação.
+
+### E-mail
+
+Há duas formas de receber e-mails. Ambas processam as mensagens da mesma forma para gerar alertas.
+
+**Ler uma caixa de e-mail** (recomendado): o MoleSignal lê uma caixa de e-mail IMAP em intervalos regulares. Basta ter uma conexão de saída e uma caixa de e-mail. Não é necessário ter endereço público, registro MX, porta 25 nem certificado. Essa é a opção mais simples para instalações autogerenciadas. Envie os e-mails de alerta do sistema de monitoramento para essa caixa ou encaminhe as mensagens com uma regra de e-mail.
+
+Na página da origem, em **Ler uma caixa de e-mail**, preencha **Servidor IMAP**, **Porta**, **Criptografia**, **Nome de usuário**, **Senha**, **Pasta** (`INBOX` por padrão) e **Ler a cada** (de 15 a 3600 segundos, com padrão de 60). Clique em **Testar conexão** e depois em **Salvar caixa de e-mail**.
+
+- **Somente leitura**: o MoleSignal usa `EXAMINE` e `BODY.PEEK[]`, sem marcar mensagens como lidas nem excluí-las. Uma conta com acesso somente leitura é suficiente.
+- **Sem leitura de mensagens antigas**: na primeira conexão, o MoleSignal registra a posição e lê apenas as mensagens que chegam depois. Se o host, a conta ou a pasta mudar, ou se o servidor reconstruir a caixa de e-mail (alterando `UIDVALIDITY`), a leitura recomeça a partir desse momento. Enquanto a origem estiver desativada, o MoleSignal não lê mensagens nem mantém a posição. A leitura recomeça no momento da reativação.
+- **Lista de remetentes obrigatória**: qualquer pessoa que conheça o endereço pode enviar mensagens para a caixa. Nas configurações da origem, informe endereços em **Aceitar e-mails de** ou use `@example.com` para aceitar um domínio inteiro. Use `*` para aceitar qualquer remetente. A lista verifica o cabeçalho `From`, que pode ser falsificado. Mantenha ativos o filtro de spam e o DMARC do provedor de e-mail. O MoleSignal registra mensagens de outros remetentes como **Recusada** e não abre incidentes.
+- **Autenticação**: use uma senha ou uma senha de aplicativo do provedor. O Microsoft 365 não aceita mais senhas. Selecione **OAuth 2.0** e preencha o endereço do token `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token`, o ID do cliente, o segredo do cliente e o escopo `https://outlook.office365.com/.default`. O aplicativo precisa da permissão `IMAP.AccessAsApp` e de acesso à caixa de e-mail.
+- **Sem criptografia**: use essa opção apenas em uma rede confiável, pois a senha trafega em texto claro.
+- Se a leitura falhar, a página da origem mostra o motivo e o MoleSignal tenta novamente no próximo ciclo. Se houver vários nós de alertas, apenas um deles lê cada caixa. Em uma configuração federada, configure a caixa no cluster receptor da origem. A configuração não é sincronizada, e a senha fica nesse cluster.
+
+**Enviar o e-mail bruto via POST**: se já houver um sistema de e-mail em operação (`pipe` do Postfix, SES ou MIME bruto do Mailgun), envie a mensagem bruta via POST para o endereço de recebimento:
+
+```bash
+curl -X POST 'https://<molesignal-host>/api/v1/intake/alerts' \
+  -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: message/rfc822' \
+  --data-binary @alert.eml
+```
+
+O sistema de e-mail precisa conseguir acessar o endereço de recebimento. Aqui, a lista de remetentes é opcional, pois o token já identifica quem faz a solicitação. Se houver uma lista, o MoleSignal a aplica.
+
+O MoleSignal não tem um receptor SMTP integrado. Isso exigiria uma porta 25 aberta, um registro MX, um certificado TLS e um filtro de spam próprio, recursos que a maioria das instalações autogerenciadas não consegue oferecer.
+
+**Como os e-mails são processados**: configure a leitura em **Como os e-mails são lidos**, nas configurações da origem:
+
+| Configuração | Descrição |
+|---|---|
+| **Assuntos que indicam recuperação** | Uma expressão regular. Se o campo estiver vazio, o MoleSignal usa a expressão integrada: `resolved`, `recovered`, `recovery`, `cleared`, `恢复`, `已解决` e `OK` no início do assunto. Os demais e-mails acionam alertas. |
+| **Chave de deduplicação extraída do assunto** | Uma expressão regular. O MoleSignal usa o primeiro grupo de captura, como em `host=(\S+)`. Se o campo estiver vazio ou não houver correspondência, o MoleSignal normaliza o assunto: remove `Re:` e `Fwd:`, termos de status (`PROBLEM`, `RECOVERY`, `告警`, `恢复` etc.), níveis de gravidade, datas, horários e porcentagens, sem distinguir maiúsculas de minúsculas. Assim, “CRITICAL: disk full on web-1 (91%)” e “RECOVERY: disk full on web-1 (40%)” correspondem ao mesmo alerta, enquanto `web-1` e `web-2` correspondem a alertas diferentes. O domínio do remetente também faz parte da chave. |
+| **Assuntos que não geram alertas** | Uma expressão regular. O MoleSignal ignora os e-mails que correspondem à expressão e os exibe na seção Recebidos recentemente. |
+
+O MoleSignal determina a gravidade pelos termos no assunto (`critical`, `fatal`, `disaster` e `P1` indicam crítico; `error` e `P2`, erro; `warning` e `P3`, aviso; `info`, `notice`, `P4` e `P5`, informativo). Se nenhum termo corresponder, usa a gravidade padrão da origem. As palavras high e low em `High CPU` e `Low disk` não contam. O MoleSignal registra o corpo na anotação `message` (converte e-mails em HTML para texto e limita o conteúdo a 4096 caracteres), registra o remetente no rótulo `email.from` e na anotação `from` e obtém o horário do cabeçalho `Date`. Respostas automáticas (`Auto-Submitted: auto-replied`) e devoluções (`multipart/report`) não geram alertas. O MoleSignal aceita GBK, GB2312 e outros conjuntos de caracteres. O MoleSignal registra mensagens acima de 4 MiB como **Recusada** sem ler o corpo.
+
+## Como os alertas se tornam incidentes
+
+| Tipo | Chave de desduplicação | Disparo | Resolução | Gravidade |
+|---|---|---|---|---|
+| **API** | `dedupKey` | `trigger` | `resolve` | `severity` |
+| **Alertmanager** | URL externa e `groupKey` | `status` do grupo igual a `firing` | `status` do grupo igual a `resolved`: todos os alertas do grupo voltaram ao normal | O valor mais alto do rótulo `severity` entre os alertas ativos do grupo |
+| **Grafana** | URL externa, organização e `groupKey` | Igual ao Alertmanager | Igual ao Alertmanager | Igual ao Alertmanager |
+| **Datadog** | Site, organização, ID do monitor e escopo | Qualquer transição, exceto para `Recovered` | `Recovered` | `$ALERT_PRIORITY`; sem esse valor, Warn e No Data correspondem a aviso, e os demais estados seguem `$ALERT_TYPE` |
+| **PagerDuty** | Domínio da conta e ID do incidente no PagerDuty | `incident.triggered`, `incident.reopened`; `incident.priority_updated` altera a gravidade | `incident.resolved` | Prioridade de P1 a P5; sem prioridade, urgência alta corresponde a erro e urgência baixa, a aviso |
+| **Alibaba Cloud CloudMonitor** | Conta, ID da regra e `dimensions`; para eventos do sistema, conta e `dedupId` | `ALERT`, `INSUFFICIENT_DATA`; evento do sistema `TRIGGERED` | `OK`; evento do sistema `RESOLVED` | `triggerLevel`; `severity` do evento do sistema |
+| **Tencent Cloud Observability Platform** | Conta, política, nome da métrica ou do evento, nível e objeto | `alarmStatus` igual a `1` ou `5` | `alarmStatus` igual a `0` | `alarmLevel` |
+| **Amazon CloudWatch** | `AlarmArn` | `NewStateValue` igual a `ALARM` ou `INSUFFICIENT_DATA` | `NewStateValue` igual a `OK` | Nenhuma: usa a gravidade padrão da origem |
+| **Zabbix** | Host de `{$ZABBIX.URL}` e `{EVENT.ID}` | `{EVENT.VALUE}` igual a 1; operações de atualização também disparam o incidente, com a gravidade correspondente | `{EVENT.VALUE}` igual a 0 ou uma operação de atualização encerra o problema | `{EVENT.NSEVERITY}`: Disaster corresponde a crítica; High, a erro; Average e Warning, a aviso; Information, a informativa |
+| **E-mail** | Domínio do remetente e trecho extraído do assunto | Outros e-mails | Assunto que indica retorno ao normal | Palavras no assunto |
+
+O MoleSignal lê a prioridade e a urgência separadamente: `priority` e `urgency` da API, `$ALERT_PRIORITY` do Datadog e a prioridade e a urgência do PagerDuty definem a prioridade e a urgência do incidente. Quando a origem não informa a urgência, a política de escalonamento da origem a define. Alertas que não informam a gravidade têm urgência alta. Consulte [Urgência](/pt-BR/alerting/on-call#urgência).
+
+Alertas sem gravidade usam a **Gravidade padrão** da origem. Os termos de gravidade de todos os remetentes não diferenciam maiúsculas de minúsculas: `critical`, `crit`, `fatal`, `page` e `P1` correspondem a crítica; `error`, `major`, `high` e `P2`, a erro; `warning`, `warn`, `minor`, `medium` e `P3`, a aviso; `info`, `low`, `P4` e `P5`, a informativa. Qualquer outro termo usa a gravidade padrão.
+
+- **Abertura**: cada origem tem no máximo um incidente ativo por chave de desduplicação. O incidente inclui os rótulos `alert.source=external` e `external.kind=<kind>`, os rótulos do próprio alerta (no Alertmanager e no Grafana, os `commonLabels` do grupo) e os rótulos adicionais da origem. O rótulo `service.name` ou `service` identifica um serviço afetado, e `host.name`, `host` ou `hostname` identifica um host.
+- **Título**: a API usa `summary`; o Alertmanager e o Grafana usam a anotação `summary` ou, se ela não existir, `alertname`; o Datadog usa `$ALERT_TITLE`; o PagerDuty usa o título do incidente; o Alibaba Cloud CloudMonitor usa "nome do alarme · nome da instância".
+- **Links**: o MoleSignal guarda os endereços do remetente em anotações como `alertmanager_url`, `generator_url`, `dashboard_url`, `datadog_url` e `pagerduty_url`. A página do incidente exibe esses endereços como links. O MoleSignal usa o `name` de cada item de `links` da API para registrá-lo nas anotações.
+- **Alertas de um grupo**: um incidente do Alertmanager ou do Grafana mantém até 100 alertas do grupo e atualiza seus status a cada notificação. A seção **Alerta externo** da página do incidente lista os alertas com os rótulos que os distinguem.
+- **Alterações de gravidade**: enquanto o incidente não tiver reconhecimento, sua gravidade acompanha a do alerta, conforme definem os [pipelines de alertas](/pt-BR/pipelines/alert-events#alterações-de-severidade). Se a gravidade aumentar, o escalonamento recomeça na primeira etapa. A gravidade definida manualmente não muda.
+- **Reconhecimento**: `acknowledge` da API, `incident.acknowledged` do PagerDuty e as operações de atualização do Zabbix que reconhecem um problema marcam o incidente como reconhecido e interrompem as etapas de escalonamento e as chamadas restantes. O MoleSignal não atribui o reconhecimento a nenhum usuário.
+- **Resolução**: o MoleSignal resolve o incidente quando a origem informa que o alerta voltou ao normal, mesmo se o incidente já tiver reconhecimento. O MoleSignal não atribui a resolução a nenhum usuário, e a linha do tempo indica o retorno ao normal.
+- **Mensagens atrasadas**: para cada chave de desduplicação, o MoleSignal guarda o horário mais recente que aceitou do remetente e ignora mensagens anteriores a esse horário. Um disparo atrasado não reabre um incidente antigo, e uma notificação atrasada de retorno ao normal não encerra um incidente novo. Como a API não envia o horário, o MoleSignal processa as mensagens na ordem de chegada.
+- **Resolução manual antes do retorno ao normal**: se a origem ainda indicar que o alerta está ativo, o próximo reenvio abre um novo incidente, assim como ocorre com as regras.
+- **Sem dados**: os incidentes que `INSUFFICIENT_DATA` do CloudMonitor ou No Data do Datadog abrem incluem `alert.condition=no_data`, e os títulos das notificações começam com `NO DATA`.
+- **Desativação e exclusão**: uma origem desativada recusa alertas (`409`), e os incidentes em aberto permanecem abertos. Excluir uma origem invalida seu token imediatamente e resolve seus incidentes em aberto.
+
+As [políticas de silenciamento](/pt-BR/alerting/silences), os [grupos semânticos](/pt-BR/alerting/silences#grupos-semânticos) e as [políticas de notificação](/pt-BR/notification-channels) se aplicam a incidentes externos da mesma forma que aos demais. Use `external.kind`, os rótulos adicionais da origem ou os rótulos do próprio alerta como critérios de correspondência.
+
+## Solicitações recentes
+
+O topo da página da origem mostra o status: **Aguardando a primeira solicitação**, **Recebendo solicitações**, **Última solicitação recusada**, **Sem solicitações nos últimos 7 dias** ou **Desativada**. Ao lado do status, a página mostra as solicitações e os alertas das últimas 24 horas e os incidentes que a origem abriu e que continuam em aberto.
+
+Assim que a origem recebe solicitações, a seção **Solicitações recentes** da página da origem lista o horário, o resultado (**Processada**, **Recusada** ou **Encaminhada**), o status HTTP, a quantidade de alertas e o resultado de cada alerta (**Aberto**, **Atualizado**, **Sem alterações**, **Reconhecido**, **Resolvido** ou **Ignorado**). Clique em uma linha para ver o título, a gravidade, a ação, o resultado e o incidente de cada alerta. Se a solicitação tiver sido recusada, a página também mostra o motivo e o início do corpo da solicitação (até 16 KiB). O MoleSignal mantém as últimas 500 solicitações de cada origem por até 7 dias.
+
+## Vários clusters
+
+Com a [federação entre clusters](/pt-BR/settings/data-plane#federação-de-clusters) ativada:
+
+- O MoleSignal sincroniza as origens entre os clusters, incluindo os tokens, assim como faz com as demais configurações de alertas. Assim, o mesmo token funciona no endereço de recebimento de cada cluster.
+- Os incidentes de uma origem são abertos apenas no **Cluster receptor**: por padrão, o cluster em que a origem foi criada. Para usar outro, altere a configuração da origem. Se outro cluster receber um alerta da origem, ele encaminha o alerta por gRPC ao cluster receptor e retorna ao remetente a resposta desse cluster. Assim, um alerta externo gera um único incidente, independentemente do endereço do cluster que o recebe.
+- Se o cluster receptor estiver inacessível, o MoleSignal retorna `503` e o remetente tenta novamente. Se a região do cluster receptor continuar indisponível, selecione um cluster disponível em **Cluster receptor** nas configurações da origem.
+- O cluster que processou a solicitação registra a entrada em **Solicitações recentes**. Ao abrir a página da origem em outro cluster, a página informa onde fica o registro.
+
+## Limites
+
+| Item | Limite |
+|---|---|
+| Corpo da requisição para um e-mail | Até 4 MiB. |
+| Leitura de uma caixa de correio | Até 50 e-mails por vez. Os demais ficam para a próxima rodada. |
+| Uma requisição à API | 100 alertas, com até 255 caracteres em `dedupKey` e até 1024 caracteres em `summary`. |
+| Um alerta | 64 rótulos e 64 anotações. A API rejeita requisições que excedem esses limites. Nos outros tipos de fonte, o MoleSignal descarta o excedente e trunca títulos e anotações longos demais. |
+| Alertas de um grupo | O MoleSignal mantém 100 alertas. |
+| Rótulos extras de uma fonte | 32. Nenhuma chave pode começar com `alert.` nem ser `external.kind`. |
+| Requisições recebidas recentemente | As últimas 500 requisições de cada fonte, por até 7 dias. |
+
+O MoleSignal não verifica a assinatura HMAC do Grafana nem a assinatura do PagerDuty, pois o token já identifica a fonte. O MoleSignal não informa ao remetente quando um incidente é reconhecido ou resolvido.
+
+## API de fontes de alertas
+
+| Operação | Endpoint |
+|---|---|
+| Enviar alertas | [`POST /api/v1/intake/alerts`](/pt-BR/api/alerting/send-alerts) |
+| Listar fontes | [`GET /api/v1/alerts/sources`](/pt-BR/api/alerting/list-sources) |
+| Criar uma fonte | [`POST /api/v1/alerts/sources`](/pt-BR/api/alerting/create-source) |
+| Atualizar uma fonte | [`PUT /api/v1/alerts/sources/{id}`](/pt-BR/api/alerting/update-source) |
+| Excluir uma fonte | [`DELETE /api/v1/alerts/sources/{id}`](/pt-BR/api/alerting/delete-source) |
+| Rotacionar um token | [`POST /api/v1/alerts/sources/{id}/token`](/pt-BR/api/alerting/rotate-source-token) |
+| Requisições recebidas recentemente | [`GET /api/v1/alerts/sources/{id}/requests`](/pt-BR/api/alerting/list-source-requests) |
+| Caixa de correio de uma fonte de e-mail | [`/api/v1/alerts/sources/{id}/mailbox`](/pt-BR/api/alerting/source-mailbox) |
+| Fonte de um incidente externo | [`GET /api/v1/alerts/incidents/{id}/source`](/pt-BR/api/alerting/incident-source) |

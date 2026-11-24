@@ -1,0 +1,100 @@
+---
+title: "Importar e exportar regras"
+description: "Exporte regras de alerta em um pacote que identifica suas referências ou importe um pacote ou um arquivo de regras de alerta do Prometheus."
+"en_link": "/en-US/api/alerting/rule-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/rule-transfer"
+"zh-Hant_link": "/zh-Hant/api/alerting/rule-transfer"
+"ja_link": "/ja/api/alerting/rule-transfer"
+"ko_link": "/ko/api/alerting/rule-transfer"
+"de_link": "/de/api/alerting/rule-transfer"
+"es_link": "/es/api/alerting/rule-transfer"
+"fr_link": "/fr/api/alerting/rule-transfer"
+---
+
+```http
+GET  /api/v1/alerts/rules/export
+POST /api/v1/alerts/rules/import
+```
+
+## Exportar
+
+Requer `alerts.rules.read`. O parâmetro de consulta `ids` aceita IDs de regras separados por vírgulas. Se estiver vazio, exporta todas as
+regras. A resposta é um pacote:
+
+```json
+{
+  "format": "molesignal.alert-rules/v1",
+  "exportedAt": "2026-10-28T08:00:00Z",
+  "rules": [
+    {
+      "name": "High error rate",
+      "description": "",
+      "enabled": true,
+      "kind": "scheduled",
+      "query": {"language": "promql", "statement": "sum(rate(http_requests_total{code=~\"5..\"}[5m]))", "periodSecs": 60, "stream": {"name": "http_requests_total", "streamType": "metrics"}},
+      "trigger": {"operator": "gt", "threshold": 5, "forPeriods": 2, "silenceSecs": 300},
+      "thresholds": [],
+      "severity": "error",
+      "escalationPolicy": "Payments on-call",
+      "labels": {"service": "checkout"},
+      "annotations": {}
+    }
+  ]
+}
+```
+
+Cada regra mantém a definição completa, mas não inclui ID, organização, estado de avaliação nem horários.
+`escalationPolicy` indica o nome da política de escalonamento e não aparece quando a política é a padrão. O campo
+`query.composite.rules` de uma regra composta lista os nomes das regras filhas. O pacote não inclui o endereço de check-in de uma
+regra de heartbeat.
+
+## Importar
+
+Requer `alerts.rules.manage`.
+
+| Campo | Tipo | Obrigatório | Descrição |
+|---|---|---|---|
+| `content` | string | Sim | Um pacote (JSON ou YAML, com `format`) ou um arquivo de regras de alerta do Prometheus (`groups` no nível raiz ou `spec.groups` de um `PrometheusRule`). Limites: 4 MiB e 500 regras. |
+| `dryRun` | boolean | Não | O valor padrão, `true`, apenas simula a importação. Use `false` para gravar as regras. |
+| `createOnly` | boolean | Não | Use `true` para manter inalteradas as regras existentes com o mesmo nome. |
+
+A importação identifica cada regra pelo nome: cria uma regra se o nome for novo, compara os campos se houver uma única regra com o mesmo nome e
+falha se houver várias regras com esse nome ou se o arquivo repetir o nome. A importação aplica a cada regra as mesmas validações usadas ao salvá-la. Se alguma regra falhar,
+a importação não grava nada. Caso contrário, grava tudo em uma única transação, envia um evento de alteração da federação
+por regra e registra um único evento de auditoria `alert_rules.imported`. Consulte
+[Importar e exportar](/pt-BR/alerting/rules#importar-e-exportar) para saber como o MoleSignal converte uma regra do Prometheus em uma
+regra do MoleSignal.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content rules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "prometheus",
+  "items": [
+    {"name": "HighErrorRate", "action": "create", "ruleId": "3KF1..."},
+    {"name": "DiskFull", "action": "update", "changes": ["query", "trigger"], "ruleId": "3KC9..."},
+    {"name": "TargetDown", "action": "error", "error": "no escalation policy is named `ops`"}
+  ],
+  "notes": ["recording rule `job:errors:rate5m` in group `api` is not imported"],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` pode ser `create`, `update`, `unchanged`, `skip` (regra existente com `createOnly`) ou `error`.
+`applied` indica se a importação gravou alguma alteração.
+
+**Erros**
+
+| Status | Motivo |
+|---|---|
+| `400` | O conteúdo não é um pacote nem um arquivo de regras do Prometheus, declara outro formato ou excede o limite de tamanho ou de quantidade de regras. |
+| `403` | O token não tem a permissão necessária. |

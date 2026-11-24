@@ -1,0 +1,152 @@
+---
+title: "Introduction à l’API"
+description: "URL de base, authentification, autorisations, conventions de requête, pagination, streaming et gestion des erreurs."
+"en_link": "/en-US/api-reference"
+"zh-Hans_link": "/zh-Hans/api-reference"
+"zh-Hant_link": "/zh-Hant/api-reference"
+"ja_link": "/ja/api-reference"
+"ko_link": "/ko/api-reference"
+"de_link": "/de/api-reference"
+"es_link": "/es/api-reference"
+"pt-BR_link": "/pt-BR/api-reference"
+---
+
+MoleSignal expose une API HTTP versionnée. Les points de terminaison du produit utilisent `/api/v1`. La sonde d’état de santé, les métriques Prometheus, les liens de partage publics et certains protocoles de compatibilité utilisent d’autres chemins.
+
+## URL de base
+
+Pour une instance locale :
+
+```text
+http://localhost:5080/api/v1
+```
+
+En production, remplacez l’hôte par l’adresse publique du déploiement, définie par la valeur de `[http].external_url`.
+
+## Authentification
+
+Les points de terminaison protégés acceptent un jeton Bearer dans l’en-tête `Authorization` :
+
+```http
+Authorization: Bearer <token>
+```
+
+| Jeton | Comment l’obtenir | Durée de validité |
+|---|---|---|
+| Jeton d’API | **Paramètres du compte → Jetons d’API** ou [Émettre un jeton d’API](/fr/api/auth/issue-token). Les jetons suivent le format `mspat-<36>`. | Jusqu’à la révocation ou à la date d’expiration choisie. |
+| Jeton d’ingestion par défaut | `GET /api/v1/me/api-tokens/default`. Autorise uniquement `logs.write`, `metrics.write`, `traces.write`, `profiles.write` et `apm.deploy`. | N’expire pas. |
+| Jeton client RUM | `GET /api/v1/auth/tokens/rum?applicationId=<id>`. Autorise uniquement `rum.write`. | N’expire pas. |
+
+Utilisez un jeton d’API pour les scripts et les collecteurs. Consultez [Source de données](/fr/intake#jetons-d’ingestion) pour en savoir plus sur les jetons d’ingestion.
+
+L’interface web utilise `POST /api/v1/auth/signin` pour la connexion. Ce point de terminaison définit des cookies de session au lieu de renvoyer un jeton. L’en-tête `Authorization` n’accepte pas les jetons de session. Consultez [Se connecter](/fr/api/auth/login).
+
+L’authentification crée un contexte IAM qui contient le sujet, le périmètre actif (organisation ou plateforme) et les autorisations effectives. L’organisation associée à une requête provient toujours de ce contexte. Le corps d’une requête ne permet pas de sélectionner une autre organisation.
+
+## Routes publiques et routes avec leur propre authentification
+
+Certaines routes ne peuvent pas utiliser de jeton Bearer d’organisation. Elles vérifient à la place un élément d’authentification à portée plus restreinte ou une politique :
+
+- connexion, politique d’inscription et réinitialisation du mot de passe ;
+- `GET /api/v1/healthz` et `/metrics` à la racine ;
+- échange de jetons de partage public de ressources et requêtes de session de partage ;
+- téléchargements de fichiers signés et avatars publics ;
+- points de terminaison des connecteurs push, qui valident un jeton push.
+
+Une route publique reste soumise à des restrictions. Le gestionnaire de la route vérifie la politique d’inscription, un jeton de partage, un jeton de téléchargement, une signature ou l’élément d’authentification du connecteur.
+
+## Autorisation
+
+Un point de terminaison peut exiger une ou plusieurs des conditions suivantes :
+
+- une autorisation d’organisation comme `streams.query` ;
+- une autorisation de plateforme comme `sys.telemetry.read` ;
+- la propriété d’une ressource, un lien avec cette ressource ou une autorisation interorganisation.
+
+`GET /api/v1/iam/capabilities` renvoie les autorisations effectives du sujet actuel. Ne déduisez pas les droits d’accès du nom d’un rôle ou de la présence d’un élément de menu.
+
+## Requêtes
+
+- La plupart des corps de requête utilisent JSON avec `Content-Type: application/json`.
+- Les points de terminaison d’ingestion compatibles utilisent le format de données de leur protocole, par exemple Protobuf, NDJSON ou un corps compressé avec gzip.
+- Les points de terminaison d’ingestion renvoient `413` si le corps dépasse 2 MiB, ou 16 MiB pour l’ingestion JSON native.
+- Les valeurs temporelles sont des entiers exprimés en microsecondes depuis l’époque Unix. Le nom d’un instant indique l’événement correspondant (`createdAt`, `expiresAt)`. Il inclut `Time` si un seul mot prête à confusion (`startTime`) ; le nom d’une durée se termine par `Time` (`p95Time`), sauf s’il exprime déjà cette notion (`duration`). Les enregistrements de télémétrie natifs utilisent `_timestamp`, également exprimé en microsecondes.
+- Encodez les identifiants dans les chemins et les noms de flux au format URL.
+
+## Réponses et erreurs
+
+Une réponse de succès utilise JSON, sauf si le point de terminaison transmet les données en continu ou fournit un fichier à télécharger. Une réponse d’erreur contient un code de statut et un corps JSON avec un code `error` exploitable par programme et un champ `message` :
+
+```json
+{
+  "error": "unauthorized",
+  "message": "unauthorized: missing Authorization Bearer token"
+}
+```
+
+Une erreur `validation_failed` ajoute un tableau `issues` avec une entrée par champ non valide.
+
+| Statut | `error` | Signification |
+|---|---|---|
+| `400` | `invalid_argument`, `validation_failed` | La requête ou l’un de ses paramètres n’est pas valide. |
+| `401` | `unauthorized` | Le jeton est absent, mal formé, non valide ou expiré. |
+| `403` | `forbidden` | L’autorisation, le lien ou le périmètre requis manque. |
+| `404` | `not_found` | La ressource n’existe pas ou n’est pas visible dans le périmètre autorisé. |
+| `409` | `conflict` | Un conflit d’état ou d’unicité s’est produit. |
+| `413` | `payload_too_large` | Le corps dépasse la taille maximale. |
+| `429` | `resource_exhausted` | Une limite de débit s’applique. Respectez l’en-tête `Retry-After` s’il est présent. |
+| `499` | `cancelled` | La requête a été annulée. |
+| `503` | `unavailable` | Une dépendance est indisponible. |
+| `500` | `internal` | Une erreur interne s’est produite. Le corps contient le message `internal error`. Seul le journal du serveur contient les détails. |
+
+Si le serveur ne peut pas analyser le corps d’une requête, il la rejette avant qu’elle n’atteigne le point de terminaison. Dans ce cas, la réponse utilise du texte brut plutôt que du JSON :
+
+| Statut | Signification |
+|---|---|
+| `400` | Le corps ne contient pas de JSON valide. |
+| `415` | La requête ne contient pas `Content-Type: application/json`. |
+| `422` | Un champ manque ou présente un type incorrect. Le texte indique le nom du champ. |
+
+Chaque réponse contient les en-têtes `X-Request-Id` et `X-Trace-Id`. Incluez ces deux en-têtes dans tout signalement d’une erreur côté serveur.
+
+## Pagination
+
+Les points de terminaison qui peuvent renvoyer de nombreuses lignes acceptent `limit` et `cursor`. Leurs réponses contiennent `items` et `nextCursor`. Passez la valeur de `nextCursor` dans `cursor` pour lire la page suivante. Arrêtez-vous lorsque `nextCursor` est vide. Les autres points de terminaison de liste renvoient la liste complète. Consultez la page de chaque point de terminaison.
+
+## Requêtes et traitements de longue durée
+
+Les points de terminaison de requête renvoient du JSON standard, transmettent du NDJSON en continu et exécutent les requêtes longues sous forme de tâches de recherche asynchrones. Si une requête est trop volumineuse, le point de terminaison renvoie `202` avec un `jobId` et un chemin `monitor`. Si le point de terminaison transmet les résultats en continu, gérez la réception partielle et annulez la requête dès que le résultat n’est plus nécessaire. Consultez [Requête](/fr/query).
+
+Pour les éléments volumineux comme les rapports générés, les objets binaires de profil ou les exports, l’API fournit des fichiers accessibles avec un jeton de téléchargement à portée limitée, plutôt que de les inclure dans un corps JSON.
+
+## Parcourir l’API
+
+<CardGroup cols={3}>
+  <Card title="Catalogue de l’API" icon="list" href="/fr/api/catalog">
+    Familles de routes, usages et autorisations requises.
+  </Card>
+  <Card title="Authentification" icon="key" href="/fr/api/auth/login">
+    Connectez-vous et gérez les jetons d’API.
+  </Card>
+  <Card title="Ingestion" icon="inbox" href="/fr/api/intake/native-json">
+    Envoyez des données de télémétrie au format JSON natif ou dans un format compatible avec le protocole.
+  </Card>
+  <Card title="Requête" icon="magnifying-glass" href="/fr/api/query/execute">
+    Exécutez des requêtes SQL, compatibles avec PromQL, à résultats en continu ou enregistrées.
+  </Card>
+  <Card title="APM" icon="gauge-high" href="/fr/api/apm">
+    Consultez les métriques de services, de transactions, de dépendances et d’erreurs.
+  </Card>
+  <Card title="Flux" icon="database" href="/fr/api/streams/list">
+    Créez, inspectez et configurez des flux.
+  </Card>
+  <Card title="Alertes" icon="bell" href="/fr/api/alerting/list-rules">
+    Gérez les règles, les incidents, les canaux et les escalades.
+  </Card>
+  <Card title="Corrélation et web" icon="diagram-project" href="/fr/api/web/correlation">
+    Recherche, topologie, traces et navigation entre les signaux.
+  </Card>
+  <Card title="Plateforme et administration" icon="shield-halved" href="/fr/api/admin/audit">
+    Journal d’audit, clés de chiffrement et état de santé.
+  </Card>
+</CardGroup>

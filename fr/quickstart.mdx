@@ -1,0 +1,204 @@
+---
+title: "Démarrage rapide"
+description: "Lancez un environnement de test local de MoleSignal avec Docker Compose, envoyez un événement de log et retrouvez-le dans l’interface web."
+"en_link": "/en-US/quickstart"
+"zh-Hans_link": "/zh-Hans/quickstart"
+"zh-Hant_link": "/zh-Hant/quickstart"
+"ja_link": "/ja/quickstart"
+"ko_link": "/ko/quickstart"
+"de_link": "/de/quickstart"
+"es_link": "/es/quickstart"
+"pt-BR_link": "/pt-BR/quickstart"
+---
+
+Ce guide lance un bac à sable MoleSignal en local, envoie un événement de journal et le retrouve dans l’interface web et via l’API de requête. Le bac à sable sert uniquement à l’évaluation.
+
+## Prérequis
+
+- **Docker** avec **Docker Compose** v2.
+- Environ 2 GB de mémoire disponible.
+- Ports locaux disponibles : `5080` (interface web et API), `5082`, `5432` (PostgreSQL), `9000` et `9001` (RustFS).
+
+## Démarrer le bac à sable
+
+<Steps>
+  <Step title="Cloner le dépôt et démarrer la pile">
+    ```bash
+    git clone https://github.com/molesignal/molesignal
+    cd molesignal
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
+    ```
+
+    Au premier démarrage, Docker Compose télécharge ou construit les images, ce qui peut prendre plusieurs minutes. La pile comprend PostgreSQL 17 pour les métadonnées, RustFS pour le stockage d’objets compatible S3 et un processus MoleSignal qui assure tous les rôles et sert l’interface web.
+
+    Vérifiez que le serveur est prêt :
+
+    ```bash
+    curl http://localhost:5080/api/v1/healthz
+    ```
+
+    Un serveur opérationnel renvoie `{"status":"ok"}`.
+  </Step>
+
+  <Step title="Se connecter à l’interface web">
+    Ouvrez [http://localhost:5080](http://localhost:5080) et connectez-vous avec les identifiants suivants :
+
+    - **Adresse e-mail :** `admin@example.com`
+    - **Mot de passe :** `admin`
+
+    <Warning>
+      La configuration du bac à sable crée ce compte racine uniquement au premier démarrage. Remplacez ce compte avant toute utilisation autre qu’une évaluation locale. Consultez la [Liste de contrôle pour la production](/fr/deployment/production-checklist).
+    </Warning>
+
+    Accédez à la console RustFS à l’adresse [http://localhost:9001](http://localhost:9001) avec `rustfsadmin` / `rustfsadmin`. Ces identifiants du bac à sable ne sont pas sûrs.
+  </Step>
+
+  <Step title="Obtenir un jeton d’accès">
+    La connexion via l’API définit les cookies de session utilisés par l’interface web, et `curl` les conserve dans `ms-cookies.txt`. L’API accepte un jeton d’API comme jeton de type Bearer. Utilisez la session une seule fois pour créer un jeton d’API personnel valable 7 jours, puis notez l’identifiant de l’organisation. Le jeton dispose des mêmes autorisations que le compte.
+
+    ```bash
+    RESP=$(curl -s -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+      -H 'content-type: application/json' \
+      -d '{"email":"admin@example.com","password":"admin"}')
+
+    export MS_ORG=$(echo "$RESP" | jq -r .login.orgId)
+
+    export MS_TOKEN=$(curl -s -b ms-cookies.txt -X POST http://localhost:5080/api/v1/me/api-tokens \
+      -H 'content-type: application/json' \
+      -d '{"name":"quickstart","expiresInDays":7}' | jq -r .token)
+    ```
+
+    Sans `jq`, copiez `orgId` depuis la réponse de connexion et `token` depuis la dernière réponse, puis exportez-les manuellement.
+
+    <Note>
+      Par défaut, les cookies de session expirent au bout de 24 heures. Le jeton d’API reste utilisable jusqu’à son expiration ou sa révocation dans **Paramètres du compte → Jetons d’API**. Consultez [Jetons d’API](/fr/identity/tokens).
+    </Note>
+  </Step>
+
+  <Step title="Envoyer un événement de journal">
+    L’ingestion native de JSON via HTTP accepte un tableau d’enregistrements. `_timestamp` contient le nombre de microsecondes écoulées depuis l’époque Unix. La première écriture crée le flux `app`.
+
+    ```bash
+    curl -X POST http://localhost:5080/api/v1/intake/logs/app \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+    ```
+
+    La réponse indique les enregistrements acceptés :
+
+    ```json
+    {"accepted":1,"rejected":0,"errors":[]}
+    ```
+  </Step>
+
+  <Step title="Retrouver l’événement dans l’interface web">
+    1. Ouvrez **Journaux**.
+    2. Sélectionnez le flux `app` dans le sélecteur de flux.
+    3. Conservez la plage temporelle **Dernière heure** et cliquez sur **Exécuter**.
+
+    Le tableau des résultats affiche l’événement. Sélectionnez la ligne pour examiner ses champs d’origine.
+  </Step>
+
+  <Step title="Rechercher l’événement via l’API">
+    Lancez la même recherche via l’API de requête. Envoyez toujours un `timeRange` borné en microsecondes. Si la plage est trop large, le planificateur transforme la requête en tâche de recherche asynchrone.
+
+    ```bash
+    NOW=$(date +%s)000000
+
+    curl -X POST http://localhost:5080/api/v1/query \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+           \"statement\":\"SELECT level, msg, trace_id FROM app WHERE trace_id = 'abc123'\",
+           \"timeRange\":{\"start\":$((NOW - 3600000000)),\"end\":$((NOW + 60000000))},
+           \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+    ```
+
+    La réponse contient `columns`, `rows`, `scannedRows` et `tookMs` :
+
+    ```json
+    {"columns":["level","msg","trace_id"],"rows":[["error","db pool exhausted","abc123"]],"scannedRows":1,"tookMs":120}
+    ```
+  </Step>
+</Steps>
+
+## Charger des données d’exemple
+
+Dans un espace de travail sans données, les pages restent vides. Chargez un petit jeu de données de démonstration corrélées (journaux, métriques et traces qui partagent des valeurs `trace_id`) pour tester l’investigation entre plusieurs signaux :
+
+```bash
+curl -X POST http://localhost:5080/api/v1/onboarding/sample-data \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+
+La requête crée les flux `sample_app_logs`, `sample_app_metrics` et `sample_app_traces`. Si l’espace de travail ne contient encore aucun flux, effectuez la même opération dans l’interface web : dans **Accueil**, cliquez sur le bouton des étapes de configuration en haut de la page, puis sur **Charger** à côté de **Charger des données d’exemple**. Les étapes précédentes créent le flux `app` dans l’espace de travail. Si ces étapes sont terminées, utilisez donc la requête. Le bouton disparaît une fois toutes les étapes de la liste terminées.
+
+La réponse indique le nombre de lignes écrites dans chaque flux et fournit les identifiants du tableau de bord d’exemple et des vues enregistrées :
+
+```json
+{
+  "loaded": true,
+  "totalRows": 196,
+  "streams": [
+    { "stream": "sample_app_traces", "rows": 24 },
+    { "stream": "sample_app_logs", "rows": 24 },
+    { "stream": "sample_app_metrics", "rows": 148 }
+  ],
+  "dashboardId": "<dashboard id>",
+  "savedViewIds": ["<saved view id>", "<saved view id>", "<saved view id>", "<saved view id>"]
+}
+```
+
+`GET /api/v1/onboarding/sample-data` renvoie `{"loaded":true}` uniquement si les trois flux, le tableau de bord et les quatre vues enregistrées existent. Cette réponse n’indique pas si la plage temporelle affichée contient encore des données d’exemple. Consultez [Démarrage rapide sur la page d’accueil](/fr/home#démarrage-rapide) pour savoir ce que le chargement crée, ce qui se passe lors d’un nouveau chargement et quelles autorisations sont nécessaires.
+
+## Envoyer des données OpenTelemetry
+
+OTLP sur HTTP fonctionne avec n’importe quel SDK ou Collector OpenTelemetry. Configurez l’exportateur avec le chemin de base `/api`. L’exportateur ajoute `/v1/logs`, `/v1/metrics` et `/v1/traces` :
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer $MS_TOKEN"
+export OTEL_SERVICE_NAME=checkout
+```
+
+MoleSignal écrit les données de télémétrie dans le flux `default` de chaque type de signal, sauf si un en-tête `stream-name` désigne un autre flux. Consultez [Source de données](/fr/intake) et les [Guides d’intégration](/fr/intake/integrations) pour configurer Collector, Vector, Fluent Bit, Prometheus et les SDK.
+
+## Arrêter le bac à sable
+
+```bash
+# Stop the containers and keep the data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down
+
+# Stop the containers and delete all sandbox data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down -v
+```
+
+## Dépannage
+
+| Symptôme | Cause et solution |
+|---|---|
+| `healthz` renvoie `503` avec `"status":"degraded"` | Un sous-système présente un problème, par exemple la sonde du stockage d’objets. Lisez le champ `reason` et vérifiez le conteneur `rustfs`. |
+| La connexion renvoie `401` | La configuration crée le compte racine uniquement au premier démarrage. Un volume de base de données issu d’une exécution précédente conserve l’ancien mot de passe. Exécutez `down -v` pour réinitialiser le bac à sable. |
+| La requête renvoie `202` avec un `jobId` | La plage temporelle est trop large (environ 13,9 heures ou plus avec les paramètres par défaut). Le planificateur a donc lancé une tâche de recherche asynchrone. Réduisez la plage, envoyez `Prefer: respond-sync` ou interrogez régulièrement `GET /api/v1/query/jobs/{id}`. Consultez [Requêtes](/fr/query#plages-temporelles-et-tâches-asynchrones). |
+| La requête renvoie `422 missing field orgId` ou `400 query.stream hint is required` | Envoyez à la fois `orgId` et l’objet `stream`. |
+| Un port est déjà utilisé | Arrêtez l’autre processus ou modifiez les ports publiés dans `deploy/docker/docker-compose.yaml`. |
+| OTLP gRPC sur le port `4317` est inaccessible depuis l’hôte | Le fichier Compose du bac à sable ne publie pas le port `4317`. Ajoutez le mappage de ports `4317:4317` au service `molesignal`. |
+
+## Étapes suivantes
+
+<CardGroup cols={2}>
+  <Card title="Connecter des données réelles" icon="inbox" href="/fr/intake">
+    Utilisez la page Source de données, les jetons d’ingestion et les protocoles compatibles.
+  </Card>
+  <Card title="Guides d’intégration" icon="plug" href="/fr/intake/integrations">
+    Configurez OpenTelemetry Collector, Vector, Fluent Bit, Filebeat et Prometheus.
+  </Card>
+  <Card title="Concepts clés" icon="book" href="/fr/concepts">
+    Découvrez les signaux, les flux, les espaces de travail et les autorisations.
+  </Card>
+  <Card title="Déployer en production" icon="server" href="/fr/deployment">
+    Passez du bac à sable à un déploiement en production.
+  </Card>
+</CardGroup>

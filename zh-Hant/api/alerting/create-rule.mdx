@@ -1,0 +1,376 @@
+---
+title: "建立規則"
+description: "建立定時、即時、異常偵測、預測、離群、組合或心跳告警規則。"
+"en_link": "/en-US/api/alerting/create-rule"
+"zh-Hans_link": "/zh-Hans/api/alerting/create-rule"
+"ja_link": "/ja/api/alerting/create-rule"
+"ko_link": "/ko/api/alerting/create-rule"
+"de_link": "/de/api/alerting/create-rule"
+"es_link": "/es/api/alerting/create-rule"
+"fr_link": "/fr/api/alerting/create-rule"
+"pt-BR_link": "/pt-BR/api/alerting/create-rule"
+---
+
+```http
+POST /api/v1/alerts/rules
+```
+
+建立一條告警規則。此呼叫需要 `alerts.rules.manage` 權限。
+
+## 規則如何評估
+
+`alert` 角色每隔 `[alert].eval_interval_secs`（預設 30 秒）評估一次所有已啟用的規則，`real_time` 規則除外：這類規則會在資料擷取路徑上比對，符合條件的記錄一抵達就會開啟事件。以下步驟適用於 `scheduled` 與 `anomaly` 規則；`forecast`、`outlier`、`composite` 和 `heartbeat` 規則的判定方式，請參閱[預測規則](#預測規則)、[離群規則](#離群規則)、[組合規則](#組合規則)和[心跳規則](#心跳規則)。判定後，連續命中、恢復和事件的處理方式與此處相同。
+
+1. 評估器在 `now - period_secs` 到 `now` 的時間區間內執行 `query.statement`。SQL 引擎執行 `sql` 陳述式，PromQL 引擎則在 `now` 時刻將 `promql` 陳述式當作即時查詢執行。APM 規則會從該區間的 APM 彙總結果讀取指標，RUM 規則則從該區間的 RUM 資料讀取指標，請參閱 [APM 規則](#apm-規則)和 [RUM 規則](#rum-規則)。
+2. 評估器將第一列的第一個欄位讀為數值。如果結果中沒有數值，就視為無資料，由 `trigger.no_data` 決定如何處理。請參閱[恢復條件與無資料](#恢復條件與無資料)。`promql` 結果的第一個欄位是樣本值 `value`，因此由第一個序列決定結果。請先將運算式彙總為單一序列，例如使用 `sum(...)`，或使用 `query.group_by` 依標籤拆分規則。請參閱[依欄位拆分的規則](#依欄位分組的規則)。
+3. 評估器將數值與 `trigger` 比較。`thresholds` 陣列非空時，改為與各級閾值比較。
+4. 條件連續命中 `forPeriods` 次評估後，開啟一個事件。一條規則同一時間最多有一個進行中的事件；依欄位拆分的規則則是每組最多一個。`silenceSecs` 大於 0 時，從這條規則的上一個事件建立起算，在指定秒數內不會開啟新事件，即使上一個事件已解除也一樣。
+5. 滿足恢復條件時，評估器會解除處於 `open` 狀態的事件。預設在首次評估未命中條件時恢復。已確認的事件會維持已確認狀態，直到使用者解除。
+6. 每次評估完成後，評估器會將時間寫入 `lastEvalAt`，並將結果寫入 `lastState`。查詢失敗或逾時時，這兩個欄位維持不變。
+
+針對 `scheduled` 與 `anomaly` 規則，此呼叫不會檢查資料流或陳述式是否有效。啟用規則前，請先執行[測試規則](/zh-Hant/api/alerting/test-rule)。儲存 `real_time` 規則時，系統會依下列限制檢查規則。
+
+**請求本文**
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `name` | string | 是 | 不可留空。名稱會成為事件摘要。 |
+| `description` | string | 否 | 預設為空白。 |
+| `enabled` | boolean | 否 | 預設為 `true`。評估器會略過已停用的規則，但仍可呼叫測試與手動觸發 API。 |
+| `kind` | string | 否 | `scheduled`（預設）、`real_time`、`anomaly`、`forecast`、`outlier`、`composite` 或 `heartbeat`。`real_time` 規則會在資料擷取路徑上比對，請參閱[即時規則](/zh-Hant/alerting/rules#即時規則)。 |
+| `query` | object | 是 | 陳述式及其時間區間，請參閱下文。 |
+| `trigger` | object | 是 | 觸發條件，請參閱下文。 |
+| `thresholds` | array | 否 | `scheduled` 與 `real_time` 規則的嚴重程度分級。陣列非空時，各級閾值會取代 `trigger` 的條件。`anomaly` 規則會忽略分級；`forecast`、`outlier`、`composite` 和 `heartbeat` 規則只有一個嚴重程度，若指定分級，則傳回 `400`。 |
+| `severity` | string | 否 | `info`、`warning`、`error` 或 `critical`。`thresholds` 為空時生效。 |
+| `anomalyParams` | object | `anomaly` 時必填 | 基準線設定。其他類型會忽略此欄位。 |
+| `escalationPolicyId` | string | 否 | 預設為 `default`，是組織內名為 `default` 的升級原則的別名。明確指定的 ID 必須對應至該組織的其中一項升級原則，否則呼叫會傳回 `400`。請參閱[建立升級原則](/zh-Hant/api/alerting/create-escalation)。 |
+| `labels` | object | 否 | 字串對應表，會複製到事件。 |
+| `annotations` | object | 否 | 字串對應表，會複製到事件，例如操作手冊連結。 |
+| `guide` | object | 否 | 說明排查這條規則的事件時應先做什麼。請參閱[排查線索](#排查線索)。 |
+
+**`query`**
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `language` | string | 是 | `sql` 或 `promql`。語言決定由哪個引擎評估陳述式。`promql` 陳述式的時間區間由範圍選擇器指定，例如 `[5m]`；`periodSecs` 只決定查詢區間。 |
+| `statement` | string | 是 | 不可留空（APM 和 RUM 規則除外）。評估器會評估第一列的第一個欄位值。`real_time` 規則使用 `SELECT count(*) FROM <stream> [WHERE <condition>]`。 |
+| `periodSecs` | integer | 是 | 時間區間的長度，單位為秒。`real_time` 規則可設為 1 到 3600，並統計該區間內符合條件的記錄數。 |
+| `stream` | object | 是（APM 和 RUM 規則除外） | `{ "name": "app", "streamType": "logs" }`，也就是陳述式的主要資料流。 |
+| `apm` | object | APM 規則必填 | 規則直接監控的 APM 指標，不必執行陳述式。請參閱 [APM 規則](#apm-規則)。 |
+| `rum` | object | RUM 規則必填 | 規則直接監控的 RUM 指標，不必執行陳述式。請參閱 [RUM 規則](#rum-規則)。 |
+| `groupBy` | array | 否 | 依結果中的指定欄位拆分 `scheduled` 或 `outlier` 規則，例如 `["host"]`。最多可指定 8 個名稱，每個名稱可包含 1 到 128 個字元，且不得重複。請參閱[依欄位拆分的規則](#依欄位分組的規則)。 |
+| `forecast` | object | `forecast` 規則必填 | 請參閱[預測規則](#預測規則)。 |
+| `outlier` | object | `outlier` 規則必填 | 請參閱[離群規則](#離群規則)。 |
+| `composite` | object | `composite` 規則必填 | 請參閱[組合規則](#組合規則)。 |
+| `heartbeat` | object | `heartbeat` 規則必填 | 請參閱[心跳規則](#心跳規則)。 |
+| `delaySecs` | integer | 否 | 每次評估的時間區間往前移動的秒數，可設為 0 到 3600。未指定時自動設定（單機為 0，依角色分工的叢集則依執行個體設定，預設為 60）。請參閱[評估延遲](/zh-Hant/alerting/rules#評估延遲)。 |
+| `homeCluster` | string | 否 | 聯邦中負責彙總即時規則的叢集 ID。該叢集會加總所有已對應至此組織的叢集計數，再進行判定。可指定本機叢集或已啟用的遠端叢集。未指定時，各叢集會依自己的計數判定。其他類型的規則會移除此欄位。請參閱[聯邦中的即時規則](/zh-Hant/alerting/rules#聯邦中的即時規則)。 |
+| `discovery` | object | 自動探索規則必填 | 規則的資料來源是[自動探索](/zh-Hant/alerting/discovery)：`{"kinds": [...], "subjects": [...], "environments": [...], "minSeverity": "warning"}`。若未指定任何篩選條件，則納入所有探索結果。儲存時，系統會將規則統一為固定格式（依探索結果拆分、採用探索結果的嚴重程度，並將 `statement` 設為 `discovery`）。請參閱[自動探索](/zh-Hant/api/alerting/discovery)。 |
+
+`query` 只保留該規則類型使用的參數。例如，系統會捨棄 `scheduled` 規則中的 `forecast`。`composite` 和 `heartbeat` 規則不執行查詢：請勿填寫 `statement`、`stream`、`apm`、`rum` 和 `groupBy`。若指定 `apm`、`rum` 或 `groupBy`，則傳回 `400`。
+
+第一列中名為 `service`、`host` 和 `trace_id` 的欄位會補充事件資訊：新增 `service` 與 `host` 標籤，並填入 `affectedServices`、`hostIds` 與 `traceIds`。
+
+**`trigger`**
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `operator` | string | 是 | `gt`、`gte`、`lt`、`lte`、`eq` 或 `neq`。`real_time` 規則只能使用 `gt` 或 `gte`。 |
+| `threshold` | number | 是 | 用於比較的值。 |
+| `forPeriods` | integer | 是 | 開啟事件前必須連續命中條件的評估次數。`0` 與 `1` 效果相同。`real_time` 規則只能設為 `0` 或 `1`。 |
+| `silenceSecs` | integer | 是 | 冷卻時間，單位為秒。事件開啟後，這條規則在這段時間內不會開啟新事件，即使事件提前解除也一樣。`0` 表示不設冷卻時間。[手動觸發](/zh-Hant/api/alerting/trigger-rule)不受此限制。 |
+| `recovery` | object | 否 | 決定已開啟的事件何時恢復。請參閱[恢復條件與無資料](#恢復條件與無資料)。 |
+| `noData` | object | 否 | 決定如何處理沒有值的評估。請參閱[恢復條件與無資料](#恢復條件與無資料)。 |
+| `priority` | string | 否 | 新事件的優先順序，須使用組織的其中一個等級（預設為 `P1` 到 `P5`）。未指定時，事件沒有優先順序。 |
+| `urgency` | string | 否 | 新事件的緊急程度，須指定組織其中一個[緊急程度](/zh-Hant/alerting/on-call#緊急度與優先順序等級)等級的鍵。未指定時，由事件採用的升級原則決定。請參閱[緊急程度](/zh-Hant/alerting/on-call#緊急程度)。自動探索規則未指定時使用 `low`。 |
+
+`anomaly`、`outlier`、`composite` 和 `heartbeat` 規則會忽略 `operator` 與 `threshold`，但仍使用 `forPeriods`；`forecast` 規則則使用 `operator` 與 `threshold` 比較預測值。含有 `thresholds` 的規則會忽略 `trigger` 中的 `operator`、`threshold` 與 `forPeriods`，但仍須提供 `trigger` 物件。
+
+**`thresholds`**
+
+每個等級都包含 `severity`（`info`、`warning`、`error` 或 `critical`）、`operator`、`threshold` 與 `forPeriods`。各等級獨立計算連續命中次數。事件採用已觸發等級中的最高嚴重程度。已開啟的事件升至更高的嚴重程度時，升級流程會從第一步重新開始。
+
+未設定分級時，事件的嚴重程度優先採用規則的 `severity`，其次是名為 `severity` 的標籤，最後是 `warning`。若 `anomaly` 規則未設定這兩項，偏離基準線至少 10 倍時為 `critical`，至少 3 倍時為 `error`。
+
+**`anomalyParams`**
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `algorithm` | string | 是 | `mad` 或 `ewma`。 |
+| `lookbackDays` | integer | 是 | 1 到 30。用於比對相同時刻的歷史天數。 |
+| `k` | number | 是 | 偏離倍數，必須為正數。 |
+| `alpha` | number | 否 | `ewma` 的平滑係數，大於 0 且不超過 1，預設為 `0.3`。 |
+| `weeklySeasonality` | boolean | 否 | 預設為 `false`。只比對星期幾相同的日期，且 `lookbackDays` 必須至少為 7。 |
+
+## 排查線索
+
+`guide` 說明排查這條規則的事件時應先做什麼。這條規則的事件會顯示排查線索，Mole Agent 調查事件前也會先讀取。所有欄位都可省略。若規則沒有排查線索，傳回結果不會包含 `guide`。
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `steps` | string | Markdown，最多 8,000 個字元。 |
+| `queries` | array | 最多 10 筆。每筆包含 `name`（1 到 120 個字元）、`language`（`sql` 或 `promql`）、`stream`（`{ "name": "app_logs", "streamType": "logs" }`，`sql` 必填）和 `statement`（1 到 4,000 個字元）。 |
+| `dashboards` | array | 儀表板 ID，最多 5 個。重複的 ID 只保留一個。 |
+
+儲存前，系統會移除開頭和結尾的空白。超出上限，或 `sql` 查詢未指定資料流時，會傳回 `400`。更新規則（`PUT /api/v1/alerts/rules/{id}`）時，省略 `guide` 會保留原有的排查線索，指定 `"guide": {}` 則會清除排查線索。
+
+```json
+{
+  "guide": {
+    "steps": "1. Check which routes return the 5xx.\n2. Look for an edge proxy change in the last hour.",
+    "queries": [
+      {
+        "name": "5xx by route",
+        "language": "promql",
+        "statement": "sum by (route) (rate(http_requests_total{code=~\"5..\"}[5m]))"
+      },
+      {
+        "name": "Gateway error logs",
+        "language": "sql",
+        "stream": { "name": "app_logs", "streamType": "logs" },
+        "statement": "SELECT * FROM app_logs WHERE level = 'ERROR'"
+      }
+    ],
+    "dashboards": ["d2"]
+  }
+}
+```
+
+## 恢復條件與無資料
+
+`trigger.recovery` 讓事件等到數值明確回落後才恢復。否則，數值在閾值附近波動時，事件會反覆觸發及恢復。
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `recovery.threshold` | number | 已開啟的事件會等到數值越過恢復閾值、回到正常範圍才恢復。例如，高於 `90` 就觸發的規則可將恢復閾值設為 `80`。恢復閾值必須落在各級觸發閾值的正常一側：高於閾值才觸發時，不可高於觸發閾值；低於閾值才觸發時，不可低於觸發閾值。各級的觸發方向也必須一致。`anomaly`、`forecast`、`outlier`、`composite` 和 `heartbeat` 規則不可設定此欄位。未設定時，數值不再符合觸發閾值就會恢復。 |
+| `recovery.for_periods` | integer | 數值必須連續落在正常範圍的評估次數，達到指定次數後才恢復。`0` 與 `1` 都表示一次。最多 1440 次。 |
+
+`trigger.no_data` 決定如何處理沒有值的評估，例如查詢未傳回任何資料列或數值，或[依欄位拆分的規則](#依欄位分組的規則)中某一組未出現在結果中。
+
+| `no_data.action` | 沒有值的評估如何處理 |
+|---|---|
+| `resolve` | 視為未命中：已開啟的事件會依恢復條件恢復。這是 `scheduled` 規則的預設值。 |
+| `keep` | 維持原狀：不累計命中或恢復次數，`lastState` 為 `noData`。這是 `anomaly` 規則的預設值。 |
+| `alert` | 與 `keep` 相同，但連續 `no_data.for_periods` 次評估沒有值時，會開啟一個無資料事件。第一次評估取得數值時，便會解除該事件。 |
+| `zero` | 將缺少的值視為 `0` 進行比較。適合用於計數：沒有序列或資料列就表示沒有發生任何事。 |
+
+無資料事件有自己的指紋，可以與閾值觸發的事件同時開啟。無資料事件帶有標籤 `alert.condition` = `noData`，摘要與規則或該組事件的摘要相同，通知標題格式為 `NO DATA · <摘要>`。嚴重程度優先採用規則的 `severity`，其次是 `severity` 標籤，最後是 `warning`。`silenceSecs` 同樣適用於無資料事件。若在數值仍缺少時解除無資料事件，資料恢復前不會再次開啟該事件；若規則依欄位拆分，也會暫停追蹤該組。`real_time` 規則不可設定 `recovery` 和 `noData`；`composite` 和 `heartbeat` 規則一律會產生判定結果，因此不可設定 `noData`。
+
+## 依欄位分組的規則
+
+含有 `query.group_by` 的 `scheduled` 規則會分別評估結果中的每一組。指定欄位的值相同的資料列歸為一組，比對指定欄名與結果中的欄名時不區分大小寫。APM、RUM 規則，以及 `scheduled`、`outlier` 以外的規則，若含有 `groupBy`，就會傳回 `400`。`outlier` 規則必須分組，不與閾值比較，而是比較各組的值，請見[離群規則](#離群規則)。
+
+1. `sql` 陳述式最多讀取 101 列，`promql` 陳述式會傳回所有序列。每組傳回一列，最嚴重的組排在最前面。
+2. 從組內第一列取值：排除分組欄位和 `_timestamp`、`ts`、`time`、`timestamp` 後，取第一個數值欄位的值。
+3. 將值與 `trigger` 或 `thresholds` 比較，每組各自累計 `forPeriods`。
+4. 觸發的組會各自開啟事件。事件以該組的欄位值為標籤，摘要由規則名稱加上這些值組成，例如 `Errors per host · web-1`。`silenceSecs` 對每組分別生效。
+5. 將符合恢復條件的組的 `open` 事件標記為已解決。先前出現過、但不在這次結果中的組，本輪評估沒有值，由 `trigger.no_data` 決定如何處理。
+6. 有組觸發時，`lastState` 為 `firing`（若本輪有組要開啟的事件遭[告警管線](/zh-Hant/pipelines/alert-events#處理結果)捨棄，則為 `dropped`）；有組沒有值且維持原狀態時為 `noData`；有組符合條件時為 `pending`；否則為 `healthy`。
+
+每輪最多讀取 100 組。結果超過 100 組時，不評估其餘的組；未出現在結果中的組也會在本輪保留原有事件。若結果有資料列，卻缺少 `groupBy` 指定的任何欄位，本輪評估就會失敗，不會變更任何狀態。[測試規則](/zh-Hant/api/alerting/test-rule)會列出每一組。
+
+## 預測規則
+
+`forecast` 規則將每輪查詢的值記入同一個序列，再依序列推估未來的值。如果預計在前置時間內符合 `trigger.operator` 與 `trigger.threshold` 指定的條件，本輪就算符合條件。新建規則或變更查詢、視窗或回溯範圍時，先逐一查詢過去的時間點，最多補上 48 個資料點。若有一次補點失敗，就停止補點，下輪再繼續記錄。序列最多保留 168 個資料點，相鄰兩點至少相隔一個評估視窗；不足 6 個資料點時不做判斷。
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `forecast.lookback_days` | integer | 使用過去幾天的序列進行推估，範圍為 1 到 30，預設為 `7`。 |
+| `forecast.lead_secs` | integer | 前置時間：預計在指定秒數內跨越閾值就觸發，範圍為 900 到 604800（7 天），預設為 `86400`。 |
+| `forecast.model` | string | `linear`：Theil–Sen 穩健趨勢。`daily`、`weekly`：將前一個週期同一時刻的值加上趨勢，適用於有每日或每週規律的指標。`daily` 要求序列涵蓋至少一天；`weekly` 要求 `lookbackDays` 至少為 7，且序列涵蓋至少一週。 |
+
+開啟的事件會附帶註解 `forecast_crossing_at`（預計跨越閾值的時間，UTC）、`forecast_value`（該時刻的預測值）和 `forecast_model`。若最後一個資料點已跨越閾值，就以該資料點的時間為準。APM 和 RUM 指標也可以預測，但 RUM 的新問題和回歸問題除外。
+
+## 離群規則
+
+`outlier` 規則依 `query.group_by` 分組，並比較各組的值。計算偏離程度時，先用該組的值減去各組的中位數，再除以尺度。尺度取中位數絕對偏差（MAD）的 1.4826 倍與中位數絕對值的 5% 兩者中較大的值。這樣一來，即使各組的值幾乎相同，也不會把小幅波動判為離群。偏離程度超過容許值的組會各自開啟事件，並附帶註解 `outlier_score`。有值的組少於 3 組時，本輪不做判斷。
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `outlier.tolerance` | number | 偏離多少個尺度才算離群，範圍為 0.5 到 10，預設為 `3`。值越小越靈敏。 |
+| `outlier.direction` | string | `both`（預設，偏高或偏低）、`above`（只看偏高）或 `below`（只看偏低）。 |
+
+## 組合規則
+
+`composite` 規則會組合其他規則。有進行中事件的規則視為真，將各規則的真假值代入運算式。若運算式為真，本輪就算符合條件。組合規則不執行查詢。
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `composite.expression` | string | 用單個大寫字母代表規則，並以 `&&`（且）、`\|\|`（或）、`!`（非）和括號組合，例如 `A && (B \|\| !C)`，最多 200 個字元。 |
+| `composite.rules` | object | 字母與規則 ID 的對應關係，例如 `{ "A": "<rule-id>", "B": "<rule-id>" }`。最多 10 條規則。運算式中的每個字母都必須對應一條規則，且指定的字母都必須出現在運算式中。規則不得重複，也不得指向組合規則本身。 |
+| `composite.merge_children` | boolean | 預設為 `false`。設為 `true` 時，組合規則開啟事件後，會將納入組合的規則目前進行中的事件[併入](/zh-Hant/api/alerting/merge-incidents)該事件，之後每輪也會併入新開啟的事件，不再個別發送通知。 |
+
+組合規則不能納入其他組合規則，因此不會形成循環。刪除納入組合的規則後，該規則視為假。開啟的事件會附帶註解 `composite_active`，列出當時為真的字母。組合規則無法[測試](/zh-Hant/api/alerting/test-rule)。
+
+## 心跳規則
+
+`heartbeat` 規則會等待排程工作、備份指令碼等作業回報心跳。若經過週期和寬限時間仍未收到心跳，或最後一次心跳回報失敗，本輪就算符合條件。心跳規則不執行查詢，收到心跳時立即評估一輪。
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `heartbeat.period_secs` | integer | 回報心跳的間隔，範圍為 60 到 604800（7 天）。 |
+| `heartbeat.grace_secs` | integer | 週期結束後，再等多久才判定未收到心跳，範圍為 0 到 86400，預設為 `0`。 |
+
+首次儲存心跳規則時（新建或從其他類型改為心跳規則），回應會多出 `heartbeat_address`：`{ "path": "/api/v1/intake/heartbeats/<token>", "url": "<外部地址>/api/v1/intake/heartbeats/<token>" }`。未設定外部位址時，`url` 為 `null`。位址只會提供一次，遺失後只能[重設](/zh-Hant/api/alerting/heartbeats)。開啟的事件會附帶註解 `heartbeat_due_at`、`heartbeat_last_checkin_at`、`heartbeat_status`，以及回報心跳時附上的訊息 `heartbeat_message`。心跳規則無法[測試](/zh-Hant/api/alerting/test-rule)。回報方式請見[心跳回報](/zh-Hant/api/alerting/heartbeats)。
+
+## APM 規則
+
+含有 `query.apm` 的規則會監控指定 APM 服務或其端點的指標，讀取與 APM 頁面相同的彙總資料。APM 規則必須是 `scheduled`。呼叫時會將 `query.stream` 儲存為 `null`；若 `query.statement` 為空，就會填入類似 `apm:p95 checkout POST /orders` 的描述。系統會原樣儲存 `query.language`，但不會使用它。
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `service` | string | 是 | 服務名稱，最多 255 位元組。 |
+| `namespace` | string | 否 | 服務的命名空間。未指定時，包含有該服務名稱的所有命名空間。 |
+| `environment` | string | 否 | 未指定時，包含服務的所有環境。 |
+| `transaction` | object | 否 | 指定端點：`{ "name": "POST /orders", "kind": "http" }`。`kind` 可為 `http`、`rpc`、`messaging`、`span` 或 `other`。未指定時，涵蓋整個服務。 |
+| `metric` | string | 是 | 指標，請見下表。 |
+| `sloId` | string | `slo_burn_rate` 必填 | 要讀取消耗速率的 SLO。其他指標不接受 `sloId`。 |
+| `shortWindowSecs` | integer | 否 | 僅用於 `slo_burn_rate`，且必須短於 `periodSecs`。比較整個週期與週期最後 `shortWindowSecs` 這兩段的消耗速率，取較低的值，因此兩段都必須超過閾值。 |
+
+| `metric` | 值 |
+|---|---|
+| `errorRate` | 失敗請求占所有請求的百分比，範圍為 0 到 100。 |
+| `p50`、`p90`、`p95`、`p99`、`average` | 延遲，單位為毫秒。 |
+| `throughput` | 視窗內的每秒請求數。 |
+| `requestCount`、`errorCount` | 視窗內的請求數或失敗請求數。 |
+| `new_error_groups` | 服務（或 `transaction` 端點）在視窗內首次出現的錯誤群組數。 |
+| `apdex` | 閾值為 500 毫秒的 Apdex，範圍為 0 到 1。 |
+| `slo_burn_rate` | SLO 消耗錯誤預算的速率，以目標允許速率的倍數表示。為 `1` 時，錯誤預算恰好在 SLO 視窗結束時用完。 |
+
+不超過 24 小時的視窗讀取分鐘級彙總資料，更長的視窗讀取小時級彙總資料。視窗內沒有請求時，`requestCount`、`errorCount`、`new_error_groups` 和 `throughput` 的讀數為 `0`，其他指標沒有讀數，因此不會符合閾值條件。結果的欄位為 `value`、`service` 和 `trace_id`，因此事件會帶有 `service` 標籤、在 `affectedServices` 中列出服務，並附上一個範例 trace ID。
+
+## RUM 規則
+
+含有 `query.rum` 的規則會監控指定 RUM 應用程式的指標，讀取方式與 RUM 頁面相同。RUM 規則的類型為 `scheduled` 或 `anomaly`。同一條規則只能監控 APM 或 RUM 指標，不能同時監控兩者。呼叫時會將 `query.stream` 儲存為 `null`；若 `query.statement` 為空，就會填入類似 `rum:lcp_p75 checkout-web /checkout` 的描述。系統會原樣儲存 `query.language`，但不會使用它。應用程式必須存在，否則呼叫會傳回 `400`。
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `applicationId` | string | 是 | [RUM 應用程式](/zh-Hant/rum/applications)。 |
+| `environment` | string | 否 | 未指定時，包含應用程式的所有環境。 |
+| `page` | string | 否 | 指定頁面，在 App 中則是指定畫面。未指定時，涵蓋所有頁面。工作階段類和問題類指標不接受此欄位。 |
+| `version` | string | 否 | 應用程式的指定版本。未指定時，涵蓋所有版本。問題類指標不接受此欄位。 |
+| `metric` | string | 是 | 指標，請見下文。 |
+| `minSamples` | integer | 否 | 視窗內可供指標使用的資料列數至少要達到此值，指標才有讀數。未指定時，使用指標本身的預設值。計數不接受此欄位。 |
+| `customName`、`statistic` | string | `custom_vital` 和 `custom_timing` 必填 | vital 或 timing 的名稱，以及要擷取的統計值：`p50`、`p75`（預設）、`p90`、`p95`、`p99`、`avg` 或 `count`。 |
+| `search` | object | `query` 必填 | 探索頁面的查詢：`type`（`sessions`、`views`、`actions`、`errors`、`resources`、`longTasks` 或 `logs`）、輸入的 `statement`、從中擷取的 `filters`（`field`、`op`、`value`）與 `freeText`，以及 `measure`。其中 `fn` 可為 `count`、`count_distinct`、`sum`、`avg`、`min`、`max` 或 `p50` 到 `p99`，`field` 為要套用該函式的欄位。若指定的欄位不屬於該類型，會傳回 `400`。不能與 `page`、`version` 一起使用，計數和加總不接受 `minSamples`。 |
+
+`metric` 可為 `sessionCount`、`viewCount`、`errorCount`、`errorRate`、`crash_free_sessions`、`frustration_rate`、`failed_request_rate`、`lcp_p75`、`inp_p75`、`cls_p75`、`ttfb_p75`、`new_issues`、`regressed_issues`、`issue_impact`、`custom_vital`、`custom_timing` 和 `query` 其中之一。各項指標的意義、單位和所需資料列數，請見 [RUM 告警](/zh-Hant/rum/alerts#指標)。`anomaly` 規則可以使用除 `new_issues` 和 `regressed_issues` 以外的所有指標。`periodSecs` 的範圍為 60 秒到 6 小時。
+
+視窗內沒有資料列時，計數的讀數為 `0`，其他指標沒有讀數，因此不會符合閾值條件。結果只有一列，欄位為 `value` 和 `application`。事件開啟時，規則也會找出最多三個樣本工作階段，與事件一併儲存，請見 [RUM 告警](/zh-Hant/rum/alerts#事件)。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "High error rate",
+  "description": "More than 100 errors in five minutes",
+  "enabled": true,
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
+    "periodSecs": 300,
+    "stream": { "name": "app", "streamType": "logs" }
+  },
+  "trigger": { "operator": "gt", "threshold": 100, "forPeriods": 2, "silenceSecs": 0 },
+  "severity": "critical",
+  "escalationPolicyId": "<policy-id>",
+  "labels": { "team": "checkout" }
+}
+EOF
+```
+```bash APM 规则
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "Checkout p95",
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "",
+    "periodSecs": 300,
+    "apm": {
+      "namespace": "shop",
+      "service": "checkout",
+      "environment": "production",
+      "transaction": { "name": "POST /orders", "kind": "http" },
+      "metric": "p95"
+    }
+  },
+  "trigger": { "operator": "gt", "threshold": 800, "forPeriods": 2, "silenceSecs": 0 },
+  "severity": "error",
+  "labels": { "service.name": "checkout", "deployment.environment": "production" }
+}
+EOF
+```
+```bash RUM 规则
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "Checkout is slow",
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "",
+    "periodSecs": 3600,
+    "rum": {
+      "applicationId": "checkout-web",
+      "environment": "production",
+      "page": "/checkout",
+      "metric": "lcp_p75"
+    }
+  },
+  "trigger": { "operator": "gt", "threshold": 2500, "forPeriods": 1, "silenceSecs": 0 },
+  "severity": "warning",
+  "labels": { "rum.application": "checkout-web", "deployment.environment": "production", "rum.page": "/checkout" }
+}
+EOF
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KEDBLvTYO6DnWi8H9S9MNLpPT7",
+  "orgId": "<organization-id>",
+  "name": "High error rate",
+  "description": "More than 100 errors in five minutes",
+  "enabled": true,
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
+    "periodSecs": 300,
+    "stream": { "name": "app", "streamType": "logs" }
+  },
+  "trigger": { "operator": "gt", "threshold": 100.0, "forPeriods": 2, "silenceSecs": 0 },
+  "anomalyParams": null,
+  "thresholds": [],
+  "severity": "critical",
+  "escalationPolicyId": "<policy-id>",
+  "labels": { "team": "checkout" },
+  "annotations": {},
+  "lastEvalAt": null,
+  "lastState": { "kind": "healthy" },
+  "createdAt": 1790000000000000,
+  "updatedAt": 1790000000000000
+}
+```
+</ResponseExample>
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | `name` 或 `query.statement` 為空、缺少 `query.stream`、規則讀取 [`_audit` 資料串流](/zh-Hant/settings/data-security#稽核資料流)（`query.stream` 指向該串流，或 `query.statement` 在任何位置讀取該串流）、APM 規則不是 `scheduled` 或其 `query.apm` 無效（`APM alert service is invalid`、`an SLO burn-rate alert names its SLO`）、RUM 規則為 `real_time`、指定的應用程式不存在或其 `query.rum` 無效（指標不支援依 `page` 或 `version` 縮小範圍、對計數指定 `minSamples`，或視窗不在 60 到 21,600 秒的範圍內）、`escalationPolicyId` 不屬於該組織的任何策略、`anomaly` 規則缺少 `anomalyParams` 或其值無效，或者 `real_time` 規則超出上述限制。回應為 JSON，錯誤碼為 `invalid_argument`，訊息例如 `anomaly detector not yet supported: prophet`。 |
+| `403` | Token 缺少 `alerts.rules.manage` 權限。 |
+| `422` | 缺少必填欄位或值的類型有誤，例如未知的 `operator`。回應為純文字。 |
+
+主控台的操作流程請見[告警與事件應變](/zh-Hant/alerting)。

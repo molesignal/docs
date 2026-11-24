@@ -1,0 +1,376 @@
+---
+title: "ルールの作成"
+description: "スケジュール、リアルタイム、異常検知、予測、外れ値、複合条件、ハートビートのいずれかのアラートルールを作成します。"
+"en_link": "/en-US/api/alerting/create-rule"
+"zh-Hans_link": "/zh-Hans/api/alerting/create-rule"
+"zh-Hant_link": "/zh-Hant/api/alerting/create-rule"
+"ko_link": "/ko/api/alerting/create-rule"
+"de_link": "/de/api/alerting/create-rule"
+"es_link": "/es/api/alerting/create-rule"
+"fr_link": "/fr/api/alerting/create-rule"
+"pt-BR_link": "/pt-BR/api/alerting/create-rule"
+---
+
+```http
+POST /api/v1/alerts/rules
+```
+
+アラートルールを作成します。この呼び出しには `alerts.rules.manage` 権限が必要です。
+
+## ルールの評価方法
+
+`alert` ロールは、有効なルールを `[alert].eval_interval_secs`（デフォルトは 30 秒）ごとに評価します。ただし、`real_time` ルールはデータ取り込み時に条件を照合し、レコードの到着に応じてインシデントをオープンします。以下の手順は `scheduled` と `anomaly` のルールに適用されます。`forecast`、`outlier`、`composite`、`heartbeat` の判定方法については、それぞれ [予測ルール](#予測ルール)、[外れ値ルール](#外れ値ルール)、[複合ルール](#複合ルール)、[ハートビートルール](#ハートビートルール)を参照してください。判定後の処理（連続一致、復旧、インシデント）は以下と同じです。
+
+1. 評価処理は、`now - period_secs` から `now` までのウィンドウに対して `query.statement` を実行します。`sql` ステートメントは SQL エンジンで実行します。`promql` ステートメントは、`now` 時点のインスタントクエリとして PromQL エンジンで実行します。APM ルールは代わりにウィンドウ内の APM 集計結果から値を取得し、RUM ルールはウィンドウ内の RUM データから値を取得します。[APM ルール](#apm-ルール)と [RUM ルール](#rum-ルール)を参照してください。
+2. 評価処理は、先頭行の先頭列を数値として読み取ります。結果に数値がなければデータなしとみなし、`trigger.no_data` に従って処理します。[復旧とデータ欠損](#復旧とデータ欠損)を参照してください。`promql` の結果ではサンプルの `value` が先頭にあるため、最初の時系列で判定します。`sum(...)` などを使って式を 1 つの時系列に集約するか、`query.group_by` を使ってラベルごとにルールを分割してください。[列で分割するルール](#列で分割するルール)を参照してください。
+3. 評価処理は、数値を `trigger` の条件と比較します。`thresholds` 配列が空でない場合は、そのすべてのレベルと比較します。
+4. `forPeriods` 回連続で条件を満たすと、インシデントがオープンします。ルールが同時に保持できるアクティブなインシデントは最大 1 件です。列でルールを分割する場合は、グループごとに最大 1 件です。`silenceSecs` が 0 より大きい場合、前回のインシデントがすでに解決済みでも、そのルールで前回のインシデントを作成してから指定した秒数が経過するまで、新しいインシデントはオープンしません。
+5. 復旧条件を満たすと、評価処理はオープン中のインシデントを解決します。デフォルトでは、条件を満たさなくなった最初の評価で解決します。確認済みのインシデントは、ユーザーが解決するまで確認済みのままです。
+6. 評価が完了するたびに、評価処理は時刻を `lastEvalAt` に、結果を `lastState` に保存します。クエリが失敗またはタイムアウトした場合、どちらのフィールドも更新しません。
+
+`scheduled` と `anomaly` のルールでは、この API 呼び出しはストリームやステートメントの有効性を検証しません。ルールを有効にする前に、[ルールをテスト](/ja/api/alerting/test-rule)してください。`real_time` ルールは、保存時に以下の制限を満たしているか検証します。
+
+**ボディ**
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `name` | string | はい | 空にすることはできません。名前はインシデントの概要になります。 |
+| `description` | string | いいえ | デフォルトは空です。 |
+| `enabled` | boolean | いいえ | デフォルトは `true` です。評価処理は無効なルールをスキップします。テストとトリガーの API 呼び出しは引き続き使用できます。 |
+| `kind` | string | いいえ | `scheduled`（デフォルト）、`real_time`、`anomaly`、`forecast`、`outlier`、`composite`、または `heartbeat` です。`real_time` ルールは、データ取り込み時に条件を照合します。[リアルタイムルール](/ja/alerting/rules#リアルタイムルール)を参照してください。 |
+| `query` | object | はい | ステートメントとそのウィンドウです。以下を参照してください。 |
+| `trigger` | object | はい | 条件です。以下を参照してください。 |
+| `thresholds` | array | いいえ | `scheduled` と `real_time` のルールに適用する重大度レベルです。空でなければ、これらのレベルが `trigger` の条件に代わります。`anomaly` ルールは重大度レベルを無視します。`forecast`、`outlier`、`composite`、`heartbeat` のルールは単一の重大度で発報し、重大度レベルを指定すると `400` を返します。 |
+| `severity` | string | いいえ | `info`、`warning`、`error`、または `critical` です。`thresholds` が空の場合に適用します。 |
+| `anomalyParams` | object | `anomaly` の場合 | ベースラインの設定です。他の種類のルールでは無視します。 |
+| `escalationPolicyId` | string | いいえ | デフォルトは `default` です。組織内で `default` という名前のエスカレーションポリシーを指すエイリアスです。ID を明示する場合は、その組織のポリシーの ID を指定してください。それ以外の場合は `400` を返します。[エスカレーションポリシーを作成](/ja/api/alerting/create-escalation)を参照してください。 |
+| `labels` | object | いいえ | インシデントにコピーする文字列のマップです。 |
+| `annotations` | object | いいえ | インシデントにコピーする文字列のマップです。ランブックへのリンクなどを指定します。 |
+| `guide` | object | いいえ | このルールのインシデントを調査するときに最初に行うことです。[調査ガイド](#調査ガイド)を参照してください。 |
+
+**`query`**
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `language` | string | はい | `sql` または `promql` です。言語によってステートメントを評価するエンジンが決まります。`periodSecs` はクエリのウィンドウのみを設定するため、`promql` ステートメントのウィンドウは `[5m]` などの範囲セレクターで指定します。 |
+| `statement` | string | はい | APM または RUM ルールを除き、空にすることはできません。先頭行の先頭列が評価対象の値です。`real_time` ルールでは `SELECT count(*) FROM <stream> [WHERE <condition>]` を指定します。 |
+| `periodSecs` | integer | はい | ウィンドウの長さ（秒）です。`real_time` ルールでは 1〜3600 を指定し、そのウィンドウ内で条件に一致するレコードをカウントします。 |
+| `stream` | object | はい（APM または RUM ルールを除く） | `{ "name": "app", "streamType": "logs" }`。ステートメントのメインストリームです。 |
+| `apm` | object | APM ルールの場合 | ルールがステートメントの代わりに監視する APM の値です。[APM ルール](#apm-ルール)を参照してください。 |
+| `rum` | object | RUM ルールの場合 | ルールがステートメントの代わりに監視する RUM の値です。[RUM ルール](#rum-ルール)を参照してください。 |
+| `groupBy` | array | いいえ | `scheduled` または `outlier` ルールを分割する基準となる結果の列です。例：`["host"]`。列名は重複なしで最大 8 個、それぞれ 1〜128 文字で指定します。[列で分割するルール](#列で分割するルール)を参照してください。 |
+| `forecast` | object | `forecast` ルールの場合 | [予測ルール](#予測ルール)を参照してください。 |
+| `outlier` | object | `outlier` ルールの場合 | [外れ値ルール](#外れ値ルール)を参照してください。 |
+| `composite` | object | `composite` ルールの場合 | [複合ルール](#複合ルール)を参照してください。 |
+| `heartbeat` | object | `heartbeat` ルールの場合 | [ハートビートルール](#ハートビートルール)を参照してください。 |
+| `delaySecs` | integer | いいえ | 評価ごとにウィンドウを何秒さかのぼらせるかを 0〜3600 で指定します。省略すると自動設定になります（単一プロセスでは 0、ロールを分離したクラスターではインスタンス設定値で、デフォルトは 60）。[評価の遅延](/ja/alerting/rules#評価遅延)を参照してください。 |
+| `homeCluster` | string | いいえ | フェデレーション内のリアルタイムルールで、組織に割り当てられたクラスターの件数を合算して判定するクラスターの ID です。現在のクラスターまたは有効なリモートクラスターを指定します。省略すると、各クラスターが自身の件数で判定します。他の種類のルールではこのフィールドを破棄します。[フェデレーション内のリアルタイムルール](/ja/alerting/rules#フェデレーションでのリアルタイムルール)を参照してください。 |
+| `discovery` | object | ディスカバリールールの場合 | ルールのデータソースは[ディスカバリー](/ja/alerting/discovery)です。`{"kinds": [...], "subjects": [...], "environments": [...], "minSeverity": "warning"}` の各項目を省略すると、その項目では絞り込みません。保存すると、ルールは所定の形式になります（検出結果ごとに分割し、重大度も検出結果ごとに設定し、`statement` を `discovery` に設定します）。[ディスカバリー](/ja/api/alerting/discovery)を参照してください。 |
+
+`query` は、ルールの種類に対応するパラメーターのみを保持します。たとえば、`scheduled` ルールに指定した `forecast` オブジェクトは破棄します。`composite` と `heartbeat` のルールはクエリを実行しないため、`statement`、`stream`、`apm`、`rum`、`groupBy` は使用しません。`apm`、`rum`、`groupBy` のいずれかを指定すると `400` を返します。
+
+先頭行の `service`、`host`、`trace_id` という名前の列を使って、インシデントに詳細情報を追加します。これらの列から `service` と `host` のラベルを追加し、`affectedServices`、`hostIds`、`traceIds` に値を設定します。
+
+**`trigger`**
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `operator` | string | はい | `gt`、`gte`、`lt`、`lte`、`eq`、または `neq` です。`real_time` ルールでは `gt` または `gte` を指定します。 |
+| `threshold` | number | はい | 比較対象の値です。 |
+| `forPeriods` | integer | はい | インシデントをオープンするまでに、条件を連続で満たす必要がある評価回数です。`0` は `1` と同じ動作になります。`real_time` ルールでは `0` または `1` を指定します。 |
+| `silenceSecs` | integer | はい | クールダウン時間（秒）です。インシデントがオープンした後、この時間が経過するまでは、先にインシデントが解決しても新しいインシデントをオープンしません。`0` でクールダウンを無効にします。[手動トリガー](/ja/api/alerting/trigger-rule)ではこの設定を無視します。 |
+| `recovery` | object | いいえ | オープン中のインシデントを復旧とみなす条件です。[復旧とデータ欠損](#復旧とデータ欠損)を参照してください。 |
+| `noData` | object | いいえ | 評価結果に値がない場合の扱いです。[復旧とデータ欠損](#復旧とデータ欠損)を参照してください。 |
+| `priority` | string | いいえ | インシデントをオープンするときの優先度です。組織の優先度（デフォルトでは `P1`〜`P5`）のいずれかを指定します。省略すると、インシデントに優先度を設定しません。 |
+| `urgency` | string | いいえ | インシデントをオープンするときの緊急度です。組織の[緊急度レベル](/ja/alerting/on-call#緊急度と優先度のレベル)のキーを指定します。省略すると、インシデントのエスカレーションポリシーが緊急度を決定します。[緊急度](/ja/alerting/on-call#緊急度)を参照してください。ディスカバリールールのデフォルトは `low` です。 |
+
+`anomaly`、`outlier`、`composite`、`heartbeat` のルールは `operator` と `threshold` を無視しますが、`forPeriods` は使用します。`forecast` ルールは `operator` を使って予測値を `threshold` と比較します。`thresholds` を設定したルールは `trigger` の `operator`、`threshold`、`forPeriods` を無視しますが、オブジェクト自体は必須です。
+
+**`thresholds`**
+
+各レベルには `severity`（`info`、`warning`、`error`、または `critical`）、`operator`、`threshold`、`forPeriods` を指定します。レベルごとに連続一致の回数をカウントします。発報したレベルのうち、最も高い重大度をインシデントに設定します。オープン中のインシデントの重大度が上がると、エスカレーションを最初のステップから再開します。
+
+重大度レベルを設定していない場合、インシデントの重大度には、ルールの `severity`、`severity` ラベル、`warning` の順で最初に利用できる値を使用します。`anomaly` ルールでルールの `severity` も `severity` ラベルもない場合は、偏差がベースラインの 10 倍以上なら `critical`、3 倍以上なら `error` になります。
+
+**`anomalyParams`**
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `algorithm` | string | はい | `mad` または `ewma` です。 |
+| `lookbackDays` | integer | はい | 1〜30。同じ時刻のデータを比較する過去の日数です。 |
+| `k` | number | はい | 偏差の倍率です。正の値を指定してください。 |
+| `alpha` | number | いいえ | `ewma` の平滑化係数です。0 より大きく 1 以下の値を指定します。デフォルトは `0.3` です。 |
+| `weeklySeasonality` | boolean | いいえ | デフォルトは `false` です。有効にすると同じ曜日のみを比較します。`lookbackDays` に 7 以上を指定してください。 |
+
+## 調査ガイド
+
+`guide` には、ルールによって発生したインシデントの調査で最初に行うことを記載します。ルールのインシデントにガイドを表示し、Mole Agent は調査を始める前にガイドを読みます。すべてのフィールドは任意です。ガイドがないルールは `guide` を含めずに返します。
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `steps` | 文字列 | Markdown 形式で、最大 8,000 文字です。 |
+| `queries` | 配列 | 最大 10 件です。各要素には `name`（1～120 文字）、`language`（`sql` または `promql`）、`stream`（`{ "name": "app_logs", "streamType": "logs" }`、`sql` では必須）、`statement`（1～4,000 文字）を指定します。 |
+| `dashboards` | 配列 | ダッシュボード ID を最大 5 件指定します。重複する ID は 1 件だけ保持します。 |
+
+テキストの前後の空白は保存前に取り除きます。ガイドが上限を超えている場合や、`sql` クエリにストリームがない場合は、`400` を返します。ルールの更新（`PUT /api/v1/alerts/rules/{id}`）で `guide` を省略すると既存のガイドを保持し、`"guide": {}` を指定するとガイドを削除します。
+
+```json
+{
+  "guide": {
+    "steps": "1. Check which routes return the 5xx.\n2. Look for an edge proxy change in the last hour.",
+    "queries": [
+      {
+        "name": "5xx by route",
+        "language": "promql",
+        "statement": "sum by (route) (rate(http_requests_total{code=~\"5..\"}[5m]))"
+      },
+      {
+        "name": "Gateway error logs",
+        "language": "sql",
+        "stream": { "name": "app_logs", "streamType": "logs" },
+        "statement": "SELECT * FROM app_logs WHERE level = 'ERROR'"
+      }
+    ],
+    "dashboards": ["d2"]
+  }
+}
+```
+
+## 復旧とデータ欠損
+
+`trigger.recovery` を設定すると、値が明確に正常範囲に戻るまでインシデントをオープンのまま維持します。この設定がないと、値がしきい値付近で変動するたびに、発火と復旧を繰り返します。
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `recovery.threshold` | 数値 | オープン中のインシデントを復旧させるには、値がこのしきい値を越えて正常側に戻る必要があります。たとえば、`90` を超えると発火するルールには `80` を指定します。復旧しきい値はすべての発火しきい値の正常側に設定します。値が上回ると発火するしきい値より大きくすることはできず、値が下回ると発火するしきい値より小さくすることはできません。また、すべてのレベルで発火する方向をそろえます。`anomaly`、`forecast`、`outlier`、`composite`、`heartbeat` ルールには指定できません。省略すると、値がしきい値の条件を満たさなくなった時点でインシデントは復旧します。 |
+| `recovery.for_periods` | 整数 | インシデントを復旧させるために、値が連続して正常側にある必要がある評価回数です。`0` と `1` はどちらも 1 回として扱います。最大 1440 回です。 |
+
+`trigger.no_data` は、評価対象の値がない場合の扱いを指定します。クエリが行や数値を返さない場合や、[列で分割するルール](#列で分割するルール)のグループが結果に含まれない場合が該当します。
+
+| `no_data.action` | 値がない場合の動作 |
+|---|---|
+| `resolve` | 条件を満たさないものとして扱い、オープン中のインシデントは復旧条件に従って復旧します。`scheduled` ルールのデフォルトです。 |
+| `keep` | 状態を維持します。条件を満たした回数には加算せず、復旧も行いません。`lastState` は `noData` になります。`anomaly` ルールのデフォルトです。 |
+| `alert` | `keep` と同様に扱い、値がない評価が `no_data.for_periods` 回連続すると、データ欠損インシデントをオープンします。最初に値が得られた評価で、そのインシデントを解決します。 |
+| `zero` | 欠損した値を `0` として比較します。系列や行がなければ何も発生していないとみなせる件数の評価に適しています。 |
+
+データ欠損インシデントには固有のフィンガープリントがあるため、しきい値に基づくインシデントと同時にオープンできます。`alert.condition` = `noData` ラベルと、ルールまたはグループの概要を付与します。通知タイトルは `NO DATA · <summary>` です。重大度には、ルールの `severity`、`severity` ラベル、`warning` の順に、最初に該当するものを使用します。`silenceSecs` も適用します。値が欠損したまま手動で解決すると、データが戻るまで再オープンしません。列で分割するルールでは、そのグループの追跡も終了します。`real_time` ルールには `recovery` も `noData` も指定できません。`composite` と `heartbeat` ルールは常に判定できるため、`noData` は指定できません。
+
+## 列で分割するルール
+
+`query.group_by` を指定した `scheduled` ルールは、クエリ結果をグループごとに評価します。指定した列を、大文字と小文字を区別せずに結果の列名と照合し、それらの列の値が同じ行をグループ化します。APM や RUM のルール、または `scheduled` と `outlier` 以外のルールに `groupBy` を指定すると、`400` を返します。`outlier` ルールはしきい値ではなくグループ同士を比較するため、列による分割が必須です。[外れ値ルール](#外れ値ルール)を参照してください。
+
+1. `sql` ステートメントは最大 101 行に制限して実行します。`promql` ステートメントはすべての系列を返します。グループごとに 1 行を返し、状態が悪いものから順に並べてください。
+2. グループの最初の行から評価値を取得します。指定した列と `_timestamp`、`ts`、`time`、`timestamp` を除き、最初の数値列を使用します。
+3. 評価値を `trigger` または `thresholds` と比較し、`forPeriods` の回数をグループごとに数えます。
+4. グループが発火すると、そのグループ専用のインシデントをオープンします。グループの値をラベルとして付与し、ルール名の後にグループの値を続けたものを概要にします。例: `Errors per host · web-1`。`silenceSecs` はグループごとに適用します。
+5. グループが復旧条件を満たすと、そのグループのオープン中のインシデントを解決します。以前の結果に含まれていたグループが今回の結果にない場合、その評価では値なしとして扱い、`trigger.no_data` に従います。
+6. `lastState` は、いずれかのグループが発火している間は `firing`（その評価で[アラートパイプライン](/ja/pipelines/alert-events#イベントの処理結果)がグループのインシデントを破棄した場合は `dropped`）、値がなく状態を維持するグループがある間は `noData`、条件を満たすグループがある間は `pending`、それ以外は `healthy` です。
+
+1 回の評価で最大 100 グループを読み込みます。結果が上限を超える場合、残りのグループは評価せず、その回の結果に含まれないグループのインシデントはそのまま維持します。結果に行があっても `groupBy` に指定した列名に一致する列がない場合は、評価に失敗し、状態は変わりません。[ルールをテストする](/ja/api/alerting/test-rule)と、すべてのグループの結果を確認できます。
+
+## 予測ルール
+
+`forecast` ルールは、評価のたびにクエリの値を時系列に追加し、将来の値を予測します。リードタイム内の予測値が `trigger.operator` と `trigger.threshold` の条件を満たすと、その回は条件を満たしたと判定します。ルールを新規作成した場合や、クエリ、ウィンドウ、参照期間を変更した場合は、最初に過去の各時点を 1 回ずつクエリして、最大 48 点を補完します。最初の失敗で補完を打ち切り、次の評価から時系列への追加を続けます。時系列には、各点を評価ウィンドウ 1 つ分以上離して最大 168 点を保持します。データ点が 6 点未満の場合は判定しません。
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `forecast.lookback_days` | 整数 | 予測に使用する過去の時系列データの日数です。1～30 日で、デフォルトは `7` です。 |
+| `forecast.lead_secs` | 整数 | リードタイムです。この秒数以内にしきい値を越えると予測した場合に発火します。900～604800 秒（7 日）で、デフォルトは `86400` です。 |
+| `forecast.model` | 文字列 | `linear` はロバストな Theil–Sen 法でトレンドを推定します。`daily` と `weekly` は、日次または週次の周期がある値に対し、1 周期前の同じ時点の値にトレンドを加えます。`daily` には丸 1 日分の時系列が必要です。`weekly` には `lookbackDays` が 7 以上で、丸 1 週間分の時系列が必要です。 |
+
+オープンしたインシデントには、アノテーション `forecast_crossing_at`（しきい値を越える予測時刻、UTC）、`forecast_value`（その時点の予測値）、`forecast_model` を付与します。最新のデータ点がすでにしきい値を越えている場合は、そのデータ点の時刻を使用します。APM と RUM の値も予測できますが、新規または再発した RUM の問題は対象外です。
+
+## 外れ値ルール
+
+`outlier` ルールは `query.group_by` で結果を分割し、グループの値を互いに比較します。各グループについて、その値から全グループの中央値を引き、スケールで割って偏差を求めます。スケールには、中央絶対偏差（MAD）の 1.4826 倍と中央値の絶対値の 5% のうち、大きい方を使います。これにより、グループ間の値がほぼ同じときに、小さな変動を外れ値と判定するのを防ぎます。偏差が許容範囲を外れたグループごとにインシデントをオープンし、 `outlier_score` アノテーションを付与します。値があるグループが 3 つ未満の場合、その回は判定しません。
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `outlier.tolerance` | 数値 | 中央値からスケールの何倍離れると外れ値とみなすかを指定します。0.5～10 で、デフォルトは `3` です。値が小さいほど敏感に検出します。 |
+| `outlier.direction` | 文字列 | `both`（デフォルト、高い値と低い値の両方）、`above`（高い値のみ）、`below`（低い値のみ）のいずれかを指定します。 |
+
+## 複合ルール
+
+`composite` ルールは、複数のルールを組み合わせます。組み合わせた各ルールは、アクティブなインシデントがある間は真となり、その真偽値を式の評価に使用します。式が真なら、その評価ラウンドは条件に一致します。クエリは実行しません。
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `composite.expression` | string | 各ルールを大文字の英字1文字で表し、`&&`（論理積）、`\|\|`（論理和）、`!`（否定）、丸括弧で組み合わせます。例：`A && (B \|\| !C)`。最大200文字です。 |
+| `composite.rules` | object | 英字をルールIDに対応付けます。例：`{ "A": "<rule-id>", "B": "<rule-id>" }`。最大10件です。式に含まれるすべての英字にルールを割り当て、割り当てた英字はすべて式で使用してください。同じルールを重複して指定したり、複合ルール自身を指定したりすることはできません。 |
+| `composite.merge_children` | boolean | デフォルトは `false` です。`true` の場合、複合ルールがインシデントを開始すると、組み合わせたルールのアクティブなインシデントをそこに[マージします](/ja/api/alerting/merge-incidents)。以降も評価ラウンドごとに新しいインシデントをマージするため、個別の通知は送信されません。 |
+
+複合ルールには別の複合ルールを組み込めません。また、複合ルールを別のルールに組み込むこともできないため、循環参照は発生しません。組み合わせたルールを削除すると、そのルールは偽として扱われます。インシデントには次のアノテーションが付きます。 `composite_active`：真だったルールを表す英字。複合ルールは [テスト](/ja/api/alerting/test-rule)できません。
+
+## ハートビートルール
+
+`heartbeat` ルールは、cron タスクやバックアップスクリプトなどのジョブからのチェックインを待ちます。周期に猶予時間を加えた時間内にチェックインが届かない場合、または最後のチェックインが失敗を報告した場合、その評価ラウンドは条件に一致します。クエリは実行せず、チェックインを受信すると、その評価ラウンドの判定を直ちに行います。
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `heartbeat.period_secs` | integer | ジョブがチェックインする間隔です。60〜604800（7日間）の範囲で指定します。 |
+| `heartbeat.grace_secs` | integer | 周期が過ぎてからチェックインの未着と判定するまでの猶予時間です。0〜86400の範囲で指定します。デフォルトは `0` です。 |
+
+ハートビートルールを初めて保存するとき（新規作成時、または別の種類のルールから変更したとき）、レスポンスに `heartbeat_address` が追加されます。 `{ "path": "/api/v1/intake/heartbeats/<token>", "url": "<external address>/api/v1/intake/heartbeats/<token>" }`。外部アドレスを設定していない場合、`url` は `null` です。アドレスが返されるのはこのときだけです。アドレスを紛失した場合は [リセット](/ja/api/alerting/heartbeats)する必要があります。インシデントには、`heartbeat_due_at`、 `heartbeat_last_checkin_at`、`heartbeat_status`、およびチェックインのメッセージを格納する `heartbeat_message` の各アノテーションが付きます。ハートビートルールは[テスト](/ja/api/alerting/test-rule)できません。チェックインの方法については、 [ハートビートのチェックイン](/ja/api/alerting/heartbeats)を参照してください。
+
+## APM ルール
+
+`query.apm` を指定したルールは、APM サービスまたはそのエンドポイントのメトリクスを監視します。メトリクスは APM ページと同じ集計データから取得します。APM ルールは `scheduled` である必要があります。API 呼び出しでは、`query.stream` を `null` として保存し、`query.statement` が空の場合は、次のような説明を設定します。 `apm:p95 checkout POST /orders`。`query.language` は送信された値のまま保存され、動作には影響しません。
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `service` | string | はい | サービス名です。最大255バイトです。 |
+| `namespace` | string | いいえ | サービスの名前空間です。省略すると、指定した名前のサービスが存在するすべての名前空間が対象になります。 |
+| `environment` | string | いいえ | 省略すると、サービスのすべての環境が対象になります。 |
+| `transaction` | object | いいえ | 1つのエンドポイントを指定します。例：`{ "name": "POST /orders", "kind": "http" }`。`kind` は `http`、`rpc`、`messaging`、`span`、`other` のいずれかです。省略すると、サービス全体が対象になります。 |
+| `metric` | string | はい | 監視するメトリクスです。下の表を参照してください。 |
+| `sloId` | string | `slo_burn_rate` の場合 | バーンレートを取得する SLO を指定します。他のメトリクスでは `sloId` を指定できません。 |
+| `shortWindowSecs` | integer | いいえ | `slo_burn_rate` 専用です。`periodSecs` より短い値を指定します。期間全体のバーンレートと、その末尾の `shortWindowSecs` のバーンレートのうち、低い方を値として採用します。そのため、両方がしきい値を超える必要があります。 |
+
+| `metric` | 値 |
+|---|---|
+| `errorRate` | 全リクエストに占める失敗したリクエストの割合です。パーセントで表し、0〜100の範囲です。 |
+| `p50`, `p90`, `p95`, `p99`, `average` | レイテンシー（ミリ秒）です。 |
+| `throughput` | ウィンドウ内の1秒あたりのリクエスト数です。 |
+| `requestCount`, `errorCount` | ウィンドウ内のリクエスト数、または失敗したリクエスト数です。 |
+| `new_error_groups` | サービスまたは `transaction` のエラーグループのうち、ウィンドウ内で初めて検出された数です。 |
+| `apdex` | しきい値を 500 ms とした Apdex です。0〜1の範囲です。 |
+| `slo_burn_rate` | SLO が許容する消費ペースに対して、エラーバジェットを何倍のペースで消費しているかを示します。`1` の場合、SLO ウィンドウの終了時にエラーバジェットをちょうど使い切ります。 |
+
+ウィンドウが24時間以内の場合は分単位の集計を、24時間を超える場合は時間単位の集計を使用します。ウィンドウ内にリクエストがない場合、 `requestCount`、`errorCount`、`new_error_groups`、`throughput` は `0` になり、その他のメトリクスには値がないため、しきい値の条件に一致しません。結果には `value`、`service`、`trace_id` の各列が含まれます。そのため、インシデントには `service` ラベルが付き、`affectedServices` にサービスが入り、サンプルのトレース ID が記録されます。
+
+## RUM ルール
+
+`query.rum` を指定したルールは、RUM アプリケーションの指標を RUM ページと同じ方法で算出し、監視します。RUM ルールの種類は `scheduled` または `anomaly` です。1 つのルールに指定できるのは APM 指標と RUM 指標のどちらか一方です。API 呼び出しでは `query.stream` を `null` として保存し、 `query.statement` が空の場合は `rum:lcp_p75 checkout-web /checkout` のような説明を設定します。`query.language` は送信された値のまま保存しますが、ルールの動作には影響しません。アプリケーションが存在しない場合、API は `400` を返します。
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `applicationId` | 文字列 | はい | [RUM アプリケーション](/ja/rum/applications)を指定します。 |
+| `environment` | 文字列 | いいえ | 省略すると、アプリケーションのすべての環境が対象になります。 |
+| `page` | 文字列 | いいえ | 1 つのページまたはアプリの 1 つの画面を指定します。省略すると、すべてのページが対象になります。セッションやイシューの指標には指定できません。 |
+| `version` | 文字列 | いいえ | アプリケーションの 1 つのバージョンを指定します。省略すると、すべてのバージョンが対象になります。イシューの指標には指定できません。 |
+| `metric` | 文字列 | はい | 監視する指標を指定します。下記を参照してください。 |
+| `minSamples` | 整数 | いいえ | 指標の値を算出するために、集計ウィンドウ内に必要な対象行の最小数を指定します。省略すると、その指標のデフォルト値を使用します。件数には指定できません。 |
+| `customName`, `statistic` | 文字列 | `custom_vital` と `custom_timing` の場合 | バイタルまたはタイミングの名前と、集計方法を指定します。集計方法は `p50`、`p75`（デフォルト）、`p90`、`p95`、`p99`、`avg`、`count` のいずれかです。 |
+| `search` | オブジェクト | `query` の場合 | エクスプローラーのクエリを指定します。`type`（`sessions`、`views`、`actions`、`errors`、`resources`、`longTasks`、`logs` のいずれか）、入力したままの `statement`、その解析結果である `filters`（`field`、`op`、`value`）と `freeText`、および `measure` を含めます。`measure` には、`fn`（`count`、`count_distinct`、`sum`、`avg`、`min`、`max`、`p50` から `p99` のいずれか）と、その対象となる `field` を指定します。指定した `type` に存在しないフィールドを指定すると、API は `400` を返します。`page` や `version` とは併用できません。件数や合計を求める場合は `minSamples` も指定できません。 |
+
+`metric` には、`sessionCount`、`viewCount`、`errorCount`、`errorRate`、`crash_free_sessions`、`frustration_rate`、 `failed_request_rate`、`lcp_p75`、`inp_p75`、`cls_p75`、`ttfb_p75`、`new_issues`、`regressed_issues`、`issue_impact`、 `custom_vital`、`custom_timing`、`query` のいずれかを指定します。各指標の意味、単位、算出に必要な行については、 [RUM アラート](/ja/rum/alerts#指標一覧)を参照してください。`anomaly` ルールでは、`new_issues` と `regressed_issues` を除くすべての指標を使用できます。 `periodSecs` には 60 秒から 6 時間までの範囲を指定します。
+
+集計ウィンドウに行がない場合、件数は `0` になります。ほかの指標には値がなく、どのしきい値条件にも一致しません。結果は 1 行で、 `value` と `application` の列を含みます。インシデントが発生すると、ルールはサンプルセッションも最大 3 件探し、インシデントとともに保存します。[RUM アラート](/ja/rum/alerts#インシデント)を参照してください。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "High error rate",
+  "description": "More than 100 errors in five minutes",
+  "enabled": true,
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
+    "periodSecs": 300,
+    "stream": { "name": "app", "streamType": "logs" }
+  },
+  "trigger": { "operator": "gt", "threshold": 100, "forPeriods": 2, "silenceSecs": 0 },
+  "severity": "critical",
+  "escalationPolicyId": "<policy-id>",
+  "labels": { "team": "checkout" }
+}
+EOF
+```
+```bash APM rule
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "Checkout p95",
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "",
+    "periodSecs": 300,
+    "apm": {
+      "namespace": "shop",
+      "service": "checkout",
+      "environment": "production",
+      "transaction": { "name": "POST /orders", "kind": "http" },
+      "metric": "p95"
+    }
+  },
+  "trigger": { "operator": "gt", "threshold": 800, "forPeriods": 2, "silenceSecs": 0 },
+  "severity": "error",
+  "labels": { "service.name": "checkout", "deployment.environment": "production" }
+}
+EOF
+```
+```bash RUM rule
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "Checkout is slow",
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "",
+    "periodSecs": 3600,
+    "rum": {
+      "applicationId": "checkout-web",
+      "environment": "production",
+      "page": "/checkout",
+      "metric": "lcp_p75"
+    }
+  },
+  "trigger": { "operator": "gt", "threshold": 2500, "forPeriods": 1, "silenceSecs": 0 },
+  "severity": "warning",
+  "labels": { "rum.application": "checkout-web", "deployment.environment": "production", "rum.page": "/checkout" }
+}
+EOF
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KEDBLvTYO6DnWi8H9S9MNLpPT7",
+  "orgId": "<organization-id>",
+  "name": "High error rate",
+  "description": "More than 100 errors in five minutes",
+  "enabled": true,
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
+    "periodSecs": 300,
+    "stream": { "name": "app", "streamType": "logs" }
+  },
+  "trigger": { "operator": "gt", "threshold": 100.0, "forPeriods": 2, "silenceSecs": 0 },
+  "anomalyParams": null,
+  "thresholds": [],
+  "severity": "critical",
+  "escalationPolicyId": "<policy-id>",
+  "labels": { "team": "checkout" },
+  "annotations": {},
+  "lastEvalAt": null,
+  "lastState": { "kind": "healthy" },
+  "createdAt": 1790000000000000,
+  "updatedAt": 1790000000000000
+}
+```
+</ResponseExample>
+
+**エラー**
+
+| ステータス | 原因 |
+|---|---|
+| `400` | `name` または `query.statement` が空です。`query.stream` がありません。ルールが `query.stream` または `query.statement` 内のいずれかの箇所で [`_audit` ストリーム](/ja/settings/data-security#監査ストリーム)を参照しています。APM ルールが `scheduled` ではないか、`query.apm` が無効です（`APM alert service is invalid`、`an SLO burn-rate alert names its SLO`）。RUM ルールが `real_time` であるか、存在しないアプリケーションを指定しているか、`query.rum` が無効です（対象の指標では使えない `page` または `version`、件数に対する `minSamples`、60～21,600 秒の範囲外の集計ウィンドウ）。`escalationPolicyId` が組織内のどのポリシーも参照していません。`anomaly` ルールの `anomalyParams` が指定されていないか、無効です。または、`real_time` ルールが上記の制限に違反しています。レスポンスは JSON 形式で、コード `invalid_argument` と `anomaly detector not yet supported: prophet` などのメッセージを含みます。 |
+| `403` | トークンに `alerts.rules.manage` 権限がありません。 |
+| `422` | 必須フィールドが指定されていないか、値の型が正しくありません（未知の `operator` を指定した場合など）。レスポンスはプレーンテキストです。 |
+
+コンソールでの操作手順は、[アラートとインシデント対応](/ja/alerting)を参照してください。

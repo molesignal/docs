@@ -1,0 +1,117 @@
+---
+title: "PromQL-Kompatibilitätsmatrix"
+description: "Eine Übersicht über die PromQL-Funktionen, -Operatoren und -Modifikatoren, die MoleSignal unterstützt, sowie über bekannte Lücken."
+"en_link": "/en-US/query/promql-subset"
+"zh-Hans_link": "/zh-Hans/query/promql-subset"
+"zh-Hant_link": "/zh-Hant/query/promql-subset"
+"ja_link": "/ja/query/promql-subset"
+"ko_link": "/ko/query/promql-subset"
+"es_link": "/es/query/promql-subset"
+"fr_link": "/fr/query/promql-subset"
+"pt-BR_link": "/pt-BR/query/promql-subset"
+---
+
+MoleSignal wertet PromQL-Abfragen auf Metrikstreams mit einer integrierten Auswertungsengine aus (`promql-parser` und eine
+Arrow/DataFusion-Engine). MoleSignal unterstützt sowohl **Zeitpunktabfragen** als auch **Zeitraumabfragen**. Eine Abfrage mit
+`step` durchläuft `[start, end]` in Schritten und gibt eine Matrix zurück. Ohne `step` fragt sie den Zeitpunkt
+`end` ab. Diese Seite dokumentiert verbindlich, welche Funktionen MoleSignal unterstützt.
+
+## Unterstützt
+
+### Bereichsvektorfunktionen (`metric[range]`)
+
+`rate`, `irate`, `increase`, `delta`, `idelta`, `deriv`, `predict_linear`, `resets`, `changes`,
+`holt_winters` (Alias `double_exponential_smoothing`) und die gesamte Funktionsfamilie `*_over_time`:
+`avg_over_time` / `min_over_time` / `max_over_time` / `sum_over_time` / `count_over_time` /
+`quantile_over_time` / `stddev_over_time` / `stdvar_over_time` / `last_over_time` /
+`present_over_time` / `mad_over_time`.
+
+Wie Prometheus extrapolieren `rate`, `increase` und `delta` die Änderung zwischen dem ersten und letzten Messwert im
+Zeitfenster bis zu dessen Grenzen. Dieselben Messwerte liefern daher dieselben Ergebnisse.
+
+### Aggregationen (mit `by()` / `without()`)
+
+`sum`, `avg`, `min`, `max`, `count`, `stddev`, `stdvar`, `quantile`, `group`, `count_values`,
+`topk`, `bottomk`, `limitk`, `limit_ratio`.
+
+### Histogramme
+
+`histogram_quantile(q, sum by(le)(rate(metric_bucket[range])))` — lineare Interpolation über klassische
+`le`-Buckets.
+
+`histogram_fraction(lower, upper, v)` — schätzt anhand klassischer `le`-Buckets den Anteil der
+Beobachtungen in `[lower, upper]` (dieselbe stückweise lineare kumulative Verteilungsfunktion,
+`(rank(upper) - rank(lower)) / total`).
+
+### Labels und Sortierung
+
+`label_replace`, `label_join`, `sort`, `sort_desc`, `sort_by_label`, `sort_by_label_desc`.
+
+### Zeit
+
+`time`, `timestamp`, `minute`, `hour`, `day_of_week`, `day_of_month`, `day_of_year`,
+`days_in_month`, `month`, `year` (UTC; die Datumsfunktionen verwenden standardmäßig `vector(time())`).
+
+### Typ und fehlende Werte
+
+`vector`, `scalar`, `absent`, `absent_over_time`.
+
+### Mathematik, Rundung und Trigonometrie
+
+`abs`, `ceil`, `floor`, `round`, `exp`, `ln`, `log2`, `log10`, `sqrt`, `sgn`,
+`clamp` / `clamp_min` / `clamp_max`, `sin` / `cos` / `tan` / `asin` / `acos` / `atan` / `sinh` /
+`cosh` / `tanh` / `asinh` / `acosh` / `atanh`, `pi`, `deg`, `rad`.
+
+### Operatoren
+
+Arithmetische Operatoren `+ - * / % ^`, Vergleichsoperatoren `== != > < >= <=` (mit `bool`), Mengenoperatoren
+`and` / `or` / `unless`, Vektorabgleich mit `on(...)` / `ignoring(...)` und
+`group_left` / `group_right` sowie unäre Negation.
+
+### Modifikatoren und Struktur
+
+Selektormodifikatoren `@` (`start()` / `end()` / `<ts>`) und `offset` (auch für Matrixselektoren);
+Unterabfragen `inner[range:step]`.
+
+## Nicht implementiert / bekannte Abweichungen
+
+| Funktion | Status | Hinweise |
+|---|---|---|
+| Funktionen für native Histogramme `histogram_count` / `histogram_sum` / `histogram_avg` / `histogram_stddev` / `histogram_stdvar` | ❌ → 400 | Nicht auf das klassische Modell mit `le`-Buckets anwendbar. Verwenden Sie `histogram_quantile` für Quantile und `histogram_fraction` für Anteile in einem Intervall |
+| Binärer Operator `default` zum Ergänzen fehlender Werte | ❌ → 400 | — |
+| Unterabfragen innerhalb einer Zeitraumabfrage | ⚠️ | MoleSignal wertet sie nur zu einem Zeitpunkt aus (keine verschachtelten äußeren und inneren Zeitschritte). Bei Zeitpunktabfragen und Alarmregeln ist die Auswertung exakt |
+| `timestamp()` | ⚠️ | Gibt bei Zeitpunktabfragen den Auswertungszeitpunkt und bei Zeitraumabfragen den Zeitstempel des jeweiligen Datenpunkts zurück |
+| Skalare Funktionsparameter (`predict_linear` `t`, `holt_winters` `sf`/`tf`, Quantile) | ⚠️ | Nur numerische Literale |
+
+Nicht unterstützte Funktionen und Syntax führen zum Fehler `promql function not yet supported: <name>`.
+`POST /api/v1/query` (`language: "promql"`) gibt dafür den Statuscode `400` zurück.
+
+<Note>
+  Eine Alarmregel mit `promql` in `query.language` wertet den PromQL-Ausdruck als Zeitpunktabfrage am
+  Ende des Auswertungsfensters aus. Die Regel selbst ist eine MoleSignal-`AlertRule` und nicht
+  mit dem Prometheus-Regelformat kompatibel. Siehe [Regel erstellen](/de/api/alerting/create-rule).
+</Note>
+
+## Labelabgleich
+
+`=`, `!=`, `=~`, `!~` (reguläre Ausdrücke mit RE2, das sich leicht von Prometheus PCRE unterscheidet). `__name__` gleicht
+die Spalte `metric_name` ab. Ein Name in Anführungszeichen wählt eine Metrik mit Punkten im Namen aus, etwa
+`{"http.server.duration"}`. Ein Selektor ohne Metriknamen, etwa `{job="api"}` oder
+`{__name__=~"http_.*"}`, liest alle Metriken, die seine Filterbedingungen erfüllen. Die Zeitreihen behalten `__name__`.
+
+## Aufbau eines Metrikstreams
+
+Ein Metrikstream enthält die Metriken einer Quelle, etwa eines Prometheus-Servers, und speichert Labels
+in **separaten Spalten** statt in einem JSON-Blob:
+
+```sql
+_timestamp   Timestamp(Microsecond)  NOT NULL   -- time
+metric_name  Utf8                    NOT NULL   -- the metric, PromQL's __name__
+value        Float64                 NOT NULL   -- the measurement (Int64 etc. is accepted and cast to f64)
+<label_x>    Utf8 …                             -- every non-reserved column is a label
+```
+
+Die Dateien halten die Zeilen jeder Metrik zusammen und sortieren sie zuerst nach `metric_name`, dann nach Zeit. Ein Selektor liest aus den
+Streams mit der gesuchten Metrik nur Parquet-Dateien, deren Zeitraum sich mit dem Abfragezeitraum überschneidet, und daraus nur die Seiten
+mit der Metrik. Er bildet pro eindeutigem Labelsatz eine Zeitreihe und wendet die Filterbedingungen (`=`, `!=`, `=~`,
+`!~`) in der Auswertungsengine an. `@` und `offset` verschieben den Auswertungszeitpunkt. Informationen zu Metriken, die über OTLP eingehen, finden Sie unter [OTLP-Metrikfelder](/de/query#otlp-metrikfelder).

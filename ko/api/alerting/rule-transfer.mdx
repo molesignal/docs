@@ -1,0 +1,100 @@
+---
+title: "규칙 가져오기 및 내보내기"
+description: "알림 규칙을 참조 대상이 명시된 번들로 내보내거나, 번들 또는 Prometheus 알림 규칙 파일을 가져옵니다."
+"en_link": "/en-US/api/alerting/rule-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/rule-transfer"
+"zh-Hant_link": "/zh-Hant/api/alerting/rule-transfer"
+"ja_link": "/ja/api/alerting/rule-transfer"
+"de_link": "/de/api/alerting/rule-transfer"
+"es_link": "/es/api/alerting/rule-transfer"
+"fr_link": "/fr/api/alerting/rule-transfer"
+"pt-BR_link": "/pt-BR/api/alerting/rule-transfer"
+---
+
+```http
+GET  /api/v1/alerts/rules/export
+POST /api/v1/alerts/rules/import
+```
+
+## 내보내기
+
+`alerts.rules.read` 권한이 필요합니다. 쿼리 매개변수 `ids`에 규칙 ID를 쉼표로 구분해 지정합니다. 비워 두면 다음과 같이 모든
+규칙을 번들로 내보냅니다.
+
+```json
+{
+  "format": "molesignal.alert-rules/v1",
+  "exportedAt": "2026-10-28T08:00:00Z",
+  "rules": [
+    {
+      "name": "High error rate",
+      "description": "",
+      "enabled": true,
+      "kind": "scheduled",
+      "query": {"language": "promql", "statement": "sum(rate(http_requests_total{code=~\"5..\"}[5m]))", "periodSecs": 60, "stream": {"name": "http_requests_total", "streamType": "metrics"}},
+      "trigger": {"operator": "gt", "threshold": 5, "forPeriods": 2, "silenceSecs": 300},
+      "thresholds": [],
+      "severity": "error",
+      "escalationPolicy": "Payments on-call",
+      "labels": {"service": "checkout"},
+      "annotations": {}
+    }
+  ]
+}
+```
+
+번들의 각 규칙에는 전체 정의가 포함되지만 ID, 조직, 평가 상태, 시간 정보는 포함되지 않습니다.
+`escalationPolicy`는 에스컬레이션 정책의 이름이며, 기본 정책을 사용하면 이 필드를 생략합니다.
+복합 규칙의 `query.composite.rules`에는 하위 규칙의 이름이 들어갑니다. 하트비트
+규칙의 체크인 주소는 번들에 포함하지 않습니다.
+
+## 가져오기
+
+`alerts.rules.manage` 권한이 필요합니다.
+
+| 필드 | 유형 | 필수 | 설명 |
+|---|---|---|---|
+| `content` | 문자열 | 예 | 번들(`format`이 포함된 JSON 또는 YAML) 또는 Prometheus 알림 규칙 파일(최상위 `groups` 또는 `PrometheusRule`의 `spec.groups`)입니다. 최대 4 MiB, 규칙 500개까지 지원합니다. |
+| `dryRun` | 불리언 | 아니요 | 기본값 `true`는 저장하지 않고 가져오기를 테스트합니다. `false`는 변경 사항을 저장합니다. |
+| `createOnly` | 불리언 | 아니요 | `true`이면 이름이 같은 기존 규칙을 변경하지 않습니다. |
+
+규칙은 이름으로 매칭합니다. 새 이름이면 규칙을 생성하고, 이름이 같은 기존 규칙이 하나면 필드별로 비교합니다. 이름이 같은
+기존 규칙이 여러 개이거나 파일에 같은 이름이 두 번 나오면 실패합니다. 각 규칙은 개별 저장 시와 같은 방식으로 검증합니다. 하나라도 실패하면
+아무것도 저장하지 않습니다. 모두 성공하면 단일 트랜잭션으로 가져오기 결과를 저장하고, 각 규칙에 대해 페더레이션 변경 이벤트를 전송하며
+감사 이벤트 `alert_rules.imported`를 한 번 기록합니다. Prometheus 규칙을
+MoleSignal 규칙으로 변환하는 방법은 [가져오기 및 내보내기](/ko/alerting/rules#가져오기-및-내보내기)를
+참조합니다.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content rules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "prometheus",
+  "items": [
+    {"name": "HighErrorRate", "action": "create", "ruleId": "3KF1..."},
+    {"name": "DiskFull", "action": "update", "changes": ["query", "trigger"], "ruleId": "3KC9..."},
+    {"name": "TargetDown", "action": "error", "error": "no escalation policy is named `ops`"}
+  ],
+  "notes": ["recording rule `job:errors:rate5m` in group `api` is not imported"],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` 값은 `create`, `update`, `unchanged`, `skip`(`createOnly`가 `true`이고 기존 규칙이 있는 경우) 또는 `error`입니다.
+`applied`는 저장된 내용이 있는지 나타냅니다.
+
+**오류**
+
+| 상태 | 원인 |
+|---|---|
+| `400` | 콘텐츠가 번들이나 Prometheus 규칙 파일이 아니거나, 다른 형식을 지정했거나, 파일 크기 또는 규칙 수가 한도를 초과했습니다. |
+| `403` | 토큰에 필요한 권한이 없습니다. |

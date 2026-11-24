@@ -1,0 +1,224 @@
+---
+title: "Migration des plannings depuis Opsgenie ou PagerDuty"
+description: "Importez les plannings d’astreinte via l’API REST d’Opsgenie ou de PagerDuty et comparez-les à ceux affichés dans l’outil source avant tout enregistrement. Vérifiez ce qui est importé et ce qui ne l’est pas."
+"en_link": "/en-US/alerting/schedule-migration"
+"zh-Hans_link": "/zh-Hans/alerting/schedule-migration"
+"zh-Hant_link": "/zh-Hant/alerting/schedule-migration"
+"ja_link": "/ja/alerting/schedule-migration"
+"ko_link": "/ko/alerting/schedule-migration"
+"de_link": "/de/alerting/schedule-migration"
+"es_link": "/es/alerting/schedule-migration"
+"pt-BR_link": "/pt-BR/alerting/schedule-migration"
+---
+
+**Importer des plannings d’astreinte…** lit les plannings tels que les renvoient les API REST d’Opsgenie et de PagerDuty. Les équipes peuvent ainsi migrer sans recréer leurs rotations à la main. Un script utilise la clé API de la source pour récupérer les plannings et les enregistrer dans un fichier. Comme pour un [lot](/fr/alerting/on-call#importation-et-exportation), l’importation se déroule en deux temps : MoleSignal teste d’abord le fichier, puis enregistre tous les plannings en une seule fois. MoleSignal ne conserve pas la clé et n’appelle pas l’API source. L’importation nécessite l’autorisation `schedules.create`.
+
+Une seule règle détermine ce que MoleSignal importe : à partir de maintenant, la personne d’astreinte doit rester la même à tout moment. Si un réglage non pris en charge dans MoleSignal modifie le résultat, l’importation s’arrête. Si un réglage est sans effet à partir de maintenant, MoleSignal l’ignore et le signale dans le résultat.
+
+## Étapes
+
+<Steps>
+  <Step title="Ajoutez les membres">
+    Ajoutez toutes les personnes qui participent aux rotations à l’espace de travail avec la même adresse e-mail que dans la source. Consultez la page [Membres](/fr/identity/members). MoleSignal identifie les membres par leur adresse e-mail, sans tenir compte de la casse.
+  </Step>
+  <Step title="Récupérez les plannings">
+    Exécutez le script pour [Opsgenie](#opsgenie) ou [PagerDuty](#pagerduty) sur une machine équipée de `curl` et de `jq`. Le script génère un seul fichier.
+  </Step>
+  <Step title="Testez l’importation">
+    Ouvrez **Alertes → Plannings d’astreinte**, puis sélectionnez **Importer/exporter → Importer des plannings d’astreinte…**, **Choisir un fichier** et **Tester**. Le résultat indique ce que MoleSignal ferait pour chaque planning. Consultez [Lire le résultat](#lire-le-résultat).
+  </Step>
+  <Step title="Corrigez les erreurs bloquantes">
+    Modifiez les plannings dans la source et récupérez-les à nouveau, ou modifiez le fichier. MoleSignal n’enregistre rien tant qu’un planning présente une erreur.
+  </Step>
+  <Step title="Importez les plannings">
+    Sélectionnez **Importer**, puis ouvrez un planning importé et vérifiez qui est d’astreinte. Associez le planning à une [politique d’escalade](/fr/alerting/on-call#politiques-d’escalade) pour commencer à notifier les personnes d’astreinte.
+  </Step>
+</Steps>
+
+## Opsgenie
+
+Configurez une clé API qui autorise la lecture des plannings, puis exécutez le script. Les comptes de l’Union européenne utilisent `api.eu.opsgenie.com`.
+
+```bash
+export OPSGENIE_API_KEY=<api key>
+```
+
+```bash
+API=https://api.opsgenie.com   # EU accounts: https://api.eu.opsgenie.com
+DAYS=200
+
+get() { curl -fsS -H "Authorization: GenieKey $OPSGENIE_API_KEY" "$API$1"; }
+
+get /v2/schedules | jq -r '.data[].id' | while read -r id; do
+  get "/v2/schedules/$id"
+  get "/v2/schedules/$id/timeline?expand=base&interval=$DAYS&intervalUnit=days"
+done | jq -s '{
+  data: map(.data | select(has("rotations"))),
+  timelines: map(.data | select(has("baseTimeline"))
+    | {_parent, startDate, endDate, baseTimeline}
+    | .baseTimeline.rotations[].periods |= map({startDate, endDate, type, recipient}))
+}' > opsgenie-schedules.json
+```
+
+Le fichier contient chaque planning renvoyé par `GET /v2/schedules/{id}` dans `data`, ainsi que sa chronologie renvoyée par `GET /v2/schedules/{id}/timeline` dans `timelines`. `DAYS` définit le nombre de jours à venir que couvre la chronologie.
+
+| Dans Opsgenie | Dans MoleSignal |
+|---|---|
+| Nom, description, fuseau horaire, état d’activation | Identiques. |
+| Équipe propriétaire | L’équipe du même nom, si elle existe. Sinon, MoleSignal n’associe aucune équipe au planning et le signale dans le résultat. |
+| `type` et `length` de la rotation | **Quotidienne** ou **Hebdomadaire** si `length` vaut 1. Sinon, une période personnalisée, par exemple 6 heures pour `hourly` si `length` vaut 6. |
+| `startDate`, `endDate` | Le début et la fin de la rotation. MoleSignal ignore les rotations terminées. |
+| `timeRestriction` | Plages hebdomadaires dans le fuseau horaire du planning, y compris les plages qui s’étendent sur plusieurs jours. |
+| Plusieurs rotations sans chevauchement | Plusieurs rotations, par exemple une pendant les heures ouvrées et une en dehors. |
+| Participants de type utilisateur | Les membres correspondants, dans le même ordre. MoleSignal les identifie par leur `username`, qui contient leur adresse e-mail. |
+
+Les cas suivants bloquent l’importation si la rotation est en cours :
+
+| Dans Opsgenie | Pourquoi |
+|---|---|
+| Une équipe ou une escalade comme participant | Dans MoleSignal, seules des personnes peuvent participer à une rotation. |
+| Un participant **No-One** | Dans MoleSignal, chaque tour de la rotation doit avoir une personne d’astreinte. |
+| Des rotations qui se chevauchent | Opsgenie place simultanément en astreinte les personnes de toutes les rotations qui se chevauchent. Dans MoleSignal, un planning n’a qu’une personne d’astreinte à la fois. Dans le fichier, répartissez les rotations dans des plannings distincts portant des noms différents, puis indiquez les deux plannings dans une même étape d’une politique d’escalade. |
+
+MoleSignal n’importe ni les remplacements d’astreinte, ni les règles de transfert, ni les escalades, ni le routage.
+
+## PagerDuty
+
+Configurez une clé API autorisée à lire les plannings et les utilisateurs, puis exécutez le script. Les comptes de l’UE utilisent `api.eu.pagerduty.com`.
+
+```bash
+export PAGERDUTY_API_KEY=<api key>
+```
+
+```bash
+API=https://api.pagerduty.com   # EU accounts: https://api.eu.pagerduty.com
+DAYS=200
+since=$(jq -rn 'now | todate')
+until=$(jq -rn "now + $DAYS * 86400 | todate")
+
+get() {
+  curl -fsSg -H "Authorization: Token token=$PAGERDUTY_API_KEY" \
+    -H 'Accept: application/vnd.pagerduty+json;version=2' "$API$1"
+}
+pages() {
+  offset=0
+  while page=$(get "$1?limit=100&offset=$offset"); do
+    printf '%s\n' "$page"
+    [ "$(printf '%s' "$page" | jq .more)" = true ] || break
+    offset=$((offset + 100))
+  done
+}
+shift_based=$(pages /v3/schedules)
+
+{
+  pages /users
+  printf '%s\n' "$shift_based"
+  printf '%s\n' "$shift_based" | jq -r '.schedules[].id' | while read -r id; do
+    get "/v3/schedules/$id?since=$since&until=$until&include[]=final_schedule"
+  done
+  pages /schedules | jq -r '.schedules[].id' | while read -r id; do
+    get "/schedules/$id?since=$since&until=$until&include[]=final_schedule&include[]=overrides_subschedule"
+  done
+} | jq -s --arg since "$since" --arg until "$until" '{
+  since: $since,
+  until: $until,
+  users: (map(.users // []) | add // [] | map({id, email})),
+  shift_based_schedules: (map(.schedules // []) | add // [] | map({id, type, summary})),
+  schedules: map(.schedule // empty
+    | del(.users, .escalation_policies)
+    | if .type == "schedule_v3" then
+        .final_schedule.computed_shift_assignments[]? |= {start_time, end_time, member, source: {type: .source.type}}
+      else
+        del(.schedule_layers[].rendered_schedule_entries)
+        | .final_schedule.rendered_schedule_entries |= map({start, end, user: (.user | select(.) | {id})})
+        | .overrides_subschedule.rendered_schedule_entries |= map({start, end})
+      end)
+}' > pagerduty-schedules.json
+```
+
+Le fichier contient chaque planning renvoyé par `GET /schedules/{id}` et `GET /v3/schedules/{id}` sous `schedules`, les adresses e-mail renvoyées par `GET /users` sous `users` et la liste renvoyée par `GET /v3/schedules` sous `shift_based_schedules`. Les plannings indiquent les noms des personnes, mais pas leur adresse e-mail. `since` et `until` délimitent la période que PagerDuty calcule, et `DAYS` fixe jusqu’où elle s’étend dans le futur.
+
+Récupérez les plannings un par un, sans `time_zone`. `GET /schedules` affiche les plages de restriction dans le fuseau horaire du compte qui effectue la requête plutôt que dans celui du planning. L’import détecte et refuse tout planning calculé dans un autre fuseau horaire que le sien.
+
+### Plannings à couches
+
+| Dans PagerDuty | Dans MoleSignal |
+|---|---|
+| Nom, description, fuseau horaire | À l’identique. Un planning en pause le reste après une mise à jour. |
+| Équipes | La première équipe dont le nom correspond à une équipe dans MoleSignal. Le résultat indique les autres équipes. |
+| Couches | Les rotations conservent le même ordre de priorité : la couche la plus récente est prioritaire et détermine qui est d’astreinte. Les couches inférieures prennent le relais en dehors de ses plages de restriction. |
+| `rotation_turn_length_seconds` | **Quotidienne** pour exactement 24 heures et **Hebdomadaire** pour exactement 7 jours. Sinon, une période personnalisée. |
+| `rotation_virtual_start` | Le début de la rotation, qui détermine l’heure de la relève et la personne d’astreinte. |
+| `start` | La date de prise d’effet de la couche. Si cette date est passée, aucun ajustement n’est nécessaire. Si elle est à venir, la rotation commence à cette date, avec la personne prévue à ce moment-là en premier. |
+| `end` | La fin de la rotation. L’import exclut les couches terminées et les versions antérieures des couches modifiées. |
+| `restrictions` | Des plages hebdomadaires dans le fuseau horaire du planning, pour `daily_restriction` comme pour `weekly_restriction`. |
+| `users` | Les membres, dans le même ordre, identifiés par leur adresse e-mail dans `users`. |
+
+### Plannings par créneaux d’astreinte
+
+Un planning renvoyé par l’API V3 de PagerDuty se compose d’événements. Les événements n’ont pas de priorité : en cas de chevauchement, les personnes de tous les événements concernés sont d’astreinte en même temps.
+
+| Dans PagerDuty | Dans MoleSignal |
+|---|---|
+| Nom, description, équipes | Comme pour un planning à couches. |
+| Fuseau horaire des événements | Le fuseau horaire du planning, car les relèves conservent l’heure locale de l’événement. Le résultat signale toute différence avec le `time_zone` du planning source. |
+| Chaque événement | Une rotation portant le nom de l’événement. Les événements qui ne se chevauchent pas, par exemple l’un pendant les heures ouvrées et l’autre en dehors, peuvent figurer dans n’importe quel ordre. |
+| `start_time`, `end_time`, `recurrence` | Le premier créneau et sa récurrence, comme dans le tableau suivant. |
+| `shifts_per_member` | La durée d’un tour d’astreinte. Le décompte des occurrences commence à `start_time` et chaque jour de `BYDAY` compte pour une occurrence. |
+| `effective_since` | La date de prise d’effet de l’événement. Si elle est passée, aucun ajustement n’est nécessaire et cette date ne détermine pas qui est d’astreinte. Si elle est à venir, la rotation commence à cette date, avec la personne prévue à ce moment-là en premier. |
+| `effective_until` | La fin de la rotation. L’import exclut les événements terminés. |
+| `members` | Les membres, dans le même ordre, identifiés par leur adresse e-mail dans `users`. |
+
+| `recurrence` | Premier créneau | Dans MoleSignal |
+|---|---|---|
+| `RRULE:FREQ=WEEKLY` | 7 jours | Toujours active : **Hebdomadaire** si `shifts_per_member` vaut 1, sinon une période personnalisée. |
+| `RRULE:FREQ=DAILY` | 24 heures | Toujours active : **Quotidienne** si `shifts_per_member` vaut 1, **Hebdomadaire** si la valeur est 7, sinon une période personnalisée. |
+| `FREQ=WEEKLY`, `FREQ=DAILY` ou `FREQ=HOURLY` avec un `INTERVAL` | De la durée de l’intervalle | Toujours active, avec une période personnalisée, par exemple 12 heures pour `RRULE:FREQ=HOURLY;INTERVAL=12`. |
+| `RRULE:FREQ=DAILY` | Une partie de la journée | Des plages hebdomadaires pour chaque jour. |
+| `RRULE:FREQ=WEEKLY`, ou règle avec un seul jour dans `BYDAY` | Une partie de la semaine | Une plage hebdomadaire qui peut s’étendre sur plusieurs jours. |
+| `RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` | Une partie de la journée | Des plages hebdomadaires pour ces jours. Une valeur de 5 pour `shifts_per_member` correspond à une semaine par personne, et une valeur de 10 à deux semaines. |
+
+Les cas suivants bloquent l’import tant que l’événement est en cours :
+
+| Dans PagerDuty | Pourquoi |
+|---|---|
+| `every_member_assignment_strategy` avec plusieurs membres | Tous les membres sont d’astreinte en même temps, alors qu’un planning MoleSignal ne prévoit qu’une seule personne à la fois. Créez un planning distinct pour chaque personne dans le fichier, avec un nom différent, puis ajoutez toutes ces personnes à la même étape d’une politique d’escalade. |
+| `empty_member` parmi d’autres membres | Une rotation MoleSignal ne peut pas laisser un tour d’astreinte sans personne. |
+| Événements qui se chevauchent | Les personnes concernées sont d’astreinte en même temps. Placez ces événements dans des plannings distincts, comme pour Opsgenie. |
+| `EXDATE` ou `RDATE` | Une rotation MoleSignal ne permet ni de supprimer ni d’ajouter une occurrence. PagerDuty ne précise pas si ces occurrences entrent dans le calcul de `shifts_per_member`. |
+| Toute autre règle, par exemple `FREQ=MONTHLY`, `COUNT`, `UNTIL` ou un `INTERVAL` avec un créneau plus court que l’intervalle | Les tours d’astreinte ou les plages couvertes ne se répètent pas aux mêmes moments chaque semaine. |
+| `BYDAY` avec plusieurs membres et une valeur de `shifts_per_member` qui n’est pas un multiple du nombre de jours | Les relèves ne suivent pas une périodicité fixe : le créneau qui suit celui du vendredi tombe le lundi. |
+| Un créneau personnalisé à venir | Une rotation MoleSignal ne permet pas de définir un créneau ponctuel. Attendez la fin du créneau pour lancer l’import, ou retirez-le de `final_schedule` dans le fichier, puis ajoutez une dérogation après l’import. |
+| Événements dans des fuseaux horaires différents | Un planning MoleSignal ne prend en charge qu’un seul fuseau horaire. |
+
+L’import exclut tout planning par créneaux d’astreinte que le fichier ne fait que mentionner sous `shift_based_schedules`, par exemple si le script n’a pas pu le récupérer. Le résultat indique son nom. Relancez le script pour récupérer et importer ce planning. L’import se poursuit pour le reste du fichier.
+
+L’import ne prend pas en charge les dérogations, les politiques d’escalade ni les services.
+
+## Lire le résultat
+
+| Libellé | Signification |
+|---|---|
+| **Créer**, **Mettre à jour**, **Inchangée** | L’import établit les correspondances par nom, comme pour un lot. **Mettre à jour** indique les champs qui changent. |
+| **Passer** | L’import exclut un planning PagerDuty par créneaux d’astreinte que le fichier ne fait que mentionner, ou un planning existant si l’option **Créer uniquement les nouvelles règles, sans modifier celles du même nom** est sélectionnée. |
+| **Erreur** | L’erreur bloque l’import de tout le fichier. Le résultat affiche chaque motif sur une ligne distincte et répertorie toutes les adresses e-mail qui ne correspondent à aucun membre. |
+
+Les autres lignes d’un planning indiquent les éléments exclus et le résultat de la comparaison avec la source.
+
+### Comparaison avec la source
+
+Le fichier contient le planning calculé par la source : `final_schedule` pour PagerDuty et la chronologie pour Opsgenie. La simulation détermine qui est d’astreinte sur la même période à partir de maintenant et compare les deux plannings. En cas d’écart, l’erreur indique les horaires et les deux personnes concernées. L’import n’enregistre aucune modification.
+
+- L’import exclut les dérogations. La comparaison ignore donc les périodes qu’elles couvrent.
+- Un planning par créneaux d’astreinte qui indique plusieurs personnes d’astreinte en même temps dans `final_schedule` bloque l’import, même si ses événements ne se chevauchent pas.
+- L’import place les plannings désactivés dans Opsgenie en pause et ne les compare pas.
+- Dans un fuseau horaire qui applique l’heure d’été, le résultat signale si la comparaison ne couvre aucun changement d’heure. Les relèves restent à la même heure locale dans MoleSignal. Augmentez `DAYS` pour comparer les relèves avant et après le prochain changement d’heure.
+- Si le fichier ne contient pas le planning calculé par la source, le résultat signale l’absence de comparaison et l’import se poursuit. Pour importer un planning qui diffère volontairement de la source, retirez `final_schedule` ou `timelines` du fichier.
+
+### Limites
+
+Un fichier peut peser jusqu’à 4 MiB et contenir jusqu’à 500 plannings. Un planning peut contenir jusqu’à 60 rotations en cours. Réduisez `DAYS` si le fichier est trop volumineux.
+
+## Relancer l’import
+
+L’import établit les correspondances par nom. Relancez-le pour mettre à jour les rotations des plannings qui ont changé à la source et laisser les autres à l’identique. MoleSignal conserve les dérogations et les échanges de créneaux d’astreinte effectués dans MoleSignal, ainsi que les paramètres absents du fichier, comme l’équipe ou **Les échanges nécessitent une approbation**.

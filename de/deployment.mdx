@@ -1,0 +1,214 @@
+---
+title: "MoleSignal bereitstellen"
+description: "Anforderungen, Bereitstellungsoptionen, Ports und Zustandsprüfungen für den Betrieb von MoleSignal außerhalb der Sandbox."
+"en_link": "/en-US/deployment"
+"zh-Hans_link": "/zh-Hans/deployment"
+"zh-Hant_link": "/zh-Hant/deployment"
+"ja_link": "/ja/deployment"
+"ko_link": "/ko/deployment"
+"es_link": "/es/deployment"
+"fr_link": "/fr/deployment"
+"pt-BR_link": "/pt-BR/deployment"
+---
+
+MoleSignal wird als einzelne Binärdatei und als einzelnes Container-Image bereitgestellt. Die Konfiguration legt fest, welche [Rollen](/de/deployment/role-based) ein Prozess übernimmt: Ein einzelner Prozess kann alle Rollen übernehmen, oder die Rollen lassen sich auf mehrere Prozesse verteilen. Jedes Deployment benötigt zwei externe Dienste: PostgreSQL und Objektspeicher.
+
+## Anforderungen
+
+| Komponente | Anforderung |
+|---|---|
+| PostgreSQL | Speichert Metadaten, Identitäten, den Dateikatalog und Produktressourcen. PostgreSQL ist die einzige unterstützte Metadatenbank. Die Compose-Sandbox und die Kubernetes-Manifeste verwenden PostgreSQL 17. |
+| Objektspeicher | Speichert Parquet-Dateien, Suchindizes und Profil-Blobs. Verwenden Sie `s3` (AWS S3 oder einen S3-kompatiblen Dienst wie RustFS, Cloudflare R2 oder Alibaba Cloud OSS), `azure` oder `gcs`. Das Backend `local` eignet sich für den Betrieb auf einem einzelnen Knoten und für die Entwicklung. |
+| Rechenressourcen | Linux auf x86-64 oder arm64 mit dem Container-Image (`linux/amd64` und `linux/arm64`). Die Sandbox benötigt etwa 2 GB Arbeitsspeicher. |
+| Lokaler Speicher | Enthält nur Caches, die sich neu aufbauen lassen. MoleSignal bestätigt einen Schreibvorgang, sobald das zugehörige Write-Ahead-Log-Objekt (WAL) im Objektspeicher liegt. Daher benötigt kein Knoten ein persistentes Volume. Siehe [Dauerhaftigkeit und Übernahme](/de/architecture#dauerhaftigkeit-und-übernahme). |
+
+Der Bedarf an Arbeits- und Plattenspeicher hängt vom Aufnahmevolumen, der Anzahl aktiver Streams und den Cache-Einstellungen unter [Konfiguration](/de/configuration) ab. Dimensionieren Sie die Ressourcen anhand der gemessenen Nutzung: Die [Nutzung der Datenaufnahme](/de/streams#dateneingang-und-budgets) zeigt, wie viele Daten pro Quelle eingehen. Der Prozess stellt unter `/metrics` Prometheus-Metriken bereit. Siehe [Checkliste für den Produktivbetrieb](/de/deployment/production-checklist).
+
+## Container-Image
+
+Das Image ist unter `ghcr.io/molesignal/molesignal` verfügbar. Jedes Release erhält ein Versions-Tag (zum Beispiel `26.1.0.0`) und ein Kanal-Tag (zum Beispiel `alpha`). Legen Sie im Produktivbetrieb ein festes Versions-Tag fest.
+
+```bash
+docker pull ghcr.io/molesignal/molesignal:26.1.0.0
+```
+
+Alle Rollen verwenden dasselbe Image. Die Laufzeitvariable `RELEASE_CHANNEL` (`alpha`, `beta`, `rc` oder `stable`) kennzeichnet den Reifegrad des Deployments und ändert die Binärdatei nicht. Die Binärdatei enthält die Weboberfläche und stellt sie über den HTTP-Port bereit.
+
+## Bereitstellungsoptionen
+
+<Tabs>
+  <Tab title="Docker Compose">
+    Das Repository enthält `deploy/docker/docker-compose.yaml` mit zwei Profilen. Beide starten PostgreSQL 17 und RustFS und führen das MoleSignal-Image aus `ghcr.io/molesignal/molesignal` aus.
+
+    ```bash
+    # Everything in one process: serves the complete product
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
+
+    # One container per role
+    docker compose -f deploy/docker/docker-compose.yaml --profile multirole up
+    ```
+
+    Das Profil `multirole` stellt pro Rolle einen Container bereit. Der Router veröffentlicht die Weboberfläche und die HTTP-API auf Port `5080` und den OTLP-gRPC-Empfänger auf Port `4317`. Siehe [Rollenbasierte Bereitstellung](/de/deployment/role-based).
+
+    Der Standalone-Dienst veröffentlicht die Ports `5080` und `5082`. Den OTLP-gRPC-Port `4317` veröffentlicht er nicht. Um OTLP-Daten per gRPC vom Host zu senden, fügen Sie dem Dienst die Portzuordnung `4317:4317` hinzu.
+
+    Die Compose-Datei dient als Sandbox: Sie verwendet Standardzugangsdaten, einen Verschlüsselungsschlüssel für die Entwicklung und für das Profil `multirole` ein `MS_SELF_TELEMETRY_CLUSTER_TOKEN` für die Entwicklung. Ersetzen Sie diese Werte, bevor Sie echte Daten speichern. Siehe [Checkliste für den Produktionsbetrieb](/de/deployment/production-checklist). Der Sandbox-Bucket ist privat.
+  </Tab>
+  <Tab title="Binärdatei und systemd">
+    Installieren Sie die Release-Binärdatei, die Konfigurationsdatei und die GeoIP-Datenbank. Führen Sie MoleSignal anschließend als systemd-Dienst aus.
+
+    ```bash
+    sudo useradd --system --home-dir /var/lib/molesignal \
+      --shell /usr/sbin/nologin molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo install -d -o root -g molesignal -m 0750 /etc/molesignal
+    sudo install -o root -g molesignal -m 0640 \
+      conf/config.toml /etc/molesignal/config.toml
+    sudo install -Dm644 deploy/systemd/molesignal.service \
+      /etc/systemd/system/molesignal.service
+    sudo install -Dm644 mmdb/dbip-city-lite.mmdb \
+      /usr/share/molesignal/mmdb/dbip-city-lite.mmdb
+    ```
+
+    Legen Sie den Laufzeitkanal in `/etc/molesignal/molesignal.env` fest:
+
+    ```ini
+    RELEASE_CHANNEL=alpha
+    ```
+
+    Konfigurieren Sie PostgreSQL, den Objektspeicher und die Secrets in `/etc/molesignal/config.toml`. Starten Sie anschließend den Dienst:
+
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now molesignal
+    sudo systemctl status molesignal
+    ```
+
+    Die Unit speichert ihre Zustandsdaten in `/var/lib/molesignal` und gewährt `CAP_NET_BIND_SERVICE`, damit der integrierte TLS-Listener die Ports `80` und `443` binden kann.
+  </Tab>
+  <Tab title="Helm">
+    Das offizielle Chart stellt MoleSignal auf Kubernetes ab Version 1.27 mit Helm ab Version 3.8 bereit. Das Chart setzt MoleSignal ab Version 26.2.0.0 voraus. Das Chart-Repository liegt unter `https://charts.molesignal.com`. Dasselbe Chart steht auch unter `oci://ghcr.io/molesignal/charts/molesignal` bereit.
+
+    Standardmäßig startet das Chart einen Prozess für alle Rollen sowie je eine Instanz von PostgreSQL 17 und RustFS. Für diese beiden Instanzen gibt es weder Backups noch Failover. Die Standardkonfiguration eignet sich daher nur zum Testen.
+
+    ```bash
+    helm repo add molesignal https://charts.molesignal.com
+    helm repo update
+    helm install molesignal molesignal/molesignal --namespace molesignal --create-namespace
+    ```
+
+    Richten Sie für den Zugriff auf die Weboberfläche eine Portweiterleitung ein. Öffnen Sie anschließend `http://127.0.0.1:5080` im Browser:
+
+    ```bash
+    kubectl --namespace molesignal port-forward svc/molesignal 5080:5080
+    ```
+
+    Führen Sie im Produktionsbetrieb die Rollen als separate Workloads aus, deaktivieren Sie die mitgelieferten Dienste und konfigurieren Sie das Chart für eine externe PostgreSQL-Instanz und einen externen Objektspeicher. Erstellen Sie zuerst die beiden Secrets: `molesignal-db` enthält den Schlüssel `database-dsn`, und `molesignal-s3` enthält `access-key` und `secret-key`.
+
+    ```yaml
+    mode: distributed
+
+    postgresql:
+      enabled: false
+    externalDatabase:
+      existingSecret: molesignal-db
+
+    rustfs:
+      enabled: false
+    objectStore:
+      bucket: example-telemetry
+      region: eu-west-1
+      existingSecret: molesignal-s3
+    ```
+
+    [`examples/production.yaml`](https://github.com/molesignal/molesignal-helm/blob/main/examples/production.yaml) ergänzt TLS, Autoscaling und Disruption Budgets. Die [README des Charts](https://github.com/molesignal/molesignal-helm/tree/main/charts/molesignal) führt alle Konfigurationswerte auf.
+
+    | Thema | Details |
+    |---|---|
+    | Verschlüsselungsschlüssel | Das Chart erzeugt den Schlüssel bei der ersten Installation und behält ihn bei Upgrades und nach `helm uninstall` bei. Sichern Sie den Schlüssel: Ohne ihn lassen sich verschlüsselte Felder nicht lesen. Wenn Sie Argo CD oder ein anderes Tool verwenden, das mit `helm template` rendert, setzen Sie `secrets.cipherKey` und `secrets.clusterToken` oder geben Sie unter `secrets.existingSecret` ein Secret an. |
+    | Images | Mit Ausnahme des PostgreSQL-Images verwenden alle Images das Tag `latest`. Kubernetes lädt diese Images bei jedem Pod-Start. Legen Sie für den Produktionsbetrieb unter `image.tag` eine feste Version fest und setzen Sie `image.pullPolicy` auf `IfNotPresent`. |
+    | Ingress | Setzen Sie `ingress.enabled`. Wenn MoleSignal hinter einem Ingress läuft, tragen Sie das Netzwerk der Controller-Pods unter [Erkennung der Client-IP-Adresse](/de/settings/platform#client-ip-erkennung) als vertrauenswürdigen Proxy ein. |
+    | Anwendungseinstellungen | Fügen Sie die Einstellungen unter `config` ein. Verwenden Sie dabei die Struktur von `conf/config.toml`. |
+
+    Lesen Sie den Verschlüsselungsschlüssel der Standardinstallation aus:
+
+    ```bash
+    kubectl --namespace molesignal get secret molesignal-secret -o jsonpath='{.data.cipher-key}' | base64 --decode
+    ```
+  </Tab>
+  <Tab title="Kubernetes-Manifeste">
+    Die Manifeste in [`deploy/k8s/`](https://github.com/molesignal/molesignal/tree/main/deploy/k8s) verwenden dasselbe Image für alle Rollen. Sie verweisen auf das Platzhalter-Image `molesignal:dev`. Ersetzen Sie es in jedem Workload durch `ghcr.io/molesignal/molesignal:<version>`.
+
+    Die Manifeste enthalten weder PostgreSQL noch einen Objektspeicher. Stellen Sie PostgreSQL 17 unter dem Service-Namen `postgresql` bereit (oder ändern Sie `meta_database.dsn` in der ConfigMap). Stellen Sie außerdem einen beliebigen S3-kompatiblen Objektspeicher bereit (passen Sie `object_store` in der ConfigMap an).
+
+    Die Manifeste stellen die Rollen getrennt bereit: Der Workload `router` stellt die Weboberfläche und die HTTP-API bereit. Die übrigen Workloads übernehmen die Datenverarbeitung und Hintergrundaufgaben. Um stattdessen alle Rollen in einem Prozess auszuführen, verwenden Sie `40-intake.yaml` (ein Deployment ohne persistentes Volume) als Vorlage, setzen Sie `MS_NODE_ROLES` auf `["standalone"]`, fügen Sie den Service-Port `5080` hinzu und verwenden Sie `/api/v1/healthz` als Probe-Endpunkt.
+
+    | Workload | Typ | Replikate | Rolle |
+    |---|---|---|---|
+    | `router` | Deployment | 2 | `router`: Weboberfläche, HTTP-API und OTLP gRPC |
+    | `intake` | Deployment | 2 | `intake`, ohne persistentes Volume; bei einem Rolling Update startet ein neuer Pod, bevor der alte stoppt |
+    | `querier` | Deployment | 2 | `querier` |
+    | `compactor` | Deployment | 1 | `compactor`, weitere Replikate möglich |
+    | `alert` | Deployment | 1 | `alert`, weitere Replikate möglich |
+
+    Knoten mit getrennten Rollen authentifizieren die Trace-Kandidaten und die Eigentelemetrie, die sie untereinander weiterleiten, mit einem gemeinsamen `MS_SELF_TELEMETRY_CLUSTER_TOKEN`. Die Trace-Erfassung ist standardmäßig aktiv. Daher liest jeder Workload denselben Wert aus dem Schlüssel `self_telemetry_cluster_token` im Secret `molesignal-secret`. Erstellen Sie den Namespace, die Konfiguration und das Secret. Wenden Sie anschließend die Workload-Manifeste an:
+
+    ```bash
+    kubectl apply -f 00-namespace.yaml
+    kubectl apply -f 10-configmap.yaml
+    kubectl create secret generic molesignal-secret -n molesignal \
+      --from-literal=object_store_access_key="<access-key>" \
+      --from-literal=object_store_secret_key="<secret-key>" \
+      --from-literal=cipher_key="$(openssl rand -base64 32)" \
+      --from-literal=self_telemetry_cluster_token="$(openssl rand -base64 32)" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    ```
+
+    Die Workloads wählen ihre Rolle über die Umgebungsvariable `MS_NODE_ROLES` aus. Prüfen Sie den Cluster über den Router:
+
+    ```bash
+    kubectl -n molesignal port-forward svc/router 5080:5080
+    curl http://127.0.0.1:5080/api/v1/healthz
+    ```
+
+    Die Weboberfläche ist in die Binärdatei integriert. Geben Sie Port `5080` des Workloads `router` über einen Ingress oder Load Balancer frei.
+
+    Der Workload `router` stellt die vollständige API auf Port `5080` bereit. Seine Readiness-Probe ruft `GET /api/v1/healthz` auf. Alle übrigen Workloads stellen auf Port `5080` einen Listener für Zustandsprüfungen, Bereitschaftsprüfungen und Metriken bereit und verwenden `GET /api/v1/readyz` als Readiness-Probe. Sobald ein `intake`-Pod bereit ist, nimmt er Schreibvorgänge an. Beim Start spielt er kein WAL erneut ab, da die übrigen Intake-Pods das WAL eines ausgefallenen Pods übernehmen. Die Beendigungsfrist von 45 Sekunden gibt dem Pod Zeit, ausstehende WAL-Daten zu schreiben und das WAL vor dem Beenden freizugeben.
+  </Tab>
+</Tabs>
+
+Informationen zu Rollen, Skalierung und Hochverfügbarkeit finden Sie unter [Rollenbasierte Bereitstellung](/de/deployment/role-based).
+
+## Probe-Agenten
+
+Ein Probe-Agent führt synthetische Prüfungen aus einem privaten Netzwerk, einer Region oder einem Edge-Standort aus. Er baut nur ausgehende Verbindungen zu den Ports `5084` und `5085` eines `standalone`- oder `alert`-Knotens auf. Sein eigenes Image `ghcr.io/molesignal/probe-agent` verwendet dieselben Release-Tags wie das MoleSignal-Image.
+
+| Plattform | Installation | Speicherort der Identität |
+|---|---|---|
+| Kubernetes | Helm-Chart `probe-agent` aus `https://charts.molesignal.com` oder `oci://ghcr.io/molesignal/charts/probe-agent` | Ein persistentes Volume pro Replikat |
+| Docker | Image `ghcr.io/molesignal/probe-agent` | Ein unter `/var/lib/molesignal-probe` eingebundenes Volume |
+| Linux | Release-Binärdatei `probe-agent` | Das mit `--state-dir` angegebene Verzeichnis |
+
+Informationen zum Chart finden Sie unter [Agenten auf Kubernetes ausführen](/de/synthetics#agenten-auf-kubernetes-ausführen). Informationen zur Registrierung und zu den Servereinstellungen finden Sie unter [Standorte und Probe-Agenten](/de/synthetics#standorte-und-probe-agenten).
+
+## Ports
+
+| Port | Zweck | Erreichbarkeit |
+|---|---|---|
+| `5080` | Weboberfläche, HTTP-API, `/metrics` und Endpunkt für Zustandsprüfungen. Bei allen Rollen außer `router` und `standalone` stehen nur Zustandsprüfungen, Bereitschaftsprüfungen und Metriken zur Verfügung. | Bei `router` und `standalone` öffentlich über TLS erreichbar. Bei den anderen Rollen nur privat erreichbar. |
+| `4317` | OTLP-gRPC-Empfänger. Unverschlüsseltes gRPC ohne TLS. | Öffentlich nur hinter einem Proxy mit TLS-Terminierung erreichbar, ansonsten nur in einem vertrauenswürdigen Netzwerk. |
+| `5082` | Internes gRPC für die Kommunikation zwischen Knoten: Weiterleitung von Schreibvorgängen und Abfragen sowie Scannen von Shards | Nur privat erreichbar. Geben Sie diesen Port niemals öffentlich frei. |
+| `5083` | Arrow Flight SQL für Datenbankclients. Standardmäßig deaktiviert. | Optional über TLS erreichbar. |
+| `5084`, `5085` | Registrierung und Steuerung von Probe Agents für private Standorte des synthetischen Monitorings | Nur erforderlich, wenn Probe Agents außerhalb des Knotens laufen. |
+| `80`, `443` | Integrierter TLS-Listener mit automatischer Zertifikatsverwaltung, wenn `[http.tls].enabled` auf `true` gesetzt ist | Öffentlich erreichbar. |
+
+## Zustandsprüfungen und Metriken
+
+- `GET /api/v1/healthz` ist öffentlich erreichbar. Der Endpunkt gibt `200` mit `{"status":"ok"}` zurück oder, wenn der Objektspeicher nicht erreichbar ist, `503` mit einem `reason`. Verwenden Sie diesen Endpunkt für Zustandsprüfungen durch Container und Load Balancer.
+- `GET /metrics` ist öffentlich erreichbar und gibt Prometheus-Metriken zurück. Beschränken Sie den Zugriff auf Proxy- oder Netzwerkebene.
+- `GET /api/v1/readyz` und `GET /api/v1/version` erfordern auf einem `standalone`- oder `router`-Knoten ein Bearer-Token. `version` gibt die Version, den Commit, die Build-ID, den Release-Kanal und die Edition zurück.
+- In einem Cluster mit getrennten Rollen beantwortet ein Knoten, der nicht die gesamte API bereitstellt, `GET /api/v1/healthz`, `GET /api/v1/readyz` und `GET /metrics` ohne Authentifizierung auf demselben Port.
+
+Unter [Eigenüberwachung](/de/self-observability) finden Sie Informationen zu den Metriken und zur integrierten Telemetrie des Dienstes selbst.

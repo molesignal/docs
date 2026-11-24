@@ -1,0 +1,214 @@
+---
+title: "MoleSignal のデプロイ"
+description: "サンドボックス外で MoleSignal を実行するための要件、デプロイ方法、ポート、ヘルスチェックについて説明します。"
+"en_link": "/en-US/deployment"
+"zh-Hans_link": "/zh-Hans/deployment"
+"zh-Hant_link": "/zh-Hant/deployment"
+"ko_link": "/ko/deployment"
+"de_link": "/de/deployment"
+"es_link": "/es/deployment"
+"fr_link": "/fr/deployment"
+"pt-BR_link": "/pt-BR/deployment"
+---
+
+MoleSignal は、単一のバイナリと単一のコンテナイメージで配布します。各プロセスが実行する[ロール](/ja/deployment/role-based)は、設定で指定します。単一のプロセスですべてのロールを実行することも、複数のプロセスにロールを分けることもできます。どのデプロイにも、PostgreSQL とオブジェクトストレージの 2 つの外部サービスが必要です。
+
+## 要件
+
+| コンポーネント | 要件 |
+|---|---|
+| PostgreSQL | メタデータ、アイデンティティ、ファイルカタログ、製品リソースを保存します。メタデータ用データベースとしてサポートするのは PostgreSQL のみです。Compose サンドボックスと Kubernetes マニフェストでは PostgreSQL 17 を使用します。 |
+| オブジェクトストレージ | Parquet ファイル、検索インデックス、プロファイル BLOB を保存します。`s3`（AWS S3 または RustFS、Cloudflare R2、Alibaba Cloud OSS などの S3 互換サービス）、`azure`、`gcs` のいずれかを使用してください。`local` バックエンドは単一ノード構成や開発用途向けです。 |
+| コンピューティング | コンテナイメージ（`linux/amd64` と `linux/arm64`）は、x86-64 または arm64 の Linux で実行します。サンドボックスには約 2 GB のメモリが必要です。 |
+| ローカルディスク | 再構築できるキャッシュのみを保存します。先行書き込みログ（WAL）のオブジェクトをオブジェクトストレージに保存した時点で書き込みの完了を応答するため、どのノードにも永続ボリュームは不要です。[耐久性と引き継ぎ](/ja/architecture#データの耐久性と引き継ぎ)を参照してください。 |
+
+メモリとディスクの使用量は、取り込み量、アクティブなストリーム数、[設定](/ja/configuration)のキャッシュ設定によって変わります。実測した使用量に基づいて容量を決めてください。[取り込み使用量](/ja/streams#データ取り込み量と予算)でソースごとの取り込み量を確認できます。また、プロセスは `/metrics` で Prometheus メトリクスを公開します。[本番環境チェックリスト](/ja/deployment/production-checklist)を参照してください。
+
+## コンテナイメージ
+
+コンテナイメージは `ghcr.io/molesignal/molesignal` で公開します。リリースごとに、バージョンタグ（例: `26.1.0.0`）とチャネルタグ（例: `alpha`）を公開します。本番環境ではバージョンタグを固定してください。
+
+```bash
+docker pull ghcr.io/molesignal/molesignal:26.1.0.0
+```
+
+すべてのロールで同じイメージを使用します。ランタイム変数 `RELEASE_CHANNEL`（`alpha`、`beta`、`rc`、`stable` のいずれか）はデプロイの成熟度を示しますが、バイナリは変更しません。バイナリには Web UI が組み込まれており、HTTP ポートからアクセスできます。
+
+## デプロイオプション
+
+<Tabs>
+  <Tab title="Docker Compose">
+    リポジトリには、2 つのプロファイルを定義した `deploy/docker/docker-compose.yaml` が含まれています。どちらのプロファイルも PostgreSQL 17 と RustFS を起動し、`ghcr.io/molesignal/molesignal` の MoleSignal イメージを実行します。
+
+    ```bash
+    # Everything in one process: serves the complete product
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
+
+    # One container per role
+    docker compose -f deploy/docker/docker-compose.yaml --profile multirole up
+    ```
+
+    `multirole` プロファイルは、ロールごとに 1 つのコンテナをデプロイします。ルーターは Web UI と HTTP API を `5080` で、OTLP gRPC レシーバーを `4317` で公開します。[ロールベースのデプロイ](/ja/deployment/role-based)を参照してください。
+
+    スタンドアロンサービスは `5080` と `5082` を公開します。OTLP gRPC ポートの `4317` は公開しません。ホストから OTLP gRPC で送信するには、サービスに `4317:4317` のポートマッピングを追加してください。
+
+    この Compose ファイルはサンドボックス用です。デフォルトの認証情報と開発用の暗号化キーを使用し、`multirole` プロファイルでは開発用の `MS_SELF_TELEMETRY_CLUSTER_TOKEN` も使用します。実際のデータを保存する前に、これらの値を置き換えてください。[本番環境のチェックリスト](/ja/deployment/production-checklist)を参照してください。サンドボックスのバケットは非公開です。
+  </Tab>
+  <Tab title="バイナリと systemd">
+    リリースバイナリ、設定ファイル、GeoIP データベースをインストールし、MoleSignal を systemd サービスとして実行します。
+
+    ```bash
+    sudo useradd --system --home-dir /var/lib/molesignal \
+      --shell /usr/sbin/nologin molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo install -d -o root -g molesignal -m 0750 /etc/molesignal
+    sudo install -o root -g molesignal -m 0640 \
+      conf/config.toml /etc/molesignal/config.toml
+    sudo install -Dm644 deploy/systemd/molesignal.service \
+      /etc/systemd/system/molesignal.service
+    sudo install -Dm644 mmdb/dbip-city-lite.mmdb \
+      /usr/share/molesignal/mmdb/dbip-city-lite.mmdb
+    ```
+
+    `/etc/molesignal/molesignal.env` でランタイムチャネルを設定します。
+
+    ```ini
+    RELEASE_CHANNEL=alpha
+    ```
+
+    `/etc/molesignal/config.toml` を編集して PostgreSQL、オブジェクトストレージ、シークレットを設定し、サービスを起動します。
+
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now molesignal
+    sudo systemctl status molesignal
+    ```
+
+    ユニットは状態ディレクトリとして `/var/lib/molesignal` を使用します。また、組み込みの TLS リスナーがポート `80` と `443` にバインドできるように、`CAP_NET_BIND_SERVICE` を付与します。
+  </Tab>
+  <Tab title="Helm">
+    公式チャートは、Helm 3.8 以降を使用して Kubernetes 1.27 以降に MoleSignal をデプロイします。MoleSignal 26.2.0.0 以降が必要です。チャートリポジトリは `https://charts.molesignal.com` です。同じチャートを `oci://ghcr.io/molesignal/charts/molesignal` でも公開しています。
+
+    デフォルトでは、チャートはすべてのロールを担う 1 つのプロセスと、PostgreSQL 17 および RustFS の各 1 インスタンスを実行します。PostgreSQL と RustFS にはバックアップもフェイルオーバーもないため、デフォルト構成は評価用です。
+
+    ```bash
+    helm repo add molesignal https://charts.molesignal.com
+    helm repo update
+    helm install molesignal molesignal/molesignal --namespace molesignal --create-namespace
+    ```
+
+    ポートフォワーディングを設定し、ブラウザで `http://127.0.0.1:5080` にアクセスして Web UI を開きます。
+
+    ```bash
+    kubectl --namespace molesignal port-forward svc/molesignal 5080:5080
+    ```
+
+    本番環境では、ロールごとに別々のワークロードを実行し、同梱サービスを無効にして、外部の PostgreSQL とオブジェクトストレージを使用するようにチャートを設定します。先に 2 つの Secret を作成してください。`molesignal-db` には `database-dsn` キーを、`molesignal-s3` には `access-key` と `secret-key` を格納します。
+
+    ```yaml
+    mode: distributed
+
+    postgresql:
+      enabled: false
+    externalDatabase:
+      existingSecret: molesignal-db
+
+    rustfs:
+      enabled: false
+    objectStore:
+      bucket: example-telemetry
+      region: eu-west-1
+      existingSecret: molesignal-s3
+    ```
+
+    [`examples/production.yaml`](https://github.com/molesignal/molesignal-helm/blob/main/examples/production.yaml) では、TLS、オートスケーリング、中断予算を追加します。[チャートの README](https://github.com/molesignal/molesignal-helm/tree/main/charts/molesignal)には、すべての設定値を記載しています。
+
+    | 項目 | 詳細 |
+    |---|---|
+    | 暗号化キー | チャートは初回インストール時にキーを生成し、アップグレードや `helm uninstall` の後も保持します。このキーがないと暗号化されたフィールドを読み取れないため、バックアップしてください。Argo CD など、`helm template` でレンダリングするツールを使用する場合は、`secrets.cipherKey` と `secrets.clusterToken` を設定するか、`secrets.existingSecret` に参照先の Secret を指定してください。 |
+    | イメージ | PostgreSQL 以外のすべてのイメージは `latest` タグを使用し、Pod の起動時に毎回プルされます。本番環境では、`image.tag` を固定し、`image.pullPolicy` を `IfNotPresent` に設定してください。 |
+    | Ingress | `ingress.enabled` を設定してください。Ingress の背後で実行する場合は、[クライアント IP の認識](/ja/settings/platform#クライアントipの識別)で、Ingress コントローラーの Pod が属するネットワークを信頼済みプロキシとして登録してください。 |
+    | アプリケーション設定 | `conf/config.toml` と同じ構成で、`config` の配下に追加してください。 |
+
+    デフォルトのインストールで生成された暗号化キーを取得します。
+
+    ```bash
+    kubectl --namespace molesignal get secret molesignal-secret -o jsonpath='{.data.cipher-key}' | base64 --decode
+    ```
+  </Tab>
+  <Tab title="Kubernetes マニフェスト">
+    [`deploy/k8s/`](https://github.com/molesignal/molesignal/tree/main/deploy/k8s) のマニフェストは、すべてのロールで同じイメージを使用します。マニフェストはプレースホルダーのイメージ `molesignal:dev` を参照します。すべてのワークロードで、このイメージを `ghcr.io/molesignal/molesignal:<version>` に置き換えてください。
+
+    マニフェストには PostgreSQL やオブジェクトストレージは含まれていません。サービス名 `postgresql` で PostgreSQL 17 を用意するか、ConfigMap の `meta_database.dsn` を編集してください。S3 互換のオブジェクトストレージも用意し、ConfigMap の `object_store` を編集してください。
+
+    マニフェストはロールを分離した構成をデプロイします。`router` ワークロードは Web UI と HTTP API を提供し、ほかのワークロードはデータ処理とバックグラウンド処理のロールを実行します。代わりにすべてのロールを 1 つのプロセスで実行するには、永続ボリュームを持たない Deployment の `40-intake.yaml` をベースに、`MS_NODE_ROLES` を `["standalone"]` に設定し、Service にポート `5080` を追加して、プローブのパスを `/api/v1/healthz` に設定してください。
+
+    | ワークロード | 種類 | レプリカ数 | ロール |
+    |---|---|---|---|
+    | `router` | Deployment | 2 | `router`：Web UI、HTTP API、OTLP gRPC |
+    | `intake` | Deployment | 2 | `intake`：永続ボリュームなし。ローリングアップデート時は、古い Pod を停止する前に新しい Pod を起動します |
+    | `querier` | Deployment | 2 | `querier` |
+    | `compactor` | Deployment | 1 | `compactor`：レプリカを追加できます |
+    | `alert` | Deployment | 1 | `alert`：レプリカを追加できます |
+
+    ロールを分離したノードは、共有の `MS_SELF_TELEMETRY_CLUSTER_TOKEN` を使って、互いに転送するトレース候補と自己テレメトリを認証します。トレースのキャプチャはデフォルトで有効なため、すべてのワークロードが `molesignal-secret` の `self_telemetry_cluster_token` キーから同じ値を読み取ります。名前空間、設定、シークレットを作成してから、ワークロードを適用します。
+
+    ```bash
+    kubectl apply -f 00-namespace.yaml
+    kubectl apply -f 10-configmap.yaml
+    kubectl create secret generic molesignal-secret -n molesignal \
+      --from-literal=object_store_access_key="<access-key>" \
+      --from-literal=object_store_secret_key="<secret-key>" \
+      --from-literal=cipher_key="$(openssl rand -base64 32)" \
+      --from-literal=self_telemetry_cluster_token="$(openssl rand -base64 32)" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    ```
+
+    各ワークロードは、環境変数 `MS_NODE_ROLES` でロールを選択します。ルーター経由でクラスターの状態を確認します。
+
+    ```bash
+    kubectl -n molesignal port-forward svc/router 5080:5080
+    curl http://127.0.0.1:5080/api/v1/healthz
+    ```
+
+    Web UI はバイナリに組み込まれています。Ingress またはロードバランサー経由で、`router` ワークロードのポート `5080` を公開してください。
+
+    `router` ワークロードは `5080` ですべての API を提供し、準備状況プローブは `GET /api/v1/healthz` をリクエストします。ほかのワークロードはすべて、ヘルスチェック、準備状況、メトリクス用のリスナーを `5080` で提供し、準備状況プローブには `GET /api/v1/readyz` を使用します。`intake` Pod は準備が整うとすぐに書き込みを受け付けます。失われた Pod の WAL はほかの `intake` Pod が引き継ぐため、起動時にリプレイは行いません。終了猶予期間を 45 秒確保することで、停止前に WAL をフラッシュして解放できます。
+  </Tab>
+</Tabs>
+
+ロール、スケーリング、高可用性については、[ロールベースのデプロイ](/ja/deployment/role-based)を参照してください。
+
+## プローブエージェント
+
+プローブエージェントは、プライベートネットワーク、リージョン、またはエッジロケーションからシンセティックチェックを実行します。接続はアウトバウンドのみで、接続先は `standalone` または `alert` ノードのポート `5084` と `5085` に限られます。専用イメージ `ghcr.io/molesignal/probe-agent` は、MoleSignal イメージと同じタグでリリースします。
+
+| 実行環境 | インストール方法 | ID の保存先 |
+|---|---|---|
+| Kubernetes | `https://charts.molesignal.com` の Helm チャート `probe-agent`、または `oci://ghcr.io/molesignal/charts/probe-agent` | レプリカごとの永続ボリューム |
+| Docker | イメージ `ghcr.io/molesignal/probe-agent` | `/var/lib/molesignal-probe` にマウントしたボリューム |
+| Linux | リリースバイナリ `probe-agent` | `--state-dir` で指定したディレクトリ |
+
+チャートについては[Kubernetes でエージェントを実行する](/ja/synthetics#kubernetes-でエージェントを実行する)を、登録とサーバー設定については[ロケーションとプローブエージェント](/ja/synthetics#ロケーションとプローブエージェント)を参照してください。
+
+## ポート
+
+| ポート | 用途 | 公開範囲 |
+|---|---|---|
+| `5080` | Web UI、HTTP API、`/metrics`、ヘルスチェックエンドポイントに使用します。`router` と `standalone` 以外のロールでは、ヘルスチェック、レディネスチェック、メトリクスのみを提供します。 | `router` と `standalone` では TLS 経由で公開します。他のロールでは非公開にします。 |
+| `4317` | OTLP gRPC レシーバーです。TLS を使用しない平文の gRPC です。 | TLS を終端するプロキシの背後、または信頼できるネットワーク内でのみ公開します。 |
+| `5082` | ノード間通信用の内部 gRPC です。書き込みとクエリの転送、シャードのスキャンに使用します。 | 非公開です。公開しないでください。 |
+| `5083` | データベースクライアント向けの Arrow Flight SQL です。デフォルトでは無効です。 | 必要に応じて TLS 経由で公開します。 |
+| `5084`, `5085` | プライベートロケーションでの合成モニタリングに使用する Probe Agent の登録と制御に使用します。 | Probe Agent がノード外で動作する場合にのみ公開します。 |
+| `80`, `443` | `[http.tls].enabled` が `true` の場合に、自動で証明書を取得する組み込み TLS リスナーを使用します。 | 公開します。 |
+
+## ヘルスチェックとメトリクス
+
+- `GET /api/v1/healthz` は公開エンドポイントです。`200` と `{"status":"ok"}` を返します。オブジェクトストアに接続できない場合は、`503` と `reason` を返します。コンテナやロードバランサーのプローブに使用してください。
+- `GET /metrics` は公開エンドポイントで、Prometheus メトリクスを返します。プロキシまたはネットワーク層でアクセスを制限してください。
+- `standalone` または `router` ノードでは、`GET /api/v1/readyz` と `GET /api/v1/version` にベアラートークンが必要です。`version` は、バージョン、コミット、ビルド ID、リリースチャネル、エディションを返します。
+- ロールを分離したクラスターで API 全体を提供しないノードは、同じポートで `GET /api/v1/healthz`、`GET /api/v1/readyz`、`GET /metrics` に認証なしで応答します。
+
+サービス自体のメトリクスと組み込みテレメトリーについては、[セルフオブザーバビリティ](/ja/self-observability)を参照してください。

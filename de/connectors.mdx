@@ -1,0 +1,468 @@
+---
+title: "Konnektoren"
+sidebarTitle: "Konnektoren"
+description: "Importieren Sie Logs aus CloudWatch Logs, Kafka-Topics, S3-Objekten, Amazon Data Firehose, Cloudflare Logpush und Heroku. Senden Sie Pipeline-Ausgaben an S3, Kafka oder einen HTTP-Endpunkt."
+"en_link": "/en-US/connectors"
+"zh-Hans_link": "/zh-Hans/connectors"
+"zh-Hant_link": "/zh-Hant/connectors"
+"ja_link": "/ja/connectors"
+"ko_link": "/ko/connectors"
+"es_link": "/es/connectors"
+"fr_link": "/fr/connectors"
+"pt-BR_link": "/pt-BR/connectors"
+---
+
+Ein **Konnektor** ist eine verwaltete Integration mit einer externen Plattform. Konnektoren arbeiten in zwei Richtungen:
+
+- **Quellen** übernehmen Logs aus einem anderen Dienst und schreiben sie in einen Stream. MoleSignal ruft CloudWatch Logs, Kafka-Topics und S3-Objekte nach Zeitplan ab. Amazon Data Firehose, Cloudflare Logpush und Heroku senden ihre Logs an MoleSignal.
+- **Ziele** empfangen die Ausgabe einer [zeitgesteuerten Pipeline](/de/pipelines#schreibziele-und-zustellung-an-konnektoren): Amazon S3 und S3-kompatible Speicher, Apache Kafka und beliebige HTTP-Endpunkte.
+
+| Typ | Konnektor | Richtung | Authentifizierung |
+|---|---|---|---|
+| `aws_cloudwatch_logs` | AWS CloudWatch Logs | Quelle, Abruf alle 30 Sekunden | [AWS-Anmeldedaten](#aws-authentifizierung) |
+| `kafka_source` | Kafka-Topic | Quelle, Abruf alle 30 Sekunden | Keine, SASL oder Clientzertifikat |
+| `s3_source` | S3-Objekte | Quelle, Abruf alle 30 Sekunden | AWS-Anmeldedaten |
+| `aws_kinesis_firehose` | Amazon Data Firehose | Quelle, Push | [Push-Token](#push-quellen) |
+| `cloudflare_logpush` | Cloudflare Logpush | Quelle, Push | Push-Token |
+| `heroku_drain` | Heroku-Log-Drain | Quelle, Push | Push-Token |
+| `s3` | Amazon S3 | Ziel | AWS-Anmeldedaten |
+| `kafka` | Apache Kafka | Ziel | Keine, SASL oder Clientzertifikat |
+| `http` | HTTP / Webhook | Ziel | Keine, Bearer-Token, Basic-Authentifizierung, benutzerdefinierter Header oder HMAC-Signatur |
+
+## Konnektor erstellen
+
+<Steps>
+  <Step title="Konnektoren öffnen">
+    Öffnen Sie **Pipelines → Konnektoren**. Die Seite listet **Quellen** und **Ziele** auf.
+  </Step>
+  <Step title="Typ auswählen">
+    Klicken Sie auf **Neuer Konnektor** und wählen Sie den passenden Typ aus.
+  </Step>
+  <Step title="Einstellungen eingeben">
+    Geben Sie unter **Name** einen innerhalb der Organisation eindeutigen Namen ein. Geben Sie an, woher der Konnektor Daten liest oder wohin er sie sendet, und wählen Sie die **Authentifizierung**.
+  </Step>
+  <Step title="Testen und erstellen">
+    Klicken Sie auf **Verbindung testen**, um die Einstellungen vor dem Speichern zu prüfen. Klicken Sie anschließend auf **Konnektor erstellen**. Bei Push-Quellen baut MoleSignal keine Verbindung auf und bietet deshalb keinen Test an.
+  </Step>
+</Steps>
+
+In der API besteht ein Konnektor aus `name`, `kind` und `configJson`. Die Schlüssel in `configJson` hängen vom Typ ab. `auth` in `configJson` gibt das Authentifizierungsverfahren an. Jedes Verfahren verwendet eigene Schlüssel. Die API antwortet beim Speichern mit `400`, wenn ein Pflichtschlüssel fehlt, ein Paar von Anmeldedaten unvollständig ist oder das gewählte `auth`-Verfahren einen angegebenen Schlüssel nicht verwendet.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "archive",
+        "kind": "s3",
+        "configJson": {
+          "bucket": "acme-logs",
+          "region": "eu-west-1",
+          "prefix": "pipelines/checkout/",
+          "auth": "assume_role",
+          "roleArn": "arn:aws:iam::123456789012:role/molesignal-delivery"
+        }
+      }'
+```
+
+## Geheimnisse
+
+Diese Schlüssel in `configJson` enthalten Geheimnisse:
+
+| Typ | Schlüssel für Geheimnisse |
+|---|---|
+| `s3`, `aws_cloudwatch_logs` | `accessKey`, `secretKey`, `sessionToken` |
+| `aws_kinesis_firehose`, `cloudflare_logpush`, `heroku_drain` | `pushToken` |
+| `kafka` | `saslPassword`, `tlsClientKey` |
+| `http` | `url`, `bearerToken`, `basicPassword`, `headerValue`, `hmacSecret` |
+
+Die API gibt keine Geheimnisse aus. Stattdessen zeigt die Antwort `***` an und führt unter `secretKeys` die Schlüssel auf, für die ein Wert hinterlegt ist:
+
+```json
+{
+  "kind": "kafka",
+  "configJson": {
+    "brokers": "b-1.example.com:9096",
+    "topic": "logs",
+    "tls": true,
+    "auth": "sasl_scram_sha_512",
+    "saslUsername": "molesignal",
+    "saslPassword": "***"
+  },
+  "secretKeys": ["saslPassword"]
+}
+```
+
+- Wenn ein Update `***` zurücksendet, bleibt der gespeicherte Wert erhalten. So können Sie den Konnektor umbenennen, deaktivieren oder auf eine andere Quelle oder ein anderes Ziel umstellen, ohne die Anmeldedaten erneut einzugeben. Lassen Sie in der Benutzeroberfläche das Feld für ein gespeichertes Geheimnis leer, um den Wert beizubehalten.
+- Wenn ein Update ein Geheimnis nicht enthält, entfernt MoleSignal den gespeicherten Wert.
+- Wenn ein Update `kind` ändert, entfernt MoleSignal alle gespeicherten Geheimnisse.
+
+MoleSignal verschlüsselt die Geheimnisse getrennt von den übrigen Einstellungen mit dem Stammschlüssel aus `MS_CIPHER_KEY` (AES-256-GCM) und speichert kein Geheimnis im Klartext. MoleSignal identifiziert eine Push-Quelle anhand des SHA-256-Hashs ihres Tokens. Bei der Rotation des Stammschlüssels verschlüsselt `molesignal rewrap-kek` die Geheimnisse der Konnektoren zusammen mit den übrigen Geheimnissen neu. Siehe [Checkliste für den Produktivbetrieb](/de/deployment/production-checklist).
+
+## Quellen
+
+### Push-Quellen
+
+Alle drei Push-Quellen funktionieren nach demselben Prinzip: Erstellen Sie einen Konnektor mit einem **`pushToken`** und einem **`target_stream`** und richten Sie die Plattform auf den passenden Endpunkt aus. Diese Endpunkte verwenden kein JWT. Das Push-Token authentifiziert die Anfrage. Übermitteln Sie es so, wie es die Plattform unterstützt:
+
+| Methode | Verwendet von |
+|---|---|
+| Header `X-Connector-Token` | Plattformen mit konfigurierbaren Headern, etwa Cloudflare |
+| Header `X-Amz-Firehose-Access-Key` | Amazon Data Firehose, das den Header automatisch mitsendet |
+| Abfrageparameter `?token=` | Plattformen, die keine Header setzen können, etwa Heroku |
+
+Die Benutzeroberfläche generiert das Token beim Erstellen des Konnektors und zeigt es einmalig zusammen mit dem Endpunkt an, den Sie auf der Plattform angeben. Das Token lässt sich später nicht abrufen. **Neues Token generieren** ersetzt es beim Speichern des Konnektors. Geben Sie über die API ein `pushToken` mit mindestens 16 Zeichen an. Pro Konnektortyp gewährt ein Token nur Zugriff auf einen Konnektor. Ist das Token bereits in Verwendung, antwortet die API mit `409`. Fehlt das Token, ist es unbekannt oder ist der Konnektor deaktiviert, antwortet der Endpunkt mit `401`. Ein Konnektor ohne Token nimmt keine Anfragen an.
+
+MoleSignal dekomprimiert mit `Content-Encoding: gzip` gesendete Anfrageinhalte automatisch. Für diese Ereignisse gelten dieselben Regeln wie für alle anderen eingehenden Daten: Schema-on-Write, [Pipelines](/de/pipelines) und [Maskierung](/de/security).
+
+<Tabs>
+  <Tab title="Amazon Data Firehose">
+    Erstellen Sie den Konnektor mit `kind: "aws_kinesis_firehose"` und wählen Sie dann **HTTP-Endpunkt** als Ziel für den Firehose-Stream:
+
+    - **HTTP-Endpunkt-URL**: `https://molesignal.example.com/api/v1/_kinesis_firehose`
+    - **Zugriffsschlüssel**: das Push-Token. Firehose sendet es im Header `X-Amz-Firehose-Access-Key`.
+
+    MoleSignal dekodiert jeden Datensatz aus Base64, teilt ihn an den Zeilenumbrüchen auf und parst jede Zeile als JSON. Reinen Text übernimmt MoleSignal stattdessen in das Feld `message`. MoleSignal bestätigt den Empfang wie von Firehose erwartet mit `200`.
+  </Tab>
+  <Tab title="Cloudflare Logpush">
+    Erstellen Sie den Konnektor mit `kind: "cloudflare_logpush"` und anschließend einen Logpush-Job mit einem HTTP-Ziel. Cloudflare wandelt einen Abfrageparameter mit dem Präfix `header_` in einen Anfrage-Header um. So wird das Token im Header `X-Connector-Token` übertragen:
+
+    ```text
+    https://molesignal.example.com/api/v1/_cloudflare?header_X-Connector-Token=<pushToken>
+    ```
+
+    Cloudflare sendet gzip-komprimiertes NDJSON. Jede Zeile ergibt ein Ereignis. Der Endpunkt antwortet mit `204 No Content`.
+  </Tab>
+  <Tab title="Heroku">
+    Erstellen Sie den Konnektor mit `kind: "heroku_drain"` und fügen Sie dann den Log-Drain hinzu. Heroku unterstützt keine benutzerdefinierten Header. Daher wird das Token in der URL übertragen:
+
+    ```bash
+    heroku drains:add "https://molesignal.example.com/api/v1/_heroku?token=<pushToken>"
+    ```
+
+    Jede Logzeile ergibt ein Ereignis mit `message` und `source: "heroku"`. Der Endpunkt antwortet mit `204 No Content`.
+  </Tab>
+</Tabs>
+
+<Tip>
+  MoleSignal erstellt den `target_stream` beim ersten Empfang und erweitert das Schema wie bei jedem anderen Stream, sobald neue Felder hinzukommen. Lassen Sie `target_stream` weg, um den Standardwert der jeweiligen Quelle zu verwenden: `kinesis`, `cloudflare` oder `heroku`.
+</Tip>
+
+### CloudWatch Logs
+
+CloudWatch Logs ist eine **Pull**-Quelle: Statt Daten per Push zu empfangen, ruft MoleSignal alle 30 Sekunden `FilterLogEvents` auf. Beim ersten Abruf liest MoleSignal die letzten 5 Minuten. Jeder weitere Abruf setzt an der Stelle an, an der der letzte erfolgreiche Abruf endete. Ereignisse, die MoleSignal nicht lesen oder schreiben konnte, liest es beim nächsten Abruf erneut.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "cw-prod",
+        "kind": "aws_cloudwatch_logs",
+        "configJson": {
+          "region": "ap-southeast-1",
+          "logGroup": "/aws/lambda/checkout",
+          "auth": "node_role",
+          "targetStream": "cloudwatch"
+        }
+      }'
+```
+
+| Feld | Hinweise |
+|---|---|
+| `region` / `logGroup` | Pflichtfelder. Geben Sie die CloudWatch-Region und die zu lesende Loggruppe an. |
+| `auth` und die zugehörigen Schlüssel | Die Zugangsdaten benötigen die Berechtigung `logs:FilterLogEvents` für die Loggruppe. Siehe [AWS-Authentifizierung](#aws-authentifizierung). |
+| `targetStream` | Zielstream. Standard: `default`. |
+
+Pro Konnektor ruft jeweils nur ein Knoten Daten ab. Die `alert`-Knoten teilen die Konnektoren untereinander auf. Vor dem Abruf reserviert der Knoten den Konnektor. Siehe [Arbeitsaufteilung zwischen Alert-Knoten](/de/deployment/role-based#aufgabenverteilung-zwischen-alert-knoten). Aus jedem Ereignis entsteht ein Log mit `message`, `log_stream` und `log_group`. Deaktivierte Konnektoren rufen keine Daten ab.
+
+### Kafka-Topics
+
+Ein Konnektor vom Typ `kafka_source` liest alle 30 Sekunden aus einem Topic. Er setzt dort fort, wo er zuletzt Daten erfolgreich geschrieben hat. Er liest direkt zugewiesene Partitionen, ohne Mitglied einer Consumer-Gruppe zu sein, und speichert die Offsets in MoleSignal. Daher benötigt er nur Leserechte für das Topic, und im Cluster erscheint keine Consumer-Gruppe.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "orders",
+        "kind": "kafka_source",
+        "configJson": {
+          "brokers": "b-1.example.com:9096,b-2.example.com:9096",
+          "topic": "orders",
+          "tls": true,
+          "auth": "sasl_scram_sha_512",
+          "saslUsername": "molesignal",
+          "saslPassword": "<password>",
+          "targetStream": "orders",
+          "startFrom": "latest"
+        }
+      }'
+```
+
+| Feld | Hinweise |
+|---|---|
+| `brokers`, `topic`, `tls`, `tlsCaCert`, `auth` und die zugehörigen Schlüssel | Wie bei einem [Kafka-Ziel](#apache-kafka). |
+| `targetStream` | Zielstream. Standard: `default`. |
+| `startFrom` | Startpunkt für den ersten Lesevorgang: `latest` (Standard) liest nur neu eintreffende Nachrichten. `earliest` liest alle Nachrichten, die die Broker noch vorhalten. Später hinzugefügte Partitionen liest der Konnektor von Anfang an. Benutzeroberfläche: **Lesebeginn**. |
+
+- Ist der Wert einer Nachricht ein JSON-Objekt, liefert es die Felder des Logs. Jeden anderen Wert übernimmt der Konnektor in `message`. Jedes Log enthält außerdem `kafka_topic`, `kafka_partition`, `kafka_offset` und `source`. Hat die Nachricht einen Schlüssel, enthält das Log auch `kafka_key`. Das Log übernimmt den Zeitstempel der Nachricht.
+- Ein Lesevorgang erfasst bis zu 10.000 Nachrichten oder 32 MiB. Solange weitere Daten vorliegen, folgt sofort der nächste Lesevorgang, insgesamt bis zu 2 Minuten pro Abruf.
+- Der Konnektor aktualisiert die Offsets erst, nachdem er die Logs geschrieben hat. Schlägt das Lesen oder Schreiben fehl, setzt er nach 30 Sekunden an derselben Stelle erneut an. Dadurch kann er eine Nachricht doppelt schreiben, verliert sie aber nicht. Ist der gespeicherte Offset aufgrund der Aufbewahrungsfrist nicht mehr verfügbar, liest der Konnektor ab der ältesten noch verfügbaren Nachricht weiter.
+- Wenn Sie `topic` ändern, beginnt der Konnektor erneut bei `startFrom`, da die Offsets an das Topic gebunden sind.
+
+### S3-Objekte
+
+Ein Konnektor vom Typ `s3_source` listet alle 30 Sekunden die Objekte eines Buckets in AWS S3 oder einem S3-kompatiblen Speicher auf und liest die noch nicht gelesenen Objekte, beginnend mit dem ältesten.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "elb-logs",
+        "kind": "s3_source",
+        "configJson": {
+          "bucket": "acme-logs",
+          "region": "us-east-1",
+          "prefix": "AWSLogs/123456789012/",
+          "auth": "node_role",
+          "targetStream": "elb",
+          "startFrom": "latest"
+        }
+      }'
+```
+
+| Feld | Hinweise |
+|---|---|
+| `bucket`, `region`, `endpoint`, `virtualHostedStyle`, `auth` und die zugehörigen Schlüssel | Wie bei einem [S3-Ziel](#amazon-s3). Die Zugangsdaten benötigen `s3:ListBucket` für den Bucket und `s3:GetObject` für die Objekte. |
+| `prefix` | Der Konnektor liest nur Objekte mit diesem Präfix. Da er bei jedem Abruf alle Objekte mit diesem Präfix auflistet, verwenden Sie für jede Quelle ein eigenes Präfix. |
+| `targetStream` | Zielstream. Standard: `default`. |
+| `startFrom` | Startpunkt für den ersten Lesevorgang: `latest` (Standard) liest neue Objekte sowie Objekte aus den vorherigen 5 Minuten. `earliest` liest alle Objekte mit dem Präfix. Benutzeroberfläche: **Lesebeginn**. |
+
+- Der Konnektor liest jedes Objekt zeilenweise. Ist die Zeile ein JSON-Objekt, liefert es die Felder des Logs. Enthält die Zeile nur `Records`, wie bei CloudTrail, erzeugt der Konnektor ein Log pro Datensatz. Jede andere Zeile übernimmt er in `message`. Anhand der Dateiendungen `.gz` und `.zst` erkennt und dekomprimiert er komprimierte Objekte. Jedes Log enthält außerdem `s3_bucket`, `s3_key` und `source`. Als Zeitstempel dient der Zeitpunkt der letzten Änderung des Objekts.
+- Ein Abruf liest bis zu 100 Objekte oder bis zu 50.000 Logs. Solange weitere Daten vorliegen, folgt sofort der nächste Abruf, insgesamt bis zu 2 Minuten lang.
+- Der Konnektor aktualisiert den Lesestatus erst, nachdem er die Logs geschrieben hat. Kann er ein Objekt nicht abrufen, hält er an dieser Stelle an und versucht es nach 30 Sekunden erneut. Dadurch kann er ein Log doppelt schreiben, verliert es aber nicht.
+- Kann der Konnektor ein Objekt nicht lesen, überspringt er es und zeigt dies am Konnektor an. Ein erneuter Versuch würde alle folgenden Objekte aufhalten. Das betrifft beschädigte Objekte, Objekte über 256 MiB, Objekte mit mehr als 512 MiB nach der Dekomprimierung, Objekte mit mehr als einer Million Logs oder Objekte mit einer Zeile über 64 MiB.
+- Der Konnektor erkennt ein Objekt anhand seines Schlüssels und seines Änderungszeitpunkts. Dabei gilt eine Toleranz von 5 Minuten. Wird ein Objekt innerhalb dieses Zeitfensters unter demselben Schlüssel erneut geschrieben, liest der Konnektor es nicht erneut. Liegt der Änderungszeitpunkt eines Objekts mehr als 5 Minuten vor dem des neuesten gelesenen Objekts, liest er es gar nicht. S3 verwendet bei einem mehrteiligen Upload dessen Startzeit als Zeitstempel. Dauert der Upload länger als dieses Zeitfenster, kann das Objekt daher ungelesen bleiben.
+
+### Status des Datenabrufs
+
+Auf der Konnektorseite steht, wann eine Quelle zuletzt Daten empfangen hat. Ist der letzte Lesevorgang fehlgeschlagen, erscheint neben diesem Zeitpunkt eine Warnung. Den Grund finden Sie im Tooltip und in den Konnektoreinstellungen. Dort steht auch, was die Quelle zuletzt übersprungen hat. In der API enthält `readState` die Felder `lastError` und `lastWarning` mit jeweils `atTime` und `text` sowie die aktuelle Leseposition in `position`. Beim Speichern des Konnektors bleibt die Leseposition erhalten.
+
+## Ziele
+
+Ein Ziel empfängt jedes Event, das die Schritte einer geplanten Pipeline durchläuft. Fügen Sie den Konnektor unter **Ziele** des Ablaufs über **Ziel hinzufügen → Konnektor** hinzu. MoleSignal wiederholt fehlgeschlagene Zustellungen innerhalb desselben Laufs. Events, die der Konnektor danach noch immer nicht annimmt, landen im Dead-Letter-Stream. Siehe [Wiederholungsversuche und Dead Letters](/de/pipelines#wiederholungsversuche-und-dead-letters).
+
+Ein ausgeschaltetes Ziel empfängt keine Events. MoleSignal überspringt den Konnektor bei jedem Lauf und führt ihn im Feld `warning` des Laufs auf. Übersprungene Events zählen nicht als fehlgeschlagen und landen nicht im Dead-Letter-Stream. MoleSignal sendet sie auch nach dem Wiedereinschalten des Konnektors nicht. Im Editor steht bei einem ausgeschalteten Konnektor **Aus**.
+
+| Typ | Nutzlast |
+|---|---|
+| `s3` | Ein JSON-Lines-Objekt pro Batch, per `PUT` an `s3://<bucket>/<prefix><id>.jsonl`. |
+| `kafka` | Eine Nachricht pro Event im Topic. Das Event bildet die JSON-Nutzlast der Nachricht. |
+| `http` | Der Batch in einer Anfrage, bei großen Batches in mehreren, als NDJSON oder als einzelnes JSON-Array. |
+
+### Amazon S3
+
+Der Typ `s3` stellt Events auch an S3-kompatible Speicher wie MinIO, Cloudflare R2 und Alibaba Cloud OSS zu. Aktivieren Sie in der Benutzeroberfläche **S3-kompatibler Speicher**, um den Endpunkt festzulegen.
+
+| Feld | Hinweise |
+|---|---|
+| `bucket` | Pflichtfeld. |
+| `region` | Die Region des Buckets. Bei S3-kompatiblen Speichern kann die Angabe entfallen. |
+| `prefix` | MoleSignal benennt Objekte nach dem Muster `<prefix><id>.jsonl`. MoleSignal entfernt ein führendes `/` und ergänzt bei Bedarf ein abschließendes `/`. |
+| `endpoint` | Die S3-API-Adresse eines S3-kompatiblen Speichers. Sie beginnt mit `http://` oder `https://`. |
+| `virtualHostedStyle` | Mit `true` spricht MoleSignal den Bucket über den Hostnamen statt über den Pfad an. Speicher wie Alibaba Cloud OSS setzen dies voraus. Benutzeroberfläche: **Bucket über den Hostnamen ansprechen**. |
+| `auth` und zugehörige Schlüssel | Die Zugangsdaten benötigen die Berechtigung `s3:PutObject` für den Bucket. Siehe [AWS-Authentifizierung](#aws-authentifizierung). |
+
+### Apache Kafka
+
+| Feld | Hinweise |
+|---|---|
+| `brokers` | Pflichtfeld. Geben Sie Host und Port an. Trennen Sie mehrere Einträge durch Kommas. |
+| `topic` | Pflichtfeld. |
+| `tls` | Mit `true` verschlüsselt MoleSignal die Verbindung mit TLS. Verwenden Sie den TLS-Port der Broker, häufig 9093, 9094 oder 9096. Benutzeroberfläche: **Verbindung mit TLS verschlüsseln**. |
+| `tlsCaCert` | Das PEM-Zertifikat der privaten CA, die die Broker-Zertifikate ausgestellt hat. Nur mit `tls` verfügbar. Ohne diese Angabe vertraut MoleSignal den CAs des Systems. |
+
+| `auth` | Benutzeroberfläche | Schlüssel | Hinweise |
+|---|---|---|---|
+| `none` | **Keine** | | Für Broker, die keine Zugangsdaten verlangen. |
+| `sasl_plain` | **SASL/PLAIN** | `saslUsername`, `saslPassword` | Überträgt das Passwort unverändert. Verwenden Sie diese Option ohne TLS nur in einem privaten Netzwerk. |
+| `sasl_scram_sha_256` | **SCRAM-SHA-256** | `saslUsername`, `saslPassword` | Das Passwort selbst gelangt nie ins Netzwerk. |
+| `sasl_scram_sha_512` | **SCRAM-SHA-512** | `saslUsername`, `saslPassword` | Diesen Mechanismus verwendet Amazon MSK. |
+| `mtls` | **Clientzertifikat** | `tlsClientCert`, `tlsClientKey` | Gegenseitige TLS-Authentifizierung. Setzt `tls` voraus. Zertifikat und Schlüssel müssen im PEM-Format vorliegen. Der private Schlüssel darf nicht verschlüsselt sein. |
+
+TLS und SASL lassen sich kombinieren: Für SCRAM über TLS verwendet MoleSignal `SASL_SSL`.
+
+### HTTP / Webhook
+
+| Feld | Hinweise |
+|---|---|
+| `url` | Pflichtfeld. Eine absolute URL mit `http://` oder `https://`. URLs enthalten häufig Zugangsdaten, etwa einen Schlüssel im Pfad oder im Abfrageparameter. Daher speichert MoleSignal die URL als Secret. Antworten enthalten nur `urlOrigin` mit Schema, Host und Port. MoleSignal lehnt URLs mit Benutzername und Passwort ab. Verwenden Sie stattdessen `basic`. |
+| `method` | `post` (Standard) oder `put`. |
+| `format` | `ndjson` (Standard) sendet ein Event pro Zeile als `application/x-ndjson`. `json` sendet ein einzelnes JSON-Array als `application/json`. |
+
+| `auth` | Benutzeroberfläche | Schlüssel | Anfrage |
+|---|---|---|---|
+| `none` | **Keine** | | Keine Zugangsdaten. |
+| `bearer` | **Bearer-Token** | `bearerToken` | `Authorization: Bearer <token>` |
+| `basic` | **Basic-Authentifizierung** | `basicUsername`, `basicPassword` | HTTP-Basic-Authentifizierung. Verwenden Sie diese Option über `https`. |
+| `header` | **Benutzerdefinierter Header** | `headerName`, `headerValue` | Der Wert im angegebenen Header, etwa `X-API-Key` oder `DD-API-KEY`. |
+| `hmac` | **HMAC-Signatur** | `hmacSecret` | Eine Signatur des Anfrageinhalts. Das Secret muss mindestens 16 Zeichen lang sein. |
+
+Verwenden Sie keine Header als benutzerdefinierte Header, die MoleSignal bei der Zustellung selbst setzt: `Host`, `Content-Type`, `Content-Length`, `Content-Encoding`, `Transfer-Encoding`, `Connection`, `X-MoleSignal-Timestamp` oder `X-MoleSignal-Sign`.
+
+Für die Zustellung gelten folgende Regeln:
+
+- MoleSignal teilt Batches über 4 MiB auf mehrere Anfragen auf. Events über 4 MiB sendet MoleSignal jeweils in einer eigenen Anfrage.
+- Jeder Statuscode der Klasse `2xx` zählt als erfolgreiche Zustellung. Bei allen anderen Statuscodes schlägt die Zustellung fehl. Das gilt auch für Weiterleitungen: MoleSignal folgt ihnen nicht.
+- Nach 30 Sekunden bricht MoleSignal die Anfrage ab.
+- MoleSignal löst den Host vor der Anfrage auf und verbindet sich nur mit den dabei ermittelten Adressen. MoleSignal lehnt Adressen ab, unter denen Cloud-Metadatendienste antworten, unabhängig davon, ob sie direkt in der URL stehen oder aus der DNS-Auflösung stammen: `169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254` und `100.100.100.200`. Andere private Adressen lässt MoleSignal zu.
+
+#### HMAC-Signatur prüfen
+
+Mit `hmac` enthält jede Anfrage zwei Header:
+
+| Header | Inhalt |
+|---|---|
+| `X-MoleSignal-Timestamp` | Der Zeitpunkt der Anfrage in Unix-Sekunden. |
+| `X-MoleSignal-Sign` | `sha256=<hex>`: der HMAC-SHA256-Wert von `<timestamp>.<body>`, berechnet mit dem gemeinsamen Secret. |
+
+Berechnen Sie zur Prüfung einer Anfrage den HMAC-SHA256-Wert über den Zeitstempel, ein `.` und die unveränderten Bytes des Anfrageinhalts. Verwenden Sie dasselbe Secret und vergleichen Sie das Ergebnis in konstanter Zeit mit der Signatur. Lehnen Sie Anfragen mit einem Zeitstempel ab, der mehr als wenige Minuten zurückliegt. So lassen sich abgefangene Anfragen später nicht erneut senden.
+
+```python
+import hashlib
+import hmac
+import time
+
+
+def verify(secret: bytes, timestamp: str, signature: str, body: bytes, tolerance: int = 300) -> bool:
+    if abs(time.time() - int(timestamp)) > tolerance:
+        return False
+    signed = timestamp.encode() + b"." + body
+    expected = "sha256=" + hmac.new(secret, signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+```
+
+## AWS-Authentifizierung
+
+Für die Authentifizierung bei AWS unterstützen S3 und CloudWatch Logs fünf Methoden:
+
+| `auth` | Benutzeroberfläche | Schlüssel | Anmeldedaten |
+|---|---|---|---|
+| `access_key` | **Zugriffsschlüssel** | `accessKey`, `secretKey` | Der langlebige Schlüssel eines IAM-Benutzers. |
+| `temporary_key` | **Temporärer Schlüssel** | `accessKey`, `secretKey`, `sessionToken` | Ein kurzlebiger Schlüssel von AWS STS, der nur mit seinem Sitzungstoken gültig ist. Ersetzen Sie den Schlüssel vor Ablauf. |
+| `node_role` | **Knotenidentität** | | Die Identität des Knotens, auf dem MoleSignal läuft. MoleSignal speichert keinen Schlüssel. |
+| `assume_role` | **Rolle übernehmen** | `roleArn`, optional `accessKey` und `secretKey` | Eine Rolle, die MoleSignal über AWS STS mit der externen ID der Organisation übernimmt. |
+| `web_identity` | **Web-Identität** | `roleArn` | Eine Rolle, die MoleSignal mit dem Web-Identitätstoken des Knotens übernimmt. |
+
+Ohne `auth` entscheiden die gespeicherten Schlüssel: Ein Zugriffsschlüssel ergibt `access_key`, ein `roleArn` ergibt `assume_role`. Fehlen beide, gilt `node_role`. Ein `roleArn` hat das Format `arn:aws:iam::<account>:role/<name>`.
+
+### Knotenidentität
+
+`node_role` verwendet die Identität, die die AWS-SDKs auf dem Knoten finden: IAM-Rollen für EKS-Dienstkonten (IRSA), EKS Pod Identity, eine ECS-Task-Rolle oder ein EC2-Instanzprofil. Konnektoren verwenden niemals einen statischen Schlüssel aus der Umgebung des Knotens, etwa `AWS_ACCESS_KEY_ID`.
+
+<Warning>
+  Die Knotenidentität und das zugehörige Web-Identitätstoken gehören zur Bereitstellung. Jede Organisation in der Bereitstellung kann `node_role` und `web_identity` auswählen. Damit können die Konnektoren aller Organisationen auf alle Ressourcen zugreifen, die für die Knotenidentität erreichbar sind, und alle Rollen übernehmen, die dem Token des Knotens vertrauen. Gewähren Sie nur Zugriff, den jede Organisation haben darf.
+</Warning>
+
+### Rolle übernehmen
+
+`assume_role` fordert bei AWS STS einen Rollenschlüssel mit einer Stunde Gültigkeit an und erneuert den Schlüssel 5 Minuten vor Ablauf. Für die Rollenübernahme dient standardmäßig die Knotenidentität als Grundlage. Wenn die Bereitstellung nicht auf AWS läuft, wählen Sie **Rolle mit Zugriffsschlüssel statt Knotenidentität übernehmen** und geben Sie den Schlüssel eines IAM-Benutzers ein.
+
+Jede Organisation übernimmt Rollen mit ihrer eigenen, unveränderlichen externen ID `molesignal-<organization ID>`. Das Formular zeigt die ID unter **Externe ID** an. `GET /api/v1/connectors/aws-external-id` gibt die ID zurück. Legen Sie die externe ID in der Vertrauensrichtlinie der Rolle als Bedingung fest. So kann keine andere Organisation die Rolle übernehmen, selbst wenn ihr der ARN bekannt ist:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "AWS": "<ARN of the node role or IAM user>" },
+      "Action": "sts:AssumeRole",
+      "Condition": { "StringEquals": { "sts:ExternalId": "molesignal-<organization ID>" } }
+    }
+  ]
+}
+```
+
+Die Sitzung erscheint in AWS CloudTrail unter dem Namen `molesignal-<connector ID>`. Die Anfrage geht an den regionalen STS-Endpunkt für `region` des Konnektors: bei leerer Region an `us-east-1` und bei China-Regionen an die Domain `amazonaws.com.cn`.
+
+### Web-Identität
+
+`web_identity` übernimmt die Rolle mit dem Web-Identitätstoken aus der Datei, deren Pfad `AWS_WEB_IDENTITY_TOKEN_FILE` auf dem Knoten angibt. Ein Beispiel ist das Dienstkonto-Token, das EKS für IRSA bereitstellt. Ein Konnektor kann keine andere Datei angeben. Die Vertrauensrichtlinie der Rolle muss dem OIDC-Anbieter vertrauen, der das Token ausstellt. Auf einem Knoten ohne `AWS_WEB_IDENTITY_TOKEN_FILE` hat der Konnektor keine Anmeldedaten.
+
+Der Konnektor tauscht das Token am regionalen STS-Endpunkt für `region` des Konnektors aus. Wenn die Umgebung des Knotens `AWS_ENDPOINT_URL_STS` setzt, verwendet der Konnektor stattdessen diesen Endpunkt. Das gilt auch für eine Knotenidentität aus IRSA.
+
+## Verbindung testen
+
+**Verbindung testen** prüft die aktuellen Einstellungen im Formular vor dem Speichern. Bleibt ein Feld für ein Secret leer, verwendet der Test das gespeicherte Secret. Je nach Typ führt der Test nur die Schritte aus, die nötig sind, um die Zustellung oder den Abruf zu prüfen:
+
+| Typ | Test |
+|---|---|
+| `s3` | Schreibt das Objekt `.molesignal-connection-test` unter dem Präfix und löscht es, sofern die Richtlinie das erlaubt. |
+| `kafka` | Liest die Metadaten des Topics von den Brokern. Das prüft die Verbindung, TLS und die Authentifizierung und bestätigt, dass das Topic existiert. Schreibt keine Nachricht. |
+| `http` | Sendet ein als Test gekennzeichnetes Ereignis: `"message": "MoleSignal connection test"` und `"molesignal_connection_test": true`. |
+| `aws_cloudwatch_logs` | Liest höchstens ein Ereignis aus der letzten Minute in der Log-Gruppe. Schreibt nichts in den Stream und ändert die Leseposition nicht. |
+| `kafka_source` | Liest wie bei `kafka` die Metadaten des Topics von den Brokern. Liest keine Nachricht und ändert die Leseposition nicht. |
+| `s3_source` | Listet ein Objekt unter dem Präfix auf. Das prüft die Anmeldedaten und die Berechtigung `s3:ListBucket`. Liest keine Objektinhalte und ändert die Leseposition nicht. |
+
+Der Test bricht nach 25 Sekunden ab. Der API-Endpunkt `POST /api/v1/connectors/test` nimmt `kind` und `configJson` für den Test entgegen. Wenn die Anfrage die `id` eines gespeicherten Konnektors desselben Typs enthält, steht `***` für das dort gespeicherte Secret. Bei ungültigen Einstellungen gibt die API wie beim Speichern `400` zurück.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/connectors/test \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+        "id": "<connector id>",
+        "kind": "kafka",
+        "configJson": {
+          "brokers": "b-1.example.com:9096",
+          "topic": "logs",
+          "tls": true,
+          "auth": "sasl_scram_sha_512",
+          "saslUsername": "molesignal",
+          "saslPassword": "***"
+        }
+      }'
+```
+
+```json
+{ "ok": true, "code": "ok", "detail": null, "elapsedMs": 412 }
+```
+
+`elapsedMs` gibt die Dauer des Tests an. Wenn ein Test fehlschlägt, nennt `code` die Ursache. `detail` enthält bis zu 600 Zeichen der Meldung der Gegenstelle:
+
+| `code` | Bedeutung |
+|---|---|
+| `ok` | Verbindung hergestellt. |
+| `invalid` | Die Einstellungen sind ungültig oder der Konnektor ist eine Push-Quelle und baut daher keine Verbindung auf. |
+| `no_credentials` | Keine AWS-Anmeldedaten verfügbar: Der Knoten hat keine Identität oder keine Identität des angeforderten Typs. |
+| `denied` | Die Gegenstelle hat die Anmeldedaten abgelehnt oder den Vorgang nicht erlaubt. |
+| `not_found` | Der Bucket, das Topic, die Log-Gruppe oder die Adresse existiert nicht. |
+| `tls` | Der TLS-Handshake ist fehlgeschlagen: Das Zertifikat war nicht vertrauenswürdig oder fehlte. |
+| `unreachable` | Der Hostname ließ sich nicht auflösen oder der Host war nicht erreichbar. |
+| `timeout` | Keine Antwort innerhalb des Zeitlimits. |
+| `failed` | Sonstiger Fehler. |
+
+## API
+
+| Endpunkt | Berechtigung | Zweck |
+|---|---|---|
+| `GET /api/v1/connectors` | `pipelines.read` | Konnektoren der Organisation auflisten. |
+| `POST /api/v1/connectors` | `pipelines.edit` | Einen Konnektor erstellen. Der Standardwert für `enabled` ist `true`. |
+| `GET /api/v1/connectors/{id}` | `pipelines.read` | Einen Konnektor abrufen. |
+| `PUT /api/v1/connectors/{id}` | `pipelines.edit` | `name`, `kind`, `configJson` und `enabled` ersetzen. Alle vier Felder sind Pflichtfelder. |
+| `DELETE /api/v1/connectors/{id}` | `pipelines.edit` | Einen Konnektor löschen. |
+| `POST /api/v1/connectors/test` | `pipelines.edit` | Einstellungen vor dem Speichern testen. |
+| `GET /api/v1/connectors/aws-external-id` | `pipelines.read` | Die externe ID der Organisation als `externalId` zurückgeben. |
+
+Die API gibt für einen Konnektor die Felder `id`, `name`, `kind`, `configJson` mit maskierten Secrets, `secretKeys`, `enabled`, `lastRunAt`, `readState`, `createdAt` und `updatedAt` zurück.
+
+## Berechtigungen
+
+`pipelines.read` erlaubt das Auflisten und Abrufen von Konnektoren sowie das Abrufen der externen ID. `pipelines.edit` erlaubt das Erstellen, Aktualisieren, Löschen und Testen von Konnektoren. Ein Test erfordert `pipelines.edit`, weil er gespeicherte Secrets verwendet und im Auftrag des Aufrufers eine Verbindung zu einem anderen System herstellt. Push-Empfänger verwenden zur Authentifizierung das Push-Token und akzeptieren kein reguläres Anmelde-JWT als Ersatz.
+
+<Card title="API für die Datenaufnahme" icon="plug" href="/de/api/intake/kinesis">
+  Details zu den Endpunkten der Push-Empfänger für Amazon Data Firehose, Cloudflare und Heroku.
+</Card>

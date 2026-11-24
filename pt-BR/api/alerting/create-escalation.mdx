@@ -1,0 +1,124 @@
+---
+title: "Criar uma política de escalonamento"
+description: "Defina a ordem das etapas de notificação de incidentes."
+"en_link": "/en-US/api/alerting/create-escalation"
+"zh-Hans_link": "/zh-Hans/api/alerting/create-escalation"
+"zh-Hant_link": "/zh-Hant/api/alerting/create-escalation"
+"ja_link": "/ja/api/alerting/create-escalation"
+"ko_link": "/ko/api/alerting/create-escalation"
+"de_link": "/de/api/alerting/create-escalation"
+"es_link": "/es/api/alerting/create-escalation"
+"fr_link": "/fr/api/alerting/create-escalation"
+---
+
+```http
+POST /api/v1/alerts/escalations
+```
+
+Cria uma política de escalonamento. A política define uma sequência de etapas. Cada etapa notifica seus destinatários e aguarda uma confirmação. A chamada exige `alerts.escalations.manage`.
+
+## Como funciona o escalonamento
+
+1. A função `alert` verifica os incidentes ativos no intervalo definido em `[alert].dispatch_interval_secs`, que é de 10 segundos por padrão. Apenas incidentes com status `open` avançam. Confirmar um incidente interrompe o escalonamento.
+2. Uma etapa com `minSeverity` só se aplica a incidentes com essa gravidade ou superior. O escalonamento pula as etapas que não se aplicam.
+3. Cada destinatário da etapa atual recebe um evento de notificação. Os [Canais de notificação](/pt-BR/notification-channels) determinam como entregar a mensagem. O campo `assignees` do incidente passa a listar os usuários que a etapa indica diretamente: os destinatários `user` e o usuário de plantão de cada destinatário `schedule`. Uma etapa que tem apenas equipes como destinatárias mantém os responsáveis anteriores.
+4. Se o prazo `ackTimeoutSecs` terminar sem confirmação, a próxima etapa aplicável começa.
+5. Quando o prazo da última etapa aplicável termina, uma política com `repeat` definido como `true` volta à primeira etapa até completar o total de execuções definido em `maxLoops`.
+6. Com `ackRetriggerSecs` definido, um incidente `acknowledged` que continua sem resolução após esse intervalo, contado a partir da confirmação, volta ao status `open`: o sistema notifica os responsáveis ou, se não houver responsáveis, volta a notificar os destinatários da etapa atual, com `escalation.reason` definido como `ack_timeout`. O prazo de confirmação da etapa atual recomeça, e o escalonamento segue normalmente. Esse prazo não se aplica a incidentes com notificações suspensas.
+
+Uma regra seleciona uma política com `escalationPolicyId`. Sem esse campo, a regra usa `default`, um alias para a política da organização chamada `default`, sem distinção entre maiúsculas e minúsculas. Quando o escalonamento começa, o incidente armazena o ID real da política. Assim, renomear a política não transfere um incidente aberto para outra política. Se a organização não tiver uma política chamada `default`, os incidentes dessa regra nunca são escalonados, mas o evento disparado ainda chega às políticas de notificação. Crie uma política chamada `default` ou configure a regra com o ID de uma política.
+
+**Corpo**
+
+| Campo | Tipo | Obrigatório | Observações |
+|---|---|---|---|
+| `name` | string | Sim | Não pode ficar vazio. |
+| `steps` | array | Não | Vazio por padrão. Uma política sem etapas não notifica ninguém. |
+| `repeat` | boolean | Não | Padrão: `false`. Reinicia o escalonamento após a última etapa. |
+| `maxLoops` | integer | Não | Padrão: `1`. Define o total de execuções da sequência de etapas quando `repeat` é `true`. Um valor menor que 1 passa a ser 1. |
+| `ackRetriggerSecs` | integer | Não | Tempo que um incidente confirmado pode ficar sem resolução antes de gerar uma nova notificação, de 300 a 86400 segundos. Padrão: `null`, sem nova notificação. |
+| `urgencyRule` | object | Não | Define a urgência de um incidente sem urgência definida. O padrão é `{"mode": "by_severity"}`, que usa o nível que a organização atribuiu a cada gravidade (urgência alta para crítico e erro, e baixa para aviso e informativo, a menos que a organização altere essa configuração). Também aceita `{"mode": "always", "urgency": "high"}` ou `{"mode": "support_hours", "hours": {"timezone": "Asia/Shanghai", "ranges": [{"weekdayMask": 62, "start": "09:00", "end": "18:00"}], "calendar": {"calendarId": "<id>", "holidays": "exclude"}}, "inside": "high", "outside": "low", "raiseAtStart": true}`: usa `inside` durante o horário de suporte e `outside` fora dele, com `high` e `low` como padrões, respectivamente. Com `raiseAtStart`, no início do horário de suporte, o sistema eleva a urgência dos incidentes não confirmados com nível abaixo de `inside` para esse nível e volta a enviar notificações desde a primeira etapa. A urgência corresponde à chave de um dos [níveis](/pt-BR/alerting/on-call#níveis-de-urgência-e-prioridade) da organização. O bit 0 de `weekdayMask` representa domingo. O campo `calendar` é opcional e aceita `exclude` ou `only` em `holidays` (consulte [Calendários de feriados](/pt-BR/alerting/on-call#calendários-de-feriados)). Consulte [Urgência](/pt-BR/alerting/on-call#urgência). |
+| `escalateLowUrgency` | boolean | Não | `false` por padrão: para incidentes de um nível que não avança pelas etapas, a política notifica apenas os destinatários da primeira etapa, sem avançar nem repetir. Com `true`, a política escalona esses incidentes normalmente. |
+
+Uma etapa tem os seguintes campos:
+
+| Campo | Tipo | Obrigatório | Observações |
+|---|---|---|---|
+| `targets` | array | Sim | Destinatários da etapa. O sistema notifica todos ao mesmo tempo. |
+| `ackTimeoutSecs` | integer | Não | Tempo de espera, em segundos, pela confirmação antes da próxima etapa. Se o campo não estiver presente, o sistema usa `[alert].default_ack_timeout_secs` (300 por padrão) e salva esse valor com a etapa. |
+| `minSeverity` | string | Não | `info`, `warning`, `error` ou `critical`. A etapa se aplica a incidentes com essa gravidade ou superior. Omita o campo para aplicar a etapa a todos os incidentes. |
+
+Use `kind` para definir o tipo de destinatário:
+
+| `kind` | Campo adicional | Destinatários |
+|---|---|---|
+| `user` | `userId` | Um usuário. |
+| `team` | `teamId` | Os membros de uma equipe. |
+| `schedule` | `scheduleId` | O usuário de plantão na escala. |
+
+A chamada não verifica se o usuário, a equipe ou a escala referenciada existe.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/escalations \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "Primary operations",
+    "steps": [
+      { "targets": [{ "kind": "user", "userId": "<user-id>" }],
+        "ackTimeoutSecs": 300 },
+      { "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+        "ackTimeoutSecs": 900,
+        "minSeverity": "critical" }
+    ],
+    "repeat": true,
+    "maxLoops": 2,
+    "ackRetriggerSecs": 3600
+  }'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KED3sy8RBNYIdLayGZN0bp2IIY",
+  "orgId": "<organization-id>",
+  "name": "Primary operations",
+  "steps": [
+    {
+      "targets": [{ "kind": "user", "userId": "<user-id>" }],
+      "ackTimeoutSecs": 300,
+      "minSeverity": null
+    },
+    {
+      "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+      "ackTimeoutSecs": 900,
+      "minSeverity": "critical"
+    }
+  ],
+  "repeat": true,
+  "maxLoops": 2,
+  "ackRetriggerSecs": 3600
+}
+```
+</ResponseExample>
+
+**Erros**
+
+| Status | Causa |
+|---|---|
+| `400` | `name` está vazio ou `ackRetriggerSecs` está fora do intervalo de 300 a 86400. |
+| `403` | O token não tem a permissão `alerts.escalations.manage`. |
+| `422` | Um campo está ausente ou é inválido. Por exemplo, o `kind` de um destinatário não é `user`, `team` nem `schedule`, ou o valor de `minSeverity` é desconhecido. A resposta vem em texto simples. |
+
+## Outras rotas de políticas
+
+| Operação | Endpoint | Permissão |
+|---|---|---|
+| Listar | `GET /api/v1/alerts/escalations` | `alerts.escalations.read` |
+| Consultar | `GET /api/v1/alerts/escalations/{id}` | `alerts.escalations.read` |
+| Substituir | `PUT /api/v1/alerts/escalations/{id}` | `alerts.escalations.manage` |
+| Excluir | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.escalations.delete` |
+
+`PUT` aceita o mesmo corpo da chamada de criação e substitui a política. `DELETE` retorna `deleted` em texto simples ou `404` se o ID for desconhecido. Ao excluir uma política, o sistema não verifica as regras que a referenciam. Essas regras deixam de escalonar incidentes.

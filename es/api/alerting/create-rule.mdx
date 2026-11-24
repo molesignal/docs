@@ -1,0 +1,417 @@
+---
+title: "Crear una regla"
+description: "Crea una regla de alerta programada, en tiempo real, de anomalías, de pronóstico, de valores atípicos, compuesta o de latido."
+"en_link": "/en-US/api/alerting/create-rule"
+"zh-Hans_link": "/zh-Hans/api/alerting/create-rule"
+"zh-Hant_link": "/zh-Hant/api/alerting/create-rule"
+"ja_link": "/ja/api/alerting/create-rule"
+"ko_link": "/ko/api/alerting/create-rule"
+"de_link": "/de/api/alerting/create-rule"
+"fr_link": "/fr/api/alerting/create-rule"
+"pt-BR_link": "/pt-BR/api/alerting/create-rule"
+---
+
+```http
+POST /api/v1/alerts/rules
+```
+
+Crea una regla de alerta. La llamada requiere el permiso `alerts.rules.manage`.
+
+## Cómo se evalúa una regla
+
+El rol `alert` evalúa cada regla habilitada cada `[alert].eval_interval_secs` (30 segundos de forma predeterminada), salvo las reglas `real_time`: estas comprueban la condición durante la ingesta y abren un incidente a medida que llegan los registros. Los pasos siguientes se aplican a las reglas `scheduled` y `anomaly`. Para saber cómo se evalúan los demás tipos, consulta [Reglas de pronóstico](#reglas-de-pronóstico), [Reglas de valores atípicos](#reglas-de-valores-atípicos), [Reglas compuestas](#reglas-compuestas) y [Reglas de señal periódica](#reglas-de-latido). Lo que ocurre después de comprobar la condición (coincidencias consecutivas, recuperación e incidentes) es igual para todos estos tipos de reglas.
+
+1. El evaluador ejecuta `query.statement` en la ventana que va de `now - period_secs` a `now`. El motor SQL ejecuta las sentencias `sql`. El motor PromQL ejecuta las sentencias `promql` como consultas instantáneas en `now`. En cambio, para una regla de APM, el evaluador obtiene el valor de los agregados de APM de la ventana. Para una regla de RUM, lo obtiene de los datos de RUM de la ventana. Consulta [Reglas de APM](#reglas-de-apm) y [Reglas de RUM](#reglas-de-rum).
+2. El evaluador lee la primera columna de la primera fila como un número. Un resultado sin valor numérico cuenta como ausencia de datos. `trigger.no_data` define qué ocurre en ese caso. Consulta [Recuperación y ausencia de datos](#recuperación-y-datos-faltantes). Un resultado `promql` muestra primero el `value` de la muestra, por lo que la primera serie determina el resultado. Agrega la expresión en una sola serie, por ejemplo, con `sum(...)`, o divide la regla por etiquetas con `query.group_by`. Consulta [Reglas divididas por columnas](#reglas-divididas-por-columnas).
+3. El evaluador compara el número con la condición de `trigger` o con la de cada nivel de `thresholds` si ese arreglo no está vacío.
+4. El evaluador abre un incidente cuando la condición se cumple en `forPeriods` evaluaciones consecutivas. Una regla tiene como máximo un incidente activo a la vez, o uno por grupo si se divide por columnas. Si `silenceSecs` es mayor que 0, la regla no abre otro incidente hasta que transcurra esa cantidad de segundos desde la creación del incidente anterior de la regla, aunque ya se haya resuelto.
+5. Cuando se cumple la condición de recuperación, el evaluador resuelve el incidente abierto. De forma predeterminada, esto ocurre en la primera evaluación en la que deja de cumplirse la condición. Un incidente confirmado conserva ese estado hasta que alguien lo resuelve.
+6. Después de completar cada evaluación, el evaluador guarda la hora en `lastEvalAt` y el resultado en `lastState`. Si la consulta falla o supera el tiempo de espera, ambos campos quedan sin cambios.
+
+Para las reglas `scheduled` y `anomaly`, la llamada no valida el flujo ni la sentencia. Ejecuta [Probar una regla](/es/api/alerting/test-rule) antes de habilitarla. Al guardar una regla `real_time`, el sistema comprueba que cumpla los límites que se indican a continuación.
+
+**Cuerpo**
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `name` | cadena | Sí | No puede estar vacío. El nombre se usa como resumen del incidente. |
+| `description` | cadena | No | Vacío de forma predeterminada. |
+| `enabled` | booleano | No | Valor predeterminado: `true`. El evaluador omite las reglas deshabilitadas. Las llamadas de prueba y de activación siguen funcionando. |
+| `kind` | cadena | No | `scheduled` (predeterminado), `real_time`, `anomaly`, `forecast`, `outlier`, `composite` o `heartbeat`. Una regla `real_time` comprueba la condición durante la ingesta. Consulta [Reglas en tiempo real](/es/alerting/rules#reglas-en-tiempo-real). |
+| `query` | objeto | Sí | La sentencia y su ventana. Consulta los detalles a continuación. |
+| `trigger` | objeto | Sí | La condición. Consulta los detalles a continuación. |
+| `thresholds` | arreglo | No | Niveles de gravedad para las reglas `scheduled` y `real_time`. Si el arreglo no está vacío, los niveles reemplazan la condición de `trigger`. Las reglas `anomaly` ignoran los niveles. Las reglas `forecast`, `outlier`, `composite` y `heartbeat` se activan con un solo nivel de gravedad y la llamada devuelve `400` si incluye niveles. |
+| `severity` | cadena | No | `info`, `warning`, `error` o `critical`. Se aplica cuando `thresholds` está vacío. |
+| `anomalyParams` | objeto | Para `anomaly` | Configuración de la línea base. Los demás tipos la ignoran. |
+| `escalationPolicyId` | cadena | No | Valor predeterminado: `default`, un alias de la política de escalamiento llamada `default` en la organización. Si se especifica un ID, debe pertenecer a una política de la organización. De lo contrario, la llamada devuelve `400`. Consulta [Crear una política de escalamiento](/es/api/alerting/create-escalation). |
+| `labels` | objeto | No | Mapa de cadenas que se copia a los incidentes. |
+| `annotations` | objeto | No | Mapa de cadenas que se copia a los incidentes. Puede incluir, por ejemplo, un enlace a un manual operativo. |
+| `guide` | objeto | No | Primeros pasos para investigar un incidente de la regla. Consulta [Guía de investigación](#guía-de-investigación). |
+
+**`query`**
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `language` | cadena | Sí | `sql` o `promql`. El lenguaje determina qué motor evalúa la sentencia. En las sentencias `promql`, los selectores de rango como `[5m]` definen la ventana de la sentencia, ya que `periodSecs` solo define la ventana de la consulta. |
+| `statement` | cadena | Sí | No puede estar vacío, salvo en una regla de APM o RUM. El valor evaluado es el de la primera columna de la primera fila. Una regla `real_time` acepta `SELECT count(*) FROM <stream> [WHERE <condition>]`. |
+| `periodSecs` | entero | Sí | Duración de la ventana en segundos. Una regla `real_time` acepta valores de 1 a 3600 y cuenta los registros de esa ventana que cumplen la condición. |
+| `stream` | objeto | Sí, salvo en una regla de APM o RUM | `{ "name": "app", "streamType": "logs" }`. El flujo principal de la sentencia. |
+| `apm` | objeto | Para una regla de APM | El valor de APM que la regla supervisa en lugar de ejecutar una sentencia. Consulta [Reglas de APM](#reglas-de-apm). |
+| `rum` | objeto | Para una regla de RUM | El valor de RUM que la regla supervisa en lugar de ejecutar una sentencia. Consulta [Reglas de RUM](#reglas-de-rum). |
+| `groupBy` | arreglo | No | Columnas del resultado por las que se divide una regla `scheduled` u `outlier`, por ejemplo, `["host"]`. Admite hasta 8 nombres de 1 a 128 caracteres cada uno, sin duplicados. Consulta [Reglas divididas por columnas](#reglas-divididas-por-columnas). |
+| `forecast` | objeto | Para una regla `forecast` | Consulta [Reglas de pronóstico](#reglas-de-pronóstico). |
+| `outlier` | objeto | Para una regla `outlier` | Consulta [Reglas de valores atípicos](#reglas-de-valores-atípicos). |
+| `composite` | objeto | Para una regla `composite` | Consulta [Reglas compuestas](#reglas-compuestas). |
+| `heartbeat` | objeto | Para una regla `heartbeat` | Consulta [Reglas de señal periódica](#reglas-de-latido). |
+| `delaySecs` | entero | No | Cantidad de segundos que se desplaza hacia atrás la ventana de cada evaluación, de 0 a 3600. Si se omite, el valor se determina automáticamente: 0 con un solo proceso o el valor de la instancia en un clúster con roles separados (60 de forma predeterminada). Consulta [Retraso de evaluación](/es/alerting/rules#retraso-de-evaluación). |
+| `homeCluster` | cadena | No | Para una regla en tiempo real en una federación: ID del clúster que evalúa la condición al sumar los recuentos de los clústeres asignados a la organización. Puede ser el clúster actual o un clúster remoto habilitado. Si se omite, cada clúster evalúa la condición con su propio recuento. Los demás tipos descartan este campo. Consulta [Reglas en tiempo real en una federación](/es/alerting/rules#reglas-en-tiempo-real-en-una-federación). |
+| `discovery` | objeto | Para una regla de descubrimiento | La fuente de la regla es [Descubrimiento](/es/alerting/discovery): `{"kinds": [...], "subjects": [...], "environments": [...], "minSeverity": "warning"}`. Omite cualquier filtro para incluir todos los valores correspondientes. Al guardar la regla, el sistema aplica una estructura fija: división por hallazgo, gravedad por hallazgo y `statement` con el valor `discovery`. Consulta [Descubrimiento](/es/api/alerting/discovery). |
+
+`query` solo conserva los parámetros del tipo de regla. Por ejemplo, descarta un objeto `forecast` en una regla `scheduled`. Las reglas `composite` y `heartbeat` no ejecutan consultas: no admiten `statement`, `stream`, `apm`, `rum` ni `groupBy`. La llamada devuelve `400` si incluye `apm`, `rum` o `groupBy`.
+
+Si la primera fila contiene valores en las columnas `service`, `host` y `trace_id`, el evaluador los usa para agregar contexto al incidente. Estas columnas permiten agregar las etiquetas `service` y `host` y completar `affectedServices`, `hostIds` y `traceIds`.
+
+**`trigger`**
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `operator` | cadena | Sí | `gt`, `gte`, `lt`, `lte`, `eq` o `neq`. Una regla `real_time` admite `gt` o `gte`. |
+| `threshold` | número | Sí | El valor con el que se compara el resultado. |
+| `forPeriods` | entero | Sí | Número de evaluaciones consecutivas en las que debe cumplirse la condición para abrir un incidente. `0` equivale a `1`. Una regla `real_time` admite `0` o `1`. |
+| `silenceSecs` | entero | Sí | Tiempo de espera en segundos. Tras abrir un incidente, la regla no abre otro hasta que transcurra este tiempo, aunque el incidente se resuelva antes. `0` desactiva el tiempo de espera. Una [activación manual](/es/api/alerting/trigger-rule) lo ignora. |
+| `recovery` | objeto | No | Condición de recuperación de un incidente abierto. Consulta [Recuperación y ausencia de datos](#recuperación-y-datos-faltantes). |
+| `noData` | objeto | No | Cómo interpretar una evaluación sin valor. Consulta [Recuperación y ausencia de datos](#recuperación-y-datos-faltantes). |
+| `priority` | cadena | No | Prioridad que reciben los incidentes al abrirse. Debe ser una de las prioridades de la organización (de `P1` a `P5` de forma predeterminada). Si se omite, los incidentes no tienen prioridad. |
+| `urgency` | cadena | No | Urgencia que reciben los incidentes al abrirse. Es la clave de uno de los [niveles de urgencia](/es/alerting/on-call#niveles-de-urgencia-y-prioridad) de la organización. Si se omite, la política de escalamiento del incidente determina la urgencia. Consulta [Urgencia](/es/alerting/on-call#urgencia). Las reglas de descubrimiento usan `low` de forma predeterminada. |
+
+Las reglas `anomaly`, `outlier`, `composite` y `heartbeat` ignoran `operator` y `threshold`, pero sí usan `forPeriods`. Las reglas `forecast` usan `operator` para comparar el pronóstico con `threshold`. Una regla con `thresholds` ignora `operator`, `threshold` y `forPeriods` de `trigger`, pero el objeto sigue siendo obligatorio.
+
+**`thresholds`**
+
+Cada nivel tiene `severity` (`info`, `warning`, `error` o `critical`), `operator`, `threshold` y `forPeriods`. Cada nivel cuenta por separado cuántas evaluaciones consecutivas cumplen su condición. El nivel más grave que se activa determina la gravedad del incidente. Si aumenta la gravedad de un incidente abierto, el escalamiento vuelve al primer paso.
+
+Si no hay niveles, el incidente toma primero la gravedad de `severity` de la regla. Si no está definida, toma la de la etiqueta `severity` y, si tampoco hay una etiqueta, usa `warning`. Para una regla `anomaly` sin ninguno de esos dos valores, una desviación de al menos 10 veces la línea base da lugar a `critical`. Si es de al menos 3 veces pero menos de 10, da lugar a `error`.
+
+**`anomalyParams`**
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `algorithm` | cadena | Sí | `mad` o `ewma`. |
+| `lookbackDays` | entero | Sí | De 1 a 30. Número de días anteriores que se comparan a la misma hora del día. |
+| `k` | número | Sí | Multiplicador de desviación. Debe ser positivo. |
+| `alpha` | número | No | Factor de suavizado para `ewma`, mayor que 0 y menor o igual que 1. Valor predeterminado: `0.3`. |
+| `weeklySeasonality` | booleano | No | Valor predeterminado: `false`. Compara solo los datos del mismo día de la semana y requiere un valor de `lookbackDays` de al menos 7. |
+
+## Guía de investigación
+
+`guide` indica qué hacer primero al investigar un incidente de la regla. Los incidentes de la regla muestran la guía y Mole Agent la lee antes de investigar un incidente. Todos los campos son opcionales. La API devuelve las reglas sin guía sin el campo `guide`.
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `steps` | cadena | Markdown, con un máximo de 8000 caracteres. |
+| `queries` | arreglo | Hasta 10 consultas. Cada una incluye `name` (de 1 a 120 caracteres), `language` (`sql` o `promql`), `stream` (`{ "name": "app_logs", "streamType": "logs" }`, obligatorio para `sql`) y `statement` (de 1 a 4000 caracteres). |
+| `dashboards` | arreglo | Hasta 5 ID de dashboards. Cada ID se conserva una sola vez. |
+
+La API elimina los espacios en blanco al principio y al final del texto antes de guardarlo. Devuelve `400` si la guía supera algún límite o si una consulta `sql` no especifica `stream`. Si actualizas la regla (`PUT /api/v1/alerts/rules/{id}`) sin `guide`, la API conserva la guía actual. Para eliminarla, usa `"guide": {}`.
+
+```json
+{
+  "guide": {
+    "steps": "1. Check which routes return the 5xx.\n2. Look for an edge proxy change in the last hour.",
+    "queries": [
+      {
+        "name": "5xx by route",
+        "language": "promql",
+        "statement": "sum by (route) (rate(http_requests_total{code=~\"5..\"}[5m]))"
+      },
+      {
+        "name": "Gateway error logs",
+        "language": "sql",
+        "stream": { "name": "app_logs", "streamType": "logs" },
+        "statement": "SELECT * FROM app_logs WHERE level = 'ERROR'"
+      }
+    ],
+    "dashboards": ["d2"]
+  }
+}
+```
+
+## Recuperación y datos faltantes
+
+`trigger.recovery` mantiene abierto el incidente hasta que el valor vuelve claramente al rango normal. Sin esta opción, un valor que oscila cerca del umbral activa y resuelve el incidente repetidamente.
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `recovery.threshold` | número | Umbral que el valor debe cruzar de vuelta hacia el rango normal para resolver un incidente abierto. Por ejemplo, `80` para una regla que se activa por encima de `90`. Debe quedar del lado normal de todos los umbrales: no puede superar un umbral que activa la regla por encima ni quedar por debajo de uno que la activa por debajo. Todos los niveles deben activarse en la misma dirección. No se admite en reglas `anomaly`, `forecast`, `outlier`, `composite` ni `heartbeat`. Sin este campo, el incidente se resuelve en cuanto el valor deja de cumplir la condición del umbral. |
+| `recovery.for_periods` | entero | Evaluaciones consecutivas en el rango normal antes de resolver el incidente. Tanto `0` como `1` equivalen a una evaluación. El máximo es 1440. |
+
+`trigger.no_data` determina cómo se interpreta una evaluación sin valor: la consulta no devuelve ninguna fila o ningún número, o falta en el resultado un grupo de una [regla dividida por columnas](#reglas-divididas-por-columnas).
+
+| `no_data.action` | Comportamiento de una evaluación sin valor |
+|---|---|
+| `resolve` | Cuenta como una evaluación que no cumple la condición de activación: un incidente abierto se resuelve conforme a la condición de recuperación. Es la opción predeterminada para las reglas `scheduled`. |
+| `keep` | No cambia nada: la evaluación no cuenta como cumplimiento de la condición de activación ni como recuperación, y `lastState` queda en `noData`. Es la opción predeterminada para las reglas `anomaly`. |
+| `alert` | Funciona como `keep`, pero abre un incidente por falta de datos tras `no_data.for_periods` evaluaciones consecutivas sin valor. El incidente se resuelve en la primera evaluación que devuelve un valor. |
+| `zero` | Usa `0` en la comparación en lugar del valor faltante. Es útil para recuentos, cuando la ausencia de una serie o una fila significa que no ocurrió nada. |
+
+Un incidente por falta de datos tiene su propia huella digital, por lo que puede permanecer abierto junto a un incidente activado por un umbral. Lleva la etiqueta `alert.condition` = `noData` y el resumen de la regla o del grupo. Las notificaciones usan el título `NO DATA · <summary>`. La severidad se toma de `severity` en la regla o, si no se especifica, de una etiqueta `severity`. Si tampoco hay una etiqueta, se usa `warning`. `silenceSecs` también se aplica a este incidente. Si el incidente se resuelve manualmente mientras sigue faltando el valor, no se vuelve a abrir hasta que vuelvan los datos. Si corresponde a un grupo de una regla dividida, el sistema deja de hacer seguimiento de ese grupo. Las reglas `real_time` no admiten `recovery` ni `noData`. Las reglas `composite` y `heartbeat` siempre producen un resultado de evaluación y no admiten `noData`.
+
+## Reglas divididas por columnas
+
+Una regla `scheduled` con `query.group_by` evalúa por separado cada grupo del resultado. Cada grupo reúne las filas con los mismos valores en las columnas indicadas. La regla identifica esas columnas en el resultado sin distinguir entre mayúsculas y minúsculas. Si usas `groupBy` con una regla de APM o RUM, o con una regla que no sea `scheduled` ni `outlier`, la API devuelve `400`. Las reglas `outlier` deben dividirse en grupos: comparan los grupos entre sí, no con un umbral. Consulta [Reglas de valores atípicos](#reglas-de-valores-atípicos).
+
+1. Las sentencias `sql` se ejecutan con un límite de 101 filas. Las sentencias `promql` devuelven todas las series. Devuelve una fila por grupo y pon primero el grupo en peor estado.
+2. La primera fila de cada grupo determina su valor: se toma el de la primera columna numérica que no sea una de las columnas indicadas ni `_timestamp`, `ts`, `time` o `timestamp`.
+3. La regla compara el valor con `trigger` o `thresholds` y lleva un recuento de `forPeriods` por grupo.
+4. Cuando un grupo activa la regla, abre su propio incidente. El incidente usa los valores del grupo como etiquetas y, como resumen, el nombre de la regla seguido de dichos valores. Por ejemplo, `Errors per host · web-1`. `silenceSecs` se aplica a cada grupo por separado.
+5. Cuando un grupo cumple la condición de recuperación, la regla resuelve el incidente abierto de ese grupo. Si un grupo aparecía en un resultado anterior, pero no en el actual, no tiene valor en esta evaluación. `trigger.no_data` determina cómo tratarlo.
+6. `lastState` es `firing` si algún grupo activa la regla (`dropped` si un [pipeline de alertas](/es/pipelines/alert-events#qué-ocurre-con-un-evento) descarta el incidente de un grupo en esa evaluación), `noData` si algún grupo no tiene valor y conserva su estado, `pending` si algún grupo cumple la condición de activación y `healthy` en los demás casos.
+
+Cada ronda lee hasta 100 grupos. Si el resultado contiene más, la regla omite los grupos restantes y, durante esa ronda, mantiene abierto el incidente de cualquier grupo que no aparezca en el resultado. Si el resultado contiene filas, pero no incluye una columna con un nombre especificado en `groupBy`, la ronda falla y no cambia nada. [Probar una regla](/es/api/alerting/test-rule) informa sobre todos los grupos.
+
+## Reglas de pronóstico
+
+Una regla `forecast` agrega a una serie el valor que devuelve la consulta en cada ronda y proyecta la serie hacia el futuro. Si el
+pronóstico cumple la condición de `trigger.operator` y `trigger.threshold` dentro del horizonte de pronóstico, la ronda cuenta como coincidencia. Si la
+regla es nueva o cambió la consulta, la ventana o el período retrospectivo, la regla consulta primero cada instante pasado una sola vez para completar
+hasta 48 puntos. La carga se detiene en el primer error y la serie continúa a partir de la siguiente ronda. La
+serie conserva hasta 168 puntos, separados por al menos una ventana de evaluación, y la regla no emite un resultado con menos de
+6 puntos.
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `forecast.lookback_days` | entero | Número de días anteriores de la serie que se usan para hacer la proyección, de 1 a 30. Valor predeterminado: `7`. |
+| `forecast.lead_secs` | entero | Horizonte de pronóstico: la regla se activa si el pronóstico indica que el valor cruzará el umbral dentro de este plazo, de 900 a 604800 segundos (7 días). Valor predeterminado: `86400`. |
+| `forecast.model` | cadena | `linear`: tendencia robusta de Theil–Sen. `daily`, `weekly`: el valor del mismo momento del período anterior más la tendencia, para datos con un patrón diario o semanal. `daily` requiere un día completo de datos en la serie. `weekly` requiere un `lookbackDays` de al menos 7 y una semana completa de datos en la serie. |
+
+El incidente que abre la regla incluye las anotaciones `forecast_crossing_at` (momento en que se prevé que el valor
+cruce el umbral, en UTC), `forecast_value` (valor previsto en ese momento) y `forecast_model`. Si el último punto
+ya cruzó el umbral, el cruce se registra en ese punto. También puedes generar pronósticos para datos de APM y RUM, excepto para problemas de RUM nuevos o
+recurrentes tras una resolución.
+
+## Reglas de valores atípicos
+
+Una regla `outlier` se divide mediante `query.group_by` y compara los valores de los grupos entre sí. Para calcular la
+desviación de un grupo, resta la mediana de los grupos a su valor y divide el resultado por un factor de escala: el mayor entre 1,4826 veces la mediana de las
+desviaciones absolutas (MAD) y el 5 % del valor absoluto de la mediana. Así, si los grupos son casi iguales, una pequeña fluctuación
+no basta para que un valor se considere atípico. Cada grupo cuya desviación queda fuera de la tolerancia abre su propio
+incidente, con la anotación `outlier_score`. Si menos de 3 grupos tienen un valor, la ronda no emite ningún
+resultado.
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `outlier.tolerance` | número | Distancia, en unidades del factor de escala, a partir de la cual un valor se considera atípico. Admite valores de 0,5 a 10. Valor predeterminado: `3`. Cuanto menor sea el valor, mayor será la sensibilidad. |
+| `outlier.direction` | cadena | `both` (predeterminado, valores altos o bajos), `above` (solo valores altos) o `below` (solo valores bajos). |
+
+## Reglas compuestas
+
+Una regla `composite` combina otras reglas: cada regla combinada es verdadera mientras tiene un incidente activo. La expresión usa ese
+valor y la ronda cumple la condición si la expresión es verdadera. La regla no ejecuta ninguna consulta.
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `composite.expression` | cadena | Cada regla se representa con una sola letra mayúscula. Combina las letras con `&&` (y), `\|\|` (o), `!` (no) y paréntesis, por ejemplo `A && (B \|\| !C)`. Máximo de 200 caracteres. |
+| `composite.rules` | objeto | Letras asociadas a ID de reglas, por ejemplo `{ "A": "<rule-id>", "B": "<rule-id>" }`. Máximo de 10. Asigna una regla a cada letra de la expresión y usa todas las letras que declares. No repitas reglas ni incluyas la propia regla compuesta. |
+| `composite.merge_children` | booleano | Valor predeterminado: `false`. Si el valor es `true`, cuando la regla compuesta abre un incidente, los incidentes activos de las reglas combinadas se [fusionan](/es/api/alerting/merge-incidents) con él. En cada ronda posterior también se fusionan los nuevos incidentes, por lo que no envían notificaciones por separado. |
+
+Una regla compuesta no puede formar parte de otra regla compuesta, así que no se pueden
+formar ciclos. Si eliminas una regla combinada, su valor pasa a ser falso. El incidente incluye la anotación
+`composite_active`, que enumera las letras con valor verdadero. No puedes
+[probar](/es/api/alerting/test-rule) una regla compuesta.
+
+## Reglas de latido
+
+Una regla `heartbeat` espera una señal de una tarea, como una tarea de cron o un script de copia de seguridad. La ronda cumple la condición
+si no llega ninguna señal dentro del período más el margen de espera o si la última señal indica un fallo. La regla
+no ejecuta ninguna consulta y evalúa la ronda en cuanto recibe una señal.
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `heartbeat.period_secs` | entero | Intervalo entre las señales de la tarea, de 60 a 604800 (7 días). |
+| `heartbeat.grace_secs` | entero | Tiempo adicional que se espera tras el período antes de dar la señal por perdida, de 0 a 86400. Valor predeterminado: `0`. |
+
+La primera vez que guardas una regla de latido, ya sea al crearla o al convertir una regla de otro tipo, la
+respuesta incluye un campo adicional, `heartbeat_address`:
+`{ "path": "/api/v1/intake/heartbeats/<token>", "url": "<external address>/api/v1/intake/heartbeats/<token>" }`,
+donde `url` es `null` si no configuras una dirección externa. La respuesta solo incluye la dirección esa vez. Si la pierdes,
+solo puedes [restablecerla](/es/api/alerting/heartbeats). El incidente incluye las anotaciones `heartbeat_due_at`,
+`heartbeat_last_checkin_at`, `heartbeat_status` y `heartbeat_message`, que contiene el mensaje de la señal. No puedes
+[probar](/es/api/alerting/test-rule) una regla de latido. Para saber cómo enviar señales, consulta
+[Señales de latido](/es/api/alerting/heartbeats).
+
+## Reglas de APM
+
+Una regla con `query.apm` supervisa una métrica de un servicio de APM o de uno de sus endpoints, a partir de
+los mismos datos agregados que usan las páginas de APM. Una regla de APM debe ser `scheduled`. La llamada guarda `query.stream` como
+`null` y, si `query.statement` está vacío, lo completa con una descripción como
+`apm:p95 checkout POST /orders`. La llamada guarda `query.language` tal como lo recibe, pero este campo no tiene efecto.
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `service` | cadena | Sí | Nombre del servicio. Máximo de 255 bytes. |
+| `namespace` | cadena | No | Espacio de nombres del servicio. Si lo omites, incluye todos los espacios de nombres con ese nombre de servicio. |
+| `environment` | cadena | No | Si lo omites, incluye todos los entornos del servicio. |
+| `transaction` | objeto | No | Un endpoint: `{ "name": "POST /orders", "kind": "http" }`. `kind` puede ser `http`, `rpc`, `messaging`, `span` u `other`. Si omites el campo, incluye todo el servicio. |
+| `metric` | cadena | Sí | Métrica. Consulta la tabla siguiente. |
+| `sloId` | cadena | Para `slo_burn_rate` | SLO del que se obtiene la tasa de consumo. Las demás métricas no admiten `sloId`. |
+| `shortWindowSecs` | entero | No | Solo para `slo_burn_rate`. Debe ser menor que `periodSecs`. El valor es la menor de las dos tasas de consumo: la del período completo y la de sus últimos `shortWindowSecs`. Por lo tanto, ambas deben superar el umbral. |
+
+| `metric` | Valor |
+|---|---|
+| `errorRate` | Porcentaje de solicitudes fallidas sobre el total de solicitudes, de 0 a 100. |
+| `p50`, `p90`, `p95`, `p99`, `average` | Latencia en milisegundos. |
+| `throughput` | Solicitudes por segundo durante la ventana. |
+| `requestCount`, `errorCount` | Número de solicitudes o de solicitudes fallidas en la ventana. |
+| `new_error_groups` | Grupos de errores del servicio o de `transaction` que aparecen por primera vez en la ventana. |
+| `apdex` | Apdex con un umbral de 500 ms, de 0 a 1. |
+| `slo_burn_rate` | Número de veces que la tasa de consumo del presupuesto de errores supera la permitida por el SLO. Un valor de `1` indica que el presupuesto se agota justo al finalizar la ventana del SLO. |
+
+La ventana usa datos agregados por minuto hasta 24 horas y por hora para períodos más largos. Si no hay solicitudes
+en la ventana, `requestCount`, `errorCount`, `new_error_groups` y `throughput` devuelven `0`, y las demás métricas no tienen
+valor, por lo que no se cumple ninguna condición de umbral. El resultado incluye las columnas `value`, `service` y `trace_id`. Por eso,
+el incidente incluye la etiqueta `service`, el servicio en `affectedServices` y un ID de traza de ejemplo.
+
+## Reglas de RUM
+
+Una regla con `query.rum` supervisa una métrica de una aplicación RUM y la calcula del mismo modo que las páginas de RUM. Una regla de RUM es de tipo `scheduled` o
+`anomaly`, y cada regla especifica una métrica de APM o de RUM, pero no ambas. La llamada guarda `query.stream` como `null` y, cuando
+`query.statement` está vacío, lo rellena con una descripción como `rum:lcp_p75 checkout-web /checkout`. La llamada guarda `query.language` tal como lo
+recibe, pero el campo no tiene efecto. Si la aplicación no existe, la llamada devuelve `400`.
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `applicationId` | cadena | Sí | La [aplicación RUM](/es/rum/applications). |
+| `environment` | cadena | No | Si lo omites, incluye todos los entornos de la aplicación. |
+| `page` | cadena | No | Una página o una pantalla de una aplicación. Si lo omites, incluye todas las páginas. No se admite para las métricas de sesiones ni de problemas. |
+| `version` | cadena | No | Una versión de la aplicación. Si lo omites, incluye todas las versiones. No se admite para las métricas de problemas. |
+| `metric` | cadena | Sí | La métrica. Consulta la lista que aparece más abajo. |
+| `minSamples` | entero | No | Número mínimo de filas que debe contener una ventana para calcular el valor de la métrica. Si lo omites, se usa el valor predeterminado de la métrica. No se admite para un recuento. |
+| `customName`, `statistic` | cadena | Para `custom_vital` y `custom_timing` | El nombre de la métrica vital o de la medición de tiempo y la estadística que se calcula: `p50`, `p75` (la opción predeterminada), `p90`, `p95`, `p99`, `avg` o `count`. |
+| `search` | objeto | Para `query` | La consulta del explorador: `type` (`sessions`, `views`, `actions`, `errors`, `resources`, `longTasks` o `logs`), `statement` tal como se escribió, los `filters` (`field`, `op`, `value`) y el `freeText` que se extraen al interpretarlo, y `measure`, con una función `fn` (`count`, `count_distinct`, `sum`, `avg`, `min`, `max` o de `p50` a `p99`) y el `field` al que se aplica. Si el tipo no tiene un campo especificado, la llamada devuelve `400`. No se admite con `page` ni con `version`. Para un recuento o una suma, tampoco se admite `minSamples`. |
+
+`metric` admite `sessionCount`, `viewCount`, `errorCount`, `errorRate`, `crash_free_sessions`, `frustration_rate`,
+`failed_request_rate`, `lcp_p75`, `inp_p75`, `cls_p75`, `ttfb_p75`, `new_issues`, `regressed_issues`, `issue_impact`,
+`custom_vital`, `custom_timing` y `query`. Consulta la descripción, la unidad y las filas que requiere cada métrica en
+[Alertas de RUM](/es/rum/alerts#métricas). Una regla `anomaly` admite todas las métricas excepto `new_issues` y `regressed_issues`.
+`periodSecs` admite valores de 60 segundos a 6 horas.
+
+Si una ventana no contiene filas, el recuento da `0` y las demás métricas no devuelven ningún valor, por lo que no se cumple ningún umbral. El resultado contiene una sola fila con las columnas
+`value` y `application`. Cuando se abre un incidente, la regla también busca hasta tres sesiones de muestra y las guarda con
+el incidente. Consulta [Alertas de RUM](/es/rum/alerts#incidentes).
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "High error rate",
+  "description": "More than 100 errors in five minutes",
+  "enabled": true,
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
+    "periodSecs": 300,
+    "stream": { "name": "app", "streamType": "logs" }
+  },
+  "trigger": { "operator": "gt", "threshold": 100, "forPeriods": 2, "silenceSecs": 0 },
+  "severity": "critical",
+  "escalationPolicyId": "<policy-id>",
+  "labels": { "team": "checkout" }
+}
+EOF
+```
+```bash APM rule
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "Checkout p95",
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "",
+    "periodSecs": 300,
+    "apm": {
+      "namespace": "shop",
+      "service": "checkout",
+      "environment": "production",
+      "transaction": { "name": "POST /orders", "kind": "http" },
+      "metric": "p95"
+    }
+  },
+  "trigger": { "operator": "gt", "threshold": 800, "forPeriods": 2, "silenceSecs": 0 },
+  "severity": "error",
+  "labels": { "service.name": "checkout", "deployment.environment": "production" }
+}
+EOF
+```
+```bash RUM rule
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "Checkout is slow",
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "",
+    "periodSecs": 3600,
+    "rum": {
+      "applicationId": "checkout-web",
+      "environment": "production",
+      "page": "/checkout",
+      "metric": "lcp_p75"
+    }
+  },
+  "trigger": { "operator": "gt", "threshold": 2500, "forPeriods": 1, "silenceSecs": 0 },
+  "severity": "warning",
+  "labels": { "rum.application": "checkout-web", "deployment.environment": "production", "rum.page": "/checkout" }
+}
+EOF
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KEDBLvTYO6DnWi8H9S9MNLpPT7",
+  "orgId": "<organization-id>",
+  "name": "High error rate",
+  "description": "More than 100 errors in five minutes",
+  "enabled": true,
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
+    "periodSecs": 300,
+    "stream": { "name": "app", "streamType": "logs" }
+  },
+  "trigger": { "operator": "gt", "threshold": 100.0, "forPeriods": 2, "silenceSecs": 0 },
+  "anomalyParams": null,
+  "thresholds": [],
+  "severity": "critical",
+  "escalationPolicyId": "<policy-id>",
+  "labels": { "team": "checkout" },
+  "annotations": {},
+  "lastEvalAt": null,
+  "lastState": { "kind": "healthy" },
+  "createdAt": 1790000000000000,
+  "updatedAt": 1790000000000000
+}
+```
+</ResponseExample>
+
+**Errores**
+
+| Estado | Causa |
+|---|---|
+| `400` | `name` o `query.statement` está vacío; falta `query.stream`; la regla consulta el [flujo `_audit`](/es/settings/data-security#flujo-de-auditoría) mediante `query.stream` o en cualquier parte de `query.statement`; una regla de APM no es de tipo `scheduled` o su `query.apm` no es válido (`APM alert service is invalid`, `an SLO burn-rate alert names its SLO`); una regla de RUM es de tipo `real_time`, especifica una aplicación que no existe o tiene un `query.rum` no válido (un `page` o un `version` que la métrica no admite, un `minSamples` en un recuento o una ventana fuera del intervalo de 60 a 21 600 segundos); `escalationPolicyId` no identifica ninguna política de la organización; faltan los `anomalyParams` de una regla `anomaly` o no son válidos; o una regla `real_time` no respeta los límites anteriores. La respuesta está en JSON e incluye el código `invalid_argument` y un mensaje como `anomaly detector not yet supported: prophet`. |
+| `403` | El token no tiene el permiso `alerts.rules.manage`. |
+| `422` | Falta un campo obligatorio o un valor no es del tipo esperado, por ejemplo, un `operator` desconocido. La respuesta está en texto plano. |
+
+Consulta [Alertas y respuesta a incidentes](/es/alerting) para ver los pasos en la consola.

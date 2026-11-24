@@ -1,0 +1,119 @@
+---
+title: "Importar y exportar políticas, horarios y reglas de enrutamiento"
+description: "Exporta las políticas de escalamiento, los horarios de guardia y las reglas de enrutamiento en paquetes que identifican sus referencias por nombre e importa esos paquetes a una organización."
+"en_link": "/en-US/api/alerting/oncall-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/oncall-transfer"
+"zh-Hant_link": "/zh-Hant/api/alerting/oncall-transfer"
+"ja_link": "/ja/api/alerting/oncall-transfer"
+"ko_link": "/ko/api/alerting/oncall-transfer"
+"de_link": "/de/api/alerting/oncall-transfer"
+"fr_link": "/fr/api/alerting/oncall-transfer"
+"pt-BR_link": "/pt-BR/api/alerting/oncall-transfer"
+---
+
+```http
+GET  /api/v1/alerts/escalations/export
+POST /api/v1/alerts/escalations/import
+GET  /api/v1/schedules/export
+POST /api/v1/schedules/import
+GET  /api/v1/alerts/routing/rules/export
+POST /api/v1/alerts/routing/rules/import
+```
+
+| Tipo | Exportación | Importación | Formato | Clave de la lista |
+|---|---|---|---|---|
+| Políticas de escalamiento | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.escalation-policies/v1` | `policies` |
+| Horarios de guardia | `schedules.read` | `schedules.create` | `molesignal.schedules/v1` | `schedules` |
+| Reglas de enrutamiento | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.routing-rules/v1` | `rules` |
+
+## Exportación
+
+El parámetro de consulta `ids` acepta identificadores separados por comas. Si lo dejas vacío, exporta todos los elementos. La respuesta contiene un
+paquete:
+
+```json
+{
+  "format": "molesignal.escalation-policies/v1",
+  "policies": [
+    {
+      "name": "Payments on-call",
+      "steps": [
+        {"targets": [{"kind": "schedule", "schedule": "Payments primary"}], "ackTimeoutSecs": 300, "minSeverity": null},
+        {"targets": [{"kind": "user", "user": "lead@example.com"}], "ackTimeoutSecs": 600, "minSeverity": null}
+      ],
+      "repeat": false,
+      "maxLoops": 1,
+      "urgencyRule": {"mode": "by_severity"}
+    }
+  ]
+}
+```
+
+Cada elemento conserva su definición, pero no su identificador ni su organización. Las referencias usan nombres: `user` contiene la dirección de correo
+del usuario; `team`, `schedule`, `policy` y `calendar` contienen los nombres de un equipo, un horario de guardia, una
+política de escalamiento y un calendario de días festivos. `members` contiene las direcciones de correo de los miembros de una rotación. Un horario omite
+su cobertura temporal y sus marcas de tiempo; una regla de enrutamiento omite su posición y sus marcas de tiempo.
+
+## Importación
+
+| Campo | Tipo | Obligatorio | Descripción |
+|---|---|---|---|
+| `content` | cadena | Sí | Un paquete del tipo correspondiente, en JSON o YAML, de hasta 4 MiB y 500 elementos. Para los horarios, también admite el archivo descrito en [Migra horarios desde Opsgenie o PagerDuty](/es/alerting/schedule-migration). |
+| `dryRun` | booleano | No | `true` de forma predeterminada: simula la importación sin guardar cambios. `false` guarda los cambios. |
+| `createOnly` | booleano | No | Con `true`, la importación no modifica los elementos existentes con el mismo nombre. |
+
+La importación busca coincidencias por nombre: si no hay ninguna, crea el elemento; si hay una, compara los campos uno por uno; si hay
+varias, da error. También da error si el archivo repite un nombre. Cada referencia debe apuntar a un elemento
+de la organización. La importación aplica a cada elemento las mismas validaciones que al guardarlo. Si algún elemento da error, no
+guarda nada. De lo contrario, guarda los elementos uno por uno, envía un evento de cambio de federación por cada
+elemento sincronizado y registra un único evento de auditoría: `escalation_policies.imported`, `schedules.imported`
+o `routing_rules.imported`.
+
+- Al importar un horario existente, la importación conserva la cobertura temporal, los intercambios de turnos y la configuración que el archivo omite.
+- Las reglas de enrutamiento importadas van primero, en el orden del archivo. Las demás mantienen su orden a continuación.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content schedules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "molesignal.schedules/v1",
+  "items": [
+    {"name": "Payments primary", "action": "update", "changes": ["rotations"], "id": "3KC9..."},
+    {"name": "Payments nights", "action": "create"},
+    {"name": "Search", "action": "error", "error": "no user is named `ann@example.com`"}
+  ],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` toma el valor `create`, `update`, `unchanged`, `skip` (si el elemento ya existe y `createOnly` vale `true`, o si el archivo solo menciona por nombre un horario de PagerDuty
+basado en turnos) o `error`. Tras guardar los cambios, `id` identifica el elemento creado o actualizado. `applied` indica
+si la importación guardó algún cambio.
+
+`format` indica el formato que leyó la importación: el formato del paquete, `pagerduty` u `opsgenie`. Los horarios también pueden incluir estos
+campos:
+
+| Campo | Ubicación | Descripción |
+|---|---|---|
+| `unknownMembers` | Elemento | Todas las direcciones de correo que no corresponden a ningún miembro de la organización. |
+| `blockers` | Elemento | Datos que no se pueden trasladar y cuya omisión cambiaría quién está de guardia. Si hay algún bloqueo, el elemento recibe el valor `error`. |
+| `findings` | Elemento, informe | Datos omitidos y comparación del elemento con lo que muestra el sistema de origen. |
+
+Cada bloqueo o hallazgo tiene la forma `{"code": "...", "params": {...}}`: `code` identifica el mensaje y `params`
+aporta los valores para completarlo.
+
+**Errores**
+
+| Estado | Motivo |
+|---|---|
+| `400` | El contenido no corresponde a un paquete del tipo esperado ni a un archivo compatible con la importación de horarios, indica otro formato, supera el tamaño máximo o contiene demasiados elementos. |
+| `403` | El token no tiene el permiso necesario. |

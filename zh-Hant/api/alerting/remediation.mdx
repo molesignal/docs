@@ -1,0 +1,235 @@
+---
+title: "修復動作 API"
+sidebarTitle: "修復動作"
+description: "定義 HTTP 和 Kubernetes 修復動作、註冊叢集，並從事件發起修復：經核准或預先核准後執行並驗證。"
+"en_link": "/en-US/api/alerting/remediation"
+"zh-Hans_link": "/zh-Hans/api/alerting/remediation"
+"ja_link": "/ja/api/alerting/remediation"
+"ko_link": "/ko/api/alerting/remediation"
+"de_link": "/de/api/alerting/remediation"
+"es_link": "/es/api/alerting/remediation"
+"fr_link": "/fr/api/alerting/remediation"
+"pt-BR_link": "/pt-BR/api/alerting/remediation"
+---
+
+修復動作是預先定義的單一步驟處置，例如呼叫一次 Jenkins 的復原任務，或對 Deployment 執行滾動重啟。從事件發起後，進入[審批](/zh-Hant/agent#核准與執行)流程：L2 需要一人核准，L3 需要兩人核准，發起人不得核准自己發起的動作。組織啟用[預先核准](#預先核准)時，可提前取得相同人數的核准。核准後立即執行，並將執行與驗證結果記錄在事件的[時間軸](/zh-Hant/api/alerting/incident-timeline)。介面操作方式請見[修復動作](/zh-Hant/alerting/remediation)。
+
+| 方法與路徑 | 用途 | 權限 |
+|---|---|---|
+| `GET /api/v1/alerts/remediation/actions` | 列出組織的修復動作。 | `alerts.remediation.read` |
+| `POST /api/v1/alerts/remediation/actions` | 新增修復動作。 | `alerts.remediation.manage` |
+| `PUT /api/v1/alerts/remediation/actions/{id}` | 取代修復動作。 | `alerts.remediation.manage` |
+| `DELETE /api/v1/alerts/remediation/actions/{id}` | 刪除修復動作。 | `alerts.remediation.manage` |
+| `GET /api/v1/alerts/remediation/clusters` | 列出已登錄的 Kubernetes 叢集。 | `alerts.remediation.read` |
+| `POST /api/v1/alerts/remediation/clusters` | 登錄叢集。 | `alerts.remediation.manage` |
+| `PUT /api/v1/alerts/remediation/clusters/{id}` | 修改叢集。 | `alerts.remediation.manage` |
+| `DELETE /api/v1/alerts/remediation/clusters/{id}` | 刪除叢集。 | `alerts.remediation.manage` |
+| `POST /api/v1/alerts/remediation/clusters/{id}/test` | 測試連線，傳回 `{ "ok": true, "version": "v1.30.2" }`。 | `alerts.remediation.manage` |
+| `GET /api/v1/alerts/incidents/{id}/remediations` | 列出適用於事件的動作和該事件的執行記錄。 | 事件的 `alerts.incidents.read` 權限 |
+| `POST /api/v1/alerts/incidents/{id}/remediations` | 從事件發起執行並送交審批。 | 事件的 `alerts.incidents.remediate` 權限 |
+| `GET /api/v1/alerts/remediation/preapproval` | 取得組織的預先核准開關，以及每個已設定預先核准的動作在時間範圍內的執行次數和狀態。 | `alerts.remediation.read` |
+| `PUT /api/v1/alerts/remediation/preapproval` | 啟用或停用組織的預先核准，請求本文為 `{ "enabled": true }`。 | `alerts.remediation.preapprove` |
+| `PUT /api/v1/alerts/remediation/actions/{id}/preapproval` | 設定或取代動作的預先核准。 | `alerts.remediation.preapprove` 與 `agent.approve` |
+| `DELETE /api/v1/alerts/remediation/actions/{id}/preapproval` | 移除動作的預先核准。 | `alerts.remediation.preapprove` |
+| `POST /api/v1/alerts/remediation/actions/{id}/preapproval/confirm` | 由第二人確認 L3 動作的預先核准。 | `alerts.remediation.preapprove` 與 `agent.approve` |
+
+稽核日誌會記錄新增、修改、刪除與發起執行，也會記錄預先核准的啟用、停用、設定、確認與移除。
+
+## 修復動作
+
+**請求本文**
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `name` | string | 是 | 1 至 120 個字元。 |
+| `description` | string | 否 | 說明。 |
+| `target` | object | 是 | 執行方式：`kind` 為 `http` 或 `kubernetes`，其餘欄位請見下文。 |
+| `parameters` | array | 否 | 發起時要填寫的參數，最多 10 個，請見下文。 |
+| `services` | array | 否 | 適用的服務。此欄位與 `teamIds` 都留空時，適用於所有事件。設定後，事件的服務或團隊必須符合設定。 |
+| `teamIds` | array | 否 | 適用的團隊。 |
+| `risk` | string | 否 | `l2`（預設，一人核准）或 `l3`（兩人核准）。 |
+| `verifyAfterSecs` | integer | 否 | 執行成功後等待幾秒再驗證，範圍為 0 至 86400；預設為 `0`，不執行驗證。 |
+| `verifyBy` | string | 否 | 判定修復是否有效的條件：`incidentResolved`（預設，事件已解決或關閉）或 `rule_healthy`（事件的規則恢復正常）。 |
+| `enabled` | boolean | 否 | 預設為 `true`。停用的動作無法發起。 |
+
+**`target`：HTTP 請求**
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `kind` | string | `http`。 |
+| `method` | string | `GET`、`POST`（預設）、`PUT` 或 `PATCH`。 |
+| `url` | string | 網址範本，以 `http://` 或 `https://` 開頭。 |
+| `headers` | object | 請求標頭；值採用範本並加密儲存。 |
+| `body` | string | JSON 格式的請求本文範本，最長 16384 個字元。預留位置可不加引號，作為數字使用。將每個預留位置替換成 `0` 後，結果必須是有效的 JSON，否則傳回 `400`。有請求本文時，`Content-Type` 為 `application/json`；留空時不傳送請求本文。 |
+| `signingSecret` | string | 簽章密鑰，採用加密儲存。設定後，請求會帶上 `X-MoleSignal-Timestamp` 與 `X-MoleSignal-Sign`，演算法與[通用 Webhook 的簽章](/zh-Hant/notification-channels/webhooks#請求標頭與簽章)相同。 |
+
+請求只連線到網址解析出的 IP，拒絕連線到雲端服務供應商的中繼資料位址，不跟隨重新導向，逾時時間為 30 秒。收到 2xx 回應即視為成功。
+
+**`target`：Kubernetes**
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `kind` | string | `kubernetes`。 |
+| `clusterId` | string | 已登錄的叢集。 |
+| `operation` | string | `restart`（滾動重啟，等同 `kubectl rollout restart`）、`scale`（調整複本數）或 `rollback`（復原至上一個版本，等同 `kubectl rollout undo`）。 |
+| `workloadKind` | string | `Deployment`、`StatefulSet` 或 `DaemonSet`。只有 Deployment 可以復原至上一個版本，DaemonSet 無法調整複本數。 |
+| `namespace`、`workloadName` | string | 命名空間和工作負載名稱，可使用範本。 |
+| `replicas` | string | 調整後的複本數，可使用範本，例如 `{{params.replicas}}`。 |
+
+**`parameters[]`**
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `key` | string | 在範本中使用 `{{params.<key>}}`。 |
+| `label` | string | 發起時顯示的名稱。 |
+| `kind` | string | `text`（預設）、`number` 或 `select`。 |
+| `options` | array | `select` 的選項。 |
+| `required` | boolean | 預設為 `false`。 |
+| `default` | string | 未填寫時使用的值。 |
+
+**範本變數**：`{{incident.id}}`、`{{incident.summary}}`、`{{incident.severity}}`、`{{incident.status}}`、`{{incident.service}}`（`service` 標籤，若無此標籤則取第一個受影響的服務）、`{{incident.url}}`（事件頁面網址），以及 `{{params.<key>}}`。代入網址時採用百分比編碼，代入 JSON 請求本文時依 JSON 字串規則進行跳脫處理。未提供的變數會替換成空字串。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/remediation/actions \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "Roll back checkout",
+    "target": {
+      "kind": "http",
+      "method": "POST",
+      "url": "https://jenkins.example.com/job/rollback/buildWithParameters?service={{incident.service}}",
+      "headers": { "Authorization": "Bearer <jenkins-token>" },
+      "body": "{\"reason\": \"{{params.reason}}\", \"incident\": \"{{incident.url}}\"}"
+    },
+    "parameters": [{ "key": "reason", "label": "Why", "required": true }],
+    "services": ["checkout"],
+    "risk": "l3",
+    "verifyAfterSecs": 600,
+    "verifyBy": "incident_resolved"
+  }'
+```
+</RequestExample>
+
+回應會傳回已儲存的動作，但不會傳回請求標頭的值或簽章密鑰。`headers` 中的值為空，`secretsSet` 會列出已設定的機密資料，例如 `["header:Authorization", "signing_secret"]`。修改時，將請求標頭的值留空或省略 `signingSecret`，即可保留各自的原值。將 `signingSecret` 設為空字串即可移除簽章。
+
+## Kubernetes 叢集
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `name` | string | 是 | 名稱。 |
+| `apiServer` | string | 是 | API Server 位址，以 `https://` 開頭。 |
+| `caCert` | string | 否 | PEM 格式的 CA 憑證；留空時使用系統信任的根憑證。 |
+| `token` | string | 新增時必填 | ServiceAccount Token，採用加密儲存，且不會傳回。修改時留空即可保留原值。 |
+
+Token 必須具備目標工作負載的 `get` 和 `patch` 權限。若要復原至上一個版本，還必須能列出 ReplicaSet。系統只連線到 API Server 位址解析出的 IP，拒絕連線到雲端服務供應商的中繼資料位址，逾時時間為 30 秒。若仍有動作使用該叢集，系統會拒絕刪除。
+
+## 預先核准
+
+組織啟用預先核准後（預設停用），即可為修復動作設定預先核准。對於列出的服務，動作可在指定時間範圍內執行至設定上限，無須每次等待審批。L2 動作設定後立即生效；L3 動作須由另一人呼叫 `confirm` 確認後才會生效。預先核准只會提前完成審批，不會減少所需的核准人數。設定與確認時，必須以本人的帳號登入，不可使用 API Token。
+
+**請求本文**（`PUT /api/v1/alerts/remediation/actions/{id}/preapproval`）
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `services` | array | 是 | 適用的服務，最多 20 個，且都必須在動作本身的適用範圍內。 |
+| `maxRuns` | integer | 是 | 時間範圍內的執行次數上限，範圍為 1 至 20。 |
+| `windowSecs` | integer | 是 | 時間範圍的長度，範圍為 300 至 604800 秒。 |
+| `expiresAt` | integer | 否 | 到期時間，以自紀元起算的微秒數表示；未填寫則不會到期。 |
+| `channels` | array | 否 | 執行後傳送通知的目的地，最多 5 個。使用 `connectorId`、`targetType` 與 `target`，與通知策略的目標相同。 |
+
+回應為 `{ "preapproval": { ... } }`，比請求本文多出 `approvers`（`[{ "userId", "at" }]`）、`setBy` 與 `setAt`。設定者是第一位核准人。取代預先核准時，核准人清單只保留設定者。若修改修復動作本身的執行方式、參數、適用的服務或團隊，或風險等級，系統會清空核准人清單，必須重新確認。
+
+`GET /api/v1/alerts/remediation/preapproval` 傳回 `{ "enabled": true, "actions": { "<action-id>": { "used": 1, "state": "active" } } }`。`state` 為 `off`（組織未啟用）、`expired`、`awaiting_approver`（L3 還需要一人確認）、`used_up`（已達時間範圍內的執行次數上限）或 `active`。
+
+預先核准生效時，若從適用服務的事件發起此動作，系統會直接將審批記為已核准，將設定與確認預先核准的人記為核准人，並立即執行。發起人仍須具備 `alerts.incidents.remediate` 權限。發起人提供的預先核准不計入該次審批。排除發起人後若核准人數不足，仍須等待審批，且審批記錄不會列出發起人。達到執行次數上限、預先核准到期或組織停用預先核准時，仍須依一般流程審批。無論執行成功或失敗，系統都會傳送通知至 `channels`。
+
+## 從事件執行
+
+```http
+GET /api/v1/alerts/incidents/{id}/remediations
+```
+
+傳回 `{ "actions": [ ... ], "runs": [ ... ] }`：適用於此事件且已啟用的動作（不含機密資料），以及此事件的執行記錄。若審批遭駁回、已到期或已撤銷，讀取執行記錄時會顯示為 `declined`。
+
+```http
+POST /api/v1/alerts/incidents/{id}/remediations
+```
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `actionId` | string | 是 | 要執行的動作，必須適用於此事件。 |
+| `inputs` | object | 否 | 參數值，以參數的 `key` 為鍵。必須提供所有必填參數，數字參數須填入數字，選項參數須使用已定義的選項，且不得提供多餘的參數。未填寫時使用預設值。每個值最長 500 個字元。 |
+| `reason` | string | 否 | 審批記錄所列的原因，最長 2000 個字元；未填寫時會自動產生。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/remediations \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"actionId": "<action-id>", "inputs": {"reason": "pool exhausted after v2026.10.28"}}'
+```
+</RequestExample>
+
+回應為 `{ "run": { ... }, "approval": { ... } }`，包含執行記錄與已提交的審批資料。審批資料依動作的 `risk` 標示風險，並在影響說明中列出將呼叫的網址，或將在哪個叢集對哪個工作負載執行哪項操作。審批人使用 `POST /api/v1/agent/approvals/{approvalId}/review` 核准或駁回，請求本文為 `{ "approve": true, "comment": "…" }`，且須具備 `agent.approve` 權限。達到所需的核准人數後立即執行。動作適用[預先核准](#預先核准)時，會在傳回回應前完成執行。回應另含 `"preapproved": true` 和 `execution`，執行記錄的 `preapproved` 為 `true`。
+
+<ResponseExample>
+```json 200
+{
+  "run": {
+    "id": "3KJ0f2R9cWm1Xa8LpV4sNq7TbYe",
+    "orgId": "<organization-id>",
+    "incidentId": "<incident-id>",
+    "actionId": "<action-id>",
+    "actionName": "Roll back checkout",
+    "approvalId": "<approval-id>",
+    "inputs": { "reason": "pool exhausted after v2026.10.28" },
+    "status": "awaiting_approval",
+    "output": "",
+    "verifyAt": null,
+    "verification": "",
+    "requestedBy": "<user-id>",
+    "executedBy": null,
+    "createdAt": 1790000000000000,
+    "updatedAt": 1790000000000000
+  },
+  "approval": {
+    "id": "<approval-id>",
+    "orgId": "<organization-id>",
+    "investigationId": null,
+    "action": "run_remediation_action",
+    "target": "<incident-id>",
+    "parameters": { "actionId": "<action-id>", "action": "Roll back checkout", "inputs": { "reason": "pool exhausted after v2026.10.28" } },
+    "reason": "Run `Roll back checkout` on incident: High error rate · checkout",
+    "impact": "HTTP POST https://jenkins.example.com/job/rollback/buildWithParameters?service={{incident.service}} (reason=pool exhausted after v2026.10.28)",
+    "risk": "l3",
+    "status": "pending",
+    "requestedBy": "<user-id>",
+    "requiredApprovals": 2,
+    "reviews": [],
+    "expiresAt": 1790003600000000,
+    "decidedAt": null,
+    "createdAt": 1790000000000000,
+    "updatedAt": 1790000000000000
+  }
+}
+```
+</ResponseExample>
+
+| `status` | 含義 |
+|---|---|
+| `awaiting_approval` | 等待審批。 |
+| `running` | 執行中。 |
+| `succeeded`、`failed` | 執行成功或失敗；`output` 是回應或錯誤訊息的開頭。 |
+| `declined` | 審批遭駁回、已到期或已撤銷，未執行動作。 |
+| `verifying` | 執行成功，等到 `verifyAt` 再驗證。 |
+| `verified`、`verification_failed` | 驗證通過或失敗；`verification` 會列出結果。 |
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | 欄位無效、叢集不屬於此組織、動作不適用於此事件或已停用、參數無效，或事件已解決。 |
+| `403` | 缺少權限，或無權存取此事件。 |
+| `404` | 動作、叢集或事件不存在。 |

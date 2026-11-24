@@ -1,0 +1,224 @@
+---
+title: "Migrar escalas do Opsgenie ou PagerDuty"
+description: "Importe escalas de plantão pela API REST do Opsgenie ou do PagerDuty e compare-as com as escalas exibidas no sistema de origem antes de salvar qualquer dado. Confira o que é importado e o que fica de fora."
+"en_link": "/en-US/alerting/schedule-migration"
+"zh-Hans_link": "/zh-Hans/alerting/schedule-migration"
+"zh-Hant_link": "/zh-Hant/alerting/schedule-migration"
+"ja_link": "/ja/alerting/schedule-migration"
+"ko_link": "/ko/alerting/schedule-migration"
+"de_link": "/de/alerting/schedule-migration"
+"es_link": "/es/alerting/schedule-migration"
+"fr_link": "/fr/alerting/schedule-migration"
+---
+
+**Importar escalas de plantão…** lê as escalas no formato retornado pelas APIs REST do Opsgenie e do PagerDuty. Assim, a equipe não precisa recriar os rodízios manualmente ao migrar. Um script usa a chave de API da origem para buscar as escalas e salvá-las em um arquivo. O arquivo segue o mesmo processo de importação de um [pacote](/pt-BR/alerting/on-call#importação-e-exportação): primeiro, teste a importação; depois, grave tudo de uma só vez. O MoleSignal não armazena a chave nem consulta a origem. A importação exige `schedules.create`.
+
+Uma regra define o que é importado: a partir de agora, a pessoa de plantão deve ser a mesma em cada momento. Se o MoleSignal não puder representar uma configuração e isso mudar quem fica de plantão, a importação será bloqueada. O que não afeta os plantões daqui em diante fica de fora e aparece no resultado.
+
+## Etapas
+
+<Steps>
+  <Step title="Adicione as pessoas">
+    Adicione todas as pessoas dos rodízios ao espaço de trabalho com o mesmo e-mail usado na origem. Consulte [Membros](/pt-BR/identity/members). A correspondência usa o e-mail, sem distinguir maiúsculas de minúsculas.
+  </Step>
+  <Step title="Busque as escalas">
+    Execute o script do [Opsgenie](#opsgenie) ou do [PagerDuty](#pagerduty) em uma máquina com `curl` e `jq`. O script gera um único arquivo.
+  </Step>
+  <Step title="Teste a importação">
+    Abra **Alertas → Escalas de plantão**, selecione **Importar/exportar → Importar escalas de plantão…**, selecione **Selecionar arquivo** e depois **Testar**. O resultado mostra o que aconteceria com cada escala. Consulte [Leia o resultado](#leia-o-resultado).
+  </Step>
+  <Step title="Corrija os erros que bloqueiam a importação">
+    Altere a configuração na origem e busque as escalas novamente ou edite o arquivo. O MoleSignal não grava nenhuma escala enquanto houver erro em qualquer uma delas.
+  </Step>
+  <Step title="Importar">
+    Selecione **Importar**, abra uma escala importada e confira quem está de plantão. Configure uma [política de escalonamento](/pt-BR/alerting/on-call#políticas-de-escalonamento) para usar a escala e começar a notificar quem está de plantão.
+  </Step>
+</Steps>
+
+## Opsgenie
+
+Configure uma chave de API com permissão para ler escalas e execute o script. Contas na União Europeia usam `api.eu.opsgenie.com`.
+
+```bash
+export OPSGENIE_API_KEY=<api key>
+```
+
+```bash
+API=https://api.opsgenie.com   # EU accounts: https://api.eu.opsgenie.com
+DAYS=200
+
+get() { curl -fsS -H "Authorization: GenieKey $OPSGENIE_API_KEY" "$API$1"; }
+
+get /v2/schedules | jq -r '.data[].id' | while read -r id; do
+  get "/v2/schedules/$id"
+  get "/v2/schedules/$id/timeline?expand=base&interval=$DAYS&intervalUnit=days"
+done | jq -s '{
+  data: map(.data | select(has("rotations"))),
+  timelines: map(.data | select(has("baseTimeline"))
+    | {_parent, startDate, endDate, baseTimeline}
+    | .baseTimeline.rotations[].periods |= map({startDate, endDate, type, recipient}))
+}' > opsgenie-schedules.json
+```
+
+O arquivo contém, em `data`, cada escala retornada por `GET /v2/schedules/{id}` e, em `timelines`, a linha do tempo correspondente retornada por `GET /v2/schedules/{id}/timeline`. `DAYS` define quantos dias futuros a linha do tempo abrange.
+
+| No Opsgenie | No MoleSignal |
+|---|---|
+| Nome, descrição, fuso horário e estado de ativação | Sem alterações. |
+| Equipe responsável | A equipe com o mesmo nome, se houver. Caso contrário, a escala fica sem equipe e o resultado informa isso. |
+| `type` e `length` do rodízio | **Diário** e **Semanal** quando `length` é 1. Nos demais casos, um período personalizado, como 6 horas para `hourly` com `length` igual a 6. |
+| `startDate`, `endDate` | Início e fim do rodízio. O MoleSignal ignora rodízios que já terminaram. |
+| `timeRestriction` | Intervalos semanais no fuso horário da escala, inclusive os que abrangem vários dias. |
+| Vários rodízios sem sobreposição | Vários rodízios, como um para o horário comercial e outro para fora desse horário. |
+| Usuários como participantes | Membros na mesma ordem, identificados por `username`, que corresponde ao e-mail. |
+
+Os casos abaixo bloqueiam a importação enquanto o rodízio estiver em vigor:
+
+| No Opsgenie | Motivo |
+|---|---|
+| Uma equipe ou um escalonamento como participante | Um rodízio no MoleSignal só aceita pessoas como participantes. |
+| Um participante do tipo **No-One** | Um rodízio no MoleSignal não pode deixar um turno sem responsável. |
+| Rodízios sobrepostos | O Opsgenie coloca as pessoas de todos os rodízios sobrepostos de plantão ao mesmo tempo. No MoleSignal, cada escala tem uma pessoa de plantão por vez. No arquivo, mova os rodízios para escalas separadas com nomes diferentes e inclua as duas escalas na mesma etapa de uma política de escalonamento. |
+
+O MoleSignal não importa substituições, regras de encaminhamento, escalonamentos nem roteamento.
+
+## PagerDuty
+
+Configure uma chave de API com permissão para ler escalas e usuários. Em seguida, execute o script. Contas na UE usam `api.eu.pagerduty.com`.
+
+```bash
+export PAGERDUTY_API_KEY=<api key>
+```
+
+```bash
+API=https://api.pagerduty.com   # EU accounts: https://api.eu.pagerduty.com
+DAYS=200
+since=$(jq -rn 'now | todate')
+until=$(jq -rn "now + $DAYS * 86400 | todate")
+
+get() {
+  curl -fsSg -H "Authorization: Token token=$PAGERDUTY_API_KEY" \
+    -H 'Accept: application/vnd.pagerduty+json;version=2' "$API$1"
+}
+pages() {
+  offset=0
+  while page=$(get "$1?limit=100&offset=$offset"); do
+    printf '%s\n' "$page"
+    [ "$(printf '%s' "$page" | jq .more)" = true ] || break
+    offset=$((offset + 100))
+  done
+}
+shift_based=$(pages /v3/schedules)
+
+{
+  pages /users
+  printf '%s\n' "$shift_based"
+  printf '%s\n' "$shift_based" | jq -r '.schedules[].id' | while read -r id; do
+    get "/v3/schedules/$id?since=$since&until=$until&include[]=final_schedule"
+  done
+  pages /schedules | jq -r '.schedules[].id' | while read -r id; do
+    get "/schedules/$id?since=$since&until=$until&include[]=final_schedule&include[]=overrides_subschedule"
+  done
+} | jq -s --arg since "$since" --arg until "$until" '{
+  since: $since,
+  until: $until,
+  users: (map(.users // []) | add // [] | map({id, email})),
+  shift_based_schedules: (map(.schedules // []) | add // [] | map({id, type, summary})),
+  schedules: map(.schedule // empty
+    | del(.users, .escalation_policies)
+    | if .type == "schedule_v3" then
+        .final_schedule.computed_shift_assignments[]? |= {start_time, end_time, member, source: {type: .source.type}}
+      else
+        del(.schedule_layers[].rendered_schedule_entries)
+        | .final_schedule.rendered_schedule_entries |= map({start, end, user: (.user | select(.) | {id})})
+        | .overrides_subschedule.rendered_schedule_entries |= map({start, end})
+      end)
+}' > pagerduty-schedules.json
+```
+
+O arquivo contém cada escala de `GET /schedules/{id}` e `GET /v3/schedules/{id}` em `schedules`, os e-mails de `GET /users` em `users`, pois as escalas indicam os nomes das pessoas sem os e-mails, e a lista de `GET /v3/schedules` em `shift_based_schedules`. `since` e `until` delimitam o período que o PagerDuty gera, e `DAYS` define até onde esse período se estende.
+
+Busque as escalas uma por vez, sem `time_zone`. `GET /schedules` gera as restrições no fuso horário de quem faz a solicitação, não no da escala. A importação detecta e rejeita escalas geradas em outro fuso horário.
+
+### Escalas em camadas
+
+| No PagerDuty | Aqui |
+|---|---|
+| Nome, descrição, fuso horário | Permanecem iguais. Uma escala pausada continua pausada após a atualização. |
+| Equipes | A primeira equipe que tiver uma equipe de mesmo nome aqui. O resultado lista as demais. |
+| Camadas | Rodízios na mesma ordem de prioridade: a camada mais recente tem precedência, e as camadas inferiores assumem fora dos intervalos definidos pelas restrições dela. |
+| `rotation_turn_length_seconds` | **Diário** para exatamente 24 horas e **Semanal** para exatamente 7 dias. Nos demais casos, um período personalizado. |
+| `rotation_virtual_start` | O início do rodízio, que define o horário da passagem de plantão e quem está de plantão. |
+| `start` | Quando a camada entra em vigor. Se o início já passou, não é preciso fazer mais nada. Se ainda não chegou, o rodízio começa nesse momento, com a pessoa que estiver na vez. |
+| `end` | O fim do rodízio. A importação ignora camadas já encerradas e versões anteriores de camadas editadas. |
+| `restrictions` | Intervalos semanais no fuso horário da escala, tanto para `daily_restriction` quanto para `weekly_restriction`. |
+| `users` | Membros na mesma ordem, identificados pelo e-mail em `users`. |
+
+### Escalas por turnos
+
+As escalas que a API V3 do PagerDuty retorna são compostas por eventos. Os eventos não têm prioridade: quando há sobreposição, as pessoas de todos os eventos ficam de plantão ao mesmo tempo.
+
+| No PagerDuty | Aqui |
+|---|---|
+| Nome, descrição, equipes | Como nas escalas em camadas. |
+| Fuso horário dos eventos | Define o fuso horário da escala, pois as passagens de plantão mantêm o horário local do evento. Se o `time_zone` da própria escala for diferente, o resultado indica a diferença. |
+| Cada evento | Um rodízio com o nome do evento. Eventos sem sobreposição, como um para o horário comercial e outro para fora dele, podem aparecer em qualquer ordem. |
+| `start_time`, `end_time`, `recurrence` | O primeiro turno e como ele se repete, conforme a próxima tabela. |
+| `shifts_per_member` | A duração do plantão de cada membro. Conta as repetições a partir de `start_time`, com cada dia em `BYDAY` valendo uma repetição. |
+| `effective_since` | Quando o evento entra em vigor. Se esse momento já passou, não é preciso fazer mais nada, e ele não define quem está de plantão. Se ainda não chegou, o rodízio começa nesse momento, com a pessoa que estiver na vez. |
+| `effective_until` | O fim do rodízio. A importação ignora eventos já encerrados. |
+| `members` | Membros na mesma ordem, identificados pelo e-mail em `users`. |
+
+| `recurrence` | Primeiro turno | Aqui |
+|---|---|---|
+| `RRULE:FREQ=WEEKLY` | 7 dias | Sempre ativo: **Semanal** quando `shifts_per_member` é 1, ou um período personalizado nos demais casos. |
+| `RRULE:FREQ=DAILY` | 24 horas | Sempre ativo: **Diário** quando `shifts_per_member` é 1, **Semanal** quando é 7, ou um período personalizado nos demais casos. |
+| `FREQ=WEEKLY`, `FREQ=DAILY` ou `FREQ=HOURLY` com um `INTERVAL` | A mesma duração do intervalo | Sempre ativo, com um período personalizado, como 12 horas para `RRULE:FREQ=HOURLY;INTERVAL=12`. |
+| `RRULE:FREQ=DAILY` | Parte de um dia | Intervalos semanais para todos os dias. |
+| `RRULE:FREQ=WEEKLY` ou com um dia em `BYDAY` | Parte de uma semana | Um intervalo semanal que pode abranger vários dias. |
+| `RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` | Parte de um dia | Intervalos semanais para esses dias. Com `shifts_per_member` igual a 5, cada pessoa fica de plantão por uma semana. Com 10, por duas. |
+
+Os casos abaixo impedem a importação enquanto o evento estiver ativo:
+
+| No PagerDuty | Por quê |
+|---|---|
+| `every_member_assignment_strategy` com vários membros | Todos ficam de plantão ao mesmo tempo. Aqui, uma escala só permite uma pessoa por vez. Crie no arquivo uma escala com nome diferente para cada pessoa e inclua todas as escalas em uma única etapa da política de escalonamento. |
+| `empty_member` entre outros membros | O rodízio não pode deixar um plantão sem responsável. |
+| Eventos com sobreposição | As pessoas desses eventos ficam de plantão ao mesmo tempo. Mova os eventos para escalas separadas, como no Opsgenie. |
+| `EXDATE` ou `RDATE` | O rodízio não permite omitir nem adicionar uma ocorrência, e o PagerDuty não documenta se essas ocorrências entram na contagem de `shifts_per_member`. |
+| Qualquer outra regra, como `FREQ=MONTHLY`, `COUNT`, `UNTIL` ou um `INTERVAL` com um turno mais curto que o intervalo | Os plantões ou os períodos de cobertura não se repetem nos mesmos dias e horários a cada semana. |
+| `BYDAY` com vários membros e um `shifts_per_member` que não é múltiplo do número de dias | As passagens de plantão não seguem um intervalo fixo: o turno depois de sexta-feira cai na segunda-feira. |
+| Um turno personalizado que ainda não ocorreu | O rodízio não comporta um turno avulso. Importe após o fim do turno ou remova o turno de `final_schedule` no arquivo e adicione uma substituição após a importação. |
+| Eventos em fusos horários diferentes | Cada escala tem um só fuso horário. |
+
+A importação ignora escalas por turnos que o arquivo apenas lista em `shift_based_schedules` e informa os nomes no resultado. Isso pode ocorrer quando o script não consegue buscar uma escala. Execute o script novamente para importar a escala. A importação do restante do arquivo continua.
+
+A importação não inclui substituições, políticas de escalonamento nem serviços.
+
+## Leia o resultado
+
+| Termo | Significado |
+|---|---|
+| **Criar**, **Atualizar**, **Sem alterações** | A importação identifica as escalas pelo nome, como em um pacote. **Atualizar** lista os campos que mudam. |
+| **Pular** | A importação ignora uma escala por turnos do PagerDuty que o arquivo apenas lista, ou uma escala existente ao usar **Criar apenas regras novas, sem alterar as que já têm o mesmo nome**. |
+| **Erro** | Interrompe a importação de todo o arquivo. O resultado mostra cada motivo em uma linha e lista todos os e-mails sem um membro correspondente. |
+
+As outras linhas de cada escala indicam o que a importação ignorou e como a escala se compara à original.
+
+### Comparação com a origem
+
+O arquivo contém os dados que a própria origem gera: `final_schedule` do PagerDuty e a linha do tempo do Opsgenie. A simulação calcula quem fica de plantão no período e compara as duas escalas a partir do momento atual. Se houver diferença, a simulação informa um erro com os horários e as duas pessoas, sem gravar nada.
+
+- A importação não inclui substituições, por isso a simulação não compara os períodos cobertos por elas.
+- Uma escala por turnos com várias pessoas de plantão ao mesmo tempo em `final_schedule` interrompe a importação, mesmo sem sobreposição entre os eventos.
+- A importação mantém pausadas as escalas desativadas no Opsgenie, e a simulação não as compara.
+- Em fusos com horário de verão, o resultado avisa se o período comparado não abranger uma mudança de horário. As passagens de plantão mantêm o mesmo horário local aqui. Aumente `DAYS` para comparar os horários antes e depois da próxima mudança.
+- Se o arquivo não contiver uma escala gerada pela origem, o resultado informa que não houve comparação, e a importação continua. Para importar uma escala intencionalmente diferente da original, remova `final_schedule` ou `timelines` do arquivo.
+
+### Limites
+
+Cada arquivo pode ter até 4 MiB e 500 escalas. Cada escala pode ter até 60 rodízios ativos. Reduza `DAYS` se o arquivo exceder o limite de tamanho.
+
+## Importe novamente
+
+A importação identifica as escalas pelo nome. Ao repetir a importação, atualize os rodízios das escalas que mudaram na origem e mantenha as demais como estão. A importação preserva as substituições e as trocas de turno feitas aqui, além das configurações que não constam no arquivo, como a equipe ou **Trocas exigem aprovação**.

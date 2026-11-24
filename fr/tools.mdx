@@ -1,0 +1,216 @@
+---
+title: "Catalogue et exécution des outils"
+sidebarTitle: "Outils"
+description: "Découvrez le catalogue d’outils partagé de MoleSignal, la découverte progressive des outils, l’isolation des locataires, la politique de gestion des risques, les approbations et les domaines fonctionnels couverts."
+"en_link": "/en-US/tools"
+"zh-Hans_link": "/zh-Hans/tools"
+"zh-Hant_link": "/zh-Hant/tools"
+"ja_link": "/ja/tools"
+"ko_link": "/ko/tools"
+"de_link": "/de/tools"
+"es_link": "/es/tools"
+"pt-BR_link": "/pt-BR/tools"
+---
+
+MoleSignal modélise les fonctionnalités que l’IA peut utiliser sous la forme d’un **Catalogue d’outils** indépendant du protocole. Mole
+Agent et MCP entrant utilisent les mêmes contrats `ToolSpec` et le même environnement d’exécution côté serveur, au lieu
+de dupliquer la logique métier dans chaque adaptateur.
+
+Le catalogue actuel contient **254 outils enregistrés**. Chaque outil définit un nom stable, une description
+de référence, des schémas d’entrée et de sortie, les autorisations IAM requises, un niveau de risque, un mode d’accès,
+des annotations et les surfaces autorisées.
+
+<CardGroup cols={2}>
+  <Card title="Opérations du produit" icon="wrench">
+    Les outils correspondent à des actions délimitées dans le produit, comme interroger les logs, tester une alerte ou mettre à jour
+    un panneau de tableau de bord. Ils ne permettent pas d’envoyer des requêtes HTTP arbitraires.
+  </Card>
+  <Card title="Isolation du contexte entre organisations" icon="shield">
+    L’adaptateur authentifié injecte l’identité à l’origine de l’appel et son organisation. Ni `userId` ni
+    `orgId` ne déterminent l’organisation dans laquelle l’outil s’exécute.
+  </Card>
+  <Card title="Contexte progressif" icon="magnifying-glass">
+    Les outils courants restent visibles. Le système ne recherche les autres outils qu’au besoin, ce qui limite
+    la taille du contexte du modèle et le nombre de jetons utilisés.
+  </Card>
+  <Card title="Chemin d’exécution unique" icon="arrows-rotate">
+    À l’exécution, le système applique de nouveau les règles d’autorisation et la politique, le délai d’expiration, les limites de sortie et l’idempotence,
+    ainsi que les exigences d’approbation, de vérification et d’audit.
+  </Card>
+</CardGroup>
+## Granularité des outils
+
+Un bon outil MoleSignal remplit un objectif opérationnel précis et renvoie un résultat délimité.
+
+- Utilisez un outil par opération atomique de lecture, de vérification préalable ou de modification.
+- Séparez les opérations de listage, de récupération, de création, de mise à jour, de suppression, de test, de déclenchement, d’annulation et de nouvelle tentative.
+- Exposez les concepts du produit plutôt que des routes brutes ou des générateurs de requêtes arbitraires.
+- Renvoyez un résultat structuré et de taille limitée, adapté au modèle et au journal d’audit.
+- Excluez du catalogue les identifiants en clair, les transferts binaires, l’ingestion brute, l’exécution de commandes shell et le pilotage
+  du navigateur.
+
+Cette granularité permet à IAM et à la politique des outils de contrôler chaque opération précise plutôt que d’accorder un accès étendu
+à toute une famille de ressources HTTP.
+
+## Surfaces
+
+Chaque surface d’exécution expose uniquement les outils explicitement autorisés.
+
+| Surface | Découverte et exécution |
+|---|---|
+| Mole Agent | Outils courants, et `tool_search → tools_call` pour les outils intégrés accessibles à la demande et les outils MCP sortants autorisés. |
+| MCP entrant | Opérations de lecture courantes et contrôles d’approbation, ainsi que `tool_search → call_read_tool` ou `call_managed_tool`. |
+| Automatisation | Uniquement les outils explicitement activés pour l’automatisation. C’est le cas de `query_logs`, `get_stream_schema`, `search_field_values` et `analyze_log_patterns` pour les [inspections planifiées des logs](/fr/logs/inspections). |
+
+Le serveur vérifie que la surface expose l’outil lors de la création de la liste des outils, puis juste avant
+l’exécution. Appeler un outil sans passer par `tools/list` ne contourne pas les restrictions de la surface.
+
+## Découverte des outils via MCP entrant
+
+MCP entrant limite la taille de `tools/list`. La réponse peut inclure les éléments suivants, selon les autorisations :
+
+- sept outils de lecture épinglés : `query_logs`, `query_metrics`, `list_streams`,
+  `get_stream_schema`, `list_traces`, `get_trace` et `get_incident` ;
+- contrôles d’approbation : `list_agent_approvals`, `get_agent_approval` et
+  `execute_agent_approval` ;
+- contrôles d’exécution : `list_agent_executions` et `get_agent_execution` ;
+- `tool_search`, `call_read_tool` et `call_managed_tool`.
+
+IAM et la politique des outils peuvent retirer n’importe quel outil du produit de cette liste.
+
+### Rechercher dans le catalogue autorisé
+
+Appelez `tool_search` avec une expression liée au produit ou un domaine fonctionnel :
+
+```json
+{
+  "query": "status page incident",
+  "limit": 10,
+  "includeSchema": true
+}
+```
+
+Le résultat inclut uniquement les outils disponibles via MCP entrant, activés par la politique des outils de l’espace de travail
+et autorisés par les identifiants utilisés. Sur demande, chaque résultat inclut le schéma et les métadonnées d’exécution
+effectives.
+
+### Exécuter une lecture ou une vérification préalable
+
+Transmettez le nom trouvé et les arguments à `call_read_tool` :
+
+```json
+{
+  "name": "list_status_page_incidents",
+  "arguments": {
+    "pageId": "status-page-id",
+    "view": "current"
+  }
+}
+```
+
+Définissez `asTask` sur `true` pour créer une tâche de lecture persistante lorsque le client MCP annonce la prise en charge de l’extension
+Tasks. Interrogez régulièrement l’état de la tâche renvoyée, mettez-la à jour ou annulez-la à l’aide des méthodes MCP de gestion des tâches.
+
+### Exécuter une modification gérée
+
+Transmettez une clé d’idempotence unique à `call_managed_tool` :
+
+```json
+{
+  "name": "update_annotation",
+  "arguments": {
+    "annotationId": "annotation-id",
+    "title": "Deployment rollback started"
+  },
+  "idempotencyKey": "8d7788d2-9b4e-44bd-bf35-61a5690f0064"
+}
+```
+
+MoleSignal réserve la clé pour le principal authentifié avant de créer une demande d’approbation ou
+d’exécuter la modification. Répéter la même requête renvoie le résultat enregistré ou l’état de l’exécution
+en cours. MoleSignal rejette toute réutilisation de la clé avec des arguments différents.
+
+## Risque et politique d’exécution
+
+Le niveau de risque de l’outil détermine un mode d’exécution sûr par défaut. La politique des outils de l’espace de travail peut imposer un mode d’exécution
+plus strict.
+
+| Risque | Mode par défaut | Signification |
+|---|---|---|
+| L0 | Automatique | Opérations délimitées en lecture seule. |
+| L1 | Confirmation | Les modifications à faible risque nécessitent une confirmation de l’hôte MCP, sauf si la politique prévoit une exécution automatique. |
+| L2 | Approbation simple | Une approbation dans MoleSignal est nécessaire. |
+| L3 | Double approbation | Deux approbations dans MoleSignal sont nécessaires. |
+| L4 | Désactivé | Les opérations à distance à risque élevé ou destructives restent indisponibles par défaut. |
+
+Même en mode automatique, les modifications gérées génèrent une trace d’approbation consultable pour l’audit. Le mode de confirmation peut utiliser
+le mécanisme de saisie en plusieurs échanges de MCP. En mode d’approbation simple ou double, l’exécution attend la validation dans MoleSignal.
+Une fois les validations requises obtenues, le principal à l’origine de la demande peut appeler `execute_agent_approval` avec une autre valeur
+`idempotencyKey` pour terminer l’opération.
+
+Avant l’exécution, l’environnement d’exécution valide de nouveau les éléments suivants :
+
+1. le principal authentifié et l’état de l’organisation ;
+2. les autorisations IAM requises et le mode d’autorisation ;
+3. la disponibilité de l’outil sur la surface et la politique des outils en vigueur ;
+4. le schéma d’entrée, l’état de la ressource cible et le risque ;
+5. le délai d’expiration, la taille maximale de la réponse et l’idempotence ;
+6. la vérification après l’opération et la consignation dans le journal d’audit.
+
+## Périmètre du catalogue
+
+Le catalogue couvre les opérations du produit adaptées à un usage sûr de l’IA pour les enquêtes
+et l’administration.
+
+| Domaine | Fonctionnalités représentatives |
+|---|---|
+| Journaux, métriques et flux | Interrogez les données de télémétrie, examinez les schémas et les paramètres, recherchez les événements environnants et explorez les libellés ou les séries de métriques ; regroupez les journaux par motif, comparez ces motifs à ceux d’une période de référence et résumez quand une métrique a commencé à varier, de combien et sous l’effet de quelles séries et de quels libellés ; vérifiez que les données sont exploitables (présence du service, de l’environnement et de l’ID de trace, nom unique par service pour tous les signaux, présence des unités dans les noms de métriques) ; consultez les inspections de journaux planifiées et leurs rapports, ou lancez-en une immédiatement. |
+| Traces, APM, RUM et profils | Examinez les traces, la topologie des services, les sessions, les erreurs, les dépendances, les graphes de flammes et les corrélations entre signaux ; consultez les analyses APM et repérez les services accessibles depuis un service sur la carte des services ; effectuez une recherche dans le catalogue de services par nom, alias, description ou tag ; résumez les Core Web Vitals page par page ; synthétisez les données d’une application RUM, répertoriez et consultez ses problèmes, identifiez les sources de frustration à l’usage, examinez le diagramme en cascade d’une vue et agrégez les données de n’importe quel flux RUM. |
+| Alertes et incidents | Consultez les incidents et l’état des astreintes ; recherchez les incidents similaires des 90 derniers jours et répertoriez les déploiements, les modifications de configuration et les indicateurs de fonctionnalités autour d’un instant donné ou d’un incident ; créez, mettez à jour, supprimez, testez ou déclenchez des règles d’alerte ; accusez réception des incidents ou résolvez-les. |
+| Tableaux de bord, rapports et annotations | Gérez les tableaux de bord, les dossiers, les panneaux, les annotations, les modèles de rapport, les planifications et les envois. |
+| Tâches de recherche et vues enregistrées | Soumettez, examinez, annulez, relancez ou supprimez les recherches persistantes et gérez les vues enregistrées. |
+| Pipelines, fonctions, enrichissement et connecteurs | Examinez les exécutions planifiées, gérez les fonctions, testez les transformations et consultez les métadonnées d’enrichissement ou de connecteur. |
+| Surveillance synthétique et pages de statut | Examinez les moniteurs et leurs résultats, lancez ou mettez en pause les moniteurs, gérez le cycle de vie et l’automatisation des pages de statut et rédigez un brouillon du rapport post-incident. |
+| Notifications | Examinez les connecteurs, les politiques, les modèles et les envois ; relancez un envoi ou accusez-en réception. |
+| IAM et administration | Consultez les utilisateurs, les équipes, les rôles, les fonctionnalités, les événements d’audit et les métadonnées des comptes de service et des jetons d’API ; gérez l’état des identifiants sans accéder à leurs secrets. |
+| Pilotage de Mole Agent | Examinez les enquêtes, les approbations, les exécutions et les automatisations, puis exécutez une opération approuvée si les autorisations le permettent. |
+
+Appelez `get_platform_capabilities` pour obtenir un récapitulatif des fonctionnalités filtré selon l’interface utilisée. Appelez `tool_search` pour obtenir
+les noms et les schémas actuellement autorisés au lieu de vous fier à une liste statique.
+
+## Limites d’accès aux identités et aux secrets
+
+- L’identifiant d’authentification fournit les valeurs `userId` et `orgId` associées à l’appel.
+- `get_user_profile` et `get_user_preferences` acceptent le paramètre facultatif `target_user_id` uniquement pour
+  sélectionner une ressource. Pour consulter les données d’un autre membre, il faut disposer de l’autorisation `org.members.read` et vérifier son appartenance à
+  l’organisation.
+- Les outils de lecture et de listage renvoient uniquement les métadonnées des identifiants.
+- MCP entrant ne propose pas `create_api_token` ni `create_service_account`, car ces deux outils
+  renvoient un secret en clair une seule fois. Créez ces identifiants dans l’interface Web.
+- Les outils autorisés qui ne donnent pas accès aux secrets permettent toujours de lister, de mettre à jour, d’activer, de désactiver,
+  de révoquer ou de supprimer les comptes de service et les jetons d’API existants.
+- `query_logs`, `search_around`, `search_field_values`, `get_stream_schema` et les ressources de schéma de flux
+  refusent l’accès au [flux `_audit`](/fr/settings/data-security#flux-d’audit), quel que soit l’identifiant utilisé.
+
+Le catalogue exclut délibérément la connexion, l’inscription, la réinitialisation du mot de passe, les routes publiques sans
+authentification, l’ingestion de données OTLP ou Prometheus brutes, les webhooks externes, le téléversement et le téléchargement de fichiers binaires, le drainage des nœuds,
+le profilage à l’exécution, les requêtes HTTP arbitraires et l’exécution arbitraire dans un shell ou dans un navigateur.
+
+## Ressources, invites et tâches MCP
+
+MCP entrant expose également des ressources filtrées selon les autorisations IAM pour les fonctionnalités de la plateforme, le catalogue d’outils,
+les approbations, les exécutions, les tâches de recherche et les schémas de flux. Les commandes `prompts/list` et `prompts/get` donnent accès aux invites
+intégrées de Mole Agent, ainsi qu’à celles de l’organisation et du compte actif.
+
+Les opérations de lecture longues peuvent s’exécuter sous forme de tâches MCP. Les notifications de progression, les abonnements aux ressources et
+les notifications de modification du catalogue sont disponibles si la version négociée du protocole MCP
+les prend en charge.
+
+<CardGroup cols={2}>
+  <Card title="Connecter un client MCP" icon="plug" href="/fr/inbound-mcp">
+    Activez le point de terminaison et connectez le client avec OAuth 2.1 ou un jeton d’API.
+  </Card>
+  <Card title="Mole Agent" icon="robot" href="/fr/agent">
+    Utilisez le même catalogue soumis aux contrôles d’accès depuis l’agent d’opérations intégré.
+  </Card>
+</CardGroup>

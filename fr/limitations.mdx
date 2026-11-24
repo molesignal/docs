@@ -1,0 +1,60 @@
+---
+title: "Limitations connues"
+description: "Découvrez les comportements de la version actuelle qui peuvent différer de ceux attendus en déploiement, ainsi que les solutions de contournement."
+"en_link": "/en-US/limitations"
+"zh-Hans_link": "/zh-Hans/limitations"
+"zh-Hant_link": "/zh-Hant/limitations"
+"ja_link": "/ja/limitations"
+"ko_link": "/ko/limitations"
+"de_link": "/de/limitations"
+"es_link": "/es/limitations"
+"pt-BR_link": "/pt-BR/limitations"
+---
+
+MoleSignal n’a pas encore atteint la version 1.0. Cette page répertorie les limites qui influent sur la planification et l’exploitation.
+
+## Déploiement
+
+- **Délai de reprise.** Le journal d’écriture anticipée réside dans le stockage objet. La perte d’un nœud d’ingestion n’entraîne donc aucune perte de données dont la réception a été confirmée. Toutefois, les enregistrements encore en mémoire tampon ne deviennent interrogeables qu’après leur reprise par un autre nœud d’ingestion, au bout de `[wal].lease_secs` (15 secondes par défaut). Consultez [Durabilité et reprise](/fr/architecture#durabilité-et-reprise).
+- **Tâches exécutées sur un seul nœud.** Le nœud `alert` principal assure l’envoi et la propagation par gossip des événements entre clusters, le recalcul du graphe de services, l’agrégation des données APM, la maintenance des pages de statut, l’automatisation de la surveillance synthétique, l’analyse des requêtes lentes et l’analyse des causes racines des incidents. L’ajout de nœuds `alert` n’augmente pas la capacité de traitement de ces tâches. Un autre nœud les reprend lorsque le nœud principal quitte le cluster. Consultez [Déploiement par rôle](/fr/deployment/role-based#répartition-des-tâches-entre-les-nœuds-d’alerte).
+- **PostgreSQL uniquement.** PostgreSQL est la seule base de données de métadonnées prise en charge.
+- **Redémarrage nécessaire pour appliquer la configuration.** Un processus en cours d’exécution n’applique pas les modifications du fichier de configuration. Consultez [Configuration](/fr/configuration).
+- **Migrations irréversibles.** Une version plus ancienne ne peut pas ouvrir une base de données migrée par une version plus récente. Les versions antérieures à la 1.0 peuvent modifier le schéma de référence. Consultez [Mise à niveau](/fr/upgrade).
+
+## Ingestion
+
+- **Taille des requêtes.** Le service d’ingestion renvoie `413` si le corps de la requête dépasse 2 MiB, ou 16 MiB pour l’ingestion JSON native.
+- **Compression OTLP sur HTTP.** Le récepteur renvoie `400` si le corps de la requête est compressé. Désactivez la compression côté émetteur.
+- **Intervalles des histogrammes.** Les histogrammes OTLP conservent `count`, `sum`, `min` et `max`. MoleSignal ne stocke ni les bornes des intervalles, ni leurs effectifs, ni les quantiles des métriques de type résumé.
+- **Spans en double.** Le service d’ingestion ignore tout span renvoyé avec les mêmes `trace_id` et `span_id`.
+- **Envoi vers Loki.** Le point de terminaison ne décode que les requêtes au format JSON. Les émetteurs qui utilisent protobuf avec la compression Snappy, comme Promtail et Grafana Alloy, ne peuvent pas y envoyer de données.
+- **Prometheus remote_write.** Le service d’ingestion ignore les histogrammes natifs et les métadonnées des métriques.
+- **OTLP gRPC sans TLS.** Le récepteur ne termine pas les connexions TLS. Placez devant le récepteur un proxy qui assure la terminaison TLS pour le trafic qui sort d’un réseau de confiance.
+- **Limitation du débit.** Seul le rôle `router` limite le débit des requêtes. Chaque réplique du routeur comptabilise séparément les requêtes de l’organisation authentifiée.
+- **Flux de la plateforme.** Seul MoleSignal écrit dans `_molesignal`, `_synthetic_results`, `_audit`, `_agent_model_traces` et `_agent_score_traces`. Ces flux refusent l’ingestion publique. Consultez [Flux de la plateforme](/fr/streams#flux-de-la-plateforme).
+
+## Requêtes
+
+- **Exécution asynchrone sur les longues plages temporelles.** Si la taille estimée d’une requête atteint `[querier].auto_async_threshold_rows`, le moteur renvoie `202` avec une tâche dont le suivi est possible. Avec les paramètres par défaut, cela correspond à une plage d’environ 13,9 heures. Envoyez `Prefer: respond-sync` pour exécuter la requête de manière synchrone. Consultez [Requêtes](/fr/query#plages-temporelles-et-tâches-asynchrones).
+- **Sous-ensemble de PromQL.** Le moteur implémente un sous-ensemble de PromQL. Consultez [Matrice de prise en charge de PromQL](/fr/query/promql-subset).
+- **Lignes par requête.** Le moteur renvoie `400` si une requête doit lire plus de `[querier].max_scan_rows` lignes (100 millions par défaut). Réduisez la plage temporelle ou ajoutez des filtres. PromQL applique cette limite à chaque sélecteur.
+- **Fraîcheur des données dans un cluster à rôles séparés.** Une requête lit les fichiers répertoriés dans le catalogue. Un enregistrement encore en mémoire tampon sur un nœud d’ingestion devient donc visible après la prochaine écriture de cette mémoire, dans un délai de `[intake].flush_interval_secs`. Un nœud `standalone` lit aussi sa propre mémoire tampon. Par défaut, les règles d’alerte décalent leur fenêtre vers le passé du délai défini dans **Paramètres → Évaluation des alertes** (60 secondes). Consultez [Délai d’évaluation](/fr/alerting/rules#délai-d’évaluation).
+
+## Alertes
+
+- **Compteurs des règles en temps réel en mémoire.** Chaque nœud qui accepte des écritures tient un compteur pour la règle `real_time`. Le nœud d’alerte responsable de la règle additionne les compteurs chaque seconde. Un incident s’ouvre donc au plus tard une seconde après l’écriture des enregistrements. Un nœud qui redémarre ne perd que son propre compteur. Si son compteur est inaccessible, le total de cette seconde ne l’inclut pas. Les nœuds utilisent le jeton bearer du cluster pour lire leurs compteurs respectifs et ne cumulent pas les compteurs des clusters fédérés. La seule instruction prise en charge est `SELECT count(*) FROM <stream> [WHERE <condition>]`. Consultez [Règles en temps réel](/fr/alerting/rules#règles-en-temps-réel).
+
+## Sécurité et identité
+
+- **gRPC interne sans authentification.** Le port `5082` transporte le trafic entre nœuds sans authentification. Réservez ce port à un réseau privé.
+- **Une clé d’accès est liée à un seul nom de domaine.** `[http].external_url` doit contenir une URL HTTPS avec ce nom de domaine. La clé d’accès ne fonctionne pas si la console s’ouvre sous un autre nom d’hôte.
+- **La réinitialisation du mot de passe nécessite l’envoi d’e-mails.** La réinitialisation d’un mot de passe déclenche l’envoi d’un lien par e-mail. Configurez `[notify.smtp]` et `[http].external_url`.
+- **L’inscription en libre-service sans approbation nécessite l’envoi d’e-mails.** L’inscription commence par la vérification de l’adresse e-mail. Sans `[notify.smtp]` et `[http].external_url`, chaque nouveau compte nécessite l’approbation d’un administrateur.
+- **Limites de connexion par adresse IP.** La [reconnaissance de l’adresse IP du client](/fr/settings/platform#détection-de-l’adresse-ip-du-client) doit identifier correctement l’adresse. Derrière un proxy public ou un CDN non configuré, toutes les connexions partagent la même adresse. Les tentatives des uns peuvent alors bloquer les connexions des autres. Par défaut, le système ne comptabilise pas les adresses privées. Dans un déploiement interne ou derrière un proxy non configuré, seule la limite par compte s’applique.
+- **La limite par compte ne verrouille pas le compte.** Pour éviter tout verrouillage, la limitation autorise encore environ 1 400 tentatives de mot de passe par jour sur le compte. Avec l’authentification multifacteur, un mot de passe correct ne suffit pas pour accéder au compte. Si des tentatives répétées épuisent le quota, la première connexion légitime depuis cette adresse peut rester en attente. Pour se connecter sans attendre, utilisez une clé d’accès, l’authentification unique ou la réinitialisation du mot de passe.
+- **Règles de verrouillage d’un annuaire LDAP.** Les règles de verrouillage de l’annuaire peuvent se déclencher avant les limites de MoleSignal. Des tentatives externes peuvent donc toujours verrouiller un compte de l’annuaire. Définissez des [limites de connexion](/fr/settings/platform#limites-de-connexion) inférieures à celles de l’annuaire.
+- **Sessions.** La page des paramètres du compte ne gère que la session du navigateur actuel.
+
+## Rapports
+
+- **Le rendu PDF et PNG** nécessite Chrome en mode sans interface graphique. L’image de conteneur de la version inclut Chromium. Pour une installation à partir du binaire, installez Chrome. L’URL `[scheduled_reports.renderer].base_url` doit permettre d’accéder à l’interface web.

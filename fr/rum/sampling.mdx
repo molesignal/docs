@@ -1,0 +1,175 @@
+---
+title: "Échantillonnage des données RUM"
+sidebarTitle: "Échantillonnage des données"
+description: "Maîtrisez le volume de sessions RUM et de leurs enregistrements à l’aide de taux d’échantillonnage dans le SDK, de filtres de rétention côté serveur et de files d’attente de taille limitée côté client."
+"en_link": "/en-US/rum/sampling"
+"zh-Hans_link": "/zh-Hans/rum/sampling"
+"zh-Hant_link": "/zh-Hant/rum/sampling"
+"ja_link": "/ja/rum/sampling"
+"ko_link": "/ko/rum/sampling"
+"de_link": "/de/rum/sampling"
+"es_link": "/es/rum/sampling"
+"pt-BR_link": "/pt-BR/rum/sampling"
+---
+
+Le SDK RUM pour navigateur décide d’échantillonner ou non une session lors de sa création. Cette décision reste la même
+pendant toute la session, dans tous les onglets de l’application.
+
+## Configurer les taux d’échantillonnage
+
+```ts
+const rum = init({
+  applicationId: 'checkout-web',
+  clientToken: 'mspat-your-client-token',
+  site: 'https://molesignal.example.com',
+  sessionSampleRate: 25,
+  sessionReplaySampleRate: 20,
+});
+```
+
+Les deux valeurs sont des pourcentages compris entre `0` et `100` :
+
+- `sessionSampleRate` détermine si le SDK transmet une session et les événements RUM associés. La valeur par défaut est `100`.
+- `sessionReplaySampleRate` s’applique uniquement aux sessions retenues par l’échantillonnage. La valeur par défaut est `0`.
+
+Le taux de replay effectif est le produit des deux taux. Dans cet exemple, environ 25 % des
+sessions transmettent des données RUM et environ 5 % de toutes les sessions font l’objet d’un enregistrement (`25% × 20%`).
+
+<Note>
+  L’appel à `startSessionReplayRecording()` peut activer le replay pour la session échantillonnée en cours, mais cette méthode
+  ne peut pas réintégrer une session exclue par `sessionSampleRate`.
+</Note>
+
+## Conserver une part des sessions côté serveur
+
+Une application peut ne conserver qu’une part des sessions reçues après l’échantillonnage du SDK, quel que soit le client qui les a envoyées. Ouvrez
+l’application dans **RUM → Applications** et repérez **Sessions conservées**. **Part des sessions conservées (%)** va de `0` à `100` ; la valeur par défaut est
+`100`, ce qui conserve toutes les sessions.
+
+Le serveur conserve ou écarte chaque session dans son intégralité. Il s’appuie sur le hachage de l’identifiant de session pour prendre la même décision pour chaque événement et chaque segment
+de replay de la session, quel que soit le nœud. Une session conservée garde donc toutes ses données. Les sessions
+écartées ne laissent ni événement, ni ligne dans `rum_sessions`, ni replay. Seules leurs erreurs peuvent subsister (voir
+[Conserver toutes les erreurs](#conserver-toutes-les-erreurs)).
+
+Cette part s’applique aux sessions transmises par le SDK. Avec `sessionSampleRate: 50` dans le SDK et **Part des sessions conservées (%)** à `20`, environ
+10 % de toutes les sessions sont stockées. La valeur `0` ne conserve aucune session et permet de mettre une application en pause sans
+modifier ses SDK. La réponse du [point de collecte](/fr/rum/events#réponse) indique dans `sampled` combien d’événements l’échantillonnage a écartés, ce qui
+permet au SDK de distinguer un filtrage volontaire d’une perte de données. Pour un segment de replay d’une session écartée, le serveur répond `200` avec `sampled: true`.
+
+Une modification s’applique aux événements reçus après son entrée en vigueur. Les sessions déjà stockées restent en place. Pour une session commencée avant la modification,
+le nouveau taux détermine à partir de ce moment si le serveur la conserve ou l’écarte.
+
+Le serveur conserve intégralement toute [session générée par un test](/fr/rum/test-traffic), sauf si un filtre de l’application cible `session.type` : un contrôle ne doit pas perdre sa session à cause d’un taux destiné au trafic réel.
+
+### Filtres
+
+Un filtre applique un taux propre aux sessions qui correspondent à ses critères. Par exemple, conservez toutes les sessions de production et un dixième des autres. Ajoutez
+des filtres sous **Sessions conservées**. Un filtre comporte un nom, un taux de `0` à `100` et jusqu’à 5 conditions. Une session doit
+remplir toutes ces conditions. Un filtre sans condition s’applique à toutes les sessions.
+
+Une condition compare un attribut de la session à une liste de valeurs : la valeur de l’attribut **est** l’une des valeurs de la liste ou **n’est pas**
+dans la liste (une valeur absente ne correspond à aucune valeur de la liste). La comparaison ignore la casse et `*` représente n’importe quel texte.
+Ainsi, `2.*` correspond à toutes les versions de la série 2. Une condition accepte jusqu’à 20 valeurs et une application jusqu’à 10 filtres.
+
+| Attribut | Champ |
+|---|---|
+| Environnement | `env` |
+| Service | `service` |
+| Version | `version` |
+| Plateforme du SDK | `source` |
+| Type de session | `session.type` |
+| Pays | `geo.country_iso_code` |
+| Navigateur | `browser.name` |
+| Système d’exploitation | `os.name` |
+| Type d’appareil | `device.type` |
+
+Le serveur examine les filtres dans l’ordre de la liste. **Le premier filtre qui correspond à une session détermine son taux de conservation**. Placez donc un filtre plus
+précis au-dessus d’un filtre plus général. Pour les sessions qui ne correspondent à aucun filtre, le serveur applique le taux indiqué sous les filtres dans **Part des
+autres sessions conservées (%)**. Sans filtre, ce taux s’applique à toute l’application.
+
+<Note>
+  Pour que la décision soit la même pour tous les événements d’une session, une condition ne peut porter que sur des attributs qui restent stables pendant toute la session.
+  Les actions effectuées pendant la session et les informations que le SDK obtient plus tard, comme un identifiant défini après la connexion, ne peuvent pas
+  déterminer si le serveur conserve la session. L’option distincte ci-dessous contrôle la conservation des erreurs.
+</Note>
+
+Pour évaluer un segment de replay, le serveur utilise les informations que le segment fournit sur sa session : le navigateur, l’origine géographique, ainsi que `env`, `service` et
+`version`, que les SDK pour navigateur et Flutter envoient dans le corps de la requête. Le SDK omet `env` ou `version` si la configuration ne
+renseigne pas ces champs. Si un attribut manque dans le segment, le serveur conserve le segment dès lors qu’un filtre susceptible de correspondre à la session le conserverait.
+
+### Conserver toutes les erreurs
+
+Le serveur stocke aussi les erreurs des sessions écartées, sauf si l’option **Conserver toutes les erreurs** est désactivée. Ainsi, une erreur rare
+ne disparaît pas avec sa session : elle figure parmi les problèmes et entre dans leur décompte. Une telle erreur occupe uniquement une ligne dans `rum_errors`. La
+session associée n’a ni ligne, ni vue, ni replay. La page du problème affiche donc *Session non conservée* à la place du lien vers la session.
+
+### Les totaux sont des estimations
+
+Chaque ligne indique dans `retention.rate` la part conservée des lignes du même type (`25` pour une session conservée par un filtre à 25 %) et la règle qui a entraîné sa conservation
+dans `retention.filter` : l’identifiant du filtre, `default` pour le taux des autres sessions ou `errors` pour une erreur issue d’une session
+écartée. Tant que l’option **Conserver toutes les erreurs** est active, le serveur conserve toutes les erreurs. Chaque erreur indique donc `100`, quelle que soit sa session.
+
+Pour calculer les totaux, la page pondère chaque ligne selon son taux de conservation : une session conservée à un taux de 25 % compte pour quatre. La page affiche
+**Estimé** et la part des sessions conservées. Le total estime ainsi la valeur qui aurait été obtenue en conservant toutes les sessions.
+
+- Le calcul ajuste les décomptes, les sommes et les moyennes, et pondère les percentiles selon les mêmes taux.
+- Le nombre d’utilisateurs observés ainsi que les valeurs minimales et maximales restent les valeurs observées, sans ajustement.
+- Les entonnoirs et les parcours pondèrent les sessions selon leur taux de conservation. Les cohortes de rétention comptent les utilisateurs observés, sans ajustement.
+- L’explorateur liste les lignes conservées et les utilise sans pondération dans ses décomptes et ses graphiques. Transmettez `estimate=false`
+  à l’[API d’agrégation](/fr/api/rum#mesurer-les-lignes) pour obtenir les mêmes chiffres.
+- Une règle d’alerte qui exige un **nombre minimal d’échantillons** compte les lignes stockées, et non celles qu’elles représentent.
+
+L’échantillonnage introduit du bruit statistique : un total fondé sur quelques sessions reste peu fiable, quel que soit le facteur de pondération.
+
+## Choisir les valeurs initiales
+
+| Profil de trafic | Taux d’échantillonnage des sessions | Taux de replay parmi les sessions échantillonnées |
+|---|---:|---:|
+| Développement ou tests QA contrôlés | `100` | `100` |
+| Production à faible volume | `100` | `10`–`25` |
+| Production à fort volume | `10`–`50` | `1`–`10` |
+
+Ces valeurs servent de point de départ et ne constituent pas des valeurs par défaut universelles. Avant le déploiement, estimez le volume d’événements, les besoins en stockage objet, la durée de conservation
+et le nombre de sessions nécessaire pour chaque navigateur et chaque version.
+
+## Limites des sessions
+
+Le SDK enregistre la décision dans le cookie de session `_msrum_s_<applicationId>`, commun aux onglets de l’application.
+Une nouvelle session démarre dès que l’une des limites suivantes est atteinte :
+
+- `sessionInactivityTimeout` : 15 minutes par défaut ;
+- `maxSessionDuration` : 4 heures par défaut.
+
+Indiquez les deux valeurs en millisecondes. La plage autorisée s’étend d’une minute à 24 heures.
+
+```ts
+sessionInactivityTimeout: 15 * 60_000,
+maxSessionDuration: 2 * 60 * 60_000,
+```
+
+Modifier une option d’échantillonnage ne change pas la décision déjà enregistrée pour la session en cours. Appelez
+`stopSession()` ou supprimez le cookie `_msrum_s_<applicationId>` pour tester une nouvelle configuration.
+
+## Limiter le volume côté client
+
+Utilisez les paramètres de transport pour maîtriser la consommation de mémoire et la taille des requêtes :
+
+```ts
+flushInterval: 5_000,
+batchSize: 50,
+replayFlushInterval: 10_000,
+replayBatchSize: 100,
+maxQueueSize: 1_000,
+```
+
+Surveillez le débit d’ingestion, le stockage des replays, la charge sur le navigateur et la couverture des investigations après chaque
+modification. Déployez progressivement les changements d’échantillonnage par application et par version.
+
+<CardGroup cols={2}>
+  <Card title="SDK RUM pour navigateur" icon="code" href="/fr/rum/browser-sdk">
+    Consultez toutes les options d’initialisation.
+  </Card>
+  <Card title="Replay de session" icon="video" href="/fr/rum/session-replay">
+    Configurez la collecte des replays et les options qui influent sur le stockage.
+  </Card>
+</CardGroup>

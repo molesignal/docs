@@ -1,0 +1,105 @@
+---
+title: "Controla el volumen y el costo de la telemetría"
+sidebarTitle: "Volumen y costo"
+description: "Mide cuántos bytes aporta cada fuente, descarta antes de almacenarlos los datos que nadie consulta y conserva los demás solo mientras se usen. Limita las series de métricas y el alcance de las consultas."
+"en_link": "/en-US/best-practices/volume-and-cost"
+"zh-Hans_link": "/zh-Hans/best-practices/volume-and-cost"
+"zh-Hant_link": "/zh-Hant/best-practices/volume-and-cost"
+"ja_link": "/ja/best-practices/volume-and-cost"
+"ko_link": "/ko/best-practices/volume-and-cost"
+"de_link": "/de/best-practices/volume-and-cost"
+"fr_link": "/fr/best-practices/volume-and-cost"
+"pt-BR_link": "/pt-BR/best-practices/volume-and-cost"
+---
+
+La telemetría crece más rápido que las preguntas que ayuda a responder. Dejar activados los logs de depuración, usar una etiqueta con un ID de usuario o
+registrar una comprobación de estado cada segundo puede duplicar el espacio de almacenamiento sin facilitar la resolución de incidentes. Reduce
+el volumen de datos que no aportan valor y conserva lo que necesitan las investigaciones.
+
+## Mide primero
+
+Identifica los flujos con mayor volumen antes de cambiar nada.
+
+| Dónde | Qué muestra |
+|---|---|
+| [Inicio](/es/home#ingesta-de-datos) | Cuántos datos ingresaron por cada señal durante el intervalo seleccionado y cuánto se almacenó y se recibió. |
+| [Flujos](/es/streams#lista-de-flujos) | Para cada flujo: datos comprimidos en el período, **Tamaño recopilado** antes de las transformaciones, **Tamaño almacenado**, **Tamaño del índice** y **Registros**. Compara los valores para identificar los flujos más grandes. |
+| [Uso de ingesta](/es/streams#uso-de-ingesta-y-presupuestos) | Cuántos datos ingresaron por cada token, conector, flujo y servicio. Configura un presupuesto para recibir avisos cuando una fuente se acerque al límite o lo supere. |
+| [Métricas](/es/metrics#analizar-el-resultado) | **Cardinalidad** de una métrica: el número de series activas. |
+| [Uso de Mole Agent](/es/agent#uso-y-presupuesto) | Tokens del modelo por fuente y por día, y presupuesto diario. |
+
+Anota las cifras de los flujos más grandes. Úsalas como referencia para evaluar cada cambio.
+
+## Descarta lo que nadie lee antes de almacenarlo
+
+El byte más barato es el que nunca se almacena. Para los logs, una
+[canalización en tiempo real](/es/pipelines#pipelines-en-tiempo-real) se ejecuta durante la ingesta, antes del almacenamiento:
+
+- **Filtrar eventos** descarta comprobaciones de estado, sondas de disponibilidad y líneas de depuración que nadie lee en
+  producción.
+- **Muestra** conserva una parte de los eventos de un tipo frecuente pero útil. Con **Muestrear por campo**,
+  la canalización conserva o descarta juntos los eventos que comparten un valor, como el ID de una solicitud.
+- **Eliminar campos** descarta campos de gran tamaño que ninguna consulta usa, como los cuerpos completos de las solicitudes.
+
+Si es posible, modifica primero el emisor: usar el nivel de log `info` en producción o un procesador del recolector
+que descarte el ruido también reduce el tráfico de red. No puedes recuperar los eventos descartados. Muestrea solo los eventos
+repetitivos y nunca los errores.
+
+Reduce el volumen de trazas en el origen o en OpenTelemetry Collector. Mantén juntos todos los spans de una
+traza. Recuerda que las cifras de APM y los SLO solo cuentan los spans que llegan. Una
+[canalización en tiempo real](/es/pipelines#trazas) en un flujo de trazas puede aplicar otro muestreo después del muestreo al final de la traza. Configura
+**Muestrear por campo** con `trace_id` para conservar o descartar trazas completas. MoleSignal calcula las cifras de APM antes de ejecutar
+la canalización, así que esas cifras incluyen los spans que esta descarta. Para RUM, configura el
+[muestreo de sesiones](/es/rum/sampling) por aplicación.
+
+## Conserva los datos solo mientras sean útiles
+
+| Datos | Retención | Cómo |
+|---|---|---|
+| Logs de depuración y detallados | Días | Usa un flujo propio con un valor bajo en **Retención de datos (días)**. |
+| Logs de aplicaciones y de acceso | Semanas | Usa el [valor predeterminado de la plataforma](/es/settings/platform#retención-de-datos), de 30 días, o un valor por flujo. |
+| Logs de auditoría y cumplimiento | Meses o años | Usa un flujo con retención prolongada y acceso restringido. |
+| Métricas | Meses | Activa **Reducir la resolución de las muestras antiguas** en la pestaña **Retención** del flujo de métricas. MoleSignal agrupa las muestras antiguas por intervalos de tiempo y las consultas de períodos largos leen muchos menos datos. |
+
+Ajusta la retención al período que abarcan las investigaciones y deja un margen para los incidentes que tardan en detectarse.
+Si acortas la retención, MoleSignal elimina en la siguiente limpieza los datos que superen el nuevo plazo. Al reducir la resolución, MoleSignal
+elimina las muestras originales. Ninguna de estas acciones se puede deshacer. Mantén activada la opción **Combinar archivos pequeños por día** para los logs y las
+trazas. Así, las consultas que abarcan varios días abren menos archivos.
+
+## Limita la cantidad de series de métricas
+
+Cada combinación distinta de valores de etiquetas forma una serie. Las etiquetas sin un conjunto acotado de valores, como los ID de usuario,
+los ID de solicitud o las URL sin normalizar, crean series sin límite. En ese caso, los
+[límites de cardinalidad](/es/settings/platform#cardinalidad-de-métricas) impiden crear series nuevas en toda la
+organización.
+
+- Revisa **Cardinalidad** en Métricas después de agregar una etiqueta.
+- Sustituye las rutas sin normalizar por plantillas de rutas y los ID por categorías como el plan o la región.
+- Registra los detalles de cada solicitud en logs o spans, donde cada valor distinto no supone un costo adicional.
+- Si no puedes modificar el emisor, usa una [canalización en tiempo real](/es/pipelines#métricas-y-trazas) en el
+  flujo de métricas para eliminar o reescribir la etiqueta antes de almacenar las muestras.
+
+## Reduce el costo de las consultas
+
+| Hábito | Efecto |
+|---|---|
+| Configura **Intervalo máximo de consulta (horas)** en los flujos grandes | Si seleccionas «Últimos 90 días» por error, MoleSignal rechaza la consulta en lugar de examinar todos los datos. |
+| Indexa los campos que usan los filtros de los paneles | Los filtros omiten archivos en lugar de leerlos. Consulta [Diseña flujos y campos](/es/best-practices/stream-design#indexa-los-campos-que-usas-para-filtrar). |
+| Empieza con el intervalo de tiempo más corto | Empieza con un intervalo acotado y amplíalo solo si hace falta. |
+| Ejecuta las búsquedas largas como [tareas de búsqueda](/es/streams#tareas-de-búsqueda) | MoleSignal ejecuta la consulta en segundo plano y conserva el resultado sin que tengas que dejar la página abierta. |
+| Ajusta la frecuencia de actualización de los paneles a la frecuencia con que se consultan | La actualización en modo **Automático** se adapta al intervalo de tiempo. Evita actualizaciones frecuentes en pantallas de pared con paneles que consumen muchos recursos. |
+
+## Criterios de aceptación
+
+- Identificaste los cinco flujos más grandes y registraste su volumen diario antes y después de los cambios.
+- Ningún flujo almacena por error comprobaciones de estado, sondas de disponibilidad o logs de depuración de producción.
+- Cada flujo tiene un plazo de retención definido de forma explícita y las métricas que se conservan a largo plazo tienen una resolución reducida.
+- La cantidad de series de métricas se mantiene estable de una semana a otra y queda muy por debajo de los límites.
+- Los flujos grandes tienen un intervalo máximo de consulta y cuentan con índices para los campos que más se usan en los filtros.
+
+## Guías relacionadas
+
+- [Canalizaciones](/es/pipelines)
+- [Flujos](/es/streams)
+- [Configuración de la plataforma](/es/settings/platform)
+- [Diseña flujos y campos que sigan siendo útiles](/es/best-practices/stream-design)

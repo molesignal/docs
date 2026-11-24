@@ -1,0 +1,105 @@
+---
+title: "Atualização"
+description: "Atualize sua implantação do MoleSignal para uma nova versão. Veja como fazer backups, migrar esquemas, seguir o procedimento para seu tipo de implantação e voltar à versão anterior."
+"en_link": "/en-US/upgrade"
+"zh-Hans_link": "/zh-Hans/upgrade"
+"zh-Hant_link": "/zh-Hant/upgrade"
+"ja_link": "/ja/upgrade"
+"ko_link": "/ko/upgrade"
+"de_link": "/de/upgrade"
+"es_link": "/es/upgrade"
+"fr_link": "/fr/upgrade"
+---
+
+O MoleSignal ainda não chegou à versão 1.0. As notas de versão na página [Histórico de alterações](/pt-BR/changelog) listam as mudanças de cada versão. Leia as notas antes de atualizar e faça um backup antes de cada atualização.
+
+## Antes de atualizar
+
+1. Leia as notas de todas as versões entre a versão atual e a versão de destino.
+2. Faça um backup do PostgreSQL e do armazenamento de objetos. Consulte [Backup e restauração](/pt-BR/backup-restore).
+3. Anote a versão em execução. `molesignal --version` exibe a versão, e `GET /api/v1/version` retorna a versão, o commit, o ID da compilação, o canal de lançamento e a edição. A solicitação exige um token do tipo bearer.
+4. Se a implantação for crítica, teste a atualização em uma cópia restaurada do banco de dados.
+
+## Como as alterações de esquema são aplicadas
+
+O binário inclui as migrações do banco de dados e as aplica ao PostgreSQL a cada inicialização, antes de começar a atender ao tráfego. Se uma migração falhar, o processo é encerrado. Um bloqueio no PostgreSQL garante que as migrações sejam executadas em sequência, mesmo quando vários nós são iniciados ao mesmo tempo. O binário registra as versões aplicadas na tabela `_molesignal_schema_meta`.
+
+As migrações só avançam:
+
+- Um binário mais antigo que o banco de dados não inicia e exibe `migration <version> was previously applied but is missing in the resolved migrations`.
+- Um binário que inclui uma cópia alterada de uma migração já aplicada não inicia e exibe `migration <version> was previously applied but has been modified`. Compilações de pré-lançamento podem alterar o esquema de base. Por isso, não há garantia de que um banco de dados criado com uma compilação possa ser aberto com outra.
+
+Para voltar a uma versão anterior, restaure o banco de dados e os objetos a partir de um backup feito antes da atualização.
+
+## Procedimentos
+
+<Tabs>
+  <Tab title="Docker Compose">
+    Edite a tag `image` no arquivo do Compose. Depois, baixe a imagem e recrie o contêiner:
+
+    ```bash
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone pull
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up -d
+    ```
+
+    Mantenha os volumes nomeados. Eles armazenam os dados do PostgreSQL e do RustFS, incluindo o WAL do RustFS.
+  </Tab>
+  <Tab title="Binário e systemd">
+    Pare o serviço, substitua o binário e o banco de dados GeoIP e inicie o serviço novamente:
+
+    ```bash
+    sudo systemctl stop molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo install -Dm644 mmdb/dbip-city-lite.mmdb \
+      /usr/share/molesignal/mmdb/dbip-city-lite.mmdb
+    sudo systemctl start molesignal
+    sudo journalctl -u molesignal -n 50
+    ```
+
+    Versões anteriores instalavam `/usr/share/molesignal/mmdb/GeoLite2-City.mmdb`. Exclua esse arquivo. Se `[mmdb].db_path` em `/etc/molesignal/config.toml` ainda apontar para ele, altere o caminho para `dbip-city-lite.mmdb`.
+
+    Compare o arquivo `conf/config.toml` da nova versão com o arquivo instalado. Quando uma nova configuração não consta no arquivo, o MoleSignal usa o valor padrão integrado. Mudanças nos valores padrão podem afetar o comportamento.
+  </Tab>
+  <Tab title="Helm">
+    Leia o [histórico de alterações do chart](https://github.com/molesignal/molesignal-helm/blob/main/CHANGELOG.md) e atualize usando o mesmo arquivo de valores:
+
+    ```bash
+    helm repo update
+    helm upgrade molesignal molesignal/molesignal --namespace molesignal --values values.yaml
+    ```
+
+    Sem `image.tag`, o chart usa a tag de imagem `latest`. Para usar uma versão específica do MoleSignal, defina `image.tag` no arquivo de valores.
+
+    Os secrets gerados não mudam durante as atualizações. Por padrão, os pods `standalone` e `intake` têm 60 segundos para encerrar. Mantenha `terminationGracePeriodSeconds` acima de `[node].drain_timeout_secs`.
+
+    No modo `distributed`, `helm upgrade` substitui os pods de todas as cargas de trabalho ao mesmo tempo, sem seguir a ordem descrita em [Clusters com funções separadas](#clusters-com-funções-separadas).
+  </Tab>
+  <Tab title="Manifestos do Kubernetes">
+    Altere a tag da imagem nos manifestos e aplique os manifestos:
+
+    ```bash
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    kubectl -n molesignal rollout status deployment/intake
+    ```
+
+    Defina `terminationGracePeriodSeconds` acima de `[node].drain_timeout_secs` para que os pods possam gravar os dados pendentes antes de encerrar.
+  </Tab>
+</Tabs>
+
+Ao receber `SIGTERM` ou `SIGINT`, o processo aguarda até `[node].drain_timeout_secs` para gravar os dados pendentes e então encerra. Os registros que o processo não consegue gravar permanecem no WAL no armazenamento de objetos. Outro nó de ingestão publica esses registros, ou o próprio nó os publica quando reinicia.
+
+## Clusters com funções separadas
+
+Os nós de um cluster com funções separadas compartilham o mesmo esquema. Um nó que ainda executa uma versão anterior continua usando o novo esquema até reiniciar, e não há garantia de compatibilidade entre as versões. Atualize todos os nós em uma única janela de manutenção:
+
+1. Pare os nós `router`, depois os nós `intake` e `querier` e, por fim, os nós `compactor` e `alert`.
+2. Inicie um nó da nova versão e aguarde até que `GET /api/v1/healthz` retorne `200`. Esse nó aplica as migrações.
+3. Inicie os demais nós.
+
+## Verifique a atualização
+
+- Confirme que o log não mostra erros de migração e que `GET /api/v1/healthz` retorna `200`.
+- Confirme que `GET /api/v1/version` retorna a nova versão.
+- Confirme que uma consulta a dados recentes retorna linhas e que novos registros chegam.
+- Confirme em `/metrics` que `storage_reconciler_issues_total` não aumenta.

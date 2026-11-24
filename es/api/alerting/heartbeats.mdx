@@ -1,0 +1,95 @@
+---
+title: "Registros de latidos"
+description: "Envía una señal de una tarea programada a la URL de una regla de latido, consulta el último registro y restablece la URL."
+"en_link": "/en-US/api/alerting/heartbeats"
+"zh-Hans_link": "/zh-Hans/api/alerting/heartbeats"
+"zh-Hant_link": "/zh-Hant/api/alerting/heartbeats"
+"ja_link": "/ja/api/alerting/heartbeats"
+"ko_link": "/ko/api/alerting/heartbeats"
+"de_link": "/de/api/alerting/heartbeats"
+"fr_link": "/fr/api/alerting/heartbeats"
+"pt-BR_link": "/pt-BR/api/alerting/heartbeats"
+---
+
+Una [regla de latido](/es/api/alerting/create-rule#reglas-de-latido) espera que una tarea envíe una notificación después de cada
+ejecución. La regla se activa si no recibe ninguna notificación dentro del período más el margen de gracia o si una notificación indica un
+fallo.
+
+| Método y ruta | Qué hace | Permiso |
+|---|---|---|
+| `GET`, `POST /api/v1/intake/heartbeats/{token}` | Envía una notificación sin iniciar sesión. | El token de la dirección |
+| `GET /api/v1/alerts/rules/{id}/heartbeat` | Devuelve la última notificación y el plazo para la siguiente. | `alerts.rules.read` en la regla |
+| `POST /api/v1/alerts/rules/{id}/heartbeat-token` | Restablece la dirección de notificación. | `alerts.rules.manage` en la regla |
+
+## Enviar una notificación
+
+```http
+GET /api/v1/intake/heartbeats/{token}
+POST /api/v1/intake/heartbeats/{token}
+```
+
+MoleSignal proporciona la dirección al guardar por primera vez una regla de latido. Consulta
+[Crear una regla](/es/api/alerting/create-rule#reglas-de-latido). Envía una solicitud a esa dirección cuando la tarea se complete correctamente. Agrega
+`?status=fail` si falla para que la regla se active de inmediato, sin esperar a que termine el período. MoleSignal guarda el inicio del cuerpo de la solicitud
+`POST` (hasta 1000 caracteres) como mensaje de la notificación y lo muestra en la anotación del incidente
+`heartbeat_message`. Si el cuerpo supera los 64 KiB, la API devuelve `413`. Cada notificación hace que la regla se evalúe de inmediato:
+si indica un fallo, activa la regla; si indica un éxito, permite que un incidente abierto se recupere cuando se cumpla la condición de recuperación.
+
+<RequestExample>
+```bash cURL
+# The backup succeeded
+curl -fsS https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN
+
+# The backup failed: send its last lines of output
+tail -n 20 backup.log | curl -fsS -X POST --data-binary @- \
+  "https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN?status=fail"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "ok": true, "status": "fail" }
+```
+</ResponseExample>
+
+Solo `status=fail` cuenta como fallo. Cualquier otro valor, o la ausencia de un valor, cuenta como éxito. La API devuelve `404` si el token no es válido, si la
+regla se eliminó o si la dirección se restableció.
+
+## Consultar el estado de las notificaciones
+
+```http
+GET /api/v1/alerts/rules/{id}/heartbeat
+```
+
+<ResponseExample>
+```json 200
+{
+  "lastCheckinAt": 1790000000000000,
+  "lastStatus": "ok",
+  "lastMessage": "",
+  "dueAt": 1790003900000000,
+  "alarming": false,
+  "issuedAt": 1789900000000000
+}
+```
+</ResponseExample>
+
+| Campo | Notas |
+|---|---|
+| `lastCheckinAt` | Momento de la última notificación, en microsegundos de Unix. Vale `null` antes de la primera. |
+| `lastStatus`, `lastMessage` | Estado (`ok` o `fail`) y mensaje de la última notificación. |
+| `dueAt` | Plazo máximo para recibir la próxima notificación: al momento de la última notificación (o al de emisión de la dirección, si aún no llegó ninguna) se le suman el período y el margen de gracia. |
+| `alarming` | Indica si la regla debe activarse ahora: la última notificación indicó un fallo o ya pasó el plazo `dueAt`. |
+| `issuedAt` | Momento en que MoleSignal emitió o restableció la dirección actual. |
+
+La API devuelve `404` si la regla no es de latido o aún no tiene una dirección.
+
+## Restablecer la dirección de notificación
+
+```http
+POST /api/v1/alerts/rules/{id}/heartbeat-token
+```
+
+La API emite una dirección nueva. La anterior deja de funcionar de inmediato y el historial de notificaciones se conserva. Devuelve
+`{ "path": "...", "url": "..." }` y solo muestra la dirección esta vez. El campo `url` vale `null` si no hay una dirección externa
+configurada. MoleSignal registra el restablecimiento en el registro de auditoría. La API devuelve `400` si la regla no es de latido.

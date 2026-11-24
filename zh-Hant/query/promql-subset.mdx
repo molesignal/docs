@@ -1,0 +1,89 @@
+---
+title: "PromQL 支援矩陣"
+description: "MoleSignal 引擎支援的 PromQL 函式、運算子與修飾詞，以及已知差異。"
+"en_link": "/en-US/query/promql-subset"
+"zh-Hans_link": "/zh-Hans/query/promql-subset"
+"ja_link": "/ja/query/promql-subset"
+"ko_link": "/ko/query/promql-subset"
+"de_link": "/de/query/promql-subset"
+"es_link": "/es/query/promql-subset"
+"fr_link": "/fr/query/promql-subset"
+"pt-BR_link": "/pt-BR/query/promql-subset"
+---
+
+MoleSignal 使用自行開發的求值引擎（`promql-parser` + Arrow/DataFusion）在指標資料流上執行 PromQL。支援即時查詢與範圍查詢：含 `step` 的查詢在 `[start, end]` 內逐步求值，輸出矩陣；不含 `step` 的查詢則是在 `end` 求值的即時查詢。本頁是官方支援對照表。
+
+## 已支援
+
+### 範圍向量函式（輸入 `metric[range]`）
+
+`rate`、`irate`、`increase`、`delta`、`idelta`、`deriv`、`predict_linear`、`resets`、`changes`、`holt_winters`（別名 `double_exponential_smoothing`），以及所有 `*_over_time` 函式：`avg_over_time` / `min_over_time` / `max_over_time` / `sum_over_time` / `count_over_time` / `quantile_over_time` / `stddev_over_time` / `stdvar_over_time` / `last_over_time` / `present_over_time` / `mad_over_time`。
+
+`rate`、`increase` 和 `delta` 的行為與 Prometheus 相同，會將視窗內第一個到最後一個樣本之間的變化外推到視窗兩端。相同的樣本會得到相同的值。
+
+### 彙總運算子（含 `by()` / `without()`）
+
+`sum`、`avg`、`min`、`max`、`count`、`stddev`、`stdvar`、`quantile`、`group`、`count_values`、`topk`、`bottomk`、`limitk`、`limit_ratio`。
+
+### 直方圖
+
+`histogram_quantile(q, sum by(le)(rate(metric_bucket[range])))`：對傳統 `le` 分桶進行線性內插。
+
+`histogram_fraction(lower, upper, v)`：在傳統 `le` 分桶模型下，估算觀測值落在 `[lower, upper]` 區間內的比例（使用相同的折線 CDF：`(rank(upper) - rank(lower)) / total`）。
+
+### 標籤 / 排序
+
+`label_replace`、`label_join`、`sort`、`sort_desc`、`sort_by_label`、`sort_by_label_desc`。
+
+### 時間
+
+`time`、`timestamp`、`minute`、`hour`、`day_of_week`、`day_of_month`、`day_of_year`、`days_in_month`、`month`、`year`（一律使用 UTC；日期函式預設套用至 `vector(time())`）。
+
+### 型別 / 缺值
+
+`vector`、`scalar`、`absent`、`absent_over_time`。
+
+### 數學 / 取整 / 三角
+
+`abs`、`ceil`、`floor`、`round`、`exp`、`ln`、`log2`、`log10`、`sqrt`、`sgn`、`clamp` / `clamp_min` / `clamp_max`、`sin` / `cos` / `tan` / `asin` / `acos` / `atan` / `sinh` / `cosh` / `tanh` / `asinh` / `acosh` / `atanh`、`pi`、`deg`、`rad`。
+
+### 運算子
+
+算術 `+ - * / % ^`、比較 `== != > < >= <=`（含 `bool`）、集合 `and` / `or` / `unless`、向量比對 `on(...)` / `ignoring(...)` 搭配 `group_left` / `group_right`、一元負號。
+
+### 修飾詞 / 查詢結構
+
+選擇器修飾詞 `@`（`start()` / `end()` / `<ts>`）與 `offset`（包括用於矩陣選擇器的情況）；子查詢 `inner[range:step]`。
+
+## 尚未實作 / 已知差異
+
+| 功能 | 狀態 | 說明 |
+|---|---|---|
+| 原生直方圖函式 `histogram_count` / `histogram_sum` / `histogram_avg` / `histogram_stddev` / `histogram_stdvar` | ❌ → 400 | 不適用於傳統 `le` 分桶模型；分位數請使用 `histogram_quantile`，區間比例請使用 `histogram_fraction` |
+| 二元運算的 `default` 填補 | ❌ → 400 | — |
+| 範圍查詢中的子查詢 | ⚠️ | 改用即時求值（不執行外層步進 × 內層步進的雙重掃描）；即時查詢和警示的求值結果準確 |
+| `timestamp()` | ⚠️ | 即時查詢傳回求值時間點；範圍查詢傳回各資料點的時間戳記 |
+| 純量函式引數（`predict_linear` 的 `t`、`holt_winters` 的 `sf`/`tf`、各 `quantile`） | ⚠️ | 僅接受數值常值 |
+
+不支援的函式或語法會傳回錯誤 `promql function not yet supported: <name>`，`POST /api/v1/query`（`language: "promql"`）會將其對應至 `400`。
+
+<Note>
+  當警示規則的 `query.language` 為 `promql` 時，MoleSignal 會在評估視窗結束時將 PromQL 運算式當作即時查詢求值。規則本身採用 MoleSignal 的 `AlertRule`，與 Prometheus 規則格式不相容。請參閱[建立規則](/zh-Hant/api/alerting/create-rule)。
+</Note>
+
+## 標籤比對
+
+`=` / `!=` / `=~` / `!~`（規則運算式使用 RE2，行為與 Prometheus 的 PCRE 略有差異）。`__name__` 比對 `metric_name` 欄位。若指標名稱含句點，請在選擇器中用引號括住名稱，例如 `{"http.server.duration"}`。未指定指標名稱的選擇器（例如 `{job="api"}`、`{__name__=~"http_.*"}`）會讀取所有符合比對條件的指標，並在各指標的時間序列中保留 `__name__`。
+
+## 指標資料流配置
+
+每個指標資料流儲存單一來源（例如一個 Prometheus 執行個體）的所有指標，並將標籤儲存為**獨立欄位**，而非 JSON 字串：
+
+```sql
+_timestamp   Timestamp(Microsecond)  NOT NULL   -- 时间
+metric_name  Utf8                    NOT NULL   -- 指标，即 PromQL 的 __name__
+value        Float64                 NOT NULL   -- 度量值（Int64 等数值也接受、cast 到 f64）
+<label_x>    Utf8 …                             -- 剩余非保留列即 label
+```
+
+檔案中，同一指標的資料列連續排列，先依 `metric_name` 排序，再依時間排序。選擇器會讀取包含該指標的資料流，在時間範圍與查詢重疊的 Parquet 檔案中只讀取該指標所在的頁面，為每組不同的標籤建立一條時間序列，並在引擎中套用標籤比對（`=`、`!=`、`=~`、`!~`）。`@` 和 `offset` 會調整求值時間點。透過 OTLP 傳入的指標，請參閱 [OTLP 指標欄位](/zh-Hant/query#otlp-指標欄位)。

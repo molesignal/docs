@@ -1,0 +1,173 @@
+---
+title: "チケット API"
+sidebarTitle: "チケット"
+description: "Jira、ServiceNow、または Meegle (Feishu Project) に接続して、インシデントのチケットを作成します。インシデントの進捗をコメントやステータス遷移としてチケットに反映し、ステータスを同期します。"
+"en_link": "/en-US/api/alerting/tickets"
+"zh-Hans_link": "/zh-Hans/api/alerting/tickets"
+"zh-Hant_link": "/zh-Hant/api/alerting/tickets"
+"ko_link": "/ko/api/alerting/tickets"
+"de_link": "/de/api/alerting/tickets"
+"es_link": "/es/api/alerting/tickets"
+"fr_link": "/fr/api/alerting/tickets"
+"pt-BR_link": "/pt-BR/api/alerting/tickets"
+---
+
+チケットコネクターは、Jira（Cloud または Data Center / Server）、ServiceNow、Feishu Project（中国国外では Meegle）と連携します。インシデント用に作成したチケットには、インシデントの更新が反映されます。確認、解決、メモをコメントとして記録でき、インシデントを解決するとチケットを完了にできます。チケットのステータスは 5 分ごとに同期します。Jira は Webhook でステータスを即時に通知することもできます。画面での使い方については、 [チケット](/ja/alerting/tickets)を参照してください。
+
+| メソッドとパス | 操作 | 権限 |
+|---|---|---|
+| `GET /api/v1/alerts/tickets/connectors` | 組織のチケットコネクターを `{ "connectors": [ ... ] }` 形式で返します。 | `alerts.tickets.read` |
+| `POST /api/v1/alerts/tickets/connectors` | コネクターを作成します。 | `alerts.tickets.manage` |
+| `PUT /api/v1/alerts/tickets/connectors/{id}` | コネクターを置き換えます。`system` は変更できません。 | `alerts.tickets.manage` |
+| `DELETE /api/v1/alerts/tickets/connectors/{id}` | コネクターを削除します。 | `alerts.tickets.manage` |
+| `POST /api/v1/alerts/tickets/connectors/{id}/test` | 接続をテストします。Jira は `{ "ok": true, "detail": "<signed-in user>" }` を返し、Feishu Project は作業項目タイプを 1 回読み取ります。 | `alerts.tickets.manage` |
+| `GET /api/v1/alerts/tickets/sites` | Feishu Project の各プラットフォームのアドレスを返します: `{ "meegle": [{ "key": "feishu", "url": "https://project.feishu.cn" }, { "key": "lark", "url": "https://meegle.com" }] }`。 | `alerts.tickets.read` |
+| `GET /api/v1/alerts/incidents/{id}/tickets` | インシデントのチケットを `{ "tickets": [ ... ] }` 形式で返します。 | 対象インシデントの `alerts.incidents.read` |
+| `POST /api/v1/alerts/incidents/{id}/tickets` | コネクターを使ってインシデントのチケットを作成します。 | 対象インシデントの `alerts.incidents.tickets` |
+| `POST /api/v1/public/tickets/jira/{connectorId}` | サインイン不要で Jira の Webhook を受け付けます。 | `X-Hub-Signature` |
+
+## コネクター
+
+**リクエストボディ**
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `name` | string | はい | コネクターの名前です。 |
+| `system` | string | はい | `jira` または `meegle` です。 |
+| `settings` | object | はい | サイト、プロジェクト、タイプ、マッピングを指定します。以下を参照してください。 |
+| `secrets` | object | 作成時 | 認証情報です。暗号化して保存し、レスポンスには含めません。Jira には `apiToken`（Cloud の API トークンまたは Data Center の個人アクセストークン）と、必要に応じて `webhook_secret` を指定します。Feishu Project には `plugin_secret` を指定します。更新時にシークレットを空にすると、既存の値を保持します。 |
+| `comments` | object | いいえ | `{ "acknowledged": true, "resolved": true, "notes": true }`: インシデントの確認時や解決時にコメントを追加し、インシデントのメモもコメントとして記録します。デフォルトはすべて `false` です。 |
+| `transitionOnResolve` | boolean | いいえ | インシデントの解決時にチケットを完了にします。デフォルトは `false` です。 |
+| `resolveIncidentWhenDone` | boolean | いいえ | チケットが完了すると、インシデントがオープンでも確認済みでも解決し、解決者は記録しません。デフォルトは `false` です。 |
+| `auto` | object | いいえ | チケットの自動作成を設定します: `{ "enabled": true, "minSeverity": "error", "conditions": [ ... ] }`。重大度が `minSeverity` 以上で、ラベルが `conditions` を満たす新規インシデントにチケットを作成します。`conditions` は[ルーティングルール](/ja/api/alerting/create-routing-rule)と同じ形式で指定します。 |
+| `onMajorIncident` | boolean | いいえ | [重大インシデント](/ja/api/alerting/major-incidents)の宣言時にチケットを作成します。デフォルトは `false` です。 |
+| `enabled` | boolean | いいえ | デフォルトは `true` です。無効なコネクターはチケットの作成や同期を行わず、Webhook も受け付けません。 |
+
+**`settings`: Jira**
+
+| フィールド | 備考 |
+|---|---|
+| `siteUrl` | `https://` で始まるサイトのアドレスです。例: `https://example.atlassian.net`。 |
+| `deployment` | `cloud`（デフォルト）: アカウントのメールアドレスと API トークンで認証し、ボディに Atlassian Document Format を使用する REST API v3 を使います。`data_center`: 個人アクセストークンで認証し、REST API v2 を使います。 |
+| `email` | Cloud アカウントのメールアドレスです。 |
+| `projectKey`, `issueType` | プロジェクトキーと課題タイプです。例: `OPS` と `Incident`。 |
+| `priorities` | 重大度を Jira の優先度名にマッピングします。例: `{ "critical": "Highest" }`。マッピングのない重大度には優先度を設定しません。 |
+| `labels` | すべてのチケットに付く `molesignal` ラベルに加えて、チケットに付与するラベルです。 |
+| `fields` | チケット作成時に使うその他のフィールドのデフォルト値です。Jira のフィールド ID をキーにします。 |
+| `resolveTransition` | インシデントの解決時に実行するトランジションを名前または ID で指定します。空の場合は、完了ステータスへの最初のトランジションを実行します。 |
+
+**`settings`: Feishu Project**
+
+| フィールド | 備考 |
+|---|---|
+| `site` | プラットフォームを指定します。`feishu`（デフォルト、Feishu Project、`https://project.feishu.cn`）または `lark`（Meegle、`https://meegle.com`）です。アドレスはプラットフォームによって決まり、変更できません。 |
+| `pluginId` | プラグイン ID です。`plugin_secret` とともに使ってプラグイントークンを取得します。 |
+| `userKey` | チケットとコメントの作成者として記録するユーザーを指定します。 |
+| `projectKey`, `workItemTypeKey` | スペースと作業項目タイプを指定します。 |
+| `priorityField`, `priorities` | 優先度フィールドのキーと、重大度から優先度オプション値へのマッピングを指定します。空の場合は優先度を設定しません。 |
+| `fields` | チケット作成時に使うその他のフィールドのデフォルト値です。field_key をキーにします。 |
+| `resolveTransitionId` | ステータスフローの作業項目で、インシデントの解決時に実行するトランジションの ID です。 |
+| `resolveNodeId` | ノードフローの作業項目で、インシデントの解決時に完了にするノードの ID です。 |
+| `doneStates` | 完了とみなすステータスのキーです。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/tickets/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "Jira OPS",
+    "system": "jira",
+    "settings": {
+      "siteUrl": "https://example.atlassian.net",
+      "deployment": "cloud",
+      "email": "oncall-bot@example.com",
+      "projectKey": "OPS",
+      "issueType": "Incident",
+      "priorities": { "critical": "Highest", "error": "High" }
+    },
+    "secrets": { "apiToken": "<jira-api-token>", "webhookSecret": "<webhook-secret>" },
+    "comments": { "acknowledged": true, "resolved": true, "notes": true },
+    "transitionOnResolve": true,
+    "auto": { "enabled": true, "minSeverity": "critical", "conditions": [] }
+  }'
+```
+</RequestExample>
+
+レスポンスには保存済みのコネクターが含まれます。`secrets` は返さず、設定済みの認証情報を `secretsSet` に列挙します。Jira コネクターには `webhook_path` も含まれます。パスは `/api/v1/public/tickets/jira/<connector ID>` です。作成、変更、削除は監査ログに記録します。
+
+**ServiceNow の `settings`**
+
+| フィールド | 説明 |
+|---|---|
+| `instanceUrl` | https で始まるインスタンスのアドレスです。 |
+| `auth` | `basic`（デフォルト、シークレットは `password`）、`oauth`（クライアントクレデンシャル、シークレットは `clientSecret`）、または `apiKey`（シークレットは `apiKey`）です。 |
+| `username`, `clientId` | Basic 認証のユーザー名と OAuth クライアント ID です。 |
+| `table` | レコードの作成先テーブルです。デフォルトは `incident` です。`task` を継承するテーブルを指定してください。 |
+| `assignmentGroup`, `callerId`, `category` | 作成時に設定するフィールドです。最初の 2 つには `sys_id` を指定します。 |
+| `priorities` | 重大度または優先度 → `impact/urgency` のマッピングです。数値を 1 つだけ指定すると、両方に同じ値を設定します。 |
+| `fields` | 作成時に使うその他のフィールドのデフォルト値です（フィールド名 → 値）。 |
+| `resolveState`, `closeCode` | インシデントの解決時に設定する `state` と `closeCode` です。デフォルトはそれぞれ `6` と `Solution provided` です。`closeCode` が空の場合は設定しません。 |
+| `doneStates` | 完了とみなす `state` の値です。デフォルトは `6`、`7`、`8` です。 |
+
+コネクターをテストすると `{ "ok": true, "detail": "<table>" }` が返ります。
+
+## インシデントのチケットを作成する
+
+```http
+POST /api/v1/alerts/incidents/{id}/tickets
+```
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `connectorId` | string | はい | チケットの作成に使うコネクターです。そのコネクターで作成したチケットがインシデントにすでにある場合は、既存のチケットを返します。 |
+
+チケットのタイトルは `[severity] incident summary` です。本文には、インシデントの重大度、ステータス、サービス、ラベル、トリガーとなったクエリ、AI が分析した根本原因の概要、インシデントページのアドレスを、ワークスペースのデフォルト言語で記載します。チケットはインシデントのタイムラインと監査ログに記録します。
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KJ4m8T1qHd0Ue6WzB2nLc9RfPa",
+  "orgId": "<organization-id>",
+  "incidentId": "<incident-id>",
+  "connectorId": "<connector-id>",
+  "system": "jira",
+  "externalId": "10482",
+  "externalKey": "OPS-42",
+  "url": "https://example.atlassian.net/browse/OPS-42",
+  "status": "To Do",
+  "done": false,
+  "incidentStatus": "open",
+  "createdBy": "<user-id>",
+  "createdAt": 1790000000000000,
+  "syncedAt": 1790000000000000,
+  "lastError": "",
+  "actionItemId": null
+}
+```
+</ResponseExample>
+
+| フィールド | 備考 |
+|---|---|
+| `externalId`, `externalKey` | Jira の課題 ID と課題キーです。Feishu Project ではどちらも作業項目 ID です。 |
+| `status`, `done` | 前回の同期で取得したステータス名と、完了かどうかを示します。Jira では `done` ステータスカテゴリ、Feishu Project ではコネクターの `doneStates` に基づいて完了を判定します。 |
+| `syncedAt`, `lastError` | 最終同期日時と、直近の同期またはコメントの追加で発生したエラーです。処理が成功するとエラーをクリアします。 |
+| `actionItemId` | [ポストモーテムのアクション項目](/ja/api/alerting/postmortems)用に作成したチケットに設定します。このチケットには、インシデントからコメントを追加したり、ステータスを変更したりしません。 |
+
+## ステータス同期と Jira Webhook
+
+未完了のチケットは 5 分ごとに同期します。チケットが完了し、そのコネクターに `resolveIncidentWhenDone` が設定されている場合は、インシデントを解決済みにします。ただし、ポストモーテムのアクション項目用に作成したチケットは対象外です。
+
+Jira コネクターに `webhook_secret` を設定したら、Jira の **システム設定 → WebHook** で Webhook を追加してください。 URL には MoleSignal の外部アドレスの末尾に `webhook_path` を付けたものを指定し、シークレットには同じ `webhook_secret` を指定します。イベントには課題の更新を選択します。
+
+```http
+POST /api/v1/public/tickets/jira/{connectorId}
+```
+
+MoleSignal は `webhook_secret` を使ってリクエストボディの HMAC-SHA256 を計算し、その値を `X-Hub-Signature: sha256=<hex>` と比較します。リクエストボディの上限は 1 MiB です。
+
+| ステータス | 理由 |
+|---|---|
+| `204` | Webhook を受け付けました。リクエストボディ内の課題が MoleSignal で作成したチケットでない場合も `204` を返します。 |
+| `401` | 署名が一致しないか、コネクターに `webhook_secret` が設定されておらず、Webhook を受け付けません。 |
+| `404` | コネクターが存在しないか、無効になっているか、Jira コネクターではありません。 |

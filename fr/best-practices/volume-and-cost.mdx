@@ -1,0 +1,105 @@
+---
+title: "Maîtriser le volume et le coût de la télémétrie"
+sidebarTitle: "Volume et coût"
+description: "Mesurez le volume de données par source, éliminez les données jamais consultées avant leur stockage et ne les conservez que le temps nécessaire. Fixez des limites pour les séries de métriques et les requêtes."
+"en_link": "/en-US/best-practices/volume-and-cost"
+"zh-Hans_link": "/zh-Hans/best-practices/volume-and-cost"
+"zh-Hant_link": "/zh-Hant/best-practices/volume-and-cost"
+"ja_link": "/ja/best-practices/volume-and-cost"
+"ko_link": "/ko/best-practices/volume-and-cost"
+"de_link": "/de/best-practices/volume-and-cost"
+"es_link": "/es/best-practices/volume-and-cost"
+"pt-BR_link": "/pt-BR/best-practices/volume-and-cost"
+---
+
+Le volume de télémétrie augmente plus vite que le nombre de questions auxquelles elle répond. Des logs de débogage laissés actifs, un label contenant un identifiant utilisateur ou une
+vérification d’état consignée chaque seconde peuvent doubler le volume stocké sans faciliter la résolution des incidents. Réduisez
+le volume inutile et conservez les données nécessaires aux investigations.
+
+## Mesurez d’abord
+
+Repérez les flux les plus volumineux avant de modifier quoi que ce soit.
+
+| Où | Données affichées |
+|---|---|
+| [Accueil](/fr/home#ingestion-de-données) | Pour chaque signal, les volumes ingérés, stockés et reçus sur la période sélectionnée. |
+| [Flux](/fr/streams#liste-des-flux) | Pour chaque flux : volume de données compressées sur la période, **Taille collectée** avant transformation, **Taille stockée**, **Taille des index** et **Enregistrements**. Comparez ces valeurs pour repérer les flux les plus volumineux. |
+| [Utilisation de l’ingestion](/fr/streams#utilisation-de-l’ingestion-et-budgets) | Volume ingéré par jeton, connecteur, flux et service. Un budget signale qu’une source approche du seuil défini ou le dépasse. |
+| [Métriques](/fr/metrics#analyser-le-résultat) | **Cardinalité** d’une métrique, c’est-à-dire le nombre de séries actives. |
+| [Utilisation de Mole Agent](/fr/agent#utilisation-et-budget) | Jetons du modèle par source et par jour, et budget quotidien. |
+
+Notez les chiffres des flux les plus volumineux. Utilisez-les comme référence pour évaluer chaque modification.
+
+## Éliminez les données inutilisées avant le stockage
+
+L’octet le moins coûteux est celui qui n’est jamais stocké. Pour les logs, un
+[pipeline en temps réel](/fr/pipelines#pipelines-en-temps-réel) s’exécute à l’ingestion, avant le stockage :
+
+- **Filtrer les événements** élimine les vérifications d’état, les sondes de disponibilité et les lignes de débogage inutilisées en
+  production.
+- **Échantillon** conserve une partie des événements d’un type fréquent mais utile. Avec **Échantillonner par champ**, les événements qui
+  partagent une valeur, comme un identifiant de requête, sont conservés ou éliminés ensemble.
+- **Supprimer des champs** élimine les champs volumineux qu’aucune requête n’utilise, comme les corps de requête complets.
+
+Modifiez d’abord la source si possible : un niveau de log `info` en production ou un processeur du collecteur
+qui filtre le bruit réduit aussi le trafic réseau. Les événements éliminés sont irrécupérables ; échantillonnez uniquement les événements
+répétitifs, jamais les erreurs.
+
+Réduisez de préférence le volume des traces à la source ou dans OpenTelemetry Collector. Gardez tous les spans d’une
+trace ensemble et gardez à l’esprit que les indicateurs APM et les SLO ne comptent que les spans reçus. Un
+[pipeline en temps réel](/fr/pipelines#traces) sur un flux de traces peut échantillonner après l’échantillonnage en fin de trace : réglez
+**Échantillonner par champ** sur `trace_id` pour conserver ou éliminer des traces entières. Le calcul des indicateurs APM précède l’exécution du
+pipeline et tient donc compte des spans que celui-ci élimine. Pour le RUM, configurez
+[l’échantillonnage des sessions](/fr/rum/sampling) par application.
+
+## Conservez les données tant qu’elles restent utiles
+
+| Données | Rétention | Configuration |
+|---|---|---|
+| Logs de débogage et logs détaillés | Quelques jours | Un flux dédié avec une **Durée de conservation des données (jours)** courte. |
+| Logs d’application et d’accès | Quelques semaines | La [valeur par défaut de la plateforme](/fr/settings/platform#conservation-des-données), soit 30 jours, ou une valeur propre au flux. |
+| Logs d’audit et de conformité | Des mois ou des années | Un flux à accès restreint avec une longue durée de conservation. |
+| Métriques | Plusieurs mois | Activez **Sous-échantillonner les anciens échantillons** dans l’onglet **Rétention** du flux de métriques : le sous-échantillonnage agrège les anciens échantillons par intervalle et réduit fortement le volume lu par les requêtes sur de longues périodes. |
+
+Fixez la durée de conservation selon la période réellement couverte par les investigations et prévoyez une marge pour les détections tardives.
+Si vous raccourcissez cette durée, le prochain nettoyage supprime les données qui dépassent la nouvelle limite. Le sous-échantillonnage
+supprime les échantillons d’origine. Ces deux opérations sont irréversibles. Laissez **Fusionner les petits fichiers par jour** activé pour les logs et
+les traces afin que les requêtes sur plusieurs jours ouvrent moins de fichiers.
+
+## Limitez le nombre de séries de métriques
+
+Chaque combinaison distincte de valeurs de labels constitue une série. Les labels dont les valeurs ne sont pas bornées, comme les identifiants utilisateur,
+les identifiants de requête ou les URL brutes, créent des séries sans limite. Une fois les
+[limites de cardinalité](/fr/settings/platform#cardinalité-des-métriques) atteintes, la plateforme refuse toute nouvelle série pour l’ensemble de
+l’organisation.
+
+- Vérifiez la **Cardinalité** dans Métriques après l’ajout d’un label.
+- Remplacez les chemins bruts par des modèles de routes et les identifiants par des catégories comme l’offre ou la région.
+- Placez les détails propres à chaque requête dans les logs ou les spans, qui n’entraînent aucun coût supplémentaire par valeur distincte.
+- Si la source ne peut pas être modifiée, un [pipeline en temps réel](/fr/pipelines#métriques-et-traces) sur le
+  flux de métriques supprime ou réécrit le label avant le stockage des échantillons.
+
+## Réduisez le coût des requêtes
+
+| Habitude | Effet |
+|---|---|
+| Définissez une **Plage maximale d’une requête (heures)** sur les flux volumineux | La plateforme rejette une requête lancée par erreur sur les « 90 derniers jours » au lieu de parcourir toutes les données. |
+| Indexez les champs utilisés dans les filtres des tableaux de bord | Les filtres ignorent les fichiers non pertinents au lieu de les lire. Consultez [Concevoir les flux et les champs](/fr/best-practices/stream-design#indexez-les-champs-utilisés-dans-les-filtres). |
+| Commencez par la plage temporelle la plus courte | Commencez par une plage restreinte et élargissez-la seulement si nécessaire. |
+| Lancez les analyses longues sous forme de [tâches de recherche](/fr/streams#tâches-de-recherche) | La requête s’exécute en arrière-plan et conserve son résultat, sans avoir à laisser la page ouverte. |
+| Adaptez la fréquence d’actualisation des tableaux de bord à leur fréquence de consultation | Le mode **Automatique** adapte la fréquence d’actualisation à la plage temporelle ; évitez les intervalles courts sur les écrans muraux qui affichent des panneaux gourmands en ressources. |
+
+## Critères d’acceptation
+
+- Identifiez les cinq flux les plus volumineux et relevez leur volume quotidien avant et après les modifications.
+- Vérifiez qu’aucun flux ne stocke par erreur des vérifications d’état, des sondes de disponibilité ou des logs de débogage en production.
+- Définissez une durée de conservation adaptée pour chaque flux et sous-échantillonnez les métriques conservées à long terme.
+- Vérifiez que le nombre de séries de métriques reste stable d’une semaine à l’autre et bien en dessous des limites.
+- Définissez une plage maximale de requête pour les flux volumineux et indexez les champs utilisés dans leurs filtres courants.
+
+## Guides associés
+
+- [Pipelines](/fr/pipelines)
+- [Flux](/fr/streams)
+- [Paramètres de la plateforme](/fr/settings/platform)
+- [Concevoir des flux et des champs qui restent utiles](/fr/best-practices/stream-design)

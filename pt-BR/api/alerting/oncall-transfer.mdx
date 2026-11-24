@@ -1,0 +1,119 @@
+---
+title: "Importar e exportar políticas, escalas e regras de roteamento"
+description: "Exporte políticas de escalonamento, escalas de plantão e regras de roteamento em pacotes que identificam as referências por nome e importe esses pacotes para uma organização."
+"en_link": "/en-US/api/alerting/oncall-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/oncall-transfer"
+"zh-Hant_link": "/zh-Hant/api/alerting/oncall-transfer"
+"ja_link": "/ja/api/alerting/oncall-transfer"
+"ko_link": "/ko/api/alerting/oncall-transfer"
+"de_link": "/de/api/alerting/oncall-transfer"
+"es_link": "/es/api/alerting/oncall-transfer"
+"fr_link": "/fr/api/alerting/oncall-transfer"
+---
+
+```http
+GET  /api/v1/alerts/escalations/export
+POST /api/v1/alerts/escalations/import
+GET  /api/v1/schedules/export
+POST /api/v1/schedules/import
+GET  /api/v1/alerts/routing/rules/export
+POST /api/v1/alerts/routing/rules/import
+```
+
+| Tipo | Exportação | Importação | Formato | Chave da lista |
+|---|---|---|---|---|
+| Políticas de escalonamento | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.escalation-policies/v1` | `policies` |
+| Escalas de plantão | `schedules.read` | `schedules.create` | `molesignal.schedules/v1` | `schedules` |
+| Regras de roteamento | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.routing-rules/v1` | `rules` |
+
+## Exportação
+
+O parâmetro de consulta `ids` aceita IDs separados por vírgulas. Deixe-o vazio para exportar todos os itens. A resposta é um
+pacote:
+
+```json
+{
+  "format": "molesignal.escalation-policies/v1",
+  "policies": [
+    {
+      "name": "Payments on-call",
+      "steps": [
+        {"targets": [{"kind": "schedule", "schedule": "Payments primary"}], "ackTimeoutSecs": 300, "minSeverity": null},
+        {"targets": [{"kind": "user", "user": "lead@example.com"}], "ackTimeoutSecs": 600, "minSeverity": null}
+      ],
+      "repeat": false,
+      "maxLoops": 1,
+      "urgencyRule": {"mode": "by_severity"}
+    }
+  ]
+}
+```
+
+Cada item mantém a definição, mas não o ID nem a organização. As referências usam nomes: `user` é o e-mail
+do usuário; `team`, `schedule`, `policy` e `calendar` são os nomes de uma equipe, uma escala de plantão, uma
+política de escalonamento e um calendário de feriados, respectivamente. Em um rodízio, `members` contém e-mails. Uma escala não inclui
+a cobertura temporária nem os horários. Uma regra de roteamento não inclui a posição nem os horários.
+
+## Importação
+
+| Campo | Tipo | Obrigatório | Descrição |
+|---|---|---|---|
+| `content` | string | Sim | Um pacote do tipo correspondente, em JSON ou YAML, com até 4 MiB e 500 itens. Para escalas, use também o arquivo descrito em [Migrar escalas do Opsgenie ou do PagerDuty](/pt-BR/alerting/schedule-migration). |
+| `dryRun` | boolean | Não | O padrão `true` apenas simula a importação. Use `false` para gravar os itens. |
+| `createOnly` | boolean | Não | Use `true` para manter os itens existentes com o mesmo nome sem alterações. |
+
+A importação identifica os itens pelo nome: cria um item se o nome for novo, compara campo a campo se houver um único item com esse nome e
+falha se houver vários itens com o mesmo nome ou se o arquivo repetir o nome. Cada referência deve apontar para um recurso
+da organização. A importação aplica a cada item as mesmas validações usadas para salvá-lo. Se algum item falhar, a importação não
+grava nada. Caso contrário, grava os itens um por um, envia um evento de alteração da federação para cada
+item sincronizado e registra um único evento de auditoria: `escalation_policies.imported`, `schedules.imported`
+ou `routing_rules.imported`.
+
+- Ao importar uma escala existente, a importação mantém a cobertura temporária, as trocas de turno e as configurações que o arquivo não inclui.
+- As regras de roteamento importadas ficam no início, na ordem do arquivo. As demais vêm depois e mantêm a ordem original.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content schedules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "molesignal.schedules/v1",
+  "items": [
+    {"name": "Payments primary", "action": "update", "changes": ["rotations"], "id": "3KC9..."},
+    {"name": "Payments nights", "action": "create"},
+    {"name": "Search", "action": "error", "error": "no user is named `ann@example.com`"}
+  ],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` retorna `create`, `update`, `unchanged`, `skip` (para um item existente com `createOnly` ou uma escala do PagerDuty
+baseada em turnos que o arquivo apenas menciona pelo nome) ou `error`. Após a gravação, `id` identifica o item criado ou atualizado. `applied` indica
+se a importação gravou algum item.
+
+`format` identifica o formato lido: o formato do pacote, `pagerduty` ou `opsgenie`. As escalas também podem incluir estes
+campos:
+
+| Campo | Local | Descrição |
+|---|---|---|
+| `unknownMembers` | Item | Todos os endereços de e-mail sem um membro correspondente na organização. |
+| `blockers` | Item | O que não pode ser importado e mudaria quem fica de plantão. Qualquer impedimento faz com que o item retorne `error`. |
+| `findings` | Item, relatório | O que a importação omitiu e como o item se compara ao que a origem exibe. |
+
+Cada impedimento ou observação usa o formato `{"code": "...", "params": {...}}`, em que `code` identifica o texto e `params`
+fornece os valores para preenchê-lo.
+
+**Erros**
+
+| Status | Motivo |
+|---|---|
+| `400` | O conteúdo não é um pacote do tipo esperado nem um arquivo aceito pela importação de escalas, declara outro formato ou excede o limite de tamanho ou de itens. |
+| `403` | O token não tem a permissão necessária. |

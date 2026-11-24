@@ -1,0 +1,86 @@
+---
+title: "예시 샘플 조회"
+description: "Prometheus remote write 샘플과 함께 저장된 예시 샘플을 Prometheus HTTP API 응답 형식으로 조회합니다."
+"en_link": "/en-US/api/query/exemplars"
+"zh-Hans_link": "/zh-Hans/api/query/exemplars"
+"zh-Hant_link": "/zh-Hant/api/query/exemplars"
+"ja_link": "/ja/api/query/exemplars"
+"de_link": "/de/api/query/exemplars"
+"es_link": "/es/api/query/exemplars"
+"fr_link": "/fr/api/query/exemplars"
+"pt-BR_link": "/pt-BR/api/query/exemplars"
+---
+
+```http
+GET  /api/v1/prometheus/api/v1/query_exemplars
+POST /api/v1/prometheus/api/v1/query_exemplars
+```
+
+PromQL 표현식이 선택한 시계열의 엑셈플러를 Prometheus HTTP API의 `query_exemplars` 엔드포인트와 같은 응답 형식으로 반환합니다. **메트릭** 페이지는 이 엔드포인트에서 엑셈플러를 가져옵니다. 이 엔드포인트를 호출하려면 `metrics.read` 또는 시스템 범위의 `sys.telemetry.read` 권한이 필요합니다.
+
+[Prometheus 원격 쓰기](/ko/intake#prometheus-remote_write)는 엑셈플러를 전송하고 샘플과 함께 보관합니다. OTLP 메트릭은 엑셈플러 없이 저장합니다.
+
+`GET`은 쿼리 문자열로 파라미터를 받고, `POST`는 폼(`application/x-www-form-urlencoded`)으로 파라미터를 받습니다.
+
+| 파라미터 | 필수 | 설명 |
+|---|---|---|
+| `query` | 예 | PromQL 표현식입니다. 표현식의 각 셀렉터에 메트릭 이름을 지정해야 합니다. |
+| `start` | 예 | Unix 에포크 이후 경과 시간(초, 소수점 이하 허용) 또는 RFC 3339 형식의 시각입니다. |
+| `end` | 예 | `start`와 같은 형식을 사용합니다. `start`보다 빠를 수 없습니다. |
+
+표현식에서 셀렉터만 결과에 영향을 줍니다. 각 셀렉터는 지정한 메트릭에서 라벨 매칭 조건을 충족하는 시계열을 선택합니다. 함수, 연산자, 범위 길이는 결과에 영향을 주지 않습니다. 원격 쓰기 재시도 등으로 같은 엑셈플러를 두 번 전송해도 한 번만 반환합니다. 응답은 엑셈플러를 최대 10,000개까지 포함하며, 이 한도에서 결과를 잘라 내면 경고를 포함합니다. 요청은 쿼리와 마찬가지로 [승인 제어](/ko/configuration#쿼리-승인-제어)에서 처리 슬롯이 빌 때까지 대기합니다. 응답은 캐시하지 않습니다.
+
+[필드 마스킹](/ko/settings/data-security#필드-마스킹)은 시계열 라벨과 엑셈플러 라벨에 적용합니다. Prometheus 응답 형식은 마스킹한 값을 담을 수 없으므로 `value` 또는 `_timestamp`에 마스킹 규칙을 적용하면 요청이 실패합니다.
+
+<RequestExample>
+```bash cURL
+curl -G http://localhost:5080/api/v1/prometheus/api/v1/query_exemplars \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'query=histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{service="checkout"}[5m]))' \
+  --data-urlencode "start=$(( $(date +%s) - 3600 ))" \
+  --data-urlencode "end=$(date +%s)"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "status": "success",
+  "data": [
+    {
+      "seriesLabels": {
+        "__name__": "http_request_duration_seconds_bucket",
+        "le": "0.5",
+        "service": "checkout"
+      },
+      "exemplars": [
+        {
+          "labels": { "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7" },
+          "value": 0.43,
+          "timestamp": 1790000000.123
+        }
+      ]
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| 필드 | 설명 |
+|---|---|
+| `data[].seriesLabels` | 시계열의 라벨입니다. `__name__`에는 메트릭 이름이 들어갑니다. |
+| `data[].exemplars[]` | 지정한 범위에 속하는 시계열의 엑셈플러입니다. 오래된 항목부터 나열합니다. |
+| `labels` | `trace_id`, `span_id` 등 엑셈플러의 라벨입니다. |
+| `value` | 엑셈플러가 관측한 값입니다. |
+| `timestamp` | Unix 에포크 이후 경과 시간입니다. 소수점 이하를 포함한 초 단위로 표시합니다. |
+| `warnings` | 엑셈플러 10,000개 한도에서 결과를 잘라 낸 경우에만 표시합니다. |
+
+**오류**
+
+| 상태 | 원인 |
+|---|---|
+| `400` | `query`가 비어 있거나 유효한 PromQL이 아닙니다. 또는 셀렉터에 메트릭 이름이 없거나, 시각이 두 형식 중 어느 쪽에도 맞지 않거나, `end`가 `start`보다 빠릅니다. |
+| `403` | 토큰에 `metrics.read` 권한이 없거나 `value` 또는 `_timestamp`에 마스킹 규칙이 적용됩니다. |
+| `429` | [승인 제어](/ko/configuration#쿼리-승인-제어)가 요청을 거부했습니다. |
+
+이 오류는 Prometheus 형식이 아니라 다른 엔드포인트와 동일한 [오류 응답 본문](/ko/api-reference#응답-및-오류) 형식을 사용합니다.

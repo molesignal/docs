@@ -1,0 +1,182 @@
+---
+title: "Consultas desde Grafana"
+description: "Usa el complemento de fuente de datos de MoleSignal para acceder a sus métricas, logs y trazas desde los dashboards, la sección Explore y las reglas de alerta de Grafana."
+"en_link": "/en-US/query/grafana"
+"zh-Hans_link": "/zh-Hans/query/grafana"
+"zh-Hant_link": "/zh-Hant/query/grafana"
+"ja_link": "/ja/query/grafana"
+"ko_link": "/ko/query/grafana"
+"de_link": "/de/query/grafana"
+"fr_link": "/fr/query/grafana"
+"pt-BR_link": "/pt-BR/query/grafana"
+---
+
+La fuente de datos de MoleSignal es un complemento de Grafana. Grafana lee métricas con PromQL, registros y trazas con las consultas por campos de las páginas **Registros** y **Trazas**, y cualquier flujo con SQL. También puedes navegar entre señales: una línea de registro abre su traza, un ejemplar abre su traza y cada resultado enlaza a MoleSignal.
+
+<Note>
+El complemento tiene un backend que se ejecuta en el servidor de Grafana. Grafana lo inicia como proceso hijo. Todas las solicitudes a MoleSignal salen del servidor de Grafana con el token de la fuente de datos. Los navegadores nunca se conectan a MoleSignal. Grafana Cloud se conecta a una instancia de MoleSignal en una red privada mediante Private data source connect.
+</Note>
+
+## Requisitos
+
+| Elemento | Requisito |
+|---|---|
+| Grafana | 12.3 o posterior, incluida la serie 13.x. |
+| MoleSignal | Una versión que acepte el campo `step` de [`POST /api/v1/query`](/es/api/query/execute) y el parámetro `expression` de las operaciones de lectura de [registros](/es/api/web/logs) y [trazas](/es/api/web/trace). **Guardar y probar** rechaza las versiones anteriores porque devuelven resultados sin filtrar en las consultas por campos. |
+| Red | El servidor de Grafana debe tener acceso al puerto HTTP de MoleSignal, que es el 5080 de forma predeterminada. |
+| Token | Un token de API de una cuenta de servicio con el rol **Lector**. La fuente de datos usa `streams.read`, `streams.query`, `logs.read`, `traces.read` y `metrics.read`; `dashboards.read` y `dashboards.annotations.read` para las anotaciones y las variables; `apm.deployments.read` para las anotaciones de despliegues; y `alerts.incidents.read` para las anotaciones de incidentes. |
+
+## Crea un token para Grafana
+
+1. Abre **Identidad y acceso → Cuentas de servicio** y selecciona **Crear cuenta de servicio**.
+2. Escribe `grafana` en **Nombre** y elige el rol **Lector**.
+3. Selecciona **Crear cuenta y token** y copia el token. El token vence en 365 días y aparece una sola vez.
+
+Para limitar Grafana a operaciones de lectura, emite un token con un alcance más restringido para la cuenta: abre **Identidad y acceso → Tokens de API**, selecciona **Emitir token de cuenta de servicio**, elige la cuenta y selecciona la política **Observador de solo lectura** como **Alcance**. Consulta [Tokens de API y cuentas de servicio](/es/identity/tokens).
+
+Cada fuente de datos lee datos de una sola organización: la de su token. Cualquier usuario de Grafana con acceso a la fuente de datos puede leer los datos que permita el token. Restringe el acceso con los permisos de fuentes de datos de Grafana o asigna a cada equipo su propia fuente de datos y su propio token.
+
+## Instala el complemento
+
+Instala el archivo de la versión con la CLI de Grafana o descomprímelo en el directorio de complementos de Grafana, `/var/lib/grafana/plugins` en los paquetes de Linux y en la imagen de Docker:
+
+```bash
+grafana cli --pluginUrl https://github.com/molesignal/molesignal-grafana-plugin/releases/download/v0.1.0/molesignal-datasource-0.1.0.zip plugins install molesignal-datasource
+```
+
+El complemento aún no tiene firma. Autoriza su carga en `grafana.ini` o mediante la variable de entorno `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=molesignal-datasource` y luego reinicia Grafana:
+
+```ini
+[plugins]
+allow_loading_unsigned_plugins = molesignal-datasource
+```
+
+## Agrega la fuente de datos
+
+1. En Grafana, abre **Conexiones → Fuentes de datos**, selecciona **Agregar nueva fuente de datos** y elige **MoleSignal**.
+2. Introduce la **URL** de MoleSignal, por ejemplo, `https://molesignal.example.com`, y pega el **Token de API**.
+3. Selecciona **Guardar y probar**.
+
+**Guardar y probar** lee la versión de MoleSignal, comprueba que el token tenga los permisos `streams.read` y `streams.query`, cuenta los flujos de cada tipo y verifica que MoleSignal admita consultas por campos.
+
+| Configuración | Valor predeterminado | Descripción |
+|---|---|---|
+| **URL** | | La dirección de MoleSignal, sin `/api/v1`. |
+| **Token de API** | | Grafana lo almacena cifrado en el servidor. |
+| **Omitir la verificación del certificado TLS** | Desactivado | Solo para una instancia de prueba con un certificado autofirmado. |
+| **Certificado de CA** | | El certificado en formato PEM de la autoridad de certificación que firmó el certificado de MoleSignal. |
+| **Flujo de registros** | | El flujo que usa una consulta de registros nueva. Los filtros ad hoc de Explorar ofrecen los campos de este flujo. |
+| **Campos de registro** | `message`, `level`, `trace_id` | Los campos que contienen la línea de registro, su nivel y su traza. |
+| **Intervalo de recolección** | `15s` | La frecuencia con la que llegan las métricas. `$__rate_interval` abarca al menos cuatro de estos intervalos. |
+| **Clústeres federados** | Este clúster | Los clústeres a los que se envía cada consulta SQL y PromQL, separados por comas. |
+| **Dirección web de MoleSignal** | La URL | El destino de los enlaces **Abrir en MoleSignal**. |
+| **Tiempo de espera (segundos)** | `60` | El tiempo máximo de espera por solicitud a MoleSignal. |
+| **Consultas simultáneas** | `10` | El número de consultas de un panel, una vista de Explorar o una regla de alerta que se ejecutan a la vez. |
+
+## Tipos de consulta
+
+| Tipo de consulta | Datos que lee | Resultado que muestra |
+|---|---|---|
+| **PromQL** | Métricas, mediante una consulta de rango con el intervalo del panel o una consulta instantánea | Series temporales, una tabla y ejemplares |
+| **SQL** | Cualquier flujo | Una tabla, series temporales o líneas de registro |
+| **Registros** | Los registros más recientes de un flujo de registros que coinciden con una consulta por campos | Líneas de registro |
+| **Traza** | Una traza por su ID | La vista de la traza |
+| **Búsqueda de trazas** | Las trazas que coinciden con una consulta por campos | Una tabla desde la que puedes abrir cada traza |
+| **RED** | Solicitudes por segundo, errores por segundo, la proporción de errores o un percentil de duración de los spans que coinciden con una consulta por campos | Series temporales, una por cada valor del campo que especifiques en **Por** |
+| **Grafo de servicios** | Las llamadas entre servicios | Un grafo de nodos |
+
+### PromQL
+
+Una consulta de rango lee un punto por paso. El paso corresponde al intervalo del panel, pero no puede ser menor que **Paso mínimo** ni dar lugar a más de 11 000 pasos por serie. **Leyenda** asigna un nombre a cada serie. Usa `{{label}}` para incluir el valor de una etiqueta. **Ejemplares** muestra los ejemplares de la serie. Cada ejemplar abre su traza. MoleSignal implementa un [subconjunto de PromQL](/es/query/promql-subset).
+
+### Consultas por campos
+
+**Registros**, **Búsqueda de trazas** y **RED** usan la misma sintaxis de consulta por campos que las páginas **Registros** y **Trazas** de MoleSignal, por lo que una consulta se interpreta igual en ambos lugares:
+
+```text
+level = 'error' AND (service.name = 'checkout' OR timeout)
+```
+
+| Elemento | Significado |
+|---|---|
+| `AND`, `OR`, paréntesis | `AND` tiene prioridad sobre `OR`. Los paréntesis agrupan expresiones. |
+| `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains` | Comparan un campo con un valor. |
+| `field in ('a', 'b')` | Comprueba si un campo coincide con alguno de varios valores en las consultas de trazas. |
+| `MATCH(field, 'text')`, `MATCH_TEXT(field, 'words')` | Buscan en el texto completo de un campo en las consultas de registros. |
+| Una palabra sin comillas o una frase entre comillas | Texto que se busca. |
+
+La fila **Agregar una condición** crea una comparación a partir de un **Campo**, un **Operador** y un **Valor**, y la agrega con `AND`. **RED** lee los **Spans de entrada**, en los que un servicio recibió una solicitud, o **Todos los spans**.
+
+### SQL
+
+SQL lee cualquier flujo. **Flujo** indica el flujo que se usa para planificar la consulta. Si dejas el campo vacío, se usa la tabla que aparece después de `FROM`. **Formato** muestra el resultado como **Tabla**, **Serie temporal** o **Registros**. Estas macros usan el rango temporal del panel:
+
+| Macro | Se convierte en |
+|---|---|
+| `$__timeFilter(_timestamp)` | `_timestamp >= <from> AND _timestamp < <to>` |
+| `$__timeGroup(_timestamp, $__interval)` | `date_bin(INTERVAL '<interval>', _timestamp)` |
+| `$__timeFrom()`, `$__timeTo()` | El inicio y el fin del rango como marcas de tiempo |
+
+`$__interval`, `$__rate_interval` y `$__range` funcionan en PromQL y SQL, incluso en las reglas de alerta.
+
+## Explorar
+
+| Acción | Efecto |
+|---|---|
+| Ejecuta una consulta de registros | Muestra el volumen de registros por nivel encima de las líneas. |
+| Abre el contexto de una línea | Muestra los 50 registros anteriores y los 50 posteriores. |
+| Incluye o excluye un valor desde los detalles de una línea | Agrega `field = 'value'` o `field != 'value'` a la consulta con `AND`. |
+| Selecciona el ID de traza de una línea o un ejemplar | Abre la traza junto a la consulta. |
+| Selecciona **Abrir en MoleSignal** | Abre la misma consulta y el mismo rango temporal en MoleSignal. |
+
+## Variables y filtros ad hoc
+
+Una variable de consulta enumera uno de estos conjuntos:
+
+| Lista | Valores |
+|---|---|
+| **Flujos** | Los flujos de un tipo. |
+| **Campos** | Los campos de un flujo. |
+| **Valores de campo** | Los valores más frecuentes de un campo de un flujo de logs. |
+| **Métricas** | Los nombres de las métricas, con la opción de mostrar solo los que contienen un texto determinado. |
+| **Valores de etiqueta** | Los valores de una etiqueta de una métrica. |
+| **SQL** | La primera columna de una sentencia. |
+
+Cuando seleccionas varios valores en una variable, MoleSignal usa la sintaxis de lista de cada lenguaje: `(a|b)` para `=~` en PromQL, `'a', 'b'` para `IN (...)` en SQL y `'a', 'b'` para `in (...)` en una consulta de campos de trazas.
+
+Los filtros ad hoc acotan las consultas PromQL con criterios de coincidencia de etiquetas en cada selector y las consultas de campos con condiciones `AND`. Sus claves y valores provienen del **Flujo de logs** de la fuente de datos.
+
+## Anotaciones
+
+Una consulta de anotaciones marca en los paneles los eventos de un **Origen**:
+
+| Origen | Qué marca |
+|---|---|
+| **Anotaciones** | Las anotaciones de MoleSignal, con la opción de marcar solo las que tienen una **Etiqueta** determinada. |
+| **Despliegues** | Los despliegues que registró [APM](/es/apm/deployments), con la opción de limitar la consulta a un solo servicio. |
+| **Incidentes** | Los incidentes desde su inicio hasta su resolución, con la opción de limitar la consulta a un solo servicio. |
+
+## Alertas
+
+Las reglas de alerta de Grafana ejecutan consultas PromQL y SQL a través del backend del complemento. El [sistema de alertas de MoleSignal](/es/alerting) también ofrece reglas en tiempo real, gestión de incidentes, guardias y escalamiento. Cuando se activa una alerta en Grafana, puede llegar a MoleSignal como una [alerta externa](/es/alerting/sources#grafana).
+
+## Paneles
+
+La pestaña **Paneles** de la fuente de datos permite importar dos paneles:
+
+| Panel | Qué muestra |
+|---|---|
+| **MoleSignal · Servicios** | Las solicitudes, los errores y la duración de las solicitudes de cada servicio, el grafo de servicios y las trazas más lentas. |
+| **MoleSignal · Logs** | El volumen de logs y los errores más recientes de un flujo de logs. |
+
+## Límites
+
+| Elemento | Límite |
+|---|---|
+| Consulta de logs | Los 1000 registros más recientes, o hasta 5000 con **Límite de filas**. |
+| Búsqueda de trazas | 100 trazas, o hasta 5000 con **Límite de filas**. |
+| Traza | Una traza que comenzó en los últimos 31 días del intervalo seleccionado. |
+| PromQL | 11 000 pasos por serie y 100 000 puntos por consulta. Si se superan estos límites, MoleSignal conserva puntos de cada serie a intervalos regulares. |
+| SQL | 10 000 filas, o hasta 1 000 000 con **Límite de filas**. |
+
+Las aplicaciones de exploración de Grafana (Logs Drilldown, Traces Drilldown y Metrics Drilldown) solo consultan Loki, Tempo y Prometheus, por lo que no pueden abrir esta fuente de datos.

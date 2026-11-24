@@ -1,0 +1,216 @@
+---
+title: "연동 가이드"
+description: "OpenTelemetry Collector, OpenTelemetry SDK, Vector, Fluent Bit, Prometheus에서 텔레메트리를 전송합니다."
+"en_link": "/en-US/intake/integrations"
+"zh-Hans_link": "/zh-Hans/intake/integrations"
+"zh-Hant_link": "/zh-Hant/intake/integrations"
+"ja_link": "/ja/intake/integrations"
+"de_link": "/de/intake/integrations"
+"es_link": "/es/intake/integrations"
+"fr_link": "/fr/intake/integrations"
+"pt-BR_link": "/pt-BR/intake/integrations"
+---
+
+이 가이드에서는 가장 일반적인 데이터 전송 도구를 다룹니다. **데이터 소스** 페이지에서는 실제 엔드포인트와 토큰을 채운 동일한 구성을 생성하며, 더 많은 플랫폼을 지원합니다. [데이터 소스](/ko/intake)를 참조합니다.
+
+`molesignal.example.com`을 배포 인스턴스의 주소로, `MS_TOKEN`을 [수집 토큰](/ko/intake#수집-토큰)으로 바꿉니다. Docker Compose 샌드박스에서는 `http://localhost:5080`을 사용합니다.
+
+## OpenTelemetry Collector
+
+Collector의 `otlphttp` 익스포터는 `endpoint`를 기본 URL로 사용하고 뒤에 `/v1/logs`, `/v1/metrics`, `/v1/traces`를 붙입니다. 요청이 `/api/v1/logs`, `/api/v1/metrics`, `/api/v1/traces`에 도달하도록 `endpoint`를 `/api` 경로로 설정합니다.
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+processors:
+  batch:
+    send_batch_size: 500
+    send_batch_max_size: 500
+
+exporters:
+  otlphttp/molesignal:
+    endpoint: https://molesignal.example.com/api
+    compression: none
+    headers:
+      authorization: "Bearer ${env:MS_TOKEN}"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+```
+
+<Warning>
+  `compression: none`을 유지합니다. `otlphttp` 익스포터는 기본적으로 gzip으로 압축하며, HTTP를 통한 OTLP 수집은 압축된 요청 본문을 `400`으로 거부합니다. 2 MiB를 초과하는 요청 본문은 `413`으로 거부되므로 레코드 크기에 맞춰 `send_batch_max_size`를 충분히 작게 설정합니다. 익스포터 로그에 `413`이 표시되면 이 값을 낮춥니다.
+</Warning>
+
+gRPC로 전송하려면 `otlp` 익스포터를 사용합니다. 포트 `4317`은 TLS 없이 gRPC를 제공하므로, 프록시에서 TLS를 종료하지 않는다면 `tls.insecure: true`를 설정합니다:
+
+```yaml
+exporters:
+  otlp/molesignal:
+    endpoint: molesignal.example.com:4317
+    tls:
+      insecure: true
+    headers:
+      authorization: "Bearer ${env:MS_TOKEN}"
+```
+
+`default`가 아닌 스트림에 쓰려면 `headers`에 `stream-name: <stream>`을 추가합니다. 이 헤더는 해당 익스포터를 사용하는 모든 신호에 적용됩니다. 신호를 서로 다른 스트림으로 보내야 한다면 스트림마다 익스포터를 하나씩 정의합니다.
+
+## OpenTelemetry SDK
+
+모든 OpenTelemetry SDK는 표준 환경 변수를 읽습니다. `OTEL_EXPORTER_OTLP_ENDPOINT`가 `/api` 경로를 가리키도록 설정하고 HTTP를 통해 OTLP 데이터를 전송합니다:
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://molesignal.example.com/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer ${MS_TOKEN}"
+export OTEL_SERVICE_NAME=checkout
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment=production
+```
+
+SDK 익스포터는 기본적으로 압축하지 않습니다. `OTEL_EXPORTER_OTLP_COMPRESSION`을 설정하지 않거나 `none`으로 설정합니다.
+
+<Tabs>
+  <Tab title="Python">
+    ```bash
+    pip install opentelemetry-distro opentelemetry-exporter-otlp
+    opentelemetry-bootstrap -a install
+
+    opentelemetry-instrument python app.py
+    ```
+  </Tab>
+  <Tab title="Node.js">
+    ```bash
+    npm i @opentelemetry/api @opentelemetry/auto-instrumentations-node
+
+    NODE_OPTIONS="--require @opentelemetry/auto-instrumentations-node/register" node server.js
+    ```
+  </Tab>
+  <Tab title="Java">
+    ```bash
+    java -javaagent:opentelemetry-javaagent.jar \
+      -Dotel.service.name=checkout \
+      -Dotel.exporter.otlp.protocol=http/protobuf \
+      -Dotel.exporter.otlp.endpoint=https://molesignal.example.com/api \
+      -Dotel.exporter.otlp.headers="authorization=Bearer ${MS_TOKEN}" \
+      -jar app.jar
+    ```
+  </Tab>
+  <Tab title="Go">
+    Go 트레이스 익스포터에는 신호의 전체 URL을 지정합니다:
+
+    ```go
+    exp, _ := otlptracehttp.New(ctx,
+      otlptracehttp.WithEndpointURL("https://molesignal.example.com/api/v1/traces"),
+      otlptracehttp.WithHeaders(map[string]string{"authorization": "Bearer " + token}),
+    )
+    tp := trace.NewTracerProvider(trace.WithBatcher(exp))
+    otel.SetTracerProvider(tp)
+    ```
+  </Tab>
+</Tabs>
+
+## Vector
+
+`http` 싱크를 사용해 로그를 기본 HTTP JSON 수집 엔드포인트로 전송합니다. `_timestamp` 필드가 없는 이벤트에는 서버가 수신한 시각을 지정합니다.
+
+```yaml
+sources:
+  host_journald:
+    type: journald
+    current_boot_only: true
+
+sinks:
+  molesignal_logs:
+    type: http
+    inputs: [host_journald]
+    uri: https://molesignal.example.com/api/v1/intake/logs/default
+    encoding: { codec: json }
+    auth: { strategy: bearer, token: "${MS_TOKEN}" }
+```
+
+## Fluent Bit
+
+`http` 출력을 JSON 형식으로 사용합니다:
+
+```ini
+[INPUT]
+    Name        tail
+    Path        /var/log/nginx/access.log
+    Parser      nginx
+    Tag         nginx.access
+
+[OUTPUT]
+    Name        http
+    Match       nginx.*
+    Host        molesignal.example.com
+    Port        443
+    URI         /api/v1/intake/logs/default
+    Format      json
+    Header      Authorization Bearer ${MS_TOKEN}
+    tls         On
+```
+
+Docker Compose 샌드박스에서는 `Port`를 `5080`으로, `tls`를 `Off`로 설정합니다.
+
+### Kubernetes
+
+Fluent Bit를 DaemonSet으로 실행해 `/var/log/containers`에서 새 로그를 읽습니다. 엔드포인트와 토큰이 채워진 전체 매니페스트를 보려면 **데이터 소스 → Kubernetes**를 엽니다. Fluent Bit 구성의 출력 섹션에서는 위와 동일한 `http` 출력에 `Match kube.*`를 지정합니다.
+
+## Prometheus
+
+MoleSignal을 원격 쓰기 대상으로 추가합니다. 대상을 검증하는 동안에도 Prometheus에서 메트릭을 계속 스크레이핑하고 로컬에 저장합니다:
+
+```yaml
+remote_write:
+  - url: https://molesignal.example.com/api/v1/prometheus/api/v1/write
+    authorization:
+      credentials: "${MS_TOKEN}"
+```
+
+샘플은 `stream-name` 헤더가 지정한 메트릭 스트림으로 전송되며, 헤더가 없으면 `default`로 전송됩니다. Prometheus 서버마다 별도의 스트림을 사용하려면 `remote_write` 항목에 `headers: { stream-name: <source> }`를 추가합니다. PromQL에서 메트릭 이름으로 데이터를 쿼리합니다. 지원하는 함수는 [PromQL 지원 목록](/ko/query/promql-subset)을 참조합니다.
+
+## 스크립트 및 사용자 지정 전송 도구
+
+`curl` 또는 다른 HTTP 클라이언트로 JSON 레코드 배열을 전송합니다:
+
+```bash
+curl -X POST https://molesignal.example.com/api/v1/intake/logs/app \
+  -H "authorization: Bearer ${MS_TOKEN}" \
+  -H 'content-type: application/json' \
+  -d '[{"level":"info","service":"billing","msg":"invoice created"}]'
+```
+
+요청 크기가 16 MiB 미만이 되도록 레코드를 배치로 나눕니다. `Content-Encoding: gzip`으로 전송한 본문은 압축을 푼 크기를 기준으로 계산합니다. 원래 이벤트 시각이 중요하면 `_timestamp`를 마이크로초 단위로 전송합니다.
+
+## 데이터 확인
+
+1. **스트림**을 열고 스트림 이름, 유형, 마지막 수신 시각을 확인합니다.
+2. **로그**, **메트릭** 또는 **트레이스**를 열고 스트림을 선택합니다.
+
+데이터가 수신되지 않으면 전송 도구의 로그에 `401`(토큰 누락 또는 만료), `403`(`logs.write` 권한이 없는 토큰), `400`(압축된 OTLP 요청 본문), `413`(엔드포인트의 크기 제한을 초과한 요청 본문)이 있는지 확인합니다. [문제 해결](/ko/troubleshooting)을 참조합니다.
+
+## 다른 스택에서 마이그레이션
+
+| 기존 도구 | 마이그레이션 방법 |
+|---|---|
+| Prometheus | Prometheus를 유지하고 `remote_write` 대상을 추가합니다. PromQL 기능은 일부만 지원하므로 알림 규칙을 옮기기 전에 [지원 목록](/ko/query/promql-subset)을 확인합니다. |
+| Grafana | Grafana를 유지하고 [MoleSignal 데이터 소스](/ko/query/grafana)를 통해 MoleSignal 데이터를 읽거나, [대시보드 편집기](/ko/dashboards/edit)에서 대시보드를 다시 만듭니다. PromQL 표현식은 메트릭 패널에 그대로 붙여넣을 수 있습니다. Grafana 대시보드 JSON은 가져올 수 없습니다. |
+| Loki | Vector 또는 Fluent Bit가 기본 HTTP JSON 수집 엔드포인트를 가리키도록 설정합니다. Promtail과 Grafana Alloy는 Loki 엔드포인트로 데이터를 전송할 수 없습니다. |
+| Elasticsearch | `_bulk` 프로토콜을 지원하는 전송 도구는 대상을 `/api/v1/_bulk`로 변경할 수 있습니다. 쿼리에는 Elasticsearch query DSL 대신 SQL을 사용합니다. |

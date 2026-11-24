@@ -1,0 +1,328 @@
+---
+title: "Flutter アプリ向け RUM SDK"
+sidebarTitle: "Flutter アプリ向け SDK"
+description: "MoleSignal の Flutter アプリ向け RUM SDK をインストールして設定し、ビュー、タップ、エラー、リソース、レンダリングパフォーマンスを計測し、画面をリプレイできるようにします。"
+"en_link": "/en-US/rum/flutter-sdk"
+"zh-Hans_link": "/zh-Hans/rum/flutter-sdk"
+"zh-Hant_link": "/zh-Hant/rum/flutter-sdk"
+"ko_link": "/ko/rum/flutter-sdk"
+"de_link": "/de/rum/flutter-sdk"
+"es_link": "/es/rum/flutter-sdk"
+"fr_link": "/fr/rum/flutter-sdk"
+"pt-BR_link": "/pt-BR/rum/flutter-sdk"
+---
+
+MoleSignal Flutter App RUM SDK は、Browser RUM SDK と同じ[イベント形式](/ja/rum/events)でモバイルテレメトリを送信します。 Flutter ネイティブの計装により、ブラウザー専用のメトリクスを生成せずに同じ調査ワークフローを維持できます。
+
+## 機能の対応関係
+
+| ブラウザーの機能 | Flutter App SDK の対応機能 |
+|---|---|
+| 履歴に基づくビュー | `RumNavigationObserver` または `startView`。各ビューに変更があるたびに再送信します |
+| クリック | `RumApp` によるタップの自動収集、または名前付きの `RumUserAction` ウィジェット |
+| レイジクリックとエラークリック | タップ操作に付与するフラストレーションシグナル `rage_tap` と `error_tap` |
+| ランタイムエラーと Promise エラー | `FlutterError`、`PlatformDispatcher.onError`（クラッシュ）、`addError`、失敗したリクエスト |
+| Fetch リソースと XHR リソース | `MoleSignalHttpClient`、`startResource` と `stopResource`、または `addResource` |
+| ロングタスク | 低速フレームと、`is_frozen_frame` フラグ付きのフリーズフレーム |
+| Web Vitals | コールドスタートのバイタル `app_launch`、初回ビルド完了、ビューのフレームメトリクスとメモリメトリクス、カスタム所要時間バイタル |
+| rrweb DOM リプレイ | プライバシー保護処理を施し、rrweb のスナップショットと差分にエンコードしたスクリーンショット |
+| W3C トレースの相関付け | リクエスト、レスポンス、または `Server-Timing` の `traceparent` を `resource.trace_id` と `resource.span_id` に記録 |
+
+Flutter アプリケーションでは、LCP や CLS などのブラウザー専用メトリクスを生成しません。Flutter は、ビルド、ラスタライズ、リフレッシュレート、低速フレーム、フリーズフレーム、メモリのデータを報告します。
+
+## 要件
+
+- Flutter 3.35 以降
+- Dart 3.9 以降
+- デフォルトの永続 ID ストアを使用する場合は、Android 24 以降または iOS 13 以降
+
+デバイスのブランド、モデル、OS バージョン、バッテリー残量、接続状況は、パッケージの依存関係である `device_info_plus`、 `battery_plus`、`connectivity_plus` から取得します。`trackDeviceInfo: false` を設定すると、Flutter 自体が公開する情報だけを送信します。
+
+## インストールと初期化
+
+<Warning>
+  `clientToken` はアプリケーションに含まれるため、公開情報として扱ってください。 [RUM アプリケーション](/ja/rum/applications#クライアントトークン)に紐付けられたクライアントトークンを使用してください。
+</Warning>
+
+<Steps>
+  <Step title="アプリケーションを作成">
+    **RUM → アプリケーション**を開き、**アプリケーションを作成**をクリックして、プラットフォームに **Flutter** を選択します。**セットアップガイドを開く**をクリックすると、エンドポイント、トークン、識別子が入力済みの設定が表示されます。
+  </Step>
+  <Step title="パッケージを追加">
+    ```yaml
+    dependencies:
+      molesignal_flutter: ^0.3.0
+    ```
+
+    `pubspec.yaml` を更新したら、`flutter pub get` を実行します。
+  </Step>
+  <Step title="runApp の前に初期化">
+    ```dart
+    import 'package:flutter/material.dart';
+    import 'package:molesignal_flutter/molesignal_flutter.dart';
+
+    Future<void> main() async {
+      WidgetsFlutterBinding.ensureInitialized();
+
+      final rum = await initRum(
+        const RumConfiguration(
+          applicationId: 'checkout-mobile',
+          clientToken: 'mspat-your-client-token',
+          site: 'https://molesignal.example.com',
+          service: 'checkout-app',
+          env: 'production',
+          version: String.fromEnvironment('MOLESIGNAL_VERSION'),
+          architecture: String.fromEnvironment('MOLESIGNAL_ARCHITECTURE'),
+          debugId: String.fromEnvironment('MOLESIGNAL_DEBUG_ID'),
+          sessionSampleRate: 100,
+          sessionReplaySampleRate: 20,
+          trackUserInteractions: true,
+        ),
+      );
+
+      runApp(
+        RumApp(
+          client: rum,
+          child: MaterialApp(
+            navigatorObservers: <NavigatorObserver>[
+              RumNavigationObserver(rum),
+            ],
+            routes: <String, WidgetBuilder>{
+              '/': (_) => const HomePage(),
+              '/checkout': (_) => const CheckoutPage(),
+            },
+          ),
+        ),
+      );
+    }
+    ```
+
+    `initRum` はできるだけ早く呼び出します。コールドスタート時間は、この呼び出しから最初のフレームまでを計測します。`RumApp` は、リプレイの記録範囲を設定し、タップの自動収集とフラストレーションの検出を有効にします。 `sessionReplaySampleRate` によるサンプリングで現在のセッションが選ばれるか、手動で記録を開始するまで、リプレイは無効のままです。
+  </Step>
+  <Step title="最初のセッションを確認">
+    **RUM → エクスプローラー**を開き、現在時刻を含む時間範囲を選択して、 `checkout-mobile` のセッションが表示されることを確認します。セッションを開いて、ビューとデバイスのコンテキストを確認します。
+  </Step>
+</Steps>
+
+`site` には、MoleSignal のオリジン、または `/api`、`/api/v1`、`/api/v1/rum` で終わるベース URL を指定できます。SDK はパスを補完し、 `POST /api/v1/rum/events` にイベントを送信します。`applicationId` には、トークンが紐付けられたアプリケーションの ID を指定します。この値は `application.id` として送信され、 MoleSignal は別のアプリケーションを指定したイベントを拒否します。
+
+## セッションとビュー
+
+共有プリファレンスに保存した UUID でセッションを識別します。セッションは、操作がない状態が 15 分続くか、開始から 4 時間が経過すると終了します。サンプリングは開始時に一度だけ行います。SDK はセッションイベントを送信せず、MoleSignal がビューからセッションを特定します。すべてのイベントには `session.id`、`session.type`、`session.start` が含まれます。ビューには `session.has_replay` も含まれ、セッションの一部を記録すると true になります。ビューが 2 つのセッションにまたがることはありません。ビューの表示中にセッションが更新されると、そのビューは終了し、同じ画面の表示が `loading_type: session_renewal` を持つ新しいビューで続きます。
+
+`RumNavigationObserver` は、表示中の名前付きルートを記録します。`Router` または `go_router` を使うアプリケーションでは、ルーター連携を通じてオブザーバーを渡します。ルートに固定の名前がない場合や、`Navigator` の外部で画面遷移を管理する場合は、`startView` を呼び出します。
+
+```dart
+rum.startView('/checkout', name: 'Checkout');
+rum.addTiming('cart_ready');          // view.custom_timings
+rum.stopView('/checkout');
+```
+
+`view.url` はルートのパス、`view.name` はルートの名前です。`trackUrlQueryString` を設定しない限り、パスにはクエリとフラグメントを含めません。新しいビューを開始すると、前のビューは終了します。ビューに変更があると、`view.revision` を増やし、その時点までの件数を含めてビューを再送信します。再送信は `flushInterval` ごとに最大 1 回です。ただし、ビューの開始時と終了時、およびアプリのフラッシュ時にはすぐに送信します。アプリがバックグラウンドに移行するとビューは終了し、フォアグラウンドに戻ると `view_controller_redisplay` として再表示されます。最初の `startView` より前に発生したイベントは、`ApplicationLaunch` ビューに属します。
+
+## ユーザーの識別とアプリケーション操作の記録
+
+```dart
+rum.setUser(const RumUser(id: 'user-42', attributes: {'plan': 'enterprise'}));
+rum.setAccount(const RumAccount(id: 'acme', name: 'Acme'));
+rum.setGlobalContextProperty('region', 'ap-southeast-1');
+rum.addFeatureFlagEvaluation('new_checkout', true);
+
+rum.addAction('Checkout submitted', context: {'cart_size': 3});
+
+try {
+  await submitOrder();
+} catch (error, stackTrace) {
+  rum.addError(error, stackTrace: stackTrace, context: {'step': 'payment'});
+}
+
+rum.startDurationVital('checkout_form_ready');
+// ...
+rum.stopDurationVital('checkout_form_ready');
+rum.addDurationVital('cart_sync', const Duration(milliseconds: 640));
+```
+
+SDK は、既存の `FlutterError.onError` と `PlatformDispatcher.onError` のハンドラーをチェーンします。追加のアイソレートで発生したエラーはメインアイソレートに転送し、`addError` を呼び出します。サインアウト後の操作を識別済みのユーザーに紐付けない場合は、`clearUser()` を呼び出します。
+
+**操作**には、`tap`、`custom`、`back`、および自動記録される `application_start` があります。自動収集するタップには汎用名の `Tap` を使い、画面の内容は読み取りません。重要なコントロールを `RumUserAction` でラップすると、Flutter のジェスチャーアリーナの制御を引き継がずに、業務上の意味が分かる固定名を付けられます。
+
+```dart
+RumUserAction(
+  client: rum,
+  name: 'Pay now',
+  child: ElevatedButton(
+    onPressed: pay,
+    child: const Text('Pay now'),
+  ),
+)
+```
+
+タップを起点とするリクエストの処理中は、最大 5 秒間、タップ操作を終了しません。その間のエラー、クラッシュ、リソースにはタップ操作の `action.id` が付き、操作イベントにはそれぞれの件数が含まれます。1 秒以内に 50 論理ピクセルの範囲で 3 回タップすると、最後のタップが `rage_tap` になり、エラーを引き起こしたタップは `error_tap` になります。タップを収集するには、`trackUserInteractions: true` を設定します。デフォルトでは、`trackFrustrations` はこの設定に従います。
+
+**エラー**には、`source`、`type`、`message`、`stack`、構造化された `frames`、`handling` が含まれます。フレームワークのエラーは `unhandled` となり、 `PlatformDispatcher.onError` のエラーはクラッシュとしても記録します。`addError` は、指定した `source`（デフォルトは `custom`）で `handled` エラーを報告します。リクエストがレスポンスを受け取る前に失敗すると `network` エラーになります。HTTP エラーステータスは、リソースとしてのみ記録します。SDK は `error.fingerprint` を設定しません。グループ化を指定するには、`fingerprint:` を渡します。
+
+## HTTP リソースとバックエンドトレースの監視
+
+`package:http` を `MoleSignalHttpClient` でラップします。
+
+```dart
+import 'package:http/http.dart' as http;
+
+final http.Client httpClient = MoleSignalHttpClient(
+  rum,
+  inner: http.Client(),
+);
+
+await httpClient.get(Uri.parse('https://api.example.com/orders'));
+```
+
+アプリケーションで `package:http` をまだ使用していない場合は、`http: ^1.6.0` を直接依存関係として宣言します。ラッパーは、サニタイズ済みの URL、メソッド、所要時間、ステータスコード、レスポンスサイズ、取得可能な W3C トレース識別子を記録します。所要時間の計測は、レスポンスボディの読み取りが完了、失敗、またはキャンセルされた時点で終了します。トレースコンテキストは、レスポンスの `traceparent`、`Server-Timing` 内の `traceparent` エントリ、リクエストの `traceparent` の順に読み取ります。特定のサービスだけを信頼する場合は、トレースヘッダーの読み取りを制限してください。
+
+```dart
+RumConfiguration(
+  // ...
+  allowedTracingUrls: <Pattern>[
+    'https://api.example.com',
+    RegExp(r'^https://edge-\w+\.example\.com/'),
+  ],
+)
+```
+
+SDK はネットワーク通信をグローバルにはインターセプトしません。Dio などのクライアントでは、インターセプターから `startResource` と `stopResource` を呼び出すか、完了したリクエストに対して `addResource` を呼び出します。
+
+## レンダリングパフォーマンスのフィールド
+
+| フィールド | 意味 |
+|---|---|
+| `view.performance.fbc.timestamp` | 初回ビルド完了までの時間。ビューの開始から、そのビューの最初のフレームのビルドが完了するまでの時間（ナノ秒）です。 |
+| `view.flutter_build_time`, `view.flutter_raster_time` | フレームごとの UI スレッドのビルド時間とラスタースレッドの処理時間について、それぞれの最小値、最大値、平均値（ナノ秒）です。 |
+| `view.refresh_rate_average`, `view.refresh_rate_min` | 維持可能なフレームレート（フレーム/秒）です。ディスプレイのリフレッシュレートを上限とします。 |
+| `view.slow_frames_rate` | ビューの 1 秒あたりに、フレームの時間予算を超え、フリーズのしきい値には達しなかったフレームの処理に費やした時間（ミリ秒）です。 |
+| `view.freeze_rate` | ビューの 1 時間あたりに、フリーズしたフレームの処理に費やした時間（秒）です。 |
+| `view.memory_average`, `view.memory_max` | 常駐セットサイズ（バイト）です。Flutter Web では使用できません。 |
+| `long_task.duration`, `long_task.is_frozen_frame` | `longFrameThreshold`（100 ms）以上かかったフレームです。`frozenFrameThreshold`（700 ms）以上の場合はフリーズとみなします。 |
+| `app_launch` タイプの `vital` | コールドスタート時間です。`initRum` からアプリケーション UI の最初のフレームのビルドが完了するまでの時間（ナノ秒）です。 |
+
+## リリースシンボルをアップロードする
+
+リリースパイプラインの不変の値を使って、`version`、`architecture`、`debugId` を設定します。同じビルドで生成するすべてのデバッグアーティファクトに、同じ値を使用します。実行時に検出または算出するフォールバック値は開発時には便利ですが、本番環境でシンボル化に使う安定した識別情報にはなりません。
+
+`--obfuscate` と `--split-debug-info` を指定して Android と iOS のリリースをビルドし、`--dart-define` で識別情報を渡します。
+
+```bash
+flutter build apk \
+  --release \
+  --obfuscate \
+  --split-debug-info=build/molesignal-symbols/android-arm64 \
+  --target-platform=android-arm64 \
+  --dart-define=MOLESIGNAL_VERSION=1.4.0+42 \
+  --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+  --dart-define=MOLESIGNAL_DEBUG_ID="$BUILD_ID"
+```
+
+`--split-debug-info` を指定すると、各エラーフレームには `artifact_kind: flutter_symbols` と、シンボルファイルで解決する絶対アドレスおよび相対アドレスが含まれます。ビルド時に設定した `debug_id` も含まれます。生成したすべての `.symbols` ファイルについて、`kind=flutter_symbols` を指定し、対応する `android` または `ios` のプラットフォーム、正規のアーキテクチャ名、デバッグ ID を指定してアップロードします。ネイティブクラッシュのフレームを `RumStackFrame` で転送する場合は、Android のネイティブ ELF シンボルと Apple の dSYM DWARF ファイルを別途アップロードします。
+
+アーティファクトのアップロードには、`debug_artifacts.manage` 権限を持つ管理トークンが必要です。アーティファクトの管理には、アプリケーションに紐付けられたクライアントトークンを使用しないでください。
+
+<Card title="ソースマップとシンボル" icon="file-code" href="/ja/rum/source-maps">
+  Flutter、Android、iOS、Web のデバッグアーティファクトを生成、アップロード、照合、検証します。
+</Card>
+
+## セッションリプレイを有効にする
+
+Flutter には DOM がありません。最初にキャプチャしたフレームを rrweb の `Meta` イベントと `FullSnapshot` イベントに変換します。変更があったフレームは画像の差分として記録し、変更がなかったフレームはスキップします。これにより、既存の MoleSignal リプレイプレーヤーでブラウザーと Flutter のセッションを同じ手順で再生できます。
+
+```dart
+const RumConfiguration(
+  // ...
+  sessionReplaySampleRate: 20,
+  sessionReplay: RumSessionReplayConfiguration(
+    captureInterval: Duration(seconds: 2),
+    captureOnAction: true,
+    pixelRatio: 0.75,
+    maximumImageDimension: 1200,
+  ),
+)
+
+rum.startSessionReplayRecording();
+rum.stopSessionReplayRecording();
+```
+
+`sessionReplaySampleRate` は、`sessionSampleRate` でサンプリングしたセッションに適用します。実際にリプレイを記録するセッションの割合は、両方のサンプリングレートを掛け合わせて求めます。手動録画もサンプリング対象のセッションにのみ適用します。リプレイでは専用のキューを使い、デフォルトのフラッシュ間隔を 10 秒とし、セッションごとにシーケンス番号を付与します。セグメントサイズの目安は約 1 MiB、リクエストサイズの上限は 8 MiB です。セグメントは `POST /api/v1/rum/replay` に送信します。
+
+## リプレイの内容を保護する
+
+デフォルトの `RumPrivacyLevel.mask` では、PNG エンコードの前に `Text`、`RichText`、編集可能な領域をマスクします。`allow` モードでも入力フィールドはマスクします。 SDK は URL のクエリとフラグメントも削除し、機密情報を含む一般的なコンテキストキーの値を再帰的に伏せます。未加工のスタックトレースを送信するのは `RumPrivacyLevel.allow` の場合のみです。それ以外の場合は、機密情報を除去したフレームから `error.stack` を再構築します。機密情報を含む画像、地図、カスタム描画コンテンツ、プラットフォームビュー、またはコンポーネント全体を明示的なプライバシー境界で囲んでください。
+
+```dart
+RumReplayBlock(
+  child: AccountBalanceCard(),
+)
+```
+
+`RumReplayMask` と `RumReplayBlock` はどちらも、キャプチャした領域を不透明なブロックで置き換えます。マスクしていない生のピクセルがイベントキューに入ることはありません。
+
+<Warning>
+  ウィジェットの型からは、`CustomPainter` で描画したテキストを検出できません。カスタム描画領域を明示的に囲んでください。プラットフォームビューのキャプチャはプラットフォームの合成方式に依存します。機密情報を含むプラットフォームビューは、Android と iOS の実機で確認してください。
+</Warning>
+
+## イベントの送信
+
+イベントを JSON 配列にまとめ、クライアントトークンを使って `POST {site}/api/v1/rum/events` に送信します。バッチが 1 KiB を超える場合は、 `dart:io` を利用できる環境で gzip 圧縮します。圧縮を無効にするには、`compressRequests: false` を設定します。1 リクエストあたりのイベントデータは最大 48 KiB で、受信側の上限である 5000 イベント、5 MiB を大幅に下回ります。
+
+- MoleSignal がイベントを**拒否**した場合は、`onError` と `RumFlushResult` で通知し、そのイベントは再送しません。
+- ネットワークエラー、タイムアウト、`408`、`429`、`5xx` の場合は、ジッターを加えた指数バックオフで再試行します。受信側が `Retry-After` を返した場合は、指定された時刻または待機時間を過ぎてから再試行します。イベントは永続化されたオフラインキューに保持します。
+- その他の `4xx` の場合は、バッチを破棄します。
+
+キューでは、項目数、バイト数、保持期間に上限を設けます（`maxQueueSize`、`maxQueueBytes`、`queueItemTtl`）。ビューの新しいリビジョンは送信待ちの古いリビジョンを置き換えます。そのため、MoleSignal が受信するリビジョン番号は連続しない場合があります。
+
+## 主な設定
+
+| オプション | デフォルト | 用途 |
+|---|---|---|
+| `applicationId`, `clientToken`, `site` | 必須 | アプリケーションの識別、認証、エンドポイントの指定 |
+| `service` | `applicationId` | イベントに記録するサービス |
+| `env`, `user`, `globalContext` | 未設定 | デプロイ環境、ユーザー識別情報、カスタムディメンション |
+| `version`, `buildVersion` | `unknown`、未設定 | デバッグアーティファクトの照合に使うリリース識別情報とビルド番号 |
+| `architecture`, `debugId` | 検出または算出したフォールバック値 | シンボルの照合に使うモバイルビルドの識別情報 |
+| `sessionSampleRate` | `100` | サンプリングするセッションの割合（%） |
+| `sessionReplaySampleRate` | `0` | サンプリングしたセッションのうちリプレイを記録する割合（%） |
+| `sessionReplay` | プライバシーを保護するデフォルト設定 | キャプチャ間隔、解像度、アクションのキャプチャ、マスクの色 |
+| `trackUserInteractions` | `false` | タップと `back` アクションの自動収集 |
+| `trackFrustrations` | インタラクションの設定に準拠 | `rage_tap` と `error_tap` の検出 |
+| `trackResources` | `true` | HTTP リソースの収集 |
+| `trackLongTasks` | `true` | 低速フレームとフリーズしたフレームをロングタスクとして収集 |
+| `trackViewPerformance` | `true` | 起動、初回ビルド、フレーム、メモリのメトリクス |
+| `trackDeviceInfo` | `true` | プラグイン経由でブランド、モデル、バッテリー、接続状況を収集 |
+| `trackFlutterErrors`, `trackPlatformErrors` | `true` | フレームワークとルートアイソレートのエラー |
+| `trackAppLifecycle` | `true` | バックグラウンドへの移行時にビューを終了し、フラッシュを実行 |
+| `trackAnonymousUser` | `true` | 匿名ユーザー識別情報の永続化 |
+| `trackUrlQueryString` | `false` | 有効にすると URL のクエリ文字列を保持 |
+| `defaultPrivacyLevel` | `mask` | リプレイ内のテキストと未加工のスタックトレースの取り扱い |
+| `sessionInactivityTimeout`, `maxSessionDuration` | `15 min`, `4 h` | セッションの時間制限 |
+| `flushInterval`, `batchSize` | `5 s`, `50` | 標準イベントの送信設定 |
+| `replayFlushInterval`, `replayBatchSize` | `10 s`, `100` | リプレイの送信設定 |
+| `beforeSend` | 未設定 | リプレイを含むすべての種類のイベントを変更または破棄 |
+
+`RumSessionReplayConfiguration` のデフォルトでは、5 秒間隔とアクション実行後にキャプチャし、論理ピクセルあたり `0.5` ピクセルで出力します。画像の一辺は最大 900 ピクセルで、マスクの色は `#6B7280` です。`excludedUrls`、`allowedTracingUrls`、キューの上限、再試行の待機時間、タイムアウト、診断、カスタムトランスポート、永続化も設定できます。
+
+## フラッシュと停止
+
+キュー内のイベントの処理を待ってから状態を切り替える必要がある場合は、切り替え前に `flush()` を呼び出します。最終クリーンアップ時には `stop()` を呼び出して、アクティブなビューを最後のレポートを送信して終了し、インストルメンテーションを解除して、両方のイベントキューをフラッシュします。どちらも、受理されたイベント、再試行されたイベント、破棄されたイベント、キューに残っているイベント、タイムアウトしたイベントを区別する `RumFlushResult` を返します。
+
+```dart
+await rum.flush();
+await rum.stop();
+```
+
+<CardGroup cols={2}>
+  <Card title="ブラウザー RUM SDK" icon="code" href="/ja/rum/browser-sdk">
+    ブラウザー SDK のセットアップと、ブラウザー固有のインストルメンテーションを比較します。
+  </Card>
+  <Card title="RUM イベント形式" icon="braces" href="/ja/rum/events">
+    SDK が送信するイベントと、各イベントのフィールドを確認します。
+  </Card>
+  <Card title="ソースマップとシンボル" icon="file-code" href="/ja/rum/source-maps">
+    Flutter、Android、iOS、Web のリリースビルドのスタックトレースを復元します。
+  </Card>
+</CardGroup>

@@ -1,0 +1,105 @@
+---
+title: "アップグレード"
+description: "MoleSignal のデプロイ環境を新しいバージョンにアップグレードする方法を説明します。バックアップ、スキーマの移行、デプロイ方式ごとの手順、ロールバックを取り上げます。"
+"en_link": "/en-US/upgrade"
+"zh-Hans_link": "/zh-Hans/upgrade"
+"zh-Hant_link": "/zh-Hant/upgrade"
+"ko_link": "/ko/upgrade"
+"de_link": "/de/upgrade"
+"es_link": "/es/upgrade"
+"fr_link": "/fr/upgrade"
+"pt-BR_link": "/pt-BR/upgrade"
+---
+
+MoleSignal はまだバージョン 1.0 に達していません。[変更履歴](/ja/changelog)ページのリリースノートに、各バージョンの変更点を記載しています。アップグレードの前にリリースノートを確認し、アップグレードのたびにバックアップを取ってください。
+
+## アップグレード前の準備
+
+1. 現在のバージョンの次からアップグレード先まで、すべてのバージョンのリリースノートを確認します。
+2. PostgreSQL とオブジェクトストアをバックアップします。[バックアップと復元](/ja/backup-restore)を参照してください。
+3. 稼働中のバージョンを控えます。`molesignal --version` はバージョンを表示し、`GET /api/v1/version` はバージョン、コミット、ビルド ID、リリースチャネル、エディションを返します。このリクエストには Bearer トークンが必要です。
+4. 重要なデプロイ環境では、バックアップから復元したデータベースを使ってアップグレードを事前にリハーサルします。
+
+## スキーマ変更の適用方法
+
+バイナリにはデータベースのマイグレーションが組み込まれています。起動するたびに、トラフィックの処理を始める前に PostgreSQL にマイグレーションを適用します。マイグレーションに失敗すると、プロセスは停止します。PostgreSQL のロックによりマイグレーションが順番に実行されるため、複数のノードを同時に起動しても問題ありません。適用済みのバージョンは `_molesignal_schema_meta` テーブルに記録されます。
+
+マイグレーションは新しいバージョンへの移行にのみ対応します。
+
+- データベースより古いバイナリは、`migration <version> was previously applied but is missing in the resolved migrations` というエラーを出して起動しません。
+- 適用済みのマイグレーションに変更を加えたバイナリは、`migration <version> was previously applied but has been modified` というエラーを出して起動しません。プレリリースビルドではベースラインスキーマが変わることがあるため、あるビルドで作成したデータベースを別のビルドで開けるとは限りません。
+
+以前のバージョンに戻すには、アップグレード前に取得したバックアップからデータベースとオブジェクトを復元します。
+
+## 手順
+
+<Tabs>
+  <Tab title="Docker Compose">
+    Compose ファイルの `image` タグを編集し、イメージをプルしてコンテナを再作成します。
+
+    ```bash
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone pull
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up -d
+    ```
+
+    名前付きボリュームは削除しないでください。PostgreSQL のデータと、WAL を含む RustFS のデータが保存されています。
+  </Tab>
+  <Tab title="バイナリと systemd">
+    サービスを停止し、バイナリと GeoIP データベースを置き換えてから、サービスを起動します。
+
+    ```bash
+    sudo systemctl stop molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo install -Dm644 mmdb/dbip-city-lite.mmdb \
+      /usr/share/molesignal/mmdb/dbip-city-lite.mmdb
+    sudo systemctl start molesignal
+    sudo journalctl -u molesignal -n 50
+    ```
+
+    以前のリリースでは `/usr/share/molesignal/mmdb/GeoLite2-City.mmdb` をインストールしていました。このファイルを削除します。`/etc/molesignal/config.toml` の `[mmdb].db_path` がまだこのファイルを参照している場合は、`dbip-city-lite.mmdb` を参照するように変更します。
+
+    新しいリリースの `conf/config.toml` を、インストール済みの設定ファイルと比較します。新しい設定項目を指定しない場合は組み込みのデフォルト値が使われますが、デフォルト値の変更が動作に影響する場合があります。
+  </Tab>
+  <Tab title="Helm">
+    [チャートの変更履歴](https://github.com/molesignal/molesignal-helm/blob/main/CHANGELOG.md)を確認し、同じ values ファイルを使ってアップグレードします。
+
+    ```bash
+    helm repo update
+    helm upgrade molesignal molesignal/molesignal --namespace molesignal --values values.yaml
+    ```
+
+    `image.tag` を指定しない場合、チャートはイメージタグ `latest` を使います。特定のバージョンの MoleSignal に切り替えるには、values ファイルで `image.tag` を設定します。
+
+    生成済みのシークレットは、アップグレードしても変わりません。`standalone` と `intake` の Pod には、デフォルトで停止まで 60 秒の猶予があります。`terminationGracePeriodSeconds` は `[node].drain_timeout_secs` より大きい値に設定してください。
+
+    `distributed` モードでは、`helm upgrade` がすべてのワークロードの Pod を同時に置き換えるため、[ロール分割クラスター](#ロール分割クラスター)の手順どおりの順序にはなりません。
+  </Tab>
+  <Tab title="Kubernetes マニフェスト">
+    マニフェストのイメージタグを変更し、マニフェストを適用します。
+
+    ```bash
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    kubectl -n molesignal rollout status deployment/intake
+    ```
+
+    Pod が停止前にデータをフラッシュできるように、`terminationGracePeriodSeconds` を `[node].drain_timeout_secs` より大きい値に設定します。
+  </Tab>
+</Tabs>
+
+プロセスは `SIGTERM` または `SIGINT` を受け取ると、保留中のデータがフラッシュされるまで最大 `[node].drain_timeout_secs` 待ってから終了します。フラッシュできなかったレコードはオブジェクトストア内の WAL に残り、別の取り込みノードがパブリッシュするか、同じノードが再起動後にパブリッシュします。
+
+## ロール分割クラスター
+
+ロール分割クラスターでは、すべてのノードが 1 つのスキーマを共有します。稼働中の旧バージョンのノードは再起動するまで新しいスキーマを使い続けますが、バージョン間の互換性は保証されません。すべてのノードを 1 回のメンテナンス時間内にアップグレードします。
+
+1. `router` ノードを停止し、次に `intake` と `querier` ノード、最後に `compactor` と `alert` ノードを停止します。
+2. 新しいバージョンのノードを 1 台起動し、`GET /api/v1/healthz` が `200` を返すまで待ちます。このノードがマイグレーションを適用します。
+3. 残りのノードを起動します。
+
+## アップグレード後の確認
+
+- ログにマイグレーションエラーがなく、`GET /api/v1/healthz` が `200` を返します。
+- `GET /api/v1/version` が新しいバージョンを返します。
+- 直近のデータを対象としたクエリが行を返し、新しいレコードが取り込まれます。
+- `/metrics` で `storage_reconciler_issues_total` が増加していません。

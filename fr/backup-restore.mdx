@@ -1,0 +1,94 @@
+---
+title: "Sauvegarde et restauration"
+description: "Découvrez quoi sauvegarder, comment assurer la cohérence entre PostgreSQL et le stockage objet et comment restaurer un déploiement MoleSignal."
+"en_link": "/en-US/backup-restore"
+"zh-Hans_link": "/zh-Hans/backup-restore"
+"zh-Hant_link": "/zh-Hant/backup-restore"
+"ja_link": "/ja/backup-restore"
+"ko_link": "/ko/backup-restore"
+"de_link": "/de/backup-restore"
+"es_link": "/es/backup-restore"
+"pt-BR_link": "/pt-BR/backup-restore"
+---
+
+MoleSignal conserve son état dans PostgreSQL, dans le stockage d’objets ainsi que dans la configuration et les secrets. Les nœuds ne conservent que des caches sur leurs disques. Sauvegardez chaque élément qui stocke l’état et testez une restauration avant de compter sur les sauvegardes.
+
+## Éléments à sauvegarder
+
+| Élément | Contenu | Sauvegarde |
+|---|---|---|
+| PostgreSQL | Comptes utilisateur, organisations, jetons, flux, tableaux de bord, règles d’alerte et catalogue de fichiers qui associe les flux aux objets | Obligatoire |
+| Stockage d’objets | Fichiers de données Parquet, index de recherche, objets binaires de profils et objets du journal d’écriture anticipée (WAL) pour les enregistrements dont le transfert vers le stockage d’objets reste à faire (`wal/v1/`) | Obligatoire |
+| `MS_CIPHER_KEY` | Clé racine des secrets stockés dans PostgreSQL | Obligatoire. Conservez cette clé séparément de la sauvegarde de la base de données. |
+| Configuration | `config.toml`, variables d’environnement et `MS_AUTH_JWT_SECRET_OVERRIDE` le cas échéant | Obligatoire |
+| Répertoire ACME (`[http.tls].key_storage_dir`) | Clé du compte ACME et clés des domaines | Facultative. Le service ACME peut émettre de nouveaux certificats. |
+| Répertoire du cache (`[cache.object].root`) | Copie locale de plages d’octets d’objets distants | Ne sauvegardez pas ce répertoire. |
+
+## Cohérence entre la base de données et les objets
+
+Le catalogue de fichiers dans PostgreSQL référence les objets du bucket. Lors du transfert des données vers le stockage d’objets, MoleSignal charge d’abord l’objet, puis l’inscrit dans le catalogue. Lors de la compaction ou de l’application des règles de rétention, MoleSignal supprime d’abord la référence du catalogue. Le ramasse-miettes supprime ensuite l’objet à l’issue du délai `[storage.gc].grace_period_secs` (3600 secondes par défaut).
+
+Respectez cet ordre pour obtenir une sauvegarde cohérente :
+
+1. Sauvegardez PostgreSQL.
+2. Copiez le bucket immédiatement après et terminez la copie avant la fin du délai de grâce.
+
+Une copie terminée avant la fin du délai de grâce contient tous les objets que référence la sauvegarde de la base de données. Si la copie prend plus de temps, augmentez la valeur de `grace_period_secs` avant la sauvegarde ou activez la gestion des versions du bucket et restaurez les objets dans l’état où ils se trouvaient au moment de la sauvegarde de la base de données.
+
+## Sauvegarde de PostgreSQL
+
+Utilisez les fonctions de sauvegarde du service PostgreSQL, comme les instantanés planifiés avec restauration à un instant donné. Pour une base de données autogérée, un export logique suffit pour les petits déploiements :
+
+```bash
+pg_dump --format=custom --file=molesignal.dump "postgres://molesignal@db.internal:5432/molesignal"
+```
+
+## Sauvegarde du stockage d’objets
+
+Utilisez la réplication du bucket ou la gestion des versions proposée par le fournisseur. Une copie planifiée vers un second bucket convient également :
+
+```bash
+aws s3 sync s3://molesignal s3://molesignal-backup
+```
+
+Pour un service compatible S3 comme RustFS, ajoutez `--endpoint-url`. Utilisez des identifiants sans autorisation de suppression dans le bucket de sauvegarde.
+
+## Restauration
+
+<Steps>
+  <Step title="Arrêtez tous les nœuds">
+    Arrêtez tous les processus MoleSignal pour empêcher toute écriture pendant le remplacement des données.
+  </Step>
+  <Step title="Restaurez PostgreSQL">
+    Restaurez la sauvegarde dans une base de données vide :
+
+    ```bash
+    pg_restore --no-owner --dbname "postgres://molesignal@db.internal:5432/molesignal" molesignal.dump
+    ```
+  </Step>
+  <Step title="Restaurez les objets">
+    Copiez la sauvegarde dans le bucket qu’utilisent les nœuds. Restaurez le bucket dans l’état où il se trouvait au moment de la sauvegarde de la base de données ou à un instant ultérieur.
+
+    Le processus de réconciliation place les objets que le catalogue restauré ne référence pas dans la file d’attente des objets orphelins. Le ramasse-miettes les supprime à l’issue du délai `[storage.reconciler].orphan_grace_secs` (24 heures par défaut). Copiez d’abord les objets plus récents vers un autre emplacement s’ils peuvent encore servir.
+  </Step>
+  <Step title="Restaurez les secrets et la configuration">
+    Fournissez la configuration et la même clé `MS_CIPHER_KEY` que celle du déploiement sauvegardé. Avec une autre clé, le nœud ne peut pas déchiffrer les secrets stockés et ne démarre pas. Il signale une erreur telle que `open Probe CA key`.
+  </Step>
+  <Step title="Laissez l’ingestion reprendre le WAL">
+    La restauration du bucket rétablit les objets du WAL. Une fois les nœuds démarrés, un nœud d’ingestion publie le WAL de chaque processus d’écriture répertorié dans la base de données restaurée, à l’expiration du bail de ce processus. Le nœud ne publie pas les objets du WAL des processus d’écriture inscrits après la sauvegarde de la base de données.
+  </Step>
+  <Step title="Démarrez et vérifiez">
+    Démarrez les nœuds et attendez que `GET /api/v1/healthz` renvoie `200`. Connectez-vous, ouvrez un flux et exécutez une requête sur la plage de données restaurée.
+
+    Dans `/metrics`, recherchez `storage_reconciler_issues_total` avec `reason="missing"`. Ces entrées indiquent que le catalogue référence des objets absents du bucket.
+  </Step>
+</Steps>
+
+## Scénarios de panne
+
+| Élément perdu | Effet | Récupération |
+|---|---|---|
+| Disque local d’un nœud | Aucune perte de données dont la réception a été confirmée. Les nœuds reconstruisent les caches. | Remplacez le nœud. Un autre nœud d’ingestion publie son WAL à l’issue du délai `[wal].lease_secs`. Consultez [Durabilité et reprise](/fr/architecture#durabilité-et-reprise). |
+| PostgreSQL | La perte de toutes les métadonnées rend les objets inaccessibles. | Restaurez la dernière sauvegarde. La récupération des données écrites après cette sauvegarde est impossible, car le catalogue ne référence pas leurs objets. |
+| Bucket | Les requêtes sur la plage de données perdue échouent. | Restaurez le bucket. Les entrées du catalogue sans objet correspondant apparaissent sous `missing` dans `/metrics`. |
+| `MS_CIPHER_KEY` | Les nœuds ne peuvent pas déchiffrer les secrets stockés et ne démarrent pas. | Restaurez la clé depuis le gestionnaire de secrets. Sans cette clé, la récupération des colonnes chiffrées est impossible. |

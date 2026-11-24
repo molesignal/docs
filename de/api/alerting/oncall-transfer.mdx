@@ -1,0 +1,119 @@
+---
+title: "Richtlinien, Pläne und Routing-Regeln importieren und exportieren"
+description: "Exportieren Sie Eskalationsrichtlinien, Bereitschaftspläne und Routing-Regeln als Pakete, die referenzierte Elemente namentlich angeben, und importieren Sie solche Pakete in eine Organisation."
+"en_link": "/en-US/api/alerting/oncall-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/oncall-transfer"
+"zh-Hant_link": "/zh-Hant/api/alerting/oncall-transfer"
+"ja_link": "/ja/api/alerting/oncall-transfer"
+"ko_link": "/ko/api/alerting/oncall-transfer"
+"es_link": "/es/api/alerting/oncall-transfer"
+"fr_link": "/fr/api/alerting/oncall-transfer"
+"pt-BR_link": "/pt-BR/api/alerting/oncall-transfer"
+---
+
+```http
+GET  /api/v1/alerts/escalations/export
+POST /api/v1/alerts/escalations/import
+GET  /api/v1/schedules/export
+POST /api/v1/schedules/import
+GET  /api/v1/alerts/routing/rules/export
+POST /api/v1/alerts/routing/rules/import
+```
+
+| Typ | Export | Import | Format | Listenschlüssel |
+|---|---|---|---|---|
+| Eskalationsrichtlinien | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.escalation-policies/v1` | `policies` |
+| Bereitschaftspläne | `schedules.read` | `schedules.create` | `molesignal.schedules/v1` | `schedules` |
+| Routingregeln | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.routing-rules/v1` | `rules` |
+
+## Export
+
+Geben Sie im Abfrageparameter `ids` eine kommagetrennte Liste von IDs an. Ein leerer Wert exportiert alle Einträge. Die Antwort enthält ein
+Paket:
+
+```json
+{
+  "format": "molesignal.escalation-policies/v1",
+  "policies": [
+    {
+      "name": "Payments on-call",
+      "steps": [
+        {"targets": [{"kind": "schedule", "schedule": "Payments primary"}], "ackTimeoutSecs": 300, "minSeverity": null},
+        {"targets": [{"kind": "user", "user": "lead@example.com"}], "ackTimeoutSecs": 600, "minSeverity": null}
+      ],
+      "repeat": false,
+      "maxLoops": 1,
+      "urgencyRule": {"mode": "by_severity"}
+    }
+  ]
+}
+```
+
+Das Paket enthält die Definition jedes Eintrags, aber weder seine ID noch seine Organisation. Referenzen verwenden Namen: `user` enthält die
+E-Mail-Adresse des Kontos. `team`, `schedule`, `policy` und `calendar` enthalten die Namen eines Teams, eines Bereitschaftsplans, einer
+Eskalationsrichtlinie beziehungsweise eines Feiertagskalenders. `members` enthält die E-Mail-Adressen der Mitglieder einer Rotation. Bei Bereitschaftsplänen fehlen
+die temporären Vertretungen und die Zeitangaben. Bei Routingregeln fehlen die Position und die Zeitangaben.
+
+## Import
+
+| Feld | Typ | Erforderlich | Beschreibung |
+|---|---|---|---|
+| `content` | string | Ja | Ein Paket des jeweiligen Typs als JSON oder YAML mit bis zu 4 MiB und 500 Einträgen. Für Bereitschaftspläne ist auch die unter [Bereitschaftspläne aus Opsgenie oder PagerDuty migrieren](/de/alerting/schedule-migration) beschriebene Datei zulässig. |
+| `dryRun` | boolean | Nein | `true` prüft den Import, ohne Daten zu schreiben (Standard). `false` schreibt die Daten. |
+| `createOnly` | boolean | Nein | Bei `true` bleiben vorhandene Einträge mit demselben Namen unverändert. |
+
+Der Import gleicht Einträge anhand ihrer Namen ab: Bei einem neuen Namen legt er einen Eintrag an. Bei genau einem Treffer vergleicht er die Felder einzeln.
+Mehrere Treffer oder ein doppelt in der Datei vorkommender Name führen zu einem Fehler. Jede Referenz muss auf ein Objekt
+in der Organisation verweisen. Für jeden Eintrag gelten dieselben Prüfungen wie beim regulären Speichern. Schlägt ein Eintrag fehl, schreibt der Import
+nichts. Andernfalls schreibt er die Einträge nacheinander, sendet für jeden synchronisierten Eintrag ein
+Föderationsänderungsereignis und protokolliert ein Audit-Ereignis: `escalation_policies.imported`, `schedules.imported`
+oder `routing_rules.imported`.
+
+- Beim Import eines vorhandenen Bereitschaftsplans bleiben temporäre Vertretungen, Schichttausche und alle Einstellungen erhalten, die in der Datei fehlen.
+- Importierte Routingregeln stehen in der Reihenfolge der Datei an erster Stelle. Die übrigen Regeln folgen in ihrer bisherigen Reihenfolge.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content schedules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "molesignal.schedules/v1",
+  "items": [
+    {"name": "Payments primary", "action": "update", "changes": ["rotations"], "id": "3KC9..."},
+    {"name": "Payments nights", "action": "create"},
+    {"name": "Search", "action": "error", "error": "no user is named `ann@example.com`"}
+  ],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` hat den Wert `create`, `update`, `unchanged`, `skip` (bei einem vorhandenen Eintrag mit aktiviertem `createOnly` oder bei einem schichtbasierten
+PagerDuty-Bereitschaftsplan, den die Datei nur namentlich nennt) oder `error`. Nach dem Schreiben enthält `id` die ID des angelegten oder aktualisierten Eintrags. `applied` gibt an,
+ob der Import Daten geschrieben hat.
+
+`format` gibt das eingelesene Format an: das Paketformat, `pagerduty` oder `opsgenie`. Bereitschaftspläne können außerdem folgende
+Felder enthalten:
+
+| Feld | Vorkommen | Beschreibung |
+|---|---|---|
+| `unknownMembers` | Eintrag | Alle E-Mail-Adressen, denen kein Mitglied der Organisation zugeordnet ist. |
+| `blockers` | Eintrag | Nicht übertragbare Angaben, deren Fehlen die Besetzung der Bereitschaft ändern würde. Jeder solche Fall führt für den Eintrag zu `error`. |
+| `findings` | Eintrag, Bericht | Ausgelassene Angaben und ein Vergleich des Eintrags mit der Darstellung im Quellsystem. |
+
+Ein Importhindernis oder ein Befund hat die Form `{"code": "...", "params": {...}}`. Dabei identifiziert `code` den Meldungstext, und `params`
+liefert die Werte für dessen Platzhalter.
+
+**Fehler**
+
+| Status | Grund |
+|---|---|
+| `400` | Der Inhalt ist weder ein Paket des erwarteten Typs noch eine vom Bereitschaftsplanimport unterstützte Datei, gibt ein anderes Format an, ist zu groß oder enthält zu viele Einträge. |
+| `403` | Dem Token fehlt die erforderliche Berechtigung. |

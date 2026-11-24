@@ -1,0 +1,298 @@
+---
+title: "查詢"
+sidebarTitle: "概覽"
+description: "對組織的資料串流執行 SQL 查詢、相容於 PromQL 的指標查詢、串流搜尋與非同步工作。"
+"en_link": "/en-US/query"
+"zh-Hans_link": "/zh-Hans/query"
+"ja_link": "/ja/query"
+"ko_link": "/ko/query"
+"de_link": "/de/query"
+"es_link": "/es/query"
+"fr_link": "/fr/query"
+"pt-BR_link": "/pt-BR/query"
+---
+
+MoleSignal 提供由 **DataFusion** 驅動的查詢端點。此端點支援完整的 SQL（包括 JOIN、CTE 與視窗函式），也支援用於指標的 **PromQL 子集**。兩者查詢相同的儲存資料。
+
+## 查詢端點
+
+```http
+POST /api/v1/query
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+此端點需要 `streams.query` 權限。
+
+### 請求主體
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `orgId` | string | 是 | 必須提供，但端點會忽略此值，改用已驗證的組織。 |
+| `language` | string | 是 | `sql` 或 `promql`。 |
+| `statement` | string | 是 | 查詢陳述式。 |
+| `timeRange` | object | 是 | `{ "start": <微秒>, "end": <微秒> }`，自 Unix 紀元起算的微秒數。 |
+| `stream` | object | SQL 必填 | `{ "name": "app", "streamType": "logs" }`，指定陳述式的主資料表，兩個欄位皆為必填。 |
+| `limit` | integer | 否 | 資料列數量上限。 |
+
+使用查詢字串參數 `clusters` 為[聯邦搜尋](#聯邦搜尋)選取遠端叢集。
+
+### 回應
+
+回應包含 `columns`、陣列形式的 `rows`、`scannedRows` 與 `tookMs`：
+
+```json
+{
+  "columns": ["level", "n"],
+  "rows": [["error", 2], ["info", 2]],
+  "scannedRows": 4,
+  "tookMs": 155
+}
+```
+
+每個儲存格的值取決於所在欄的類型：
+
+| 欄類型 | JSON 值 |
+|---|---|
+| 缺少的值 | `null`。 |
+| 整數、浮點數 | 數字。`NaN` 與無窮大會傳回 `null`。 |
+| 定點數 | 精度不超過 15 位時為數字，否則為保留所有位數的字串。 |
+| 文字 | 字串。 |
+| 二進位 | 小寫十六進位字串。 |
+| 時間戳記 | 整數，表示自 Unix 紀元起算的微秒數，不受時間單位或時區影響。 |
+| 日期、時間 | 字串，例如 `2022-01-08`、`01:01:01.500`。 |
+| 清單、結構、對應表 | 分別為陣列、物件、物件。 |
+| 其他類型 | 字串。 |
+
+聯邦查詢的回應也可能包含聯邦中繼資料。
+
+<Note>
+  傳送 `Accept: application/x-ndjson`，即可逐行串流傳回 JSON 物件，最後附上一筆含有 `scannedRows` 與 `tookMs` 的 `{"__meta__": {...}}` 記錄。串流查詢會略過結果快取。
+</Note>
+
+## 時間範圍與非同步工作
+
+互動式查詢請使用有明確起訖時間的 `timeRange`。MoleSignal 以「時間範圍的秒數 × `[querier].estimate_throughput_per_sec`」估算查詢規模。當估算值達到 `[querier].auto_async_threshold_rows` 時，MoleSignal 會以持久化的搜尋工作執行查詢。在預設設定下，門檻對應的時間範圍為 50,000 秒，約 13.9 小時。
+
+非同步查詢會傳回 `202` 與要追蹤的工作：
+
+```json
+{
+  "jobId": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+使用 `Prefer` 請求標頭控制執行方式：
+
+| 請求標頭 | 效果 |
+|---|---|
+| `Prefer: respond-async` | 一律建立搜尋工作。 |
+| `Prefer: respond-sync` | 即使時間範圍很長，也會在請求內同步執行查詢。 |
+
+`_audit` 查詢一律在請求內執行，不受時間範圍或 `Prefer` 請求標頭影響。提交讀取 `_audit` 的搜尋工作會收到 `400`。請參閱[稽核資料串流](/zh-Hant/settings/data-security#稽核資料流)。
+
+使用下列端點追蹤工作：
+
+| 端點 | 用途 |
+|---|---|
+| `POST /api/v1/query/jobs` | 直接提交工作。 |
+| `GET /api/v1/query/jobs` | 列出工作，最新的排在前面。支援 `state`（以逗號分隔，例如 `pending,running`）、`limit`（預設為 100）與 `offset`。未知的狀態名稱會傳回 `400`。 |
+| `GET /api/v1/query/jobs/summary` | 傳回各狀態的工作數量與總數。 |
+| `GET /api/v1/query/jobs/{id}` | 傳回狀態、時間戳記、`resultRows`、`error` 與 `expiresAt`。 |
+| `GET /api/v1/query/jobs/{id}/results` | 以物件形式傳回資料列，並附上 `page`、`pageSize`（預設為 1000）與 `hasMore`。 |
+| `POST /api/v1/query/jobs/{id}/cancel` | 取消執行中的工作。 |
+| `POST /api/v1/query/jobs/{id}/retry` | 重新執行失敗或已取消的工作。 |
+| `DELETE /api/v1/query/jobs/{id}` | 刪除工作。 |
+
+工作結果保留七天。工作狀態包括 `pending`、`running`、`done`、`failed` 與 `cancelled`。
+
+工作也會傳回 `kind`（`query` 或 `backfill`，回填工作會附上 `pipelineId`）、`attempt`、提交的 `request`，以及以 `userId` 和 `submittedBy` 表示的提交者。
+
+呼叫端可以讀取和修改自行提交的工作。具備 `org.running_queries.cancel` 權限的呼叫端可以讀取和修改組織內的所有工作。其他使用者的工作會傳回 `404`，與工作不存在時相同。清單與摘要只納入呼叫端可讀取的工作。**資料串流** 下的 **搜尋工作** 頁面會顯示相同的工作。請參閱[資料串流](/zh-Hant/streams#搜尋工作)。
+
+## SQL
+
+在 SQL 陳述式的 `FROM` 中填入資料串流名稱，並在請求的 `stream` 欄位中指定同一個主要資料串流：
+
+```bash
+NOW=$(date +%s)000000
+curl -X POST http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"timeRange\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
+       \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+```
+
+### 跨訊號 JOIN
+
+日誌、指標與追蹤資料共用同一份儲存空間，因此一條查詢就能將這些資料關聯起來。在 `stream` 中指定主要資料串流，其他資料串流直接依名稱引用。例如，使用 `trace_id` 將錯誤日誌關聯至對應的 Span：
+
+```sql
+SELECT l.msg, t.name, t.duration_ns
+FROM app AS l
+JOIN traces AS t ON l.trace_id = t.trace_id
+WHERE l.level = 'error'
+```
+
+### RUM 資料列的目前版本
+
+`rum_views_latest` 和 `rum_sessions_latest` 會讀取 `rum_views` 和 `rum_sessions`，每個檢視或工作階段只保留最新版本。在 `stream` 中填入資料串流或檢視表的名稱。請求的時間範圍會限制傳回的資料列，因此 `SELECT count(*) FROM rum_views_latest WHERE "application.id" = 'shop'` 只會計算在該範圍內開始的檢視。資料串流的[欄位遮罩](/zh-Hant/settings)同樣適用。
+
+### 文字搜尋
+
+| 函式 | 行為 |
+|---|---|
+| `MATCH(field, 'text')` | 對任意欄位進行不區分大小寫的子字串比對。`%`、`_` 與 `*` 都視為字面字元。 |
+| `MATCH_TEXT(field, 'query')` | 對 `indexType` 為 `full_text` 的欄位執行全文搜尋。欄位若沒有此索引，查詢就會失敗，並傳回 `MATCH_TEXT: field ... has no full-text index configured`。 |
+
+`MATCH_TEXT` 中以空格分隔的詞都必須出現。每個詞都是不區分大小寫的子字串，可以出現在值中的任意位置。`"a b"` 是片語，引號內的文字必須連續出現。含 `*` 的詞會比對整個值：`error*` 比對以 error 開頭的值，`*error` 比對以 error 結尾的值。也可使用 `a OR b`，或用 `-a` 排除特定詞。中文不必斷詞，`登录超时` 會比對連續出現這四個字的值。建立資料串流或編輯結構描述時，可新增此索引。請參閱[資料串流](/zh-Hant/streams#schema-與欄位)。
+
+```sql
+SELECT * FROM app WHERE MATCH(msg, 'timeout');
+SELECT * FROM app WHERE MATCH_TEXT(msg, 'panic "disk full" -debug');
+```
+
+### IP 網段
+
+| 函式 | 行為 |
+|---|---|
+| `CIDR_MATCH(field, 'network')` | 位址落在網段內時傳回 true。網段可寫成 `10.0.0.0/8`、`2001:db8::/32` 或單一位址。比對時會將 IPv4 對應至 IPv6，因此 `10.0.0.0/8` 也會比對 `::ffff:10.1.2.3`。值不是位址時傳回 false，網段格式錯誤時查詢會失敗。 |
+
+```sql
+SELECT client_ip, count(*) FROM access WHERE CIDR_MATCH(client_ip, '10.0.0.0/8') GROUP BY client_ip
+```
+
+### 略過檔案的條件
+
+MoleSignal 使用 `WHERE` 中欄位的索引，略過不可能包含符合條件資料列的檔案。若有適用的索引，MoleSignal 會用它判斷條件在檔案中是否不成立，再依原本的組合方式判斷是否略過檔案：以 `AND` 連接的條件只要有一個不成立，或 `OR` 的所有分支都不成立（各分支可用不同的索引判斷），就會略過該檔案。如果沒有索引可判斷條件，例如 `NOT` 下的條件或計算得出的值，就不會排除任何檔案。結果仍然正確，只是會讀取較多檔案。
+
+| 條件 | 使用的索引 |
+|---|---|
+| `=`、`IN` | `exact`、`bloom`（文字與 `int64`）、`skip` |
+| `<`、`<=`、`>`、`>=`、`BETWEEN`、`!=`、`NOT IN`、`LIKE 'abc%'` | `exact`、`bloom`、`skip`、`range` 記錄的最小值與最大值，以及 `skip` 記錄的值集合 |
+| `MATCH`、`MATCH_TEXT`、`LIKE`、`ILIKE` 的字面值 | `full_text`、`ngram`，以及 `exact` 記錄的值 |
+| `CIDR_MATCH`、對單一位址使用 `=` | `ip` |
+| `IS NULL`、`IS NOT NULL` | 任何索引：建立索引的欄位都會記錄值為空的資料列數量 |
+| `json_text(field, 'key') = 'value'`、`IN`、`IS NOT NULL` | `key_value` |
+| 分片欄位上的 `=`、`IN`、`LIKE 'abc%'` | [依欄位分片](/zh-Hant/streams#依欄位分片)：雜湊分片適用於 `=`、`IN`，首字元分片適用於三者 |
+
+讀取檔案時，若 `ngram` 欄位上的 `LIKE`、`ILIKE`、`MATCH` 使用字面值，只會讀取五位元組片段顯示可能含有該值的區塊，每個區塊有 1024 列（字面值短於五個位元組時，會讀取所有區塊）。若 `exact` 欄位上的 `=`、`IN` 只比對到少量資料列，就只會讀取這些資料列所在的頁面。對於資料列已[叢集化](/zh-Hant/streams#依欄位叢集)的檔案，在叢集化欄位上使用 `=`、`IN`，只會讀取每個時間切片中可能含有該值的頁面。
+
+### SQL 中的時間戳記
+
+`_timestamp` 是 `Timestamp(µs, "UTC")` 類型的欄位。與 `_timestamp` 比較時，整數字面值代表自 Unix 紀元起算的微秒數，因此下列兩個篩選條件會選出相同的資料列：
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= 1790000000000000
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= to_timestamp_micros(1790000000000000)
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+只有字面值會視為微秒。若要比較 `_timestamp` 與運算式或其他欄位，請先用 `to_timestamp_micros(...)` 轉換。使用 `CAST(_timestamp AS BIGINT)` 即可讀取該筆資料列的微秒數。
+
+### 加密欄位
+
+`decrypt(field)` 會將標記為加密的欄位還原為明文。請參閱[資料串流](/zh-Hant/streams#加密欄位)。
+
+## PromQL
+
+將 `language` 設為 `promql`，即可對指標資料串流執行 PromQL。指標選取器會指定一項指標，所有含有該指標的資料串流都會參與查詢。`metric_name` 儲存指標名稱，`value` 欄位儲存樣本，其餘欄位是標籤。未指定 `step` 時，MoleSignal 會執行即時查詢，在 `time_range.end` 對運算式求值。每個時間序列傳回一列，先列出 `value`，再列出各個標籤。指定以微秒為單位的 `step` 時，MoleSignal 會執行範圍查詢，從 `time_range.start` 到 `time_range.end` 逐步求值。每個時間序列的每一步傳回一列，先列出 `_timestamp` 和 `value`。每個時間序列最多 11,000 步，`limit` 會從各序列均勻取樣，以限制資料列數量：
+
+```json
+{
+  "orgId": "<org>",
+  "language": "promql",
+  "statement": "sum by (service) (http_requests_total)",
+  "timeRange": { "start": 1790000000000000, "end": 1790003600000000 }
+}
+```
+
+支援範圍廣泛，包括 rate 系列與所有 `*_over_time` 函式、包含 `topk` 與 `limitk` 的標準彙總運算、`histogram_quantile`、`label_replace` 與 `label_join`、數學與三角函式、搭配 `on`、`ignoring`、`group_left`、`group_right` 向量比對的 `and`、`or`、`unless` 集合運算、選取器修飾詞 `@` 與 `offset`，以及子查詢。
+
+<Card title="PromQL 支援矩陣" icon="table-list" href="/zh-Hant/query/promql-subset">
+  支援的函式、運算子與修飾詞完整清單，以及已知差異（native-histogram 函式、二元 `default`）。
+</Card>
+
+## 事件前後文（search around）
+
+`POST /api/v1/query/search_around` 會傳回指定事件前後緊鄰的事件，方便在調查時查看單筆日誌的前後文。請參閱[事件前後文](/zh-Hant/api/query/search-around)。
+
+## 檢查與控制
+
+- `POST /api/v1/query/inspect` 只規劃查詢，不執行查詢。傳回查詢中繼資料與邏輯計畫。
+- `POST /api/v1/query/recommendations` 不執行查詢，只分析查詢特徵。
+- `GET /api/v1/query/running` 與 `POST /api/v1/query/{id}/cancel` 可讓組織管理員查看和取消執行中的查詢。
+- `GET /api/v1/query/sql/capabilities` 與 `GET /api/v1/query/promql/capabilities` 會列出支援的函式，供編輯器使用。
+
+一般查詢需要 `streams.query` 權限。管理執行中的查詢需要 `org.running_queries.read` 或 `org.running_queries.cancel` 權限。
+
+## 聯邦搜尋
+
+在查詢端點加上 `?clusters=local,cluster-name`，即可執行聯邦搜尋。無法存取的遠端叢集會在聯邦中繼資料中標示為降級，MoleSignal 不會將其默默視為本機資料。請參閱[依角色部署](/zh-Hant/deployment/role-based#聯邦查詢)。
+
+## 儲存欄位
+
+資料流的欄位取決於傳送端提供的內容。以下是透過 OTLP 擷取資料時產生的欄位。資源與紀錄的屬性會成為頂層欄位，保留原始鍵名（例如 `service.name`）及各自的數值型別。
+
+### OTLP 日誌欄位
+
+| 欄位 | 內容 |
+|---|---|
+| `_timestamp` | 事件時間，以微秒為單位，取自 `timeUnixNano`。 |
+| `body` | 日誌本文。 |
+| `severity_text`、`severity_number` | OTLP 的嚴重性等級。 |
+| `trace_id`、`span_id` | 關聯識別碼，以小寫十六進位表示。 |
+| `scope_name`、`scope_version` | 檢測範圍（instrumentation scope）。 |
+| 資源與紀錄屬性 | 每個屬性對應一個頂層欄位。 |
+
+### 追蹤 Span 欄位
+
+| 欄位 | 內容 |
+|---|---|
+| `_timestamp` | Span 開始時間，以微秒為單位。 |
+| `trace_id`、`span_id`、`parent_span_id` | Span 及其父 Span 的識別碼。 |
+| `name`、`kind` | Span 名稱與類型。 |
+| `start_time_unix_nano`、`end_time_unix_nano`、`duration_ns` | 以奈秒表示的時間資訊。 |
+| `status_code`、`status_message` | `OK`、`ERROR` 或 `UNSET`，以及對應的訊息。 |
+| `attributes`、`resource`、`scope`、`events`、`links` | 完整的 OTLP 結構，以 JSON 文字儲存。 |
+| `http.method`、`service.name` 等屬性鍵 | 展開後的屬性副本。 |
+| `sampling_reason` 與紀錄相關欄位 | 尾端取樣器保留這筆追蹤的原因，以及 `partial`、`late`、`duplicate`、`conflict` 旗標。 |
+
+MoleSignal 透過 `trace_id` 與 `span_id` 識別 Span，並將重複傳送的 Span 視為重複資料予以捨棄。
+
+### OTLP 指標欄位
+
+MoleSignal 將每個 OTLP 資料點攤平成一筆指標事件。資源、scope 與資料點的屬性仍是可查詢的欄位。下表中的保留欄位優先於同名屬性。
+
+| 欄位 | 含義 |
+|---|---|
+| `metric_name` | OTLP 指標名稱。PromQL 依名稱選取指標：`{"http.server.duration"}`。 |
+| `metric_kind` | `gauge`、`counter`、`up_down_counter`、`histogram`、`exponential_histogram` 或 `summary`。 |
+| `metric_description`、`metric_unit` | 值不為空時才會出現。 |
+| `metric_temporality` | `delta`、`cumulative`、`unspecified` 或 `unknown:<value>`，gauge 沒有此欄位。 |
+| `metric_monotonic` | Sum 是否為單調遞增。MoleSignal 會將單調遞增的 Sum 儲存為 `counter`。 |
+| `metric_start_time_unix_nano` | 彙總區間的開始時間，值不為零時才會出現。 |
+| `value` | gauge 或 Sum 資料點的純量值。 |
+| `count`、`sum`、`min`、`max` | histogram 資料點會儲存這四個值。指數直方圖會儲存 `count` 與 `sum`，summary 也會儲存 `count` 與 `sum`。 |
+
+MoleSignal 不會儲存直方圖的分桶邊界與各桶計數，也不會儲存 summary 的分位數。
+
+MoleSignal 原樣儲存收到的 Delta 資料點。PromQL 的 rate 系列函式依儲存的 temporality 計算：`increase` 加總視窗內的 delta 值，`rate` 再將總和除以視窗長度，`irate` 則將最後一個 delta 值除以其區間長度。計算 cumulative 單調遞增 Sum 時，會處理 counter 重設。如果匯出端在同一個視窗內變更 temporality，只計算最近一段語意一致的樣本。
+
+透過 HTTP 傳送 OTLP 時，指標、日誌與追蹤皆支援 protobuf（`http/protobuf`）和 JSON。JSON 編碼會將 64 位元整數表示為字串，例如 `"asInt": "340"` 與 `"count": "4"`。MoleSignal 以相同方式處理字串和一般數字。
+
+## 快取
+
+查詢使用程序內快取，涵蓋已開啟的索引控制代碼、已關閉的時間視窗的查詢結果、搜尋詞彙的計數與索引頁尾。對於遠端物件儲存，磁碟快取會將物件的位元組範圍儲存在 `./data/cache/objects` 下，預設容量為 10 GiB。快取不影響回應契約。透過 `/metrics` 觀察快取行為，容量設定請參閱[設定](/zh-Hant/configuration#快取)。

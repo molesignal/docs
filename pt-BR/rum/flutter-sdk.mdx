@@ -1,0 +1,382 @@
+---
+title: "SDK de RUM para apps Flutter"
+sidebarTitle: "SDK para apps Flutter"
+description: "Instale e configure o SDK de RUM do MoleSignal para apps Flutter para monitorar visualizações, toques, erros, recursos e desempenho de renderização, além de reproduzir o que aconteceu na tela."
+"en_link": "/en-US/rum/flutter-sdk"
+"zh-Hans_link": "/zh-Hans/rum/flutter-sdk"
+"zh-Hant_link": "/zh-Hant/rum/flutter-sdk"
+"ja_link": "/ja/rum/flutter-sdk"
+"ko_link": "/ko/rum/flutter-sdk"
+"de_link": "/de/rum/flutter-sdk"
+"es_link": "/es/rum/flutter-sdk"
+"fr_link": "/fr/rum/flutter-sdk"
+---
+
+O SDK de RUM da MoleSignal para aplicações Flutter envia telemetria móvel no mesmo [formato de evento](/pt-BR/rum/events) que o SDK de RUM
+para navegadores. A instrumentação nativa do Flutter mantém o mesmo fluxo de investigação sem gerar métricas exclusivas de navegadores.
+
+## Equivalência de recursos
+
+| Recurso do navegador | Equivalente no SDK para aplicações Flutter |
+|---|---|
+| Visualizações do histórico | `RumNavigationObserver` ou `startView`; o SDK envia cada visualização novamente quando ela muda |
+| Cliques | Toques coletados automaticamente pelo `RumApp` ou widgets `RumUserAction` com nome |
+| Cliques de frustração e de erro | Sinais de frustração `rage_tap` e `error_tap` na ação de toque |
+| Erros em tempo de execução e em promessas | `FlutterError`, `PlatformDispatcher.onError` (uma falha fatal), `addError` e requisições com falha |
+| Recursos de Fetch e XHR | `MoleSignalHttpClient`, `startResource` e `stopResource` ou `addResource` |
+| Tarefas longas | Quadros lentos e quadros congelados marcados com `is_frozen_frame` |
+| Web Vitals | A métrica de inicialização a frio `app_launch`, a conclusão da primeira construção, métricas de quadros e memória na visualização e métricas personalizadas de duração |
+| Replay do DOM com rrweb | Capturas de tela tratadas para proteger a privacidade e codificadas como snapshots e mutações do rrweb |
+| Correlação de traces W3C | `traceparent` da requisição, da resposta ou de `Server-Timing` em `resource.trace_id` e `resource.span_id` |
+
+O SDK não gera métricas exclusivas de navegadores, como LCP e CLS, para aplicações Flutter. O Flutter informa dados de construção, rasterização,
+taxa de atualização, quadros lentos, quadros congelados e memória.
+
+## Requisitos
+
+- Flutter 3.35 ou posterior;
+- Dart 3.9 ou posterior;
+- Android 24+ ou iOS 13+ ao usar o armazenamento persistente de identidade padrão.
+
+O pacote usa as dependências `device_info_plus`,
+`battery_plus` e `connectivity_plus` para consultar a marca e o modelo do dispositivo, a versão do sistema operacional, o nível da bateria e a conectividade. Defina `trackDeviceInfo: false` para enviar apenas os dados que o próprio Flutter
+disponibiliza.
+
+## Instale e inicialize
+
+<Warning>
+  A aplicação inclui `clientToken`. Trate esse token como público. Use o token de cliente vinculado à
+  [aplicação de RUM](/pt-BR/rum/applications#token-de-cliente).
+</Warning>
+
+<Steps>
+  <Step title="Criar a aplicação">
+    Abra **RUM → Aplicações**, clique em **Criar aplicação** e escolha a plataforma **Flutter**. A opção **Abrir o guia de
+    configuração** exibe o endpoint, o token e a configuração com o identificador já preenchido.
+  </Step>
+  <Step title="Adicionar o pacote">
+    ```yaml
+    dependencies:
+      molesignal_flutter: ^0.3.0
+    ```
+
+    Execute `flutter pub get` depois de atualizar `pubspec.yaml`.
+  </Step>
+  <Step title="Inicializar antes de runApp">
+    ```dart
+    import 'package:flutter/material.dart';
+    import 'package:molesignal_flutter/molesignal_flutter.dart';
+
+    Future<void> main() async {
+      WidgetsFlutterBinding.ensureInitialized();
+
+      final rum = await initRum(
+        const RumConfiguration(
+          applicationId: 'checkout-mobile',
+          clientToken: 'mspat-your-client-token',
+          site: 'https://molesignal.example.com',
+          service: 'checkout-app',
+          env: 'production',
+          version: String.fromEnvironment('MOLESIGNAL_VERSION'),
+          architecture: String.fromEnvironment('MOLESIGNAL_ARCHITECTURE'),
+          debugId: String.fromEnvironment('MOLESIGNAL_DEBUG_ID'),
+          sessionSampleRate: 100,
+          sessionReplaySampleRate: 20,
+          trackUserInteractions: true,
+        ),
+      );
+
+      runApp(
+        RumApp(
+          client: rum,
+          child: MaterialApp(
+            navigatorObservers: <NavigatorObserver>[
+              RumNavigationObserver(rum),
+            ],
+            routes: <String, WidgetBuilder>{
+              '/': (_) => const HomePage(),
+              '/checkout': (_) => const CheckoutPage(),
+            },
+          ),
+        ),
+      );
+    }
+    ```
+
+    Chame `initRum` o quanto antes: o SDK mede o tempo de inicialização a frio dessa chamada até o primeiro quadro. `RumApp` configura o
+    limite de captura do replay, a coleta automática de toques e a detecção de frustração. O replay só é ativado quando
+    `sessionReplaySampleRate` seleciona a sessão atual ou quando a gravação é iniciada manualmente.
+  </Step>
+  <Step title="Verificar a primeira sessão">
+    Abra **RUM → Explorador**, selecione um intervalo que inclua o horário atual e confirme que a sessão de
+    `checkout-mobile` aparece. Abra a sessão para inspecionar as visualizações e o contexto do dispositivo.
+  </Step>
+</Steps>
+
+`site` aceita a origem da MoleSignal ou uma URL base que termine em `/api`, `/api/v1` ou `/api/v1/rum`. O SDK completa o caminho
+e envia eventos para `POST /api/v1/rum/events`. Informe em `applicationId` o identificador da aplicação vinculada ao token. O SDK envia esse identificador como `application.id`,
+e a MoleSignal rejeita eventos que indiquem outra aplicação.
+
+## Sessões e visualizações
+
+Um UUID armazenado nas preferências compartilhadas identifica a sessão. A sessão termina após 15 minutos de inatividade ou após quatro horas.
+O SDK decide se inclui a sessão na amostra uma única vez, no início. O SDK não envia eventos de sessão: a MoleSignal deriva as sessões das visualizações. Cada evento
+inclui `session.id`, `session.type` e `session.start`. Uma visualização também inclui `session.has_replay`, que assume o valor verdadeiro assim que o SDK grava um segmento
+da sessão. Uma visualização nunca abrange duas sessões: se a sessão for renovada enquanto uma visualização estiver visível, essa visualização termina e a
+mesma tela continua em uma nova visualização com `loading_type: session_renewal`.
+
+`RumNavigationObserver` registra rotas visíveis que têm nome. Forneça o observador por meio da integração com o roteador em aplicações que usam `Router` ou
+`go_router`. Chame `startView` quando uma rota não tiver nome estável ou quando a navegação ocorrer fora de `Navigator`.
+
+```dart
+rum.startView('/checkout', name: 'Checkout');
+rum.addTiming('cart_ready');          // view.custom_timings
+rum.stopView('/checkout');
+```
+
+`view.url` contém o caminho da rota, sem a string de consulta nem o fragmento, a menos que `trackUrlQueryString` esteja definido. `view.name` contém o nome. Iniciar
+uma visualização encerra a anterior. Quando algo muda na visualização, o SDK a envia novamente com um `view.revision` maior e as contagens acumuladas:
+no máximo uma vez por `flushInterval` e imediatamente ao iniciar ou encerrar a visualização ou ao enviar os dados pendentes da aplicação. As visualizações terminam quando a aplicação
+vai para segundo plano e reaparecem como `view_controller_redisplay` quando a aplicação retorna. Os eventos que ocorrem antes da primeira chamada a
+`startView` pertencem a uma visualização `ApplicationLaunch`.
+
+## Identifique usuários e registre a atividade da aplicação
+
+```dart
+rum.setUser(const RumUser(id: 'user-42', attributes: {'plan': 'enterprise'}));
+rum.setAccount(const RumAccount(id: 'acme', name: 'Acme'));
+rum.setGlobalContextProperty('region', 'ap-southeast-1');
+rum.addFeatureFlagEvaluation('new_checkout', true);
+
+rum.addAction('Checkout submitted', context: {'cart_size': 3});
+
+try {
+  await submitOrder();
+} catch (error, stackTrace) {
+  rum.addError(error, stackTrace: stackTrace, context: {'step': 'payment'});
+}
+
+rum.startDurationVital('checkout_form_ready');
+// ...
+rum.stopDurationVital('checkout_form_ready');
+rum.addDurationVital('cart_sync', const Duration(milliseconds: 640));
+```
+
+O SDK encadeia os manipuladores existentes de `FlutterError.onError` e `PlatformDispatcher.onError`. Encaminhe os erros de isolates adicionais para
+o isolate principal e chame `addError`. Chame `clearUser()` após o logout quando a atividade seguinte não tiver mais que ser associada ao usuário identificado.
+
+As **Ações** são `tap`, `custom`, `back` e a ação automática `application_start`. Os toques coletados automaticamente usam o nome genérico `Tap` para evitar a leitura de
+conteúdo da tela. Envolva controles importantes com `RumUserAction` para atribuir um nome de negócio estável sem assumir o controle do sistema de resolução de
+gestos do Flutter:
+
+```dart
+RumUserAction(
+  client: rum,
+  name: 'Pay now',
+  child: ElevatedButton(
+    onPressed: pay,
+    child: const Text('Pay now'),
+  ),
+)
+```
+
+Uma ação de toque permanece aberta enquanto as requisições que ela iniciou estiverem em andamento, por até cinco segundos. Os erros, as falhas fatais e os recursos desse período
+incluem o `action.id` da ação, que informa as contagens de cada um. Três toques em um intervalo de um segundo e a até 50 pixels lógicos de distância fazem com que o último seja classificado como `rage_tap`,
+e um toque que causa um erro é classificado como `error_tap`. Defina `trackUserInteractions: true` para coletar toques. Por padrão, `trackFrustrations` segue essa configuração.
+
+Os **Erros** incluem `source`, `type`, `message`, `stack`, `frames` estruturados e `handling`. Os erros do framework são `unhandled`, e os erros de
+`PlatformDispatcher.onError` também são falhas fatais. `addError` registra um erro `handled` com o `source` especificado, que por padrão é `custom`. Uma requisição
+que falha antes de receber uma resposta é um erro `network`. Um status HTTP de erro é registrado apenas como recurso. O SDK não define `error.fingerprint`. Passe
+`fingerprint:` para definir o agrupamento.
+
+## Monitore recursos HTTP e traces do backend
+
+Envolva `package:http` com `MoleSignalHttpClient`:
+
+```dart
+import 'package:http/http.dart' as http;
+
+final http.Client httpClient = MoleSignalHttpClient(
+  rum,
+  inner: http.Client(),
+);
+
+await httpClient.get(Uri.parse('https://api.example.com/orders'));
+```
+
+Declare `http: ^1.6.0` como dependência direta se a aplicação ainda não usar `package:http`. O wrapper registra
+a URL sanitizada, o método, a duração, o código de status, o tamanho da resposta e os identificadores de trace W3C disponíveis. A medição da duração termina quando a leitura do corpo da resposta
+é concluída, falha ou é cancelada. O SDK lê o contexto de trace nesta ordem: `traceparent` da resposta, uma entrada `traceparent` em `Server-Timing`
+e, por fim, `traceparent` da requisição. Restrinja a leitura dos cabeçalhos de trace quando apenas alguns serviços forem confiáveis:
+
+```dart
+RumConfiguration(
+  // ...
+  allowedTracingUrls: <Pattern>[
+    'https://api.example.com',
+    RegExp(r'^https://edge-\w+\.example\.com/'),
+  ],
+)
+```
+
+O SDK não intercepta requisições de rede globalmente. Para Dio e outros clientes, chame `startResource` e `stopResource` nos interceptadores, ou
+`addResource` para uma requisição concluída.
+
+## Campos de desempenho de renderização
+
+| Campo | Significado |
+|---|---|
+| `view.performance.fbc.timestamp` | Conclusão da primeira compilação: nanossegundos desde o início da visualização até a conclusão do primeiro quadro gerado para ela |
+| `view.flutter_build_time`, `view.flutter_raster_time` | Tempos mínimo, máximo e médio, em nanossegundos, de compilação na thread da interface e de rasterização na thread de rasterização, por quadro |
+| `view.refresh_rate_average`, `view.refresh_rate_min` | Taxa de quadros por segundo que o processamento pode sustentar, limitada à taxa de atualização da tela |
+| `view.slow_frames_rate` | Milissegundos gastos em quadros lentos, acima do tempo previsto por quadro e abaixo do limiar de congelamento, por segundo de visualização |
+| `view.freeze_rate` | Segundos gastos em quadros congelados por hora de visualização |
+| `view.memory_average`, `view.memory_max` | Tamanho do conjunto residente em bytes, indisponível no Flutter Web |
+| `long_task.duration`, `long_task.is_frozen_frame` | Quadro com duração de pelo menos `longFrameThreshold` (100 ms), considerado congelado a partir de `frozenFrameThreshold` (700 ms) |
+| `vital` do tipo `app_launch` | Inicialização a frio: nanossegundos desde `initRum` até a conclusão do primeiro quadro gerado para a interface do aplicativo |
+
+## Enviar símbolos da versão
+
+Defina `version`, `architecture` e `debugId` com valores imutáveis do pipeline de lançamento. Use os mesmos valores para todos os artefatos de depuração
+gerados por essa compilação. Valores alternativos detectados ou derivados em tempo de execução ajudam no desenvolvimento, mas não fornecem uma identidade estável para
+simbolização em produção.
+
+Compile as versões para Android e iOS com `--obfuscate` e `--split-debug-info` e passe a identidade com `--dart-define`:
+
+```bash
+flutter build apk \
+  --release \
+  --obfuscate \
+  --split-debug-info=build/molesignal-symbols/android-arm64 \
+  --target-platform=android-arm64 \
+  --dart-define=MOLESIGNAL_VERSION=1.4.0+42 \
+  --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+  --dart-define=MOLESIGNAL_DEBUG_ID="$BUILD_ID"
+```
+
+Com `--split-debug-info`, cada quadro da pilha de erro contém `artifact_kind: flutter_symbols`, os endereços absolutos e relativos que um arquivo de símbolos resolve
+e o `debug_id` definido na configuração da compilação. Envie cada arquivo `.symbols` gerado com `kind=flutter_symbols`, a plataforma correspondente (`android` ou
+`ios`), a arquitetura canônica e o ID de depuração. Envie os símbolos ELF nativos do Android e os arquivos DWARF de dSYM da Apple separadamente ao encaminhar quadros
+da pilha de falhas nativas com `RumStackFrame`.
+
+O envio de artefatos exige um token de gerenciamento com `debug_artifacts.manage`. Nunca use o token de cliente vinculado ao aplicativo para gerenciar artefatos.
+
+<Card title="Mapas de código-fonte e símbolos" icon="file-code" href="/pt-BR/rum/source-maps">
+  Gere, envie, associe e verifique artefatos de depuração do Flutter, Android, iOS e Web.
+</Card>
+
+## Ativar a reprodução de sessões
+
+O Flutter não tem DOM. O primeiro quadro capturado gera os eventos `Meta` e `FullSnapshot` do rrweb. Quadros com alterações geram mudanças incrementais na
+imagem, e a captura ignora os quadros sem alterações. Assim, o player de reprodução do MoleSignal pode exibir sessões de navegador e do Flutter
+com o mesmo fluxo de trabalho.
+
+```dart
+const RumConfiguration(
+  // ...
+  sessionReplaySampleRate: 20,
+  sessionReplay: RumSessionReplayConfiguration(
+    captureInterval: Duration(seconds: 2),
+    captureOnAction: true,
+    pixelRatio: 0.75,
+    maximumImageDimension: 1200,
+  ),
+)
+
+rum.startSessionReplayRecording();
+rum.stopSessionReplayRecording();
+```
+
+`sessionReplaySampleRate` se aplica apenas às sessões incluídas por `sessionSampleRate`. Multiplique as duas taxas para calcular a cobertura efetiva da reprodução.
+A gravação manual também se aplica apenas às sessões incluídas. A reprodução usa uma fila separada, um intervalo padrão de envio de 10 s, números de sequência por
+sessão, segmentos com tamanho-alvo de cerca de 1 MiB e um limite de 8 MiB por requisição. O SDK envia os segmentos para `POST /api/v1/rum/replay`.
+
+## Proteger o conteúdo das reproduções
+
+O nível padrão `RumPrivacyLevel.mask` mascara `Text`, `RichText` e regiões editáveis antes da codificação em PNG. Os campos de entrada continuam mascarados no modo `allow`.
+O SDK também remove as strings de consulta e os fragmentos das URLs e oculta recursivamente chaves de contexto que costumam conter dados sensíveis. O SDK só envia o texto bruto da pilha com
+`RumPrivacyLevel.allow`. Caso contrário, reconstrói `error.stack` a partir dos quadros sanitizados. Envolva imagens sensíveis, mapas, conteúdo com desenho personalizado,
+visualizações nativas da plataforma ou componentes inteiros em um contêiner explícito de privacidade:
+
+```dart
+RumReplayBlock(
+  child: AccountBalanceCard(),
+)
+```
+
+Tanto `RumReplayMask` quanto `RumReplayBlock` substituem a região capturada por um bloco opaco. Pixels brutos sem máscara nunca entram na fila de eventos.
+
+<Warning>
+  O tipo de widget não permite detectar texto desenhado por `CustomPainter`. Envolva explicitamente a região com
+  desenho personalizado. A captura de visualizações nativas depende da composição da plataforma. Verifique as
+  visualizações nativas com conteúdo sensível em dispositivos Android e iOS reais.
+</Warning>
+
+## Entrega
+
+O SDK agrupa os eventos em um array JSON e os envia para `POST {site}/api/v1/rum/events` com o token de cliente. O SDK compacta lotes com mais de 1 KiB
+com gzip quando `dart:io` está disponível. Defina `compressRequests: false` para desativar a compactação. Cada requisição contém no máximo 48 KiB de eventos, bem abaixo
+dos limites de 5000 eventos e 5 MiB que o receptor aceita.
+
+- Se o MoleSignal **rejeitar** um evento, o SDK informa a rejeição por meio de `onError` e `RumFlushResult` e nunca reenvia o evento.
+- Em caso de erros de rede, tempos limite ou respostas `408`, `429` e `5xx`, o SDK tenta novamente com espera exponencial e variação aleatória, sempre respeitando o tempo mínimo indicado por `Retry-After`
+  na resposta do receptor. Os eventos permanecem em uma fila offline persistente.
+- Qualquer outra resposta `4xx` faz o SDK descartar o lote.
+
+A fila tem limites de quantidade de itens, tamanho em bytes e tempo de permanência (`maxQueueSize`, `maxQueueBytes`, `queueItemTtl`). Uma revisão mais recente de uma visualização substitui
+as revisões anteriores que ainda aguardam envio. Por isso, os números de revisão que o MoleSignal recebe podem não ser consecutivos.
+
+## Configuração principal
+
+| Opção | Padrão | Finalidade |
+|---|---|---|
+| `applicationId`, `clientToken`, `site` | Obrigatórios | Identificação do aplicativo, autenticação e endpoint |
+| `service` | `applicationId` | Serviço registrado nos eventos |
+| `env`, `user`, `globalContext` | Não definidos | Implantação, identidade e dimensões personalizadas |
+| `version`, `buildVersion` | `unknown`, não definido | Identidade da versão para associar artefatos de depuração e número da compilação |
+| `architecture`, `debugId` | Valor alternativo detectado ou derivado | Identidade da compilação móvel para associar símbolos |
+| `sessionSampleRate` | `100` | Porcentagem de amostragem de sessões |
+| `sessionReplaySampleRate` | `0` | Porcentagem de reprodução entre as sessões da amostra |
+| `sessionReplay` | Padrões que protegem a privacidade | Intervalo de captura, resolução, captura de ações e cor da máscara |
+| `trackUserInteractions` | `false` | Captura automática de toques e ações `back` |
+| `trackFrustrations` | Configuração de interações | Detecção de `rage_tap` e `error_tap` |
+| `trackResources` | `true` | Coleta de recursos HTTP |
+| `trackLongTasks` | `true` | Registro de quadros lentos e congelados como tarefas longas |
+| `trackViewPerformance` | `true` | Métricas de inicialização, primeira compilação, quadros e memória |
+| `trackDeviceInfo` | `true` | Marca, modelo, bateria e conectividade via plugins |
+| `trackFlutterErrors`, `trackPlatformErrors` | `true` | Erros do framework e do isolate raiz |
+| `trackAppLifecycle` | `true` | Encerra as visualizações e envia os eventos pendentes quando o aplicativo vai para segundo plano |
+| `trackAnonymousUser` | `true` | Identidade anônima persistente |
+| `trackUrlQueryString` | `false` | Preserva as strings de consulta das URLs quando a opção está ativa |
+| `defaultPrivacyLevel` | `mask` | Política de privacidade para texto na reprodução e texto bruto da pilha |
+| `sessionInactivityTimeout`, `maxSessionDuration` | `15 min`, `4 h` | Limites da sessão |
+| `flushInterval`, `batchSize` | `5 s`, `50` | Transporte padrão de eventos |
+| `replayFlushInterval`, `replayBatchSize` | `10 s`, `100` | Transporte de dados de reprodução |
+| `beforeSend` | Não definido | Modifica ou descarta qualquer tipo de evento, inclusive de reprodução |
+
+Por padrão, `RumSessionReplayConfiguration` usa um intervalo de captura de 5 s, captura após ações, `0.5` pixel de saída por pixel lógico,
+um limite de 900 pixels para o maior lado da imagem e a cor de máscara `#6B7280`. Também é possível configurar `excludedUrls`, `allowedTracingUrls`, limites da fila, intervalos entre tentativas, tempos limite,
+diagnósticos, transporte personalizado e persistência.
+
+## Esvaziar filas e encerrar
+
+Chame `flush()` antes de uma transição controlada que precise aguardar os eventos na fila. Chame `stop()` durante a limpeza final para encerrar a visualização ativa
+com um último relatório, remover a instrumentação e esvaziar as duas filas de eventos. Ambas as chamadas retornam um `RumFlushResult` que distingue os eventos aceitos, os que passaram por nova tentativa,
+os descartados, os que ainda estão na fila e os que excederam o tempo limite.
+
+```dart
+await rum.flush();
+await rum.stop();
+```
+
+<CardGroup cols={2}>
+  <Card title="SDK de RUM para navegador" icon="code" href="/pt-BR/rum/browser-sdk">
+    Compare a configuração do SDK para navegador e a instrumentação específica do navegador.
+  </Card>
+  <Card title="Formato dos eventos de RUM" icon="braces" href="/pt-BR/rum/events">
+    Confira os eventos que o SDK envia e os campos de cada um.
+  </Card>
+  <Card title="Mapas de código-fonte e símbolos" icon="file-code" href="/pt-BR/rum/source-maps">
+    Restaure os rastreamentos de pilha das versões de produção para Flutter, Android, iOS e Web.
+  </Card>
+</CardGroup>

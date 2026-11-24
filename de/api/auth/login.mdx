@@ -1,0 +1,144 @@
+---
+title: "Anmelde-API"
+sidebarTitle: "Anmelden"
+description: "Starten Sie eine Browsersitzung mit einer E-Mail-Adresse und einem Passwort."
+"en_link": "/en-US/api/auth/login"
+"zh-Hans_link": "/zh-Hans/api/auth/login"
+"zh-Hant_link": "/zh-Hant/api/auth/login"
+"ja_link": "/ja/api/auth/login"
+"ko_link": "/ko/api/auth/login"
+"es_link": "/es/api/auth/login"
+"fr_link": "/fr/api/auth/login"
+"pt-BR_link": "/pt-BR/api/auth/login"
+---
+
+```http
+POST /api/v1/auth/signin
+```
+
+Startet eine Sitzung in der Weboberfläche. Diese Route erfordert **keine Authentifizierung**. Die Antwort setzt die Sitzungscookies und gibt unter `login` die Identität des angemeldeten Kontos zurück. Der Anfragetext enthält kein Token. Für Konten mit Multi-Faktor-Authentifizierung siehe [Der zweite Schritt](#der-zweite-schritt).
+
+**Anfragetext**
+
+| Feld | Typ | Erforderlich | Hinweise |
+|---|---|---|---|
+| `email` | Zeichenfolge | Ja | |
+| `password` | Zeichenfolge | Ja | |
+| `remember` | boolesch | Nein | Erhält die Sitzung nach dem Schließen des Browsers. Der Standardwert ist `false`. |
+
+<RequestExample>
+```bash cURL
+curl -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+  -H 'content-type: application/json' \
+  -d '{"email":"admin@example.com","password":"admin"}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "login": {
+    "userId": "<user-id>",
+    "email": "admin@example.com",
+    "displayName": "root",
+    "orgId": "<organization-id>",
+    "orgName": "default",
+    "displayRole": "Owner",
+    "roles": [
+      {
+        "id": "<role-id>",
+        "key": "owner",
+        "name": "Owner",
+        "builtin": true
+      }
+    ],
+    "scope": "organization"
+  }
+}
+```
+</ResponseExample>
+
+Bei der Anmeldung wählt MoleSignal die erste Organisation aus, der das Konto angehört und die die Anmeldung zulässt. Programme senden stattdessen ein API-Token im Header `Authorization`. Der Header akzeptiert kein Sitzungstoken. Siehe [API-Token ausstellen](/de/api/auth/issue-token).
+
+## Zu viele fehlgeschlagene Anmeldeversuche
+
+Nach zu vielen fehlgeschlagenen Passwortversuchen antwortet MoleSignal mit `429`, dem Header `Retry-After` mit einer Wartezeit in Sekunden und dem Code `signin_limited`. Der Antworttext ist für vorhandene und nicht vorhandene Konten identisch. MoleSignal prüft das Passwort nicht. Bei einem falschen Passwort oder einem unbekannten Konto antwortet MoleSignal mit `401`. Bei einem richtigen Passwort für ein deaktiviertes oder noch nicht freigegebenes Konto antwortet MoleSignal mit `403` und nennt den Grund. Siehe [Anmeldelimits](/de/settings/platform#anmeldelimits).
+
+```json
+{
+  "error": "resource_exhausted",
+  "code": "signin_limited",
+  "message": "too many failed password attempts; try again in 14 minutes"
+}
+```
+
+## Der zweite Schritt
+
+Bei einem Konto mit [Multi-Faktor-Authentifizierung](/de/identity/mfa) setzt MoleSignal nach der Passworteingabe noch keine Cookies. Die Antwort enthält `mfa` statt `login` und nennt die verfügbaren Methoden zum Abschließen der Anmeldung:
+
+```json
+{
+  "mfa": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp", "recovery_code"],
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| Endpunkt | Zweck |
+|---|---|
+| `POST /api/v1/auth/signin/verify` | Schließt die Anmeldung ab. Erwartet `challenge` und entweder `method` (`totp` oder `recovery_code`) mit `code` oder `method` mit dem Wert `passkey` sowie `ceremony` und `credential`. Gibt `{"login": …}` zusammen mit den Sitzungscookies zurück. Bei Verwendung eines Wiederherstellungscodes enthält die Antwort zusätzlich `recoveryCodesLeft`. |
+| `POST /api/v1/auth/signin/verify/passkey` | Erwartet `challenge` und gibt `ceremony` und `options` für die Passkey-Prüfung zurück. Übergeben Sie `options` an `navigator.credentials.get()` und senden Sie `ceremony` zusammen mit dem Ergebnis zurück. `ceremony` lässt sich nur einmal verwenden. |
+
+## Zweiten Faktor direkt bei der Anmeldung einrichten
+
+Wenn die Organisation [Multi-Faktor-Authentifizierung verlangt](/de/identity/sso#anmeldeanforderungen) und das Konto noch keinen zweiten Faktor hat, enthält die Antwort `enroll` statt `login`:
+
+```json
+{
+  "enroll": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp"],
+    "organizationName": "default",
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| Endpunkt | Zweck |
+|---|---|
+| `POST /api/v1/auth/signin/enroll/totp` | Erwartet `challenge` und gibt `setup`, `secret`, `otpauthUrl`, `qrSvg` und `expiresAt` zurück. |
+| `POST /api/v1/auth/signin/enroll/totp/confirm` | Erwartet `challenge`, `setup` und `code`. Gibt `{"login": …, "recoveryCodes": […]}` zusammen mit den Sitzungscookies zurück. |
+| `POST /api/v1/auth/signin/enroll/passkey/options` | Erwartet `challenge` und gibt `ceremony` und `options` für `navigator.credentials.create()` zurück. |
+| `POST /api/v1/auth/signin/enroll/passkey` | Erwartet `challenge`, `ceremony`, `credential` und optional `name`. Gibt `{"login": …, "recoveryCodes": […]}` zusammen mit den Sitzungscookies zurück. |
+
+Wenn die Organisation [nur Single Sign-on zulässt](/de/identity/sso#anmeldeanforderungen), antwortet MoleSignal auf die Passwortanmeldung mit `403`. Gehört das Konto mehreren Organisationen an, wählt MoleSignal die erste aus, die die Anmeldung zulässt.
+
+## Anmeldung mit Passkey
+
+Mit einem [Passkey](/de/identity/mfa#mit-passkey-ohne-passwort) ist die Anmeldung ohne Passwort und ohne zweiten Schritt möglich.
+
+| Endpunkt | Zweck |
+|---|---|
+| `POST /api/v1/auth/signin/passkey/options` | Gibt `ceremony` und `options` zurück. Antwortet mit `400`, wenn sich `[http].external_url` der Instanz nicht für die [Relying Party](/de/identity/mfa#voraussetzungen-für-die-instanz) des Passkeys eignet. |
+| `POST /api/v1/auth/signin/passkey` | Erwartet `ceremony`, `credential` und optional `remember`. Gibt `{"login": …}` zusammen mit den Sitzungscookies zurück. |
+
+## Sitzungscookies
+
+| Cookie | Pfad | Inhalt | Gültigkeitsdauer |
+|---|---|---|---|
+| `accessToken` | `/api` | Zugriffstoken, das der Browser bei jeder API-Anfrage mitsendet. | 15 Minuten. Erneuern Sie das Token mit `POST /api/v1/auth/refresh`. |
+| `refreshToken` | `/api/v1/auth` | Aktualisierungstoken, das ausschließlich zur Erneuerung des Zugriffstokens dient. | Bis zum Sitzungsende nach `[auth].session_ttl_secs` Sekunden ab der Anmeldung. Standardmäßig 24 Stunden. |
+
+Beide Cookies haben die Attribute `HttpOnly` und `SameSite=Strict`. Greift der Browser per HTTPS auf MoleSignal zu, setzt MoleSignal zusätzlich `Secure`. Ohne `remember` verwirft der Browser beide Cookies beim Schließen. Beide Tokens sind signierte JWTs. Der Server speichert sie nicht und prüft bei jedem Token die Signatur, den Verwendungszweck und den Ablaufzeitpunkt. Ist das Konto deaktiviert oder gelöscht, endet die Sitzung bei der nächsten Anfrage.
+
+## Sitzungsendpunkte
+
+| Endpunkt | Zweck |
+|---|---|
+| `POST /api/v1/auth/refresh` | Stellt anhand des Aktualisierungstokens ein neues Zugriffstoken aus und antwortet mit `204` und einem neuen `accessToken`-Cookie. Der Ablaufzeitpunkt der Sitzung bleibt unverändert. Ist die Sitzung abgelaufen, das Konto deaktiviert oder fehlt das Cookie, antwortet der Endpunkt mit `401` und löscht beide Cookies. |
+| `GET /api/v1/auth/session` | Gibt die Identität der aktuellen Sitzung im Format von `login` aus der Anmeldeantwort zurück. |
+| `POST /api/v1/auth/signout` | Löscht beide Cookies und antwortet mit `204`. |
+
+Eine Anfrage, die mit einem Sitzungscookie Daten ändert, muss von einer MoleSignal-Seite stammen. Enthält eine Browseranfrage im Header `Sec-Fetch-Site` einen anderen Wert als `same-origin`, antwortet MoleSignal mit `403`.

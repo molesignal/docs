@@ -1,0 +1,214 @@
+---
+title: "Déployer MoleSignal"
+description: "Prérequis, options de déploiement, ports et contrôles d’intégrité pour exécuter MoleSignal hors du bac à sable."
+"en_link": "/en-US/deployment"
+"zh-Hans_link": "/zh-Hans/deployment"
+"zh-Hant_link": "/zh-Hant/deployment"
+"ja_link": "/ja/deployment"
+"ko_link": "/ko/deployment"
+"de_link": "/de/deployment"
+"es_link": "/es/deployment"
+"pt-BR_link": "/pt-BR/deployment"
+---
+
+MoleSignal est fourni sous la forme d’un seul binaire et d’une seule image de conteneur. La configuration détermine les [rôles](/fr/deployment/role-based) qu’assume chaque processus : un seul processus peut assumer tous les rôles, ou plusieurs processus peuvent se les répartir. Chaque déploiement nécessite deux services externes : PostgreSQL et un stockage objet.
+
+## Prérequis
+
+| Composant | Prérequis |
+|---|---|
+| PostgreSQL | Stocke les métadonnées, les identités, le catalogue de fichiers et les ressources du produit. Seul PostgreSQL est pris en charge pour le stockage des métadonnées. L’environnement de test Compose et les manifestes Kubernetes utilisent PostgreSQL 17. |
+| Stockage objet | Stocke les fichiers Parquet, les index de recherche et les blobs de profils. Utilisez `s3` (AWS S3 ou un service compatible S3, comme RustFS, Cloudflare R2 ou Alibaba Cloud OSS), `azure` ou `gcs`. Réservez le moteur de stockage `local` aux déploiements à nœud unique et au développement. |
+| Calcul | Exécutez l’image de conteneur sous Linux sur x86-64 ou arm64 (`linux/amd64` et `linux/arm64`). L’environnement de test nécessite environ 2 GB de mémoire. |
+| Disque local | Contient uniquement des caches que MoleSignal peut reconstruire. MoleSignal confirme chaque écriture dès que l’objet correspondant du journal d’écriture anticipée (WAL) se trouve dans le stockage objet. Aucun nœud n’a donc besoin d’un volume persistant. Consultez [Durabilité et prise de relais](/fr/architecture#durabilité-et-reprise). |
+
+L’utilisation de la mémoire et du disque dépend du volume ingéré, du nombre de flux actifs et des paramètres de cache dans [Configuration](/fr/configuration). Dimensionnez les ressources en fonction de l’utilisation observée : le [suivi de l’ingestion](/fr/streams#utilisation-de-l’ingestion-et-budgets) indique le volume de données ingérées pour chaque source, et le processus expose les métriques Prometheus sur `/metrics`. Consultez la [liste de contrôle pour la production](/fr/deployment/production-checklist).
+
+## Image de conteneur
+
+L’image est disponible sous le nom `ghcr.io/molesignal/molesignal`. Chaque publication fournit un tag de version (par exemple `26.1.0.0`) et un tag de canal (par exemple `alpha`). En production, spécifiez un tag de version fixe.
+
+```bash
+docker pull ghcr.io/molesignal/molesignal:26.1.0.0
+```
+
+La même image convient à tous les rôles. La variable d’exécution `RELEASE_CHANNEL` (`alpha`, `beta`, `rc` ou `stable`) indique le niveau de maturité du déploiement sans modifier le binaire. Le binaire intègre l’interface web et la sert sur le port HTTP.
+
+## Options de déploiement
+
+<Tabs>
+  <Tab title="Docker Compose">
+    Le dépôt fournit le fichier `deploy/docker/docker-compose.yaml` avec deux profils. Les deux démarrent PostgreSQL 17 et RustFS, puis exécutent l’image MoleSignal depuis `ghcr.io/molesignal/molesignal`.
+
+    ```bash
+    # Everything in one process: serves the complete product
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
+
+    # One container per role
+    docker compose -f deploy/docker/docker-compose.yaml --profile multirole up
+    ```
+
+    Le profil `multirole` déploie un conteneur par rôle. Le routeur expose l’interface web et l’API HTTP sur le port `5080`, ainsi que le récepteur OTLP gRPC sur le port `4317`. Consultez [Déploiement par rôle](/fr/deployment/role-based).
+
+    Le service autonome expose les ports `5080` et `5082`. Il n’expose pas le port OTLP gRPC `4317`. Pour envoyer des données via OTLP gRPC depuis l’hôte, ajoutez la redirection de port `4317:4317` au service.
+
+    Le fichier Compose sert de bac à sable : il utilise des identifiants par défaut, une clé de chiffrement de développement et un jeton `MS_SELF_TELEMETRY_CLUSTER_TOKEN` de développement pour le profil `multirole`. Remplacez-les avant de stocker des données réelles. Consultez la [liste de contrôle pour la mise en production](/fr/deployment/production-checklist). Le bucket du bac à sable est privé.
+  </Tab>
+  <Tab title="Binaire et systemd">
+    Installez le binaire de la version publiée, le fichier de configuration et la base de données GeoIP, puis exécutez MoleSignal en tant que service systemd.
+
+    ```bash
+    sudo useradd --system --home-dir /var/lib/molesignal \
+      --shell /usr/sbin/nologin molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo install -d -o root -g molesignal -m 0750 /etc/molesignal
+    sudo install -o root -g molesignal -m 0640 \
+      conf/config.toml /etc/molesignal/config.toml
+    sudo install -Dm644 deploy/systemd/molesignal.service \
+      /etc/systemd/system/molesignal.service
+    sudo install -Dm644 mmdb/dbip-city-lite.mmdb \
+      /usr/share/molesignal/mmdb/dbip-city-lite.mmdb
+    ```
+
+    Définissez le canal d’exécution dans `/etc/molesignal/molesignal.env` :
+
+    ```ini
+    RELEASE_CHANNEL=alpha
+    ```
+
+    Modifiez `/etc/molesignal/config.toml` pour configurer PostgreSQL, le stockage objet et les secrets, puis démarrez le service :
+
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now molesignal
+    sudo systemctl status molesignal
+    ```
+
+    L’unité utilise `/var/lib/molesignal` comme répertoire d’état et accorde la capacité `CAP_NET_BIND_SERVICE` pour permettre au serveur TLS intégré d’écouter sur les ports `80` et `443`.
+  </Tab>
+  <Tab title="Helm">
+    Le chart officiel déploie MoleSignal sur Kubernetes 1.27 ou version ultérieure, avec Helm 3.8 ou version ultérieure. Il nécessite MoleSignal 26.2.0.0 ou version ultérieure. Le dépôt de charts se trouve à l’adresse `https://charts.molesignal.com`. Le même chart est également disponible à l’adresse `oci://ghcr.io/molesignal/charts/molesignal`.
+
+    Par défaut, le chart lance un seul processus qui assure tous les rôles, ainsi qu’une instance de PostgreSQL 17 et une instance de RustFS. Ces deux instances ne disposent ni de sauvegardes ni de mécanisme de basculement. Réservez donc la configuration par défaut à l’évaluation.
+
+    ```bash
+    helm repo add molesignal https://charts.molesignal.com
+    helm repo update
+    helm install molesignal molesignal/molesignal --namespace molesignal --create-namespace
+    ```
+
+    Accédez à l’interface web via une redirection de port, puis ouvrez `http://127.0.0.1:5080` :
+
+    ```bash
+    kubectl --namespace molesignal port-forward svc/molesignal 5080:5080
+    ```
+
+    En production, exécutez chaque rôle dans une charge de travail distincte, désactivez les services fournis avec le chart et configurez un serveur PostgreSQL et un stockage objet externes. Créez d’abord les deux ressources Secret : `molesignal-db` contient la clé `database-dsn`, et `molesignal-s3` contient les clés `access-key` et `secret-key`.
+
+    ```yaml
+    mode: distributed
+
+    postgresql:
+      enabled: false
+    externalDatabase:
+      existingSecret: molesignal-db
+
+    rustfs:
+      enabled: false
+    objectStore:
+      bucket: example-telemetry
+      region: eu-west-1
+      existingSecret: molesignal-s3
+    ```
+
+    [`examples/production.yaml`](https://github.com/molesignal/molesignal-helm/blob/main/examples/production.yaml) ajoute TLS, la mise à l’échelle automatique et des budgets d’interruption. Le [README du chart](https://github.com/molesignal/molesignal-helm/tree/main/charts/molesignal) répertorie toutes les valeurs.
+
+    | Sujet | Détail |
+    |---|---|
+    | Clé de chiffrement | Le chart génère la clé à la première installation et la conserve après les mises à niveau et l’exécution de `helm uninstall`. Sauvegardez-la : sans cette clé, impossible de lire les champs chiffrés. Avec Argo CD ou un autre outil qui génère les manifestes avec `helm template`, définissez `secrets.cipherKey` et `secrets.clusterToken`, ou faites pointer `secrets.existingSecret` vers une ressource Secret. |
+    | Images | Toutes les images sauf PostgreSQL utilisent le tag `latest`, et Kubernetes les récupère à chaque démarrage de pod. En production, fixez la valeur de `image.tag` et définissez `image.pullPolicy` sur `IfNotPresent`. |
+    | Ingress | Définissez `ingress.enabled`. Derrière un Ingress, ajoutez le réseau des pods du contrôleur à la liste des proxys de confiance sous [Reconnaissance de l’adresse IP du client](/fr/settings/platform#détection-de-l’adresse-ip-du-client). |
+    | Paramètres de l’application | Ajoutez-les sous `config`, en reprenant la structure de `conf/config.toml`. |
+
+    Récupérez la clé de chiffrement de l’installation par défaut :
+
+    ```bash
+    kubectl --namespace molesignal get secret molesignal-secret -o jsonpath='{.data.cipher-key}' | base64 --decode
+    ```
+  </Tab>
+  <Tab title="Manifestes Kubernetes">
+    Les manifestes de [`deploy/k8s/`](https://github.com/molesignal/molesignal/tree/main/deploy/k8s) utilisent la même image pour tous les rôles. Ils référencent l’image temporaire `molesignal:dev`. Remplacez-la par `ghcr.io/molesignal/molesignal:<version>` dans chaque charge de travail.
+
+    Les manifestes n’incluent ni PostgreSQL ni stockage objet. Fournissez une instance PostgreSQL 17 sous le nom de service `postgresql` (ou modifiez `meta_database.dsn` dans la ConfigMap) et un stockage objet compatible avec S3 (modifiez `object_store` dans la ConfigMap).
+
+    Les manifestes déploient une topologie à rôles séparés : la charge de travail `router` fournit l’interface web et l’API HTTP, tandis que les autres charges de travail assurent les rôles de traitement des données et d’exécution des tâches en arrière-plan. Pour exécuter tous les rôles dans un seul processus, partez de `40-intake.yaml` (un Deployment sans volume persistant), définissez `MS_NODE_ROLES` sur `["standalone"]`, ajoutez le port `5080` au Service et configurez une sonde sur `/api/v1/healthz`.
+
+    | Charge de travail | Type | Réplicas | Rôle |
+    |---|---|---|---|
+    | `router` | Deployment | 2 | `router` : interface web, API HTTP et OTLP gRPC |
+    | `intake` | Deployment | 2 | `intake`, sans volume persistant ; une mise à jour progressive démarre un nouveau pod avant d’en arrêter un ancien |
+    | `querier` | Deployment | 2 | `querier` |
+    | `compactor` | Deployment | 1 | `compactor`, avec possibilité d’ajouter des réplicas |
+    | `alert` | Deployment | 1 | `alert`, avec possibilité d’ajouter des réplicas |
+
+    Les nœuds à rôles séparés utilisent un jeton `MS_SELF_TELEMETRY_CLUSTER_TOKEN` partagé pour authentifier les traces candidates et les données de télémétrie interne qu’ils se transmettent. La capture de traces est active par défaut. Chaque charge de travail lit donc la même valeur dans la clé `self_telemetry_cluster_token` de `molesignal-secret`. Créez l’espace de noms, la configuration et le secret, puis appliquez les manifestes des charges de travail :
+
+    ```bash
+    kubectl apply -f 00-namespace.yaml
+    kubectl apply -f 10-configmap.yaml
+    kubectl create secret generic molesignal-secret -n molesignal \
+      --from-literal=object_store_access_key="<access-key>" \
+      --from-literal=object_store_secret_key="<secret-key>" \
+      --from-literal=cipher_key="$(openssl rand -base64 32)" \
+      --from-literal=self_telemetry_cluster_token="$(openssl rand -base64 32)" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    ```
+
+    Les charges de travail sélectionnent leur rôle avec la variable d’environnement `MS_NODE_ROLES`. Vérifiez le cluster via le routeur :
+
+    ```bash
+    kubectl -n molesignal port-forward svc/router 5080:5080
+    curl http://127.0.0.1:5080/api/v1/healthz
+    ```
+
+    Le binaire intègre l’interface web. Exposez le port `5080` de la charge de travail `router` via un Ingress ou un équilibreur de charge.
+
+    La charge de travail `router` expose l’API complète sur le port `5080`, et sa sonde de disponibilité envoie la requête `GET /api/v1/healthz`. Toutes les autres charges de travail exposent les points de terminaison d’état de santé, de disponibilité et de métriques sur le port `5080`, et utilisent `GET /api/v1/readyz` comme sonde de disponibilité. Un pod `intake` prêt accepte immédiatement les écritures : il ne rejoue rien au démarrage, car les autres pods `intake` prennent en charge le WAL du pod perdu. Le délai de grâce de 45 secondes lui permet de vider ses tampons et de libérer son WAL avant de s’arrêter.
+  </Tab>
+</Tabs>
+
+Consultez [Déploiement par rôle](/fr/deployment/role-based) pour en savoir plus sur les rôles, la mise à l’échelle et la haute disponibilité.
+
+## Agents de sonde
+
+Un agent de sonde exécute des tests synthétiques depuis un réseau privé, une région ou un site en périphérie. Il ouvre uniquement des connexions sortantes vers les ports `5084` et `5085` d’un nœud `standalone` ou `alert`. Il dispose de sa propre image, `ghcr.io/molesignal/probe-agent`, publiée avec les mêmes tags que l’image MoleSignal.
+
+| Plateforme | Installation | Stockage de l’identité |
+|---|---|---|
+| Kubernetes | Chart Helm `probe-agent` depuis `https://charts.molesignal.com` ou `oci://ghcr.io/molesignal/charts/probe-agent` | Un volume persistant par réplica |
+| Docker | Image `ghcr.io/molesignal/probe-agent` | Un volume monté sur `/var/lib/molesignal-probe` |
+| Linux | Binaire publié `probe-agent` | Le répertoire indiqué par `--state-dir` |
+
+Consultez [Exécuter des agents sur Kubernetes](/fr/synthetics#exécuter-des-agents-sur-kubernetes) pour le chart, et [Emplacements et agents de sonde](/fr/synthetics#emplacements-et-agents-de-sonde) pour l’enregistrement et les paramètres du serveur.
+
+## Ports
+
+| Port | Utilisation | Exposition |
+|---|---|---|
+| `5080` | Interface web, API HTTP, `/metrics` et point de terminaison de vérification de l’état de santé. Pour les rôles autres que `router` et `standalone`, seuls les contrôles de santé et de disponibilité ainsi que les métriques sont accessibles. | Public avec TLS pour les rôles `router` et `standalone`. Privé pour les autres rôles. |
+| `4317` | Récepteur OTLP gRPC. gRPC sans TLS. | Public uniquement derrière un proxy qui termine les connexions TLS ou au sein d’un réseau de confiance. |
+| `5082` | gRPC interne pour le trafic entre nœuds : transfert des écritures et des requêtes, et analyse des fragments | Privé. Ne l’exposez jamais. |
+| `5083` | Arrow Flight SQL pour les clients de base de données. Désactivé par défaut. | Facultatif, avec TLS. |
+| `5084`, `5085` | Enregistrement et contrôle des agents de sondage pour les emplacements privés de surveillance synthétique | Uniquement si les agents de sondage s’exécutent en dehors du nœud. |
+| `80`, `443` | Écouteur TLS intégré avec gestion automatique des certificats lorsque `[http.tls].enabled` vaut `true` | Public. |
+
+## État de santé et métriques
+
+- `GET /api/v1/healthz` est public. Ce point de terminaison renvoie `200` avec `{"status":"ok"}`, ou `503` avec un champ `reason` si le stockage d’objets est inaccessible. Utilisez ce point de terminaison pour les sondes des conteneurs et des équilibreurs de charge.
+- `GET /metrics` est public et renvoie les métriques Prometheus. Limitez l’accès au niveau du proxy ou du réseau.
+- `GET /api/v1/readyz` et `GET /api/v1/version` nécessitent un jeton Bearer sur un nœud `standalone` ou `router`. `version` renvoie la version, le commit, l’identifiant de build, le canal de publication et l’édition.
+- Dans un cluster à rôles séparés, un nœud qui n’expose pas l’intégralité de l’API répond à `GET /api/v1/healthz`, `GET /api/v1/readyz` et `GET /metrics` sans authentification sur le même port.
+
+Consultez la page [Auto-observabilité](/fr/self-observability) pour en savoir plus sur les métriques et la télémétrie intégrée du service lui-même.

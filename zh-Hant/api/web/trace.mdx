@@ -1,0 +1,390 @@
+---
+title: "追蹤列表與詳細資料"
+description: "列出追蹤摘要與 Span，依時間統計追蹤數量，讀取單筆追蹤的所有 Span，並找出連結至該筆追蹤的 Span。"
+"en_link": "/en-US/api/web/trace"
+"zh-Hans_link": "/zh-Hans/api/web/trace"
+"ja_link": "/ja/api/web/trace"
+"ko_link": "/ko/api/web/trace"
+"de_link": "/de/api/web/trace"
+"es_link": "/es/api/web/trace"
+"fr_link": "/fr/api/web/trace"
+"pt-BR_link": "/pt-BR/api/web/trace"
+---
+
+所有呼叫都會讀取組織中的一個追蹤資料流：包含 `trace_id`、`span_id`、`service.name`、`name`、`start_time_unix_nano`、`end_time_unix_nano` 和 `status_code` 所有欄位的資料流。名為 `default` 的資料流優先於其他符合條件的資料流，若仍同順位，則依資料流名稱決定。組織沒有這類資料流時，結果為空。只能讀取透過[尾端取樣](/zh-Hant/configuration#追蹤擷取與尾端取樣)保留的追蹤。
+
+所有呼叫都需要 `traces.read`，系統範圍可使用 `sys.telemetry.read`。
+
+## 列出追蹤摘要
+
+```http
+GET /api/v1/web/traces
+```
+
+每筆追蹤會傳回一筆摘要，並使用游標分頁。資料流還沒有追蹤摘要時，會傳回空白頁面。
+
+**查詢參數**
+
+| 參數 | 類型 | 說明 |
+|---|---|---|
+| `from`、`to` | integer | 以微秒表示的時間範圍。預設為截至目前的最近 24 小時。`to` 必須大於 `from`。 |
+| `q` | string | 不區分大小寫的文字，必須出現在某個 Span 的 `trace_id`、`span_id`、服務、操作或狀態中。最長 256 個字元。 |
+| `filters` | string | 篩選條件的 JSON 陣列，見下文。 |
+| `where` | string | JSON 條件樹：以 AND 和 OR 連接的篩選條件和文字，見下文。 |
+| `expression` | string | 採用**追蹤**頁面語法的欄位查詢。用來取代 `q`、`filters` 和 `where`，兩種寫法不能併用，見下文。 |
+| `sort` | string | `latest`（預設）、`earliest`、`duration_desc`、`duration_asc`、`span_count_desc` 或 `errors_desc`。 |
+| `limit` | integer | 每頁筆數。預設為 `20`。值限於 1 到 5000。 |
+| `cursor` | string | 先前某個頁面傳回的 `nextCursor` 或 `previousCursor`。 |
+| `fields` | string | 隨每筆追蹤一起傳回的根 Span 欄位，以逗號分隔，並使用資料流中的欄位名稱。最多 12 個。指定未知欄位、JSON 欄位或 `molesignal.trace.*` 欄位時，會傳回 `400`。 |
+
+篩選條件是包含 `field`、`op` 和 `value` 的物件，單一請求最多可帶 32 個篩選條件。必須同時符合所有篩選條件。`in` 運算子以 `values`（值的清單）取代 `value`。
+
+| 欄位 | 類型 | 運算子 |
+|---|---|---|
+| `trace_id` | 文字 | `=`、`!=`、`contains`、`in` |
+| `duration_ns`、`span_count`、`error_count` | 整數 | `=`、`!=`、`>`、`>=`、`<`、`<=`、`in` |
+| 追蹤資料流中的任何其他純量欄位 | 取決於欄位類型 | 文字：`=`、`!=`、`contains`、`in`。數字與時間戳記：`=`、`!=`、`>`、`>=`、`<`、`<=`、`in`。布林值：`=`、`!=`、`in`。 |
+
+篩選條件只接受資料流中的欄位名稱，例如 `service.name`、`name`，不接受其他名稱。運算子 `eq`、`ne` 和 `like` 分別是 `=`、`!=` 和 `contains` 的別名。JSON 欄位不能用於篩選條件。
+
+`trace_id`、`duration_ns`、`span_count` 和 `error_count` 以追蹤為單位比較。其他欄位都屬於 Span：追蹤中只要有一個 Span 符合篩選條件，該追蹤就符合；使用 `!=` 時，追蹤中的所有 Span 都不含該值才算符合。缺少該欄位的 Span 視為不含該值。
+
+`in` 比對 `values` 中的任一值：可指定 1 到 64 個值，每個值最長 512 位元組，且必須符合欄位類型。重複列出的值只算一次。套用至 Span 欄位時，追蹤中只要有一個 Span 含有其中任一值，該追蹤就符合。
+
+`where` 可表達篩選條件清單無法表達的多個可選分支。它是下列四種形式之一的 JSON 物件：
+
+| 形式 | 比對方式 |
+|---|---|
+| 與 `filters` 中相同的篩選條件 | 符合該篩選條件。 |
+| `{"text": "..."}` | 比對該文字，方式與 `q` 相同。 |
+| `{"and": [...]}` | 符合清單中的所有條件。 |
+| `{"or": [...]}` | 符合清單中的任一條件。 |
+
+必須同時符合 `filters`、`q` 和 `where`。條件樹中的篩選條件含義不變：套用至 Span 欄位時，追蹤中只要有一個 Span 符合即可；使用 `!=` 時，追蹤中的所有 Span 都不含該值才算符合。追蹤只要符合 `A` 或 `B`，就符合 `{"or": [A, B]}`。`filters` 和 `where` 中的篩選條件合計最多 32 個。每棵條件樹最多可搜尋 8 段文字，群組最多可巢狀 8 層，每個群組至少要有一個條件。
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'filters=[{"field":"status_code","op":"=","value":"ERROR"}]' \
+  --data-urlencode 'where={"or":[{"field":"service.name","op":"=","value":"checkout"},{"field":"span_count","op":">","value":"50"}]}'
+```
+
+此請求會列出失敗的追蹤中，有 Span 含有 `checkout` 或 Span 數量超過 50 的追蹤。
+
+`expression` 改為接收**追蹤**頁面的文字：使用 `=`、`!=`、`>`、`>=`、`<`、`<=`、`contains` 和 `field in ('a', 'b')` 的比較式、要搜尋的詞、加上引號的片語、不區分大小寫的 `AND` 和 `OR`（`AND` 優先），以及括號。伺服器會將文字解析為頁面會傳送的 `q`、`filters` 和 `where`，再依上述規則驗證。文字最長 8 KiB，括號最多可巢狀 32 層。遇到無法解析的部分（例如括號未閉合或比較值為空）時，會傳回 `400` 並指出該部分。
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode "expression=status_code = 'ERROR' AND (service.name = 'checkout' OR span_count > 50)"
+```
+
+此請求列出的追蹤與上一個請求相同。
+
+`cursor` 會將頁面繫結至簽發該游標的查詢。帶著 `cursor` 再次送出請求時，若變更 `limit`、`sort`、`q`、`filters` 或 `where`，會傳回 `400`。
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'sort=duration_desc' \
+  --data-urlencode 'limit=2' \
+  --data-urlencode 'fields=http.route' \
+  --data-urlencode 'filters=[{"field":"service.name","op":"in","values":["checkout","payments"]}]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    {
+      "traceId": "0af7651916cd43dd8448eb211c80319c",
+      "service": "checkout",
+      "operation": "GET /checkout",
+      "startNs": 1790000000000000000,
+      "durationMs": 180.0,
+      "spanCount": 3,
+      "errorCount": 1,
+      "status": "ERROR",
+      "httpStatusCode": 502,
+      "fields": { "http.route": "/checkout" }
+    }
+  ],
+  "nextCursor": null,
+  "previousCursor": null,
+  "hasMore": false
+}
+```
+</ResponseExample>
+
+每個項目以根 Span 描述一筆追蹤：根 Span 的 `service` 與 `operation`、以奈秒表示的開始時間、以毫秒表示的持續時間、Span 數量和錯誤 Span 數量。設定了 `nextCursor` 時，`hasMore` 為 `true`。
+
+| 欄位 | 說明 |
+|---|---|
+| `status` | 根 Span 的狀態：`OK`、`ERROR` 或 `UNSET`。 |
+| `httpStatusCode` | 根 Span 的 `http.response.status_code` 或 `http.status_code`，值介於 100 到 599 時才會傳回。其他情況不會傳回此欄位；開始在摘要中儲存此欄位之前寫入的追蹤也不會傳回。 |
+| `fields` | 在 `fields` 中要求且根 Span 有值的欄位。沒有符合條件的欄位時不會傳回。讀取失敗時，仍會傳回頁面，但不含這些欄位。 |
+
+## 按時間統計追蹤數量
+
+```http
+GET /api/v1/web/traces/histogram
+```
+
+依追蹤的開始時間，將清單查詢符合的每筆追蹤計入對應的時間桶。此呼叫使用與清單相同的時間範圍、`q`、`filters` 和 `where`，因此符合的追蹤也相同。時間桶由呼叫端指定。
+
+**查詢參數**
+
+| 參數 | 類型 | 說明 |
+|---|---|---|
+| `from`、`to` | integer | 以微秒表示的時間範圍，兩者皆為必填。`to` 必須大於 `from`。 |
+| `q`、`filters`、`where`、`expression` | string | 與清單相同。 |
+| `bucketTime` | integer | 單一時間桶的長度，單位為微秒。不得小於 `1000`。 |
+| `originTime` | integer | 第一個時間桶的起點，單位為微秒。不得晚於 `from`。 |
+
+從 `originTime` 到 `to`，單一請求最多涵蓋 512 個時間桶。
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces/histogram" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'from=1790000100000000' \
+  --data-urlencode 'to=1790003700000000' \
+  --data-urlencode 'bucketTime=900000000' \
+  --data-urlencode 'originTime=1790000100000000' \
+  --data-urlencode 'filters=[{"field":"service.name","op":"=","value":"checkout"}]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "bucketTime": 900000000,
+  "originTime": 1790000100000000,
+  "buckets": [
+    { "startTime": 1790000100000000, "total": 42, "errors": 3, "p50Ns": 41000000, "p95Ns": 180000000, "p99Ns": 320000000 },
+    { "startTime": 1790001900000000, "total": 17, "errors": 0, "p50Ns": 38000000, "p95Ns": 95000000, "p99Ns": 120000000 }
+  ],
+  "split": true
+}
+```
+</ResponseExample>
+
+`buckets` 只會列出包含追蹤的時間桶，並依時間從早到晚排序。`total` 是在該時間桶內開始的追蹤數量。`errors` 是其中至少有一個錯誤 Span 的追蹤數量。`p50Ns`、`p95Ns` 和 `p99Ns` 是這些追蹤耗時的中位數、第 95 和第 99 百分位數，以奈秒表示。這些數字是估算值，未統計到耗時時不會傳回。
+
+統計時會讀取追蹤摘要；篩選條件套用至 Span 欄位時，也會讀取 Span。清單中的每筆追蹤只會傳回一筆摘要。若寫入重試導致同一筆摘要儲存了兩份，統計時會計算兩次。
+
+無法統計時，呼叫仍會傳回 `200`。此時 `buckets` 為空，`unavailable` 會指出原因。
+
+| `unavailable` | 原因 |
+|---|---|
+| `time_budget` | 統計耗時超過 20 秒。 |
+| `busy` | 該角色的查詢已達到 [`[search.admission]`](/zh-Hant/configuration#准入控制) 允許的數量上限，且在 `max_wait_secs` 內沒有等到可用名額。 |
+| `scan_limit` | 時間範圍內的資料列數超過 `[querier].max_scan_rows` 允許單次查詢讀取的數量。 |
+
+## 讀取請求指標
+
+```http
+GET /api/v1/web/traces/red
+GET /api/v1/web/traces/red/breakdown
+```
+
+讀取符合清單查詢的請求速率、錯誤和耗時：提供總計、各時間桶的統計，以及耗時分布。分組介面會依指定欄位的每個值讀取相同的指標。每個請求對應一個 Span。預設會讀取服務接收請求的 Span：server 或 consumer Span，或追蹤的根 Span；`scope=all` 會讀取所有 Span。
+
+套用至 Span 欄位的篩選條件會比對 Span 本身，因此 `service.name = 'api'` 會讀取 `api` 處理的請求。`trace_id` 和 `duration_ns` 取自 Span，`span_count` 和 `error_count` 取自 Span 所屬的追蹤。
+
+**查詢參數**
+
+| 參數 | 類型 | 說明 |
+|---|---|---|
+| `from`、`to`、`bucketTime`、`originTime` | integer | 與按時間統計追蹤數量相同。 |
+| `q`、`filters`、`where`、`expression` | string | 與清單相同。 |
+| `scope` | string | `entry`（預設）或 `all`。 |
+| `by` | string | 僅用於分組，且為必填：使用資料流中的欄位名稱，指定依哪個欄位將請求分組。 |
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces/red" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'from=1790000100000000' \
+  --data-urlencode 'to=1790003700000000' \
+  --data-urlencode 'bucketTime=60000000' \
+  --data-urlencode 'originTime=1790000100000000' \
+  --data-urlencode "expression=service.name = 'checkout'"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "bucketTime": 60000000,
+  "originTime": 1790000100000000,
+  "scope": "entry",
+  "total": { "requests": 1840, "errors": 12, "p50Ns": 41000000.0, "p95Ns": 180000000.0, "p99Ns": 320000000.0 },
+  "buckets": [
+    { "startTime": 1790000100000000, "requests": 31, "errors": 0, "p50Ns": 40000000.0, "p95Ns": 150000000.0, "p99Ns": 210000000.0 }
+  ],
+  "latency": [
+    { "fromNs": 0, "toNs": 50000000, "requests": 1203, "errors": 2 },
+    { "fromNs": 50000000, "toNs": null, "requests": 637, "errors": 10 }
+  ]
+}
+```
+</ResponseExample>
+
+`buckets` 只會列出含有請求的時間桶，並依時間從早到晚排序。`latency` 依耗時從短到長分段列出請求，最後一段沒有上限。無法判斷請求是否失敗時，`errors` 為 `null`；耗時以奈秒為單位，沒有請求或耗時遭遮罩時為 `null`。
+
+分組介面會傳回 `field`、`bucketTime`、`originTime`、`scope` 和 `groups`：最常見的 50 個值排在前面，每個值都包含各自的指標，以及由 `requests`、`errors` 和 `p95Ns` 組成的時間桶序列 `series`。請求沒有該欄位的值時，`value` 為 `null`。還有未列出的值時，`more` 為 `true`。
+
+無法讀取指標時，兩個介面仍會傳回 `200`，並附上 `unavailable`：`time_budget`、`busy` 和 `scan_limit` 的含義與追蹤統計相同；讀取端看到的時間遭遮罩時為 `timestamp_masked`；分組欄位遭遮罩或加密時為 `field_protected`。
+
+## 列出 Span
+
+```http
+GET /api/v1/web/traces/spans
+```
+
+每個符合查詢的 Span 會傳回一列，並使用游標分頁。此呼叫接受追蹤清單的時間範圍、`q`、`filters` 和 `where`，並以單一 Span 為單位比對：套用至 Span 欄位的篩選條件會比對 Span 本身，`!=` 會保留缺少該欄位的 Span。`duration_ns` 是 Span 本身的耗時，`span_count` 和 `error_count` 是 Span 所屬追蹤的計數。Span 只要符合 `A` 或 `B`，就符合 `{"or": [A, B]}`。
+
+**查詢參數**
+
+| 參數 | 類型 | 說明 |
+|---|---|---|
+| `from`、`to` | integer | 以微秒表示的時間範圍。預設為截至目前的最近 24 小時。`to` 必須大於 `from`。 |
+| `q`、`filters`、`where`、`expression` | string | 與追蹤清單相同。 |
+| `sort` | string | `latest`（預設）、`earliest`、`duration_desc` 或 `duration_asc`。 |
+| `limit` | integer | 每頁筆數。預設為 `100`。值限於 1 到 5000。 |
+| `cursor` | string | 先前某個頁面傳回的 `nextCursor` 或 `previousCursor`。游標會帶有該頁面的查詢；變更 `limit` 時會傳回 `400`。 |
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    {
+      "traceId": "0af7651916cd43dd8448eb211c80319c",
+      "spanId": "53995c3f42cd8ad8",
+      "parentSpanId": "b7ad6b7169203331",
+      "service": "payments",
+      "operation": "POST /pay",
+      "startNs": 1790000000020000000,
+      "durationNs": 140000000,
+      "status": "ERROR",
+      "kind": 2,
+      "httpStatusCode": 502
+    }
+  ],
+  "nextCursor": null,
+  "previousCursor": null,
+  "hasMore": false
+}
+```
+</ResponseExample>
+
+`status` 為 `OK`、`ERROR` 或 `UNSET`。`kind` 依 OTLP 的編號表示 Span 類型：`1` internal、`2` server、`3` client、`4` producer、`5` consumer。Span 沒有 `parent_span_id`、`kind` 或 `http_status_code` 時，不會傳回對應欄位。此呼叫會以受追蹤的查詢執行，並與其他查詢一樣通過准入控制。
+
+## 讀取單筆追蹤
+
+```http
+GET /api/v1/web/trace/{traceId}
+```
+
+傳回一筆追蹤的所有 Span，並依開始時間排序。`trace_id` 由 1 到 128 個字元組成，只能使用 `A-Z`、`a-z`、`0-9`、`-` 和 `_`。
+
+**查詢參數**
+
+| 參數 | 類型 | 說明 |
+|---|---|---|
+| `from`、`to` | integer | 以微秒表示的時間範圍，也就是該追蹤的 Span 開始的時間範圍。兩者必須同時提供或都不提供。最長 31 天。未提供時，會搜尋最近 24 小時。 |
+
+回應最多包含 100,000 個 Span，大小不超過 32 MiB。因達到上限而截斷 Span 清單時，`truncated` 為 `true`。
+
+<ResponseExample>
+```json 200
+{
+  "traceId": "0af7651916cd43dd8448eb211c80319c",
+  "rootSpanId": "b7ad6b7169203331",
+  "spans": [
+    {
+      "spanId": "53995c3f42cd8ad8",
+      "parentSpanId": "b7ad6b7169203331",
+      "service": "payments",
+      "operation": "POST /pay",
+      "startNs": 1790000000020000000,
+      "endNs": 1790000000160000000,
+      "durationNs": 140000000,
+      "kind": 2,
+      "status": "ERROR",
+      "statusMessage": "upstream timeout",
+      "attributes": { "http.method": "POST", "http.status_code": "502" },
+      "events": [],
+      "links": [],
+      "samplingReason": "error",
+      "partial": false,
+      "late": false,
+      "duplicate": false,
+      "conflict": false
+    }
+  ],
+  "truncated": false,
+  "partial": false,
+  "partialReasons": [],
+  "samplingReasons": ["error"],
+  "lateSpanCount": 0,
+  "duplicateSpanCount": 0,
+  "conflictSpanCount": 0
+}
+```
+</ResponseExample>
+
+範例只顯示一個 Span 的主要欄位。實際的 Span 還包含 `traceFlags`、`traceState`、`resource`、`scope`、各個 `dropped_*_count` 計數器、`schemaVersion` 和 `semanticConventionsVersion`。
+
+| 欄位 | 說明 |
+|---|---|
+| `rootSpanId` | 第一個沒有上層 Span 的 Span。請依 `span_id` 和 `parent_span_id` 建立樹狀結構。 |
+| `spans[].status` | `OK`、`ERROR` 或 `UNSET`。 |
+| `spans[].attributes` | Span 屬性，已與資料流中展開的屬性欄合併。 |
+| `spans[].sampling_reason` | 尾端取樣器保留該追蹤的原因，例如 `error`。 |
+| `partial`、`partialReasons` | 是否缺少 Span，以及缺少的原因。 |
+| `lateSpanCount`、`duplicateSpanCount`、`conflictSpanCount` | 延遲抵達、重複或衝突的 Span 數量。 |
+
+## 尋找連結至特定追蹤的 Span
+
+```http
+GET /api/v1/web/trace/{traceId}/linked
+```
+
+Span 會儲存指向來源 Span 的連結，追蹤詳細資料會隨 Span 一併傳回這些連結。此呼叫會尋找反向連結：其他追蹤中連結至此追蹤內任一 Span 的 Span。此呼叫接受與追蹤詳細資料相同的 `from` 和 `to`，並在該時間範圍內尋找。
+
+<ResponseExample>
+```json 200
+{
+  "spans": [
+    {
+      "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "spanId": "00f067aa0ba902b7",
+      "service": "billing-worker",
+      "operation": "process invoice",
+      "startNs": 1790000005000000000,
+      "durationNs": 30000000,
+      "status": "OK",
+      "linkedSpanId": "53995c3f42cd8ad8",
+      "attributes": { "messaging.operation": "process" }
+    }
+  ],
+  "more": false
+}
+```
+</ResponseExample>
+
+`spans` 最多列出 200 個連結至此追蹤的 Span，依時間由新到舊排列。若還有更多 Span 連結至此追蹤，`more` 為 `true`。`linkedSpanId` 是連結指向的此追蹤內 Span 的 ID，`attributes` 是連結本身的屬性。
+
+搜尋會以文字形式讀取時間範圍內每個 Span 的連結，並受追蹤統計的時間預算限制。若無法完成，呼叫仍會傳回 `200`，`spans` 為空，`unavailable` 會指出原因：`time_budget`、`busy` 或 `scan_limit`，含義與追蹤統計相同。
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | 參數無效：`to` 不大於 `from`、篩選條件使用未知的欄位或運算子（`unsupported trace filter field: nope`）、`in` 篩選條件沒有值或超過 64 個值、`where` 不是條件樹或超出其限制、`expression` 與 `q`、`filters` 或 `where` 同時提供，或包含無法解析的部分、游標與查詢不相符、`fields` 中有未知欄位或欄位是文件，或 `trace_id` 的字元或長度無效。統計時也包括：缺少時間範圍或時間分桶參數、`bucketTime` 小於 `1000`、`originTime` 晚於 `from`，或請求涵蓋超過 512 個時間分桶。追蹤詳細資料及其反向連結也包括：只提供 `from` 或 `to` 其中一個，或時間範圍超過 31 天。 |
+| `403` | 權杖缺少 `traces.read`。 |
+| `404` | 時間範圍內找不到此追蹤，或此追蹤已在取樣時捨棄。 |

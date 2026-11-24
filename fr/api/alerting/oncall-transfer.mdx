@@ -1,0 +1,119 @@
+---
+title: "Importer et exporter les politiques, les plannings et les règles de routage"
+description: "Exportez les politiques d’escalade, les plannings d’astreinte et les règles de routage sous forme de lots qui identifient par leur nom les éléments référencés, puis importez ces lots dans une organisation."
+"en_link": "/en-US/api/alerting/oncall-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/oncall-transfer"
+"zh-Hant_link": "/zh-Hant/api/alerting/oncall-transfer"
+"ja_link": "/ja/api/alerting/oncall-transfer"
+"ko_link": "/ko/api/alerting/oncall-transfer"
+"de_link": "/de/api/alerting/oncall-transfer"
+"es_link": "/es/api/alerting/oncall-transfer"
+"pt-BR_link": "/pt-BR/api/alerting/oncall-transfer"
+---
+
+```http
+GET  /api/v1/alerts/escalations/export
+POST /api/v1/alerts/escalations/import
+GET  /api/v1/schedules/export
+POST /api/v1/schedules/import
+GET  /api/v1/alerts/routing/rules/export
+POST /api/v1/alerts/routing/rules/import
+```
+
+| Type | Exportation | Importation | Format | Clé de la liste |
+|---|---|---|---|---|
+| Politiques d’escalade | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.escalation-policies/v1` | `policies` |
+| Plannings d’astreinte | `schedules.read` | `schedules.create` | `molesignal.schedules/v1` | `schedules` |
+| Règles de routage | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.routing-rules/v1` | `rules` |
+
+## Exportation
+
+Indiquez dans le paramètre de requête `ids` les identifiants séparés par des virgules. Laissez-le vide pour tout exporter. La réponse contient un
+lot :
+
+```json
+{
+  "format": "molesignal.escalation-policies/v1",
+  "policies": [
+    {
+      "name": "Payments on-call",
+      "steps": [
+        {"targets": [{"kind": "schedule", "schedule": "Payments primary"}], "ackTimeoutSecs": 300, "minSeverity": null},
+        {"targets": [{"kind": "user", "user": "lead@example.com"}], "ackTimeoutSecs": 600, "minSeverity": null}
+      ],
+      "repeat": false,
+      "maxLoops": 1,
+      "urgencyRule": {"mode": "by_severity"}
+    }
+  ]
+}
+```
+
+Chaque élément conserve sa définition, mais pas son identifiant ni son organisation. Les références utilisent des noms : `user` contient
+l’adresse e-mail du compte ; `team`, `schedule`, `policy` et `calendar` contiennent respectivement les noms d’une équipe, d’un planning d’astreinte,
+d’une politique d’escalade et d’un calendrier de jours fériés. Le champ `members` d’une rotation contient des adresses e-mail. Un planning exclut
+les remplacements temporaires et les horodatages. Une règle de routage exclut sa position et ses horodatages.
+
+## Importation
+
+| Champ | Type | Obligatoire | Description |
+|---|---|---|---|
+| `content` | chaîne | Oui | Un lot du type attendu, au format JSON ou YAML, limité à 4 MiB et à 500 éléments. Pour les plannings, le fichier décrit dans [Migrer des plannings depuis Opsgenie ou PagerDuty](/fr/alerting/schedule-migration) est également accepté. |
+| `dryRun` | booléen | Non | `true` par défaut : simule l’importation. `false` enregistre les modifications. |
+| `createOnly` | booléen | Non | Avec `true`, l’importation ne modifie pas les éléments existants du même nom. |
+
+L’importation recherche chaque élément par nom : si le nom est nouveau, elle crée l’élément ; s’il correspond à un seul élément, elle compare les champs un à un. Un
+nom qui correspond à plusieurs éléments ou qui apparaît deux fois dans le fichier provoque une erreur. Chaque référence doit désigner un élément
+de l’organisation. L’importation applique à chaque élément les mêmes contrôles qu’à l’enregistrement. Si un élément échoue, l’importation
+n’enregistre rien. Sinon, elle enregistre les éléments l’un après l’autre, émet un événement de modification de la fédération pour chaque élément
+synchronisé et consigne un seul événement d’audit : `escalation_policies.imported`, `schedules.imported`
+ou `routing_rules.imported`.
+
+- Lors de l’importation d’un planning existant, conservez les remplacements temporaires, les échanges de créneaux et les paramètres absents du fichier.
+- Les règles de routage importées passent en tête, dans l’ordre du fichier. Les autres règles viennent ensuite, dans leur ordre initial.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content schedules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "molesignal.schedules/v1",
+  "items": [
+    {"name": "Payments primary", "action": "update", "changes": ["rotations"], "id": "3KC9..."},
+    {"name": "Payments nights", "action": "create"},
+    {"name": "Search", "action": "error", "error": "no user is named `ann@example.com`"}
+  ],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` vaut `create`, `update`, `unchanged`, `skip` (pour un élément existant avec `createOnly` ou un planning PagerDuty
+organisé par créneaux que le fichier mentionne uniquement par son nom) ou `error`. Après l’enregistrement, `id` identifie l’élément créé ou mis à jour. `applied` indique
+si l’importation a enregistré des modifications.
+
+`format` indique le format lu : le format du lot, `pagerduty` ou `opsgenie`. Les plannings peuvent aussi comporter les
+champs suivants :
+
+| Champ | Emplacement | Description |
+|---|---|---|
+| `unknownMembers` | Élément | Toutes les adresses e-mail qui ne correspondent à aucun membre de l’organisation. |
+| `blockers` | Élément | Les données que l’importation ne peut pas transférer et dont l’absence modifierait l’attribution des astreintes. Un seul blocage suffit pour que `action` vaille `error`. |
+| `findings` | Élément, rapport | Les données omises et la comparaison entre l’élément et le résultat affiché dans le système source. |
+
+Chaque blocage ou constat prend la forme `{"code": "...", "params": {...}}`. `code` identifie le texte du message et `params`
+fournit les valeurs à y insérer.
+
+**Erreurs**
+
+| Statut | Motif |
+|---|---|
+| `400` | Le contenu n’est ni un lot du type attendu ni un fichier compatible avec l’importation de plannings, déclare un autre format, dépasse la taille maximale ou contient trop d’éléments. |
+| `403` | Le jeton ne dispose pas de l’autorisation requise. |

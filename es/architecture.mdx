@@ -1,0 +1,115 @@
+---
+title: "Arquitectura"
+description: "Cómo interactúan el binario de MoleSignal, PostgreSQL, el almacenamiento de objetos, los roles y los procesos en segundo plano."
+"en_link": "/en-US/architecture"
+"zh-Hans_link": "/zh-Hans/architecture"
+"zh-Hant_link": "/zh-Hant/architecture"
+"ja_link": "/ja/architecture"
+"ko_link": "/ko/architecture"
+"de_link": "/de/architecture"
+"fr_link": "/fr/architecture"
+"pt-BR_link": "/pt-BR/architecture"
+---
+
+MoleSignal consta de un único binario de Rust que integra la aplicación web. La opción `[node].roles` determina qué responsabilidades asume cada proceso. Dos servicios externos guardan todo el estado persistente: PostgreSQL y el almacenamiento de objetos.
+
+## Componentes
+
+| Componente | Responsabilidad |
+|---|---|
+| API HTTP e interfaz web | Puerto `5080`. Sirve la API del producto, la aplicación web integrada, `/metrics` y el endpoint de comprobación de estado. |
+| Ingesta | Recibe telemetría por HTTP y OTLP gRPC (`4317`), la valida, aplica el enmascaramiento y las canalizaciones, y la escribe en el WAL y en un búfer en memoria. |
+| Registro de escritura anticipada (WAL) | Objetos en el almacenamiento de objetos que contienen los registros cuyo volcado está pendiente. El proceso solo confirma una escritura después de almacenar su objeto WAL. |
+| Almacenamiento de objetos | Archivos de datos Parquet, archivos auxiliares de índices de búsqueda, manifiestos de particiones selladas, blobs de perfiles, exportaciones y evidencias de gran tamaño del agente. |
+| PostgreSQL | Metadatos: identidades, organizaciones, flujos y esquemas, el catálogo de archivos, recursos del producto y estado de las tareas. |
+| Motor de consultas | Apache DataFusion sobre Arrow. Ejecuta consultas SQL y consultas compatibles con PromQL, descarta archivos mediante los metadatos del catálogo y los índices de búsqueda, y combina los escaneos locales y federados. |
+| Tareas de búsqueda | Consultas asíncronas persistentes que los nodos de consulta toman de PostgreSQL. |
+| Compactador | Combina archivos, aplica la retención, mantiene el catálogo y los índices, y elimina los objetos que ya no se necesitan. |
+| Alertas | Evalúa reglas, gestiona los escalamientos, genera informes programados y ejecuta conectores. |
+| Ejecutor de sondas | Ejecuta monitores sintéticos. Un nodo independiente ejecuta un ejecutor integrado, y los agentes de sonda externos se conectan a través de los puertos `5084` y `5085`. |
+| Mole Agent | Investiga problemas mediante el catálogo de herramientas compartido, con los permisos de la cuenta que inició sesión. |
+
+No hay Kafka, Redis ni servicio de consenso. Las cachés residen en la memoria del proceso y en el disco local. Ningún nodo conserva datos confirmados en su disco local.
+
+## Roles de ejecución
+
+La opción `[node].roles` asigna uno o más roles al proceso:
+
+| Rol | Responsabilidad principal |
+|---|---|
+| `standalone` | Todas las API, la interfaz web y todos los procesos de trabajo en un único proceso. |
+| `router` | La API HTTP completa y la interfaz web, la limitación de la tasa de solicitudes y el reenvío de escrituras a los nodos de ingesta y de consultas a los nodos de consulta. |
+| `intake` | Validación, canalizaciones, enmascaramiento, WAL, búferes, volcado a Parquet y recuperación del WAL de los nodos de ingesta que dejan de estar disponibles. |
+| `querier` | Ejecución de las consultas que reenvían otros nodos y de las tareas de búsqueda asíncronas. |
+| `compactor` | Compactación de archivos, retención y mantenimiento del almacenamiento. |
+| `alert` | Evaluación de reglas, programación, escalamiento, gestión de envíos y conectores. |
+
+Todos los roles usan el mismo binario y modelo de configuración. Para cambiar de rol, reinicia el proceso. Consulta [Implementación basada en roles](/es/deployment/role-based).
+
+## Recorrido de los datos
+
+<Frame caption="Data path">
+  <img src="/images/architecture/data-path_en_light.svg" alt="Ruta de escritura: emisor, receptor del protocolo, autenticación e IAM, esquema, enmascaramiento y canalización, WAL y búfer de Arrow, Parquet e índice de búsqueda y, por último, almacenamiento de objetos y una fila del catálogo en PostgreSQL. Ruta de lectura: consulta, planificador y reescritura según la organización, descarte de archivos mediante el catálogo y el índice, DataFusion o PromQL, escaneo local o federado y, por último, filas, NDJSON o una tarea de búsqueda asíncrona" className="block dark:hidden" />
+  <img src="/images/architecture/data-path_en_dark.svg" alt="Ruta de escritura: emisor, receptor del protocolo, autenticación e IAM, esquema, enmascaramiento y canalización, WAL y búfer de Arrow, Parquet e índice de búsqueda y, por último, almacenamiento de objetos y una fila del catálogo en PostgreSQL. Ruta de lectura: consulta, planificador y reescritura según la organización, descarte de archivos mediante el catálogo y el índice, DataFusion o PromQL, escaneo local o federado y, por último, filas, NDJSON o una tarea de búsqueda asíncrona" className="hidden dark:block" />
+</Frame>
+
+Durante un volcado, el proceso carga los archivos, los registra en el catálogo y luego elimina los objetos WAL que contienen los datos volcados. Al ejecutar una consulta, el motor revisa el catálogo para encontrar los archivos del flujo que coinciden con el intervalo de tiempo solicitado. Solo recupera esos archivos del almacenamiento de objetos.
+
+## Durabilidad y recuperación
+
+El proceso solo confirma una escritura cuando el objeto WAL que la contiene ya está en el almacenamiento de objetos. Si llegan escrituras mientras el proceso escribe un objeto del mismo conjunto de datos, las agrupa en el siguiente objeto hasta el límite de `[wal].max_group_size`.
+
+Cada proceso registra un escritor del WAL en PostgreSQL. El escritor tiene una época única en todo el clúster y una concesión de `[wal].lease_secs` que el proceso renueva. El proceso deja de confirmar escrituras antes de que venza la concesión.
+
+| Evento | Qué ocurre |
+|---|---|
+| Un nodo falla o pierde su disco | Cuando vence la concesión, otro nodo de ingesta bloquea al escritor, publica todos los registros del WAL posteriores al último volcado confirmado y elimina los objetos. |
+| Un nodo se pausa y vuelve a funcionar | El catálogo rechaza los volcados del escritor bloqueado y el nodo descarta las filas de su búfer. El nodo obtiene una nueva época y sigue aceptando escrituras. El nodo que asumió la recuperación publica los registros anteriores. |
+| Un nodo inicia el cierre ordenado al recibir `SIGTERM` | Deja de confirmar escrituras, vuelca sus búferes, elimina los objetos WAL de los datos volcados y libera su escritor. Otro nodo se hace cargo de inmediato de lo que quede pendiente. |
+| La recuperación se interrumpe a mitad del proceso | El siguiente intento continúa desde el último volcado confirmado. Cada volcado tiene un identificador determinista, por lo que ningún registro se publica dos veces. |
+
+Los nodos de ingesta reparten el trabajo de recuperación entre los nodos de ingesta activos mediante un hash de los conjuntos de datos. Cada `[wal].takeover_interval_secs` comprueban si algún escritor tiene una concesión vencida. Los registros que confirmó un nodo que dejó de estar disponible vuelven a estar disponibles para consultas cuando el nodo que asumió la recuperación los publica.
+
+## Dónde se guarda cada dato
+
+| Ubicación | Contenido |
+|---|---|
+| PostgreSQL | Metadatos y catálogo de archivos. |
+| Almacenamiento de objetos | Archivos de datos e índices en `artifacts/v1/...`, manifiestos de particiones selladas en `manifests/v1/...`, objetos WAL con registros pendientes de volcado en `wal/v1/...`, resultados de tareas de búsqueda en `search_jobs/v1/...` y otros blobs, como perfiles y grabaciones de sesiones. El sistema agrupa los objetos por organización, tipo de señal, conjunto de datos y partición temporal. |
+| Disco local de un nodo | Cachés opcionales en `./data/cache` que el nodo puede reconstruir. |
+
+Los flujos y las organizaciones son entidades lógicas. Un flujo corresponde a un conjunto de datos en el almacenamiento de objetos y a una fila de metadatos en PostgreSQL. Una organización corresponde a un prefijo y a un ámbito que el planificador de consultas hace respetar.
+
+## Procesos en segundo plano
+
+| Proceso | Dónde se ejecuta | Intervalo predeterminado |
+|---|---|---|
+| Señal de actividad y detección de nodos inactivos | Todos los nodos | 5 segundos, 60 segundos |
+| Comprobación de estado del almacenamiento de objetos | Todos los nodos | 30 segundos |
+| Volcado de ingesta | `intake` | 30 segundos o al alcanzar el umbral del búfer |
+| Compactación y retención | `compactor` | 300 segundos |
+| Sellado del catálogo, creación de índices, recolección de elementos no utilizados y conciliación | `compactor` | De 30 a 300 segundos |
+| Evaluación de alertas y envío de escalamientos | `alert` | 30 segundos, 10 segundos |
+| Informes programados | `alert` | Cada 60 segundos, el proceso comprueba qué informes toca generar |
+| Tareas de búsqueda | Nodos que sirven la API | Los nodos toman las tareas bajo demanda |
+| Emisión y renovación de certificados mediante ACME | Nodos que terminan TLS | 60 segundos, 6 horas |
+| Recopilación de telemetría propia | Todos los nodos | 15 segundos para las métricas |
+
+El rol seleccionado determina qué tareas asume cada proceso, por lo que no todos los procesos del mismo rol ejecutan la misma tarea. Los nodos `compactor` se reparten el trabajo por flujo y organización. Los nodos `alert` se lo reparten por regla, informe, canalización y conector. Consulta [Implementación basada en roles](/es/deployment/role-based#distribución-del-trabajo-entre-nodos-compactadores) y [Distribución del trabajo entre nodos de alertas](/es/deployment/role-based#distribución-del-trabajo-entre-nodos-de-alertas). Consulta [Configuración](/es/configuration) para ver todos los intervalos.
+
+## Autorización
+
+La autenticación genera un contexto de IAM. La autorización consulta los permisos, los roles, las relaciones entre recursos y las concesiones explícitas de acceso entre organizaciones que almacena la base de datos. Antes de realizar un cambio, los controladores de recursos cargan el recurso de destino, verifican a qué organización pertenece y autorizan la acción solicitada. Consulta [Seguridad y arquitectura multiinquilino](/es/security).
+
+## Aplicación web
+
+El binario incluye la aplicación web, que comparte el puerto HTTP. La instantánea de capacidades determina qué opciones aparecen en el menú. El backend comprueba los permisos incluso si la opción está oculta.
+
+<CardGroup cols={2}>
+  <Card title="Conceptos básicos" icon="diagram-project" href="/es/concepts">
+    Conoce las señales, los flujos, las organizaciones y el almacenamiento.
+  </Card>
+  <Card title="Despliegue basado en roles" icon="server" href="/es/deployment/role-based">
+    Ejecuta los roles en procesos separados.
+  </Card>
+</CardGroup>

@@ -1,0 +1,300 @@
+---
+title: "쿼리"
+sidebarTitle: "개요"
+description: "조직의 스트림에서 SQL 쿼리, PromQL 호환 메트릭 쿼리, 스트리밍 검색 및 비동기 작업을 실행합니다."
+"en_link": "/en-US/query"
+"zh-Hans_link": "/zh-Hans/query"
+"zh-Hant_link": "/zh-Hant/query"
+"ja_link": "/ja/query"
+"de_link": "/de/query"
+"es_link": "/es/query"
+"fr_link": "/fr/query"
+"pt-BR_link": "/pt-BR/query"
+---
+
+MoleSignal은 **DataFusion** 기반의 단일 쿼리 엔드포인트를 제공합니다. 이 엔드포인트는 동일한 저장소를 대상으로 조인, CTE, 윈도우 함수를 포함한 전체 SQL과 메트릭용 **PromQL 하위 집합**을 지원합니다.
+
+## 쿼리 엔드포인트
+
+```http
+POST /api/v1/query
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+이 엔드포인트에는 `streams.query` 권한이 필요합니다.
+
+### 요청 본문
+
+| 필드 | 유형 | 필수 여부 | 참고 |
+|---|---|---|---|
+| `orgId` | string | 예 | 필드는 필수지만 값은 무시합니다. 인증된 조직을 사용합니다. |
+| `language` | string | 예 | `sql` 또는 `promql`입니다. |
+| `statement` | string | 예 | 쿼리 텍스트입니다. |
+| `timeRange` | object | 예 | `{ "start": <microseconds>, "end": <microseconds> }` 형식이며, 값은 Unix 에포크 이후 경과한 마이크로초입니다. |
+| `stream` | object | SQL에서 필수 | `{ "name": "app", "streamType": "logs" }` 형식입니다. 쿼리의 기본 테이블을 지정합니다. 두 필드 모두 필수입니다. |
+| `limit` | integer | 아니요 | 최대 행 수입니다. |
+
+쿼리 문자열 매개변수 `clusters`로 [연합 검색](#연합-검색)에 사용할 원격 클러스터를 선택합니다.
+
+### 응답
+
+응답에는 `columns`, 배열 형태의 `rows`, `scannedRows`, `tookMs`가 포함됩니다.
+
+```json
+{
+  "columns": ["level", "n"],
+  "rows": [["error", 2], ["info", 2]],
+  "scannedRows": 4,
+  "tookMs": 155
+}
+```
+
+각 셀의 값은 해당 열의 유형을 따릅니다.
+
+| 열 유형 | JSON 값 |
+|---|---|
+| 누락된 값 | `null`입니다. |
+| 정수, 부동 소수점 | 숫자입니다. `NaN`과 무한대는 `null`로 반환합니다. |
+| 십진수 | 정밀도가 15자리 이하면 숫자로, 그보다 크면 모든 자릿수를 보존하는 문자열로 반환합니다. |
+| 텍스트 | 문자열입니다. |
+| 바이너리 | 소문자 16진수 문자열입니다. |
+| 타임스탬프 | 시간 단위나 시간대에 관계없이 Unix 에포크 이후 경과한 마이크로초를 정수로 반환합니다. |
+| 날짜, 시간 | `2022-01-08` 또는 `01:01:01.500`과 같은 문자열입니다. |
+| 리스트, 구조체, 맵 | 각각 배열, 객체, 객체입니다. |
+| 기타 유형 | 문자열입니다. |
+
+연합 검색 응답에는 연합 검색 메타데이터도 포함될 수 있습니다.
+
+<Note>
+  행마다 JSON 객체 하나를 스트리밍하려면 `Accept: application/x-ndjson`을 전송합니다.
+  마지막으로 `scannedRows`와 `tookMs`가 포함된 `{"__meta__": {...}}` 레코드를 전송합니다. 스트리밍은 결과 캐시를 사용하지 않습니다.
+</Note>
+
+## 시간 범위 및 비동기 작업
+
+대화형 쿼리에는 시작과 끝이 명확한 `timeRange`를 사용합니다. MoleSignal은 시간 범위의 길이(초)에 `[querier].estimate_throughput_per_sec`를 곱해 쿼리의 예상 행 수를 계산합니다. 예상 행 수가 `[querier].auto_async_threshold_rows`에 도달하면 쿼리를 영속적으로 저장되는 검색 작업으로 실행합니다. 기본 설정에서는 50,000초, 즉 약 13.9시간의 범위가 이 기준에 해당합니다.
+
+비동기 쿼리는 `202` 상태 코드와 함께 추적할 작업 정보를 반환합니다.
+
+```json
+{
+  "jobId": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+`Prefer` 요청 헤더로 실행 모드를 제어합니다.
+
+| 헤더 | 동작 |
+|---|---|
+| `Prefer: respond-async` | 항상 검색 작업을 생성합니다. |
+| `Prefer: respond-sync` | 시간 범위가 길어도 요청 내에서 쿼리를 실행합니다. |
+
+`_audit` 쿼리는 시간 범위나 `Prefer` 헤더에 관계없이 항상 요청 내에서 실행합니다. 이 쿼리를 검색 작업으로 제출하면 `400`을 반환합니다. [감사 스트림](/ko/settings/data-security#감사-스트림)을 참고합니다.
+
+다음 엔드포인트로 작업을 추적하고 관리합니다.
+
+| 엔드포인트 | 용도 |
+|---|---|
+| `POST /api/v1/query/jobs` | 작업을 직접 제출합니다. |
+| `GET /api/v1/query/jobs` | 작업을 최신순으로 나열합니다. `state`(`pending,running`처럼 쉼표로 구분), `limit`(기본값 100), `offset`을 받습니다. 알 수 없는 상태 이름을 지정하면 `400`을 반환합니다. |
+| `GET /api/v1/query/jobs/summary` | 상태별 작업 수와 전체 작업 수를 반환합니다. |
+| `GET /api/v1/query/jobs/{id}` | 상태, 타임스탬프, `resultRows`, `error`, `expiresAt`을 반환합니다. |
+| `GET /api/v1/query/jobs/{id}/results` | 행을 객체로 반환하며 `page`, `pageSize`(기본값 1000), `hasMore`를 포함합니다. |
+| `POST /api/v1/query/jobs/{id}/cancel` | 실행 중인 작업을 취소합니다. |
+| `POST /api/v1/query/jobs/{id}/retry` | 실패했거나 취소된 작업을 다시 실행합니다. |
+| `DELETE /api/v1/query/jobs/{id}` | 작업을 삭제합니다. |
+
+작업 결과는 7일간 보관합니다. 작업 상태는 `pending`, `running`, `done`, `failed`, `cancelled` 중 하나입니다.
+
+작업 정보에는 `kind`(`query` 또는 `backfill`, `backfill`인 경우 `pipelineId`도 포함), `attempt`, 제출한 `request`, 제출자 정보인 `userId`와 `submittedBy`도 포함됩니다.
+
+호출자는 직접 제출한 작업을 조회하고 변경할 수 있습니다. `org.running_queries.cancel` 권한이 있으면 조직의 모든 작업을 조회하고 변경할 수 있습니다. 다른 사용자의 작업에 접근할 권한이 없으면 존재하지 않는 작업과 동일하게 `404`를 반환합니다. 목록과 요약에는 호출자가 조회할 수 있는 작업만 포함합니다. **스트림** 아래의 **검색 작업** 페이지에서도 동일한 작업을 확인할 수 있습니다. [스트림](/ko/streams#검색-작업)을 참고합니다.
+
+## SQL
+
+SQL 문에서 `FROM`으로 스트림을 지정하고, 요청의 `stream` 필드에도 같은 기본 스트림을 지정합니다.
+
+```bash
+NOW=$(date +%s)000000
+curl -X POST http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"timeRange\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
+       \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+```
+
+### 신호 간 조인
+
+로그, 메트릭, 트레이스는 같은 저장소에 있으므로 하나의 쿼리에서 조인할 수 있습니다. `stream`에 기본 스트림을 지정하고 다른 스트림은 이름으로 참조합니다. 예를 들어 `trace_id`를 기준으로 오류 로그를 해당 스팬과 조인합니다.
+
+```sql
+SELECT l.msg, t.name, t.duration_ns
+FROM app AS l
+JOIN traces AS t ON l.trace_id = t.trace_id
+WHERE l.level = 'error'
+```
+
+### RUM 행의 최신 버전
+
+`rum_views_latest`와 `rum_sessions_latest`는 각각 `rum_views`와 `rum_sessions`에서 각 뷰 또는 세션의 최신 버전만 읽습니다. `stream`에 스트림 이름이나 뷰 자체의 이름을 지정합니다. 요청의 시간 범위가 조회할 행을 제한하므로 `SELECT count(*) FROM rum_views_latest WHERE "application.id" = 'shop'`은 해당 범위에서 시작한 뷰의 수를 반환합니다. 스트림의 [필드 마스킹](/ko/settings)이 이러한 행에도 적용됩니다.
+
+### 텍스트 검색
+
+| 함수 | 동작 |
+|---|---|
+| `MATCH(field, 'text')` | 모든 필드에서 대소문자를 구분하지 않고 부분 문자열을 검색합니다. `%`, `_`, `*`는 일반 문자로 처리합니다. |
+| `MATCH_TEXT(field, 'query')` | `indexType`이 `full_text`인 필드에서 전문 검색을 수행합니다. 해당 인덱스가 없는 필드에서는 `MATCH_TEXT: field ... has no full-text index configured` 오류가 발생합니다. |
+
+`MATCH_TEXT`에서는 공백으로 구분한 모든 단어가 값의 어느 위치에든 대소문자 구분 없이 부분 문자열로 나타나야 합니다. `"a b"`는 입력한 그대로 나타나야 하는 구문입니다. `*`를 포함한 단어는 값 전체를 기준으로 일치 여부를 판단하므로 `error*`는 error로 시작하는 값과, `*error`는 error로 끝나는 값과 일치합니다. `a OR b`와 검색어를 제외하는 `-a`도 사용할 수 있습니다. 한중일 텍스트에는 단어 구분이 필요하지 않습니다. `登录超时`는 이 네 문자가 연속으로 나타나는 값과 일치합니다. 스트림을 만들거나 스키마를 편집할 때 인덱스를 추가합니다. [스트림](/ko/streams#스키마-및-필드)을 참조합니다.
+
+```sql
+SELECT * FROM app WHERE MATCH(msg, 'timeout');
+SELECT * FROM app WHERE MATCH_TEXT(msg, 'panic "disk full" -debug');
+```
+
+### IP 네트워크
+
+| 함수 | 동작 |
+|---|---|
+| `CIDR_MATCH(field, 'network')` | 주소가 네트워크에 속하면 참을 반환합니다. 네트워크는 `10.0.0.0/8`, `2001:db8::/32` 또는 단일 주소로 지정합니다. IPv4 주소는 IPv6에 매핑하여 비교하므로 `10.0.0.0/8`은 `::ffff:10.1.2.3`과도 일치합니다. 값이 주소가 아니면 거짓을 반환하고, 네트워크 형식이 잘못되면 쿼리가 실패합니다. |
+
+```sql
+SELECT client_ip, count(*) FROM access WHERE CIDR_MATCH(client_ip, '10.0.0.0/8') GROUP BY client_ip
+```
+
+### 파일을 건너뛰는 조건
+
+MoleSignal은 `WHERE`에 지정한 필드의 인덱스를 사용하여 일치하는 행이 있을 수 없는 파일을 건너뜁니다. 파일마다 각 조건에 사용할 수 있는 인덱스로 해당 조건을 충족하는 행이 있는지 판단한 다음, 쿼리에 작성된 대로 조건을 결합합니다. `AND`로 연결한 조건 중 하나라도 충족할 수 없거나 `OR`로 연결한 모든 분기를 충족할 수 없으면 파일을 건너뜁니다. 각 분기에 서로 다른 인덱스를 사용해도 동일하게 동작합니다. `NOT` 아래의 조건이나 계산된 값에 대한 조건처럼 사용할 수 있는 인덱스가 없으면 해당 조건으로는 파일을 제외하지 않습니다. 결과의 정확성은 그대로 유지되며 더 많은 파일을 읽을 뿐입니다.
+
+| 조건 | 사용하는 인덱스 |
+|---|---|
+| `=`, `IN` | `exact`, `bloom`(텍스트 및 `int64`), `skip` |
+| `<`, `<=`, `>`, `>=`, `BETWEEN`, `!=`, `NOT IN`, `LIKE 'abc%'` | `exact`, `bloom`, `skip`, `range`의 최솟값과 최댓값, `skip`의 값 집합 |
+| `MATCH`, `MATCH_TEXT`, `LIKE`, `ILIKE`의 리터럴 | `full_text`, `ngram`, `exact`의 값 |
+| `CIDR_MATCH`, 주소에 대한 `=` | `ip` |
+| `IS NULL`, `IS NOT NULL` | 모든 인덱스: 인덱싱된 각 필드의 값이 비어 있는 행 수를 집계합니다. |
+| `json_text(field, 'key') = 'value'`, `IN`, `IS NOT NULL` | `key_value` |
+| 분할 필드에 대한 `=`, `IN`, `LIKE 'abc%'` | [필드별 분할](/ko/streams#필드별-분할): `=`와 `IN`에는 해시를 사용하고, 세 조건 모두에 첫 문자를 사용합니다. |
+
+파일을 읽을 때 `ngram` 필드에 대한 `LIKE`, `ILIKE`, `MATCH`의 리터럴은 5바이트 단위의 조각을 기준으로 해당 리터럴을 포함할 수 있는 1,024행 블록만 읽습니다. 리터럴이 5바이트보다 짧으면 모든 블록을 읽습니다. `exact` 필드에 대한 `=` 또는 `IN` 조건과 일치하는 행이 적으면 해당 행이 있는 페이지만 읽습니다. 행을 [클러스터링한](/ko/streams#필드별-클러스터링) 파일에서는 클러스터링 필드에 대한 `=` 또는 `IN` 조건이 각 시간 구간에서 해당 값을 포함할 수 있는 페이지만 읽습니다.
+
+### SQL의 타임스탬프
+
+`_timestamp`는 `Timestamp(µs, "UTC")` 열입니다. `_timestamp`와 비교하는 정수 리터럴은 Unix 에포크 이후 경과한 마이크로초를 나타냅니다. 따라서 다음 두 필터는 같은 행을 선택합니다.
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= 1790000000000000
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= to_timestamp_micros(1790000000000000)
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+리터럴만 마이크로초로 해석합니다. `_timestamp`를 표현식이나 다른 열과 비교하려면 `to_timestamp_micros(...)`로 값을 변환합니다. 행의 타임스탬프를 마이크로초 단위로 읽으려면 `CAST(_timestamp AS BIGINT)`를 사용합니다.
+
+### 암호화된 필드
+
+`decrypt(field)`는 암호화 대상으로 표시한 필드의 평문을 복원합니다. [스트림](/ko/streams#암호화된-필드)을 참조합니다.
+
+## PromQL
+
+메트릭 스트림에서 PromQL을 실행하려면 `language`를 `promql`로 설정합니다. 메트릭 셀렉터로 메트릭을 지정하면 해당 메트릭을 포함한 모든 스트림이 쿼리 대상이 됩니다. `metric_name`에는 메트릭 이름이, `value` 열에는 샘플이 들어 있으며, 나머지 열은 레이블입니다. `step`이 없으면 MoleSignal은 `time_range.end` 시점에서 표현식을 인스턴트 쿼리로 평가합니다. 시계열마다 행 하나를 반환하며, `value`가 먼저 나오고 그 뒤에 레이블이 이어집니다. `step`을 마이크로초 단위로 지정하면 `time_range.start`부터 `time_range.end`까지 범위 쿼리를 평가합니다. 각 시계열의 각 스텝마다 행 하나를 반환하며, `_timestamp`와 `value`가 먼저 나옵니다. 시계열당 최대 스텝 수는 11,000개이며, `limit`는 각 시계열에서 일정한 간격으로 샘플링해 행 수를 제한합니다.
+
+```json
+{
+  "orgId": "<org>",
+  "language": "promql",
+  "statement": "sum by (service) (http_requests_total)",
+  "timeRange": { "start": 1790000000000000, "end": 1790003600000000 }
+}
+```
+
+다양한 기능을 지원합니다. 지원 범위에는 rate 계열과 모든 `*_over_time` 함수, `topk`와 `limitk`를 포함한 표준 집계, `histogram_quantile`, `label_replace`와 `label_join`, 수학 및 삼각 함수, `on`, `ignoring`, `group_left`, `group_right` 매칭을 사용하는 집합 연산자 `and`, `or`, `unless`, 셀렉터 수정자 `@`와 `offset`, 하위 쿼리가 포함됩니다.
+
+<Card title="PromQL 지원 범위" icon="table-list" href="/ko/query/promql-subset">
+  지원하는 함수, 연산자, 수정자의 전체 목록과 알려진 미지원 기능을 확인합니다.
+  (네이티브 히스토그램 함수와 이항 연산의 `default` 값 채우기)
+</Card>
+
+## 이벤트 전후 검색
+
+`POST /api/v1/query/search_around`는 지정한 이벤트의 직전과 직후에 발생한 이벤트를 반환합니다. 조사 중에 로그 줄의 전후 맥락을 확인할 수 있습니다. [이벤트 전후 검색](/ko/api/query/search-around)을 참조합니다.
+
+## 쿼리 검사 및 제어
+
+- `POST /api/v1/query/inspect`는 쿼리를 실행하지 않고 계획을 수립한 뒤 쿼리 메타데이터와 논리 실행 계획을 반환합니다.
+- `POST /api/v1/query/recommendations`는 쿼리를 실행하지 않고 쿼리 프로필을 분석합니다.
+- 조직 관리자는 `GET /api/v1/query/running`과 `POST /api/v1/query/{id}/cancel`을 사용해 실행 중인 쿼리를 확인하고 취소할 수 있습니다.
+- `GET /api/v1/query/sql/capabilities`와 `GET /api/v1/query/promql/capabilities`는 편집기에서 사용할 수 있는 함수 목록을 반환합니다.
+
+일반 쿼리에는 `streams.query` 권한이 필요합니다. 실행 중인 쿼리를 관리하려면 `org.running_queries.read` 또는 `org.running_queries.cancel` 권한이 필요합니다.
+
+## 연합 검색
+
+연합 검색을 실행하려면 쿼리 엔드포인트에 `?clusters=local,cluster-name`을 추가합니다. 연결할 수 없는 원격 클러스터는 연합 메타데이터에서 성능 저하 상태로 표시되며, 별도 표시 없이 로컬 데이터로 대체하지 않습니다. [역할 기반 배포](/ko/deployment/role-based#페더레이션-쿼리)를 참조합니다.
+
+## 저장 필드
+
+스트림의 필드는 송신자가 제공하는 데이터에 따라 달라집니다. 다음은 OTLP 수집 과정에서 생성하는 필드입니다. 리소스 및 레코드 속성은 `service.name`과 같은 원래 키와 숫자 타입을 유지한 채 최상위 필드가 됩니다.
+
+### OTLP 로그 필드
+
+| 필드 | 내용 |
+|---|---|
+| `_timestamp` | `timeUnixNano`에서 가져온 이벤트 시각(마이크로초)입니다. |
+| `body` | 로그 본문입니다. |
+| `severity_text`, `severity_number` | OTLP 심각도입니다. |
+| `trace_id`, `span_id` | 소문자 16진수로 표현한 상관관계 식별자입니다. |
+| `scope_name`, `scope_version` | 계측 범위입니다. |
+| 리소스 및 레코드 속성 | 속성당 최상위 필드 1개입니다. |
+
+### 트레이스 스팬 필드
+
+| 필드 | 내용 |
+|---|---|
+| `_timestamp` | 스팬 시작 시각(마이크로초)입니다. |
+| `trace_id`, `span_id`, `parent_span_id` | 트레이스, 스팬 및 상위 스팬의 식별자입니다. |
+| `name`, `kind` | 스팬 이름과 종류입니다. |
+| `start_time_unix_nano`, `end_time_unix_nano`, `duration_ns` | 시작 시각, 종료 시각, 지속 시간(나노초)입니다. |
+| `status_code`, `status_message` | `OK`, `ERROR`, `UNSET` 중 하나인 상태 코드와 해당 메시지입니다. |
+| `attributes`, `resource`, `scope`, `events`, `links` | 전체 OTLP 구조를 담은 JSON 텍스트입니다. |
+| `http.method`, `service.name` 등의 속성 키 | 속성을 평탄화한 복사본입니다. |
+| `sampling_reason` 및 관리용 필드 | 테일 샘플러가 트레이스를 보존한 이유와 `partial`, `late`, `duplicate`, `conflict` 플래그입니다. |
+
+MoleSignal은 `trace_id`와 `span_id`로 스팬을 식별합니다. 같은 스팬을 다시 전송하면 중복으로 간주해 삭제합니다.
+
+### OTLP 메트릭 필드
+
+MoleSignal은 각 OTLP 데이터 포인트를 하나의 메트릭 이벤트로 평탄화합니다. 리소스, 범위, 데이터 포인트 속성은 쿼리 가능한 필드로 유지합니다. 아래 예약 필드는 이름이 같은 속성보다 우선합니다.
+
+| 필드 | 의미 |
+|---|---|
+| `metric_name` | PromQL에서 `{"http.server.duration"}`과 같이 선택하는 OTLP 메트릭 이름입니다. |
+| `metric_kind` | `gauge`, `counter`, `up_down_counter`, `histogram`, `exponential_histogram`, `summary` 중 하나입니다. |
+| `metric_description`, `metric_unit` | 값이 비어 있지 않을 때 포함합니다. |
+| `metric_temporality` | `delta`, `cumulative`, `unspecified`, `unknown:<value>` 중 하나입니다. 게이지에는 이 필드가 없습니다. |
+| `metric_monotonic` | 합계의 단조 증가 여부입니다. 단조 증가하는 합계는 `counter`로 저장합니다. |
+| `metric_start_time_unix_nano` | 집계 구간의 시작 시각입니다. 값이 0이 아닐 때 포함합니다. |
+| `value` | 게이지 또는 합계 데이터 포인트의 스칼라 값입니다. |
+| `count`, `sum`, `min`, `max` | 히스토그램 데이터 포인트는 이 네 값을 저장합니다. 지수 히스토그램과 요약은 `count`와 `sum`을 저장합니다. |
+
+히스토그램 버킷의 경곗값과 개수, 요약의 분위수는 저장하지 않습니다.
+
+MoleSignal은 델타 데이터 포인트를 수신한 그대로 저장합니다. PromQL의 `rate` 계열 함수는 저장된 집계 시간성을 사용합니다. `increase`는 시간 창 내 델타 값을 합산하고, `rate`는 그 합계를 시간 창의 길이로 나누며, `irate`는 가장 최근 델타 값을 해당 구간의 길이로 나눕니다. 누적 단조 증가 합계에서는 카운터 재설정을 반영합니다. 익스포터가 한 시간 창 안에서 집계 시간성을 변경하면, 집계 방식이 동일하게 이어지는 가장 최근 구간만 평가합니다.
+
+HTTP를 통한 OTLP는 메트릭, 로그, 트레이스에 protobuf(`http/protobuf`)와 JSON을 지원합니다. JSON 인코딩은 64비트 정수를 `"asInt": "340"` 및 `"count": "4"`처럼 문자열로 기록합니다. MoleSignal은 문자열과 숫자 리터럴을 모두 읽습니다.
+
+## 캐싱
+
+쿼리는 열린 인덱스 핸들, 종료된 시간 창의 결과, 검색어 개수, 인덱스 푸터에 프로세스 내부 캐시를 사용합니다. 원격 오브젝트 스토리지의 경우 디스크 캐시가 오브젝트의 바이트 범위를 `./data/cache/objects`에 저장하며, 기본 용량은 10 GiB입니다. 캐싱은 응답 규약에 영향을 주지 않습니다. `/metrics`에서 캐시 동작을 측정하고, [구성](/ko/configuration#캐시)에서 캐시 크기 설정 방법을 확인합니다.

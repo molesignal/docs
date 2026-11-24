@@ -1,0 +1,117 @@
+---
+title: "Matriz de compatibilidad con PromQL"
+description: "Consulta las funciones, los operadores y los modificadores de PromQL que admite el motor de MoleSignal, así como sus limitaciones conocidas."
+"en_link": "/en-US/query/promql-subset"
+"zh-Hans_link": "/zh-Hans/query/promql-subset"
+"zh-Hant_link": "/zh-Hant/query/promql-subset"
+"ja_link": "/ja/query/promql-subset"
+"ko_link": "/ko/query/promql-subset"
+"de_link": "/de/query/promql-subset"
+"fr_link": "/fr/query/promql-subset"
+"pt-BR_link": "/pt-BR/query/promql-subset"
+---
+
+MoleSignal ejecuta PromQL sobre flujos de métricas con un evaluador integrado (`promql-parser` más un
+evaluador de Arrow/DataFusion). Admite consultas **instantáneas** y **de rango**: una consulta con
+`step` recorre `[start, end]` por pasos y devuelve una matriz; sin ese parámetro, es una consulta instantánea en
+`end`. Esta página contiene la matriz oficial de compatibilidad.
+
+## Funciones y sintaxis compatibles
+
+### Funciones de vector de rango (`metric[range]`)
+
+`rate`, `irate`, `increase`, `delta`, `idelta`, `deriv`, `predict_linear`, `resets`, `changes`,
+`holt_winters` (alias `double_exponential_smoothing`) y toda la familia `*_over_time`:
+`avg_over_time` / `min_over_time` / `max_over_time` / `sum_over_time` / `count_over_time` /
+`quantile_over_time` / `stddev_over_time` / `stdvar_over_time` / `last_over_time` /
+`present_over_time` / `mad_over_time`.
+
+`rate`, `increase` y `delta` extrapolan hasta los límites de la ventana el cambio entre la primera y la última muestra
+de esa ventana, igual que Prometheus. Así, las mismas muestras producen los mismos valores.
+
+### Agregaciones (con `by()` / `without()`)
+
+`sum`, `avg`, `min`, `max`, `count`, `stddev`, `stdvar`, `quantile`, `group`, `count_values`,
+`topk`, `bottomk`, `limitk`, `limit_ratio`.
+
+### Histogramas
+
+`histogram_quantile(q, sum by(le)(rate(metric_bucket[range])))` — interpolación lineal en los
+intervalos clásicos `le`.
+
+`histogram_fraction(lower, upper, v)` — estima, a partir de los intervalos clásicos `le`, la proporción de
+observaciones que caen en `[lower, upper]` (con la misma función de distribución acumulada lineal por tramos,
+`(rank(upper) - rank(lower)) / total`).
+
+### Etiquetas y ordenamiento
+
+`label_replace`, `label_join`, `sort`, `sort_desc`, `sort_by_label`, `sort_by_label_desc`.
+
+### Tiempo
+
+`time`, `timestamp`, `minute`, `hour`, `day_of_week`, `day_of_month`, `day_of_year`,
+`days_in_month`, `month`, `year` (UTC; las funciones de fecha usan `vector(time())` de forma predeterminada).
+
+### Tipo / ausencia
+
+`vector`, `scalar`, `absent`, `absent_over_time`.
+
+### Matemáticas / redondeo / trigonometría
+
+`abs`, `ceil`, `floor`, `round`, `exp`, `ln`, `log2`, `log10`, `sqrt`, `sgn`,
+`clamp` / `clamp_min` / `clamp_max`, `sin` / `cos` / `tan` / `asin` / `acos` / `atan` / `sinh` /
+`cosh` / `tanh` / `asinh` / `acosh` / `atanh`, `pi`, `deg`, `rad`.
+
+### Operadores
+
+Operadores aritméticos `+ - * / % ^`, de comparación `== != > < >= <=` (con `bool`), de conjuntos
+`and` / `or` / `unless`, coincidencia de vectores con `on(...)` / `ignoring(...)` y
+`group_left` / `group_right`, y negación unaria.
+
+### Modificadores y estructura
+
+Selector `@` (`start()` / `end()` / `<ts>`) y `offset` (también en selectores de matriz);
+subconsultas `inner[range:step]`.
+
+## Funciones sin implementar y diferencias conocidas
+
+| Funcionalidad | Estado | Notas |
+|---|---|---|
+| Funciones de histogramas nativos `histogram_count` / `histogram_sum` / `histogram_avg` / `histogram_stddev` / `histogram_stdvar` | ❌ → 400 | No aplican al modelo de intervalos clásicos `le`; usa `histogram_quantile` para cuantiles y `histogram_fraction` para proporciones por intervalo |
+| Relleno binario con `default` | ❌ → 400 | — |
+| Subconsultas dentro de una consulta de rango | ⚠️ | usan la evaluación instantánea (sin recorrer los pasos internos por cada paso externo); la evaluación de consultas instantáneas y alertas es exacta |
+| `timestamp()` | ⚠️ | devuelve el instante de evaluación en las consultas instantáneas y la marca de tiempo del propio punto en las consultas de rango |
+| Parámetros escalares de funciones (`t` de `predict_linear`, `sf`/`tf` de `holt_winters`, cuantiles) | ⚠️ | solo literales numéricos |
+
+Las funciones y la sintaxis incompatibles devuelven el error `promql function not yet supported: <name>`,
+que `POST /api/v1/query` (`language: "promql"`) convierte en una respuesta `400`.
+
+<Note>
+  Cuando `query.language` es `promql`, la regla de alerta evalúa la expresión PromQL como una consulta instantánea al
+  final de la ventana de evaluación. La regla es de tipo `AlertRule` de MoleSignal y no
+  es compatible con el formato de reglas de Prometheus. Consulta [Crea una regla](/es/api/alerting/create-rule).
+</Note>
+
+## Coincidencia de etiquetas
+
+`=`, `!=`, `=~`, `!~` (expresiones regulares con RE2, que difiere ligeramente de PCRE de Prometheus). `__name__` busca coincidencias en
+la columna `metric_name`. Usa comillas para seleccionar una métrica cuyo nombre contiene puntos, como en
+`{"http.server.duration"}`. Un selector sin nombre de métrica, como `{job="api"}` o
+`{__name__=~"http_.*"}`, lee todas las métricas que cumplen sus condiciones de coincidencia, y las series resultantes conservan `__name__`.
+
+## Estructura del flujo de métricas
+
+Un flujo de métricas contiene las métricas de una sola fuente, como un servidor de Prometheus, y almacena las etiquetas
+en **columnas separadas** en lugar de guardarlas en un solo bloque JSON:
+
+```sql
+_timestamp   Timestamp(Microsecond)  NOT NULL   -- time
+metric_name  Utf8                    NOT NULL   -- the metric, PromQL's __name__
+value        Float64                 NOT NULL   -- the measurement (Int64 etc. is accepted and cast to f64)
+<label_x>    Utf8 …                             -- every non-reserved column is a label
+```
+
+Los archivos mantienen juntas las filas de cada métrica y las ordenan primero por `metric_name` y luego por tiempo. El selector lee los
+flujos que contienen la métrica. De sus archivos Parquet cuyo rango de tiempo se superpone con el de la consulta, solo lee las páginas
+que contienen la métrica. El selector genera una serie por cada conjunto distinto de etiquetas y aplica las condiciones de coincidencia (`=`, `!=`, `=~`,
+`!~`) en el motor. `@` y `offset` desplazan el instante de evaluación. Para las métricas que llegan por OTLP, consulta los [campos de métricas de OTLP](/es/query#campos-de-métricas-otlp).

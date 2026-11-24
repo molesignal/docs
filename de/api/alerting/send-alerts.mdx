@@ -1,0 +1,79 @@
+---
+title: "Alerts senden"
+description: "Lösen Sie Alerts aus einem externen System aus, bestätigen Sie sie oder markieren Sie sie als behoben."
+"en_link": "/en-US/api/alerting/send-alerts"
+"zh-Hans_link": "/zh-Hans/api/alerting/send-alerts"
+"zh-Hant_link": "/zh-Hant/api/alerting/send-alerts"
+"ja_link": "/ja/api/alerting/send-alerts"
+"ko_link": "/ko/api/alerting/send-alerts"
+"es_link": "/es/api/alerting/send-alerts"
+"fr_link": "/fr/api/alerting/send-alerts"
+"pt-BR_link": "/pt-BR/api/alerting/send-alerts"
+---
+
+```http
+POST /api/v1/intake/alerts
+```
+
+Ein externes System verwendet beim Aufruf das Token einer [Alarmquelle](/de/alerting/sources): im Header `Authorization: Bearer <token>` oder, falls das System keine Header setzen kann, als `?token=<token>` in der URL. Alle Quellen verwenden dieselbe Adresse. Das Token ordnet den Alarm einer Quelle zu, und der Typ der Quelle bestimmt das Format des Request-Bodys. [Absender einrichten](/de/alerting/sources#absender-einrichten) beschreibt das Format für jeden Absender (eine E-Mail-Quelle liest eine unverarbeitete E-Mail mit `Content-Type: message/rfc822`). Diese Seite beschreibt den Request-Body für den Typ **API**. Der Body darf höchstens 4 MiB groß sein.
+
+Der Body enthält entweder ein einzelnes Alarmobjekt oder ein Array mit bis zu 100 Alarmobjekten. Die API lehnt unbekannte Felder ab.
+
+| Feld | Typ | Beschreibung |
+|---|---|---|
+| `action` | string | `trigger` (Standard), `acknowledge` oder `resolve`. |
+| `dedupKey` | string | Deduplizierungsschlüssel innerhalb der Quelle, bis zu 255 Zeichen. Pro Schlüssel gibt es höchstens einen aktiven Vorfall gleichzeitig. Pflichtfeld für `acknowledge` und `resolve`. Bei `trigger` ohne Schlüssel berechnet die API einen Schlüssel aus `summary` und `labels` und gibt ihn in der Antwort zurück. |
+| `summary` | string | Titel des Vorfalls, bis zu 1024 Zeichen. Pflichtfeld für `trigger`. |
+| `severity` | string | `critical`, `error`, `warning` oder `info`. Ohne Angabe gilt der Standardschweregrad der Quelle. |
+| `priority` | string | Priorität des Vorfalls: `P1` bis `P9` (auch `1` bis `9`). Liegt der Wert außerhalb der in der Organisation definierten Stufen, gilt die niedrigste Stufe. Ohne Angabe hat der Vorfall keine Priorität. |
+| `urgency` | string | Dringlichkeit des Vorfalls als Schlüssel einer Stufe der Organisation, etwa `high` oder `low`. Die API ignoriert unbekannte Schlüssel. Ohne Angabe bestimmt die Eskalationsrichtlinie der Quelle die Dringlichkeit. Bei einem Alarm ohne `severity` gilt `high`. |
+| `labels` | object | Bis zu 64 Labels. Ein Schlüssel darf weder mit `alert.` oder `__molesignal` beginnen noch `external.kind` lauten. |
+| `annotations` | object | Annotationen, zusammen mit den Links insgesamt bis zu 64. |
+| `links` | array | Bis zu 10 Einträge der Form `{"name": "…", "url": "https://…"}`. Die API übernimmt sie anhand von `name` in die Annotationen. Fehlt `name`, verwendet die API `link`. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/alerts \
+  -H "authorization: Bearer $SOURCE_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"dedupKey": "disk-full/web-1", "summary": "Disk almost full on web-1", "severity": "critical", "labels": {"host.name": "web-1"}, "links": [{"name": "Runbook", "url": "https://wiki.example.com/disk"}]}'
+```
+</RequestExample>
+
+Die Antwort enthält für jeden Alarm das Ergebnis in der Reihenfolge der Anfrage. Wenn die API den Body lesen kann, er aber keinen zu verarbeitenden Alarm enthält, nennt `message` den Grund. Das ist etwa bei einem PagerDuty-Testereignis der Fall.
+
+<ResponseExample>
+```json 200
+{
+  "alerts": [
+    {
+      "dedupKey": "disk-full/web-1",
+      "outcome": "opened",
+      "incidentId": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+      "reason": null
+    }
+  ],
+  "message": null
+}
+```
+</ResponseExample>
+
+| `outcome` | Bedeutung |
+|---|---|
+| `opened` | Die API hat einen neuen Vorfall eröffnet. |
+| `updated` | Der Schweregrad des aktiven Vorfalls oder die Alarme in seiner Benachrichtigungsgruppe haben sich geändert. |
+| `unchanged` | Der aktive Vorfall war bereits in diesem Zustand oder jemand hatte ihn bereits bestätigt. |
+| `acknowledged` | Die API hat den Vorfall als bestätigt markiert. |
+| `resolved` | Die API hat den Vorfall als behoben markiert. Das gilt auch für bereits bestätigte Vorfälle. |
+| `ignored` | Nichts hat sich geändert. `reason` nennt den Grund: Es gibt etwa keinen aktiven Vorfall oder die Nachricht ist älter als die letzte. |
+
+**Fehler**
+
+| Status | Ursache |
+|---|---|
+| `400` | Die API kann den Body nicht lesen. `message` nennt den Grund. |
+| `401` | Das Token fehlt oder ist ungültig, oder die Quelle existiert nicht. |
+| `403` | Die Organisation ist deaktiviert. |
+| `409` | Die Quelle ist deaktiviert. |
+| `413` | Der Body ist größer als 4 MiB. |
+| `503` | Der empfangende Cluster der Quelle ist nicht erreichbar, oder die API konnte die Anfrage nicht vollständig verarbeiten. Senden Sie die Anfrage erneut. Dadurch eröffnet die API keinen Vorfall doppelt. |

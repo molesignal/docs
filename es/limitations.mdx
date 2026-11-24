@@ -1,0 +1,60 @@
+---
+title: "Limitaciones conocidas"
+description: "Consulta qué comportamientos de la versión actual pueden diferir de lo esperado en un despliegue y qué alternativas tienes."
+"en_link": "/en-US/limitations"
+"zh-Hans_link": "/zh-Hans/limitations"
+"zh-Hant_link": "/zh-Hant/limitations"
+"ja_link": "/ja/limitations"
+"ko_link": "/ko/limitations"
+"de_link": "/de/limitations"
+"fr_link": "/fr/limitations"
+"pt-BR_link": "/pt-BR/limitations"
+---
+
+MoleSignal aún no ha llegado a la versión 1.0. Esta página enumera los límites que afectan a la planificación y la operación.
+
+## Despliegue
+
+- **Demora en la toma de control.** El registro de escritura anticipada reside en el almacenamiento de objetos. Si se pierde un nodo de ingesta, no se pierde ningún registro confirmado, pero los registros pendientes de volcar no se pueden consultar hasta que otro nodo de ingesta se haga cargo de ellos, una vez transcurrido el plazo de `[wal].lease_secs` (15 segundos de forma predeterminada). Consulta [Durabilidad y toma de control](/es/architecture#durabilidad-y-recuperación).
+- **Tareas que se ejecutan en un solo nodo.** El nodo `alert` principal se encarga del envío y la propagación de eventos entre clústeres mediante gossip, el recálculo del grafo de servicios, la agregación de datos de APM, el mantenimiento de las páginas de estado, la automatización del monitoreo sintético, el análisis de consultas lentas y el análisis de causa raíz de incidentes. Estas tareas no escalan al agregar nodos `alert`. Se reanudan en otro nodo cuando el principal deja de pertenecer al clúster. Consulta [Despliegue basado en roles](/es/deployment/role-based#distribución-del-trabajo-entre-nodos-de-alertas).
+- **Solo PostgreSQL.** PostgreSQL es la única base de datos de metadatos compatible.
+- **Reinicio para aplicar la configuración.** Un proceso en ejecución no aplica los cambios del archivo de configuración. Consulta [Configuración](/es/configuration).
+- **Migraciones sin retroceso.** Una compilación anterior no puede abrir una base de datos migrada por una compilación más reciente. Las compilaciones anteriores a la versión 1.0 pueden cambiar el esquema base. Consulta [Actualización](/es/upgrade).
+
+## Ingesta
+
+- **Tamaño de la solicitud.** El servidor rechaza con `413` las solicitudes cuyo cuerpo supera los 2 MiB, o los 16 MiB para la ingesta nativa de JSON.
+- **Compresión de OTLP sobre HTTP.** El servidor rechaza con `400` los cuerpos de solicitud comprimidos. Desactiva la compresión en el emisor.
+- **Intervalos de histogramas.** Los histogramas de OTLP almacenan `count`, `sum`, `min` y `max`. No almacenan los límites de los intervalos, los recuentos por intervalo ni los cuantiles de los resúmenes.
+- **Spans duplicados.** El receptor descarta cualquier span que se vuelva a enviar con los mismos valores de `trace_id` y `span_id`.
+- **Envío de Loki.** El endpoint solo decodifica solicitudes con la estructura JSON. Los emisores que usan protobuf comprimido con Snappy, como Promtail y Grafana Alloy, no pueden enviar datos a este endpoint.
+- **Prometheus remote_write.** El receptor omite los histogramas nativos y los metadatos de las métricas.
+- **OTLP gRPC sin TLS.** El receptor no termina las conexiones TLS. Coloca delante del receptor un proxy que termine las conexiones TLS para el tráfico que salga de una red de confianza.
+- **Límite de frecuencia de solicitudes.** Solo el rol `router` limita las solicitudes. Cada réplica del enrutador contabiliza por separado las solicitudes de cada organización autenticada.
+- **Flujos de la plataforma.** Solo MoleSignal escribe en `_molesignal`, `_synthetic_results`, `_audit`, `_agent_model_traces` y `_agent_score_traces`. Estos flujos no aceptan ingesta pública. Consulta [Flujos de la plataforma](/es/streams#flujos-de-la-plataforma).
+
+## Consultas
+
+- **Ejecución asíncrona para intervalos largos.** Una consulta cuyo tamaño estimado alcanza `[querier].auto_async_threshold_rows` devuelve `202` con una tarea cuyo estado puedes consultar. Con la configuración predeterminada, el umbral corresponde a un intervalo de unas 13,9 horas. Envía `Prefer: respond-sync` para ejecutar la consulta en la misma solicitud. Consulta [Consultas](/es/query#rangos-de-tiempo-y-tareas-asincrónicas).
+- **Subconjunto de PromQL.** El motor implementa un subconjunto de PromQL. Consulta la [Matriz de compatibilidad de PromQL](/es/query/promql-subset).
+- **Filas por consulta.** El motor rechaza con `400` cualquier consulta que requiera leer más de `[querier].max_scan_rows` filas (100 millones de forma predeterminada). Reduce el intervalo de tiempo o agrega filtros. PromQL aplica el límite a cada selector.
+- **Disponibilidad de datos recientes en un clúster con roles separados.** Una consulta lee los archivos que enumera el catálogo. Si un registro sigue en el búfer de un nodo de ingesta, la consulta no lo ve hasta el siguiente volcado, dentro del plazo de `[intake].flush_interval_secs`. Un nodo `standalone` también lee su propio búfer. De forma predeterminada, las reglas de alerta desplazan su ventana hacia atrás según el retraso de evaluación de **Configuración → Evaluación de alertas** (60 segundos). Consulta [Retraso de evaluación](/es/alerting/rules#retraso-de-evaluación).
+
+## Alertas
+
+- **Recuentos en memoria para las reglas en tiempo real.** Cada nodo que acepta escrituras lleva su propio recuento para una regla `real_time`. El nodo de alertas a cargo de la regla suma los recuentos cada segundo, por lo que el incidente se abre como máximo un segundo después de la escritura de los registros. Si un nodo se reinicia, solo pierde su propio recuento. Si no se puede leer el recuento de un nodo, no se incluye en el total de ese segundo. Los nodos usan el token de portador del clúster para leer los recuentos de los demás nodos y no suman los recuentos de otros clústeres federados. La instrucción se limita a `SELECT count(*) FROM <stream> [WHERE <condition>]`. Consulta [Reglas en tiempo real](/es/alerting/rules#reglas-en-tiempo-real).
+
+## Seguridad e identidad
+
+- **gRPC interno sin autenticación.** El puerto `5082` transporta tráfico entre nodos sin autenticación. Mantén ese puerto en una red privada.
+- **Cada clave de acceso está vinculada a un solo dominio.** `[http].external_url` debe especificar una URL HTTPS con un nombre de dominio. La clave no funciona si se abre la consola con otro nombre de host.
+- **El restablecimiento de contraseñas requiere correo electrónico.** El sistema envía un enlace por correo electrónico para restablecer la contraseña. Configura `[notify.smtp]` y `[http].external_url`.
+- **El registro de autoservicio sin aprobación requiere correo electrónico.** El registro verifica primero la dirección de correo electrónico. Sin `[notify.smtp]` y `[http].external_url`, cada cuenta nueva queda pendiente de aprobación administrativa.
+- **Los límites de inicio de sesión se aplican por dirección.** El [Reconocimiento de IP del cliente](/es/settings/platform#identificación-de-la-ip-del-cliente) debe identificar correctamente la dirección. Si no configuras un proxy público o una CDN para este reconocimiento, el sistema atribuye la misma dirección a todas las sesiones y los intentos de inicio de sesión de una cuenta pueden bloquear los de otras. De forma predeterminada, las direcciones privadas no cuentan. Por eso, en un despliegue interno o detrás de un proxy sin configurar, solo se aplica el límite por cuenta.
+- **El límite por cuenta no bloquea la cuenta.** Para evitar el bloqueo total de una cuenta, el límite aún permite unos 1400 intentos de adivinar la contraseña al día. Si la cuenta usa autenticación multifactor, acertar la contraseña no basta para iniciar sesión. Si los intentos disponibles se agotan continuamente, iniciar sesión desde una dirección sin inicios de sesión previos puede seguir requiriendo una espera. Usa una clave de acceso, el inicio de sesión único o el restablecimiento de la contraseña para evitar la espera.
+- **Políticas de bloqueo de un directorio LDAP.** La política de bloqueo del directorio puede activarse primero. En ese caso, los intentos de terceros aún pueden bloquear una cuenta del directorio. Configura los [límites de inicio de sesión](/es/settings/platform#límites-de-inicio-de-sesión) por debajo de los del directorio.
+- **Sesiones.** La página de configuración de la cuenta solo permite administrar la sesión del navegador actual.
+
+## Informes
+
+- **La generación de PDF y PNG** requiere Chrome sin interfaz gráfica. La imagen del contenedor de la versión incluye Chromium. Si instalas MoleSignal mediante un binario, instala también Chrome y asegúrate de que `[scheduled_reports.renderer].base_url` permita acceder a la interfaz web.

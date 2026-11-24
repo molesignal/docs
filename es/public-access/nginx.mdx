@@ -1,0 +1,318 @@
+---
+title: "nginx"
+description: "Configura dos puntos de entrada con nginx: el interno reenvía todas las solicitudes y el público solo reenvía las de callbacks externos y páginas públicas. Para cualquier otra ruta, el punto de entrada público devuelve un código 404."
+"en_link": "/en-US/public-access/nginx"
+"zh-Hans_link": "/zh-Hans/public-access/nginx"
+"zh-Hant_link": "/zh-Hant/public-access/nginx"
+"ja_link": "/ja/public-access/nginx"
+"ko_link": "/ko/public-access/nginx"
+"de_link": "/de/public-access/nginx"
+"fr_link": "/fr/public-access/nginx"
+"pt-BR_link": "/pt-BR/public-access/nginx"
+---
+
+La siguiente configuración sigue el método recomendado en [Acceso público](/es/public-access): un solo nombre, `molesignal.example.com`, que el DNS interno resuelve a la dirección interna de nginx `10.0.0.10` y el DNS público a su dirección pública `203.0.113.10`. Los dos bloques `server` comparten un certificado y se distinguen por sus direcciones de escucha. Conserva solo los bloques `location` que uses.
+
+## Elementos compartidos
+
+Define el servidor de origen, el formato del registro público y la zona de limitación de solicitudes en el bloque `http`, por ejemplo, al inicio de `/etc/nginx/conf.d/molesignal.conf`:
+
+```nginx
+upstream molesignal {
+    # A standalone node, or the router of a role-split deployment
+    server 10.0.1.20:5080;
+    keepalive 16;
+}
+
+# The public entry point logs paths, never query strings; heartbeat, calendar, action link and Huawei
+# Cloud callback paths carry a token, so only their prefix is logged.
+map $uri $molesignal_log_uri {
+    ~^(/api/v1/(?:intake/heartbeats|public/calendar|public/notify/actions)/)  $1<token>;
+    ~^(/notify/actions/)                                                      $1<token>;
+    ~^(/api/v1/public/notify/[^/]+/(?:replies|keypress)/)                     $1<token>;
+    default                                                                   $uri;
+}
+
+log_format molesignal_public '$remote_addr [$time_local] "$request_method $molesignal_log_uri $server_protocol" '
+                             '$status $body_bytes_sent "$http_user_agent" $request_time';
+
+limit_req_zone $binary_remote_addr zone=molesignal_public:10m rate=20r/s;
+```
+
+Todos los bloques de reenvío usan la misma configuración de proxy, definida en `/etc/nginx/snippets/molesignal-proxy.conf`:
+
+```nginx
+proxy_pass http://molesignal;
+proxy_http_version 1.1;
+proxy_set_header Connection "";
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+```
+
+## Punto de entrada interno
+
+El punto de entrada interno reenvía todas las rutas, tal como lo haría si no hubiera un punto de entrada público. Las consultas en vivo devuelven respuestas en streaming, así que no las almacenes en búfer:
+
+```nginx
+server {
+    listen 10.0.0.10:443 ssl;
+    server_name molesignal.example.com;
+    ssl_certificate     /etc/nginx/tls/molesignal.crt;
+    ssl_certificate_key /etc/nginx/tls/molesignal.key;
+
+    client_max_body_size 16m;
+
+    location /api/v1/query/stream {
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+    location / {
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+## Punto de entrada público
+
+El punto de entrada público enumera solo las rutas que se deben abrir y permite en cada una únicamente los métodos que usa. El bloque final `location /` devuelve 404 para el resto:
+
+```nginx
+server {
+    listen 203.0.113.10:443 ssl;
+    server_name molesignal.example.com;
+    ssl_certificate     /etc/nginx/tls/molesignal.crt;
+    ssl_certificate_key /etc/nginx/tls/molesignal.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    access_log /var/log/nginx/molesignal-public.log molesignal_public;
+    client_max_body_size 2m;
+    limit_req zone=molesignal_public burst=40 nodelay;
+    limit_req_status 429;
+
+    # External alerts
+    location = /api/v1/intake/alerts {
+        limit_except POST { deny all; }
+        client_max_body_size 4m;
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Heartbeat check-ins
+    location ^~ /api/v1/intake/heartbeats/ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # The Jira ticket webhook
+    location ~ ^/api/v1/public/tickets/jira/[^/]+$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # On-call calendar subscriptions
+    location ^~ /api/v1/public/calendar/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Mole Agent in Teams
+    location ^~ /api/v1/public/im/teams/ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Replies to texts and calls; Huawei Cloud's address ends with the callback token
+    location ~ ^/api/v1/public/notify/[^/]+/(replies|keypress)(/[^/]+)?$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Buttons from a WeCom app: WeCom checks the address with a GET first
+    location ~ ^/api/v1/public/notify/[^/]+/wecom$ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Buttons from a Mattermost bot
+    location ~ ^/api/v1/public/notify/[^/]+/mattermost$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # One-time action links: the confirm page and its API
+    location ^~ /notify/actions/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/notify/actions/ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Automation API triggers
+    location ~ ^/api/v1/public/automations/[^/]+/trigger$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Push sources
+    location ~ ^/api/v1/(_kinesis_firehose|_cloudflare|_heroku)$ {
+        limit_except POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # RUM: browsers send a CORS preflight first
+    location ~ ^/api/v1/rum/(events|replay)$ {
+        limit_except POST OPTIONS { deny all; }
+        client_max_body_size 8m;
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Synthetics Probe Agent artifact uploads
+    location ^~ /api/v1/synthetics/artifacts/ {
+        limit_except PUT { deny all; }
+        client_max_body_size 10m;
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Status pages
+    location ^~ /status/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/status-pages/ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Resource sharing
+    location ^~ /s/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location = /shared {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/share {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # Web files of status pages, shared resources and action link pages
+    location ^~ /assets/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ~ ^/favicon(-dark)?\.(ico|svg)$ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+
+    # No other path exists on the internet
+    location / {
+        return 404;
+    }
+}
+```
+
+`limit_except GET` también permite `HEAD`. Para restringir el acceso a una ruta por dirección de origen, agrega `allow` y `deny all;` a su bloque `location`. Por ejemplo, puedes permitir que solo los rangos de la etiqueta de servicio de Azure `AzureBotService` accedan al endpoint de devolución de llamada de Teams.
+
+## Dominios personalizados de las páginas de estado
+
+Si una página de estado usa `status.example.org`, agrega un bloque `server` público que exponga solo las rutas raíz, los endpoints y los archivos web de esa página:
+
+```nginx
+server {
+    listen 203.0.113.10:443 ssl;
+    server_name status.example.org;
+    ssl_certificate     /etc/nginx/tls/status.example.org.crt;
+    ssl_certificate_key /etc/nginx/tls/status.example.org.key;
+
+    access_log /var/log/nginx/molesignal-public.log molesignal_public;
+    limit_req zone=molesignal_public burst=40 nodelay;
+    limit_req_status 429;
+
+    location ~ ^/(history|uptime)?$ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /incidents/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /api/v1/public/status-pages/ {
+        limit_except GET POST { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ^~ /assets/ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location ~ ^/favicon(-dark)?\.(ico|svg)$ {
+        limit_except GET { deny all; }
+        include /etc/nginx/snippets/molesignal-proxy.conf;
+    }
+    location / {
+        return 404;
+    }
+}
+```
+
+Cuando MoleSignal emite el certificado del dominio personalizado, TLS termina en MoleSignal. En ese caso, nginx solo puede reenviar la conexión según el SNI con el módulo `stream`. Como no puede ver las rutas, tampoco puede exponer solo la página de estado. Para restringir las rutas en el punto de entrada, administra el certificado en nginx.
+
+## Con un solo punto de entrada
+
+Si nginx tiene una sola dirección de escucha, distingue las solicitudes por su dirección de origen: conserva las rutas abiertas del bloque `server` público, sustituye el bloque final `location /` por uno que permita solo los rangos de la red de la oficina y de la VPN, y agrega la configuración de streaming para las consultas en vivo:
+
+```nginx
+location /api/v1/query/stream {
+    allow 10.0.0.0/8;
+    allow 192.168.0.0/16;
+    deny all;
+    include /etc/nginx/snippets/molesignal-proxy.conf;
+    proxy_buffering off;
+    proxy_read_timeout 600s;
+    proxy_send_timeout 600s;
+}
+
+location / {
+    allow 10.0.0.0/8;
+    allow 192.168.0.0/16;
+    deny all;
+    include /etc/nginx/snippets/molesignal-proxy.conf;
+}
+```
+
+Las solicitudes internas pasan entonces por el mismo bloque `server`: aumenta `client_max_body_size` a `16m` y ten en cuenta que el registro de acceso también incluirá las rutas de las solicitudes internas. Si hay un balanceador de carga delante de nginx, recupera la dirección original con `set_real_ip_from` y `real_ip_header`. De lo contrario, `allow` solo verá la dirección del balanceador de carga.
+
+## Verificación
+
+Verifica la configuración y vuelve a cargarla:
+
+```bash
+nginx -t
+```
+
+```bash
+nginx -s reload
+```
+
+Ante una solicitud desde Internet, el endpoint de inicio de sesión devuelve `404`:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://molesignal.example.com/api/v1/auth/signin
+```
+
+Si envías una solicitud sin token desde Internet al endpoint de recepción de alertas, este devuelve `401`, lo que confirma que la solicitud llegó a MoleSignal:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://molesignal.example.com/api/v1/intake/alerts
+```
+
+Por último, en la organización `_sys`, agrega las direcciones de nginx como proxies de confianza en **Configuración → Identificación de la IP del cliente**. Consulta [Identificación de la IP del cliente](/es/settings/platform#identificación-de-la-ip-del-cliente).

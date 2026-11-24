@@ -1,0 +1,158 @@
+---
+title: "CI et versions"
+description: "Avec la CLI MoleSignal, signalez les déploiements à l’APM depuis la CI, importez les fichiers de correspondance du code source pour le RUM et les symboles mobiles, vérifiez une version avec des tests synthétiques et une comparaison de versions, et envoyez la sortie des tâches vers un flux."
+"en_link": "/en-US/cli/ci"
+"zh-Hans_link": "/zh-Hans/cli/ci"
+"zh-Hant_link": "/zh-Hant/cli/ci"
+"ja_link": "/ja/cli/ci"
+"ko_link": "/ko/cli/ci"
+"de_link": "/de/cli/ci"
+"es_link": "/es/cli/ci"
+"pt-BR_link": "/pt-BR/cli/ci"
+---
+
+Les commandes de cette page appellent l’API de MoleSignal et utilisent un jeton d’API. Définissez `MOLESIGNAL_URL` et
+`MOLESIGNAL_TOKEN` dans le pipeline, ou utilisez `--url` et `--token`. Créez le jeton dans
+**Identité et accès → Jetons d’API** avec un rôle qui dispose des autorisations indiquées pour chaque commande.
+
+## Signaler un déploiement
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production
+```
+
+Le déploiement apparaît sur la chronologie du service dans APM. APM compare la version déployée à la version
+précédente. En CI, le commit, le dépôt, la pull request, l’auteur et le lien vers l’exécution
+proviennent de l’environnement GitHub Actions, GitLab CI/CD, Jenkins, CircleCI, Buildkite,
+Bitbucket Pipelines ou Azure Pipelines. Hors CI, le commit et le dépôt proviennent de git.
+Le rôle associé au jeton doit disposer de l’autorisation `apm.deploy`.
+
+Si une commande suit `--`, la CLI l’exécute d’abord, puis enregistre la réussite ou l’échec du déploiement
+selon le résultat de la commande et renvoie le même code de sortie :
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production -- ./scripts/deploy.sh
+```
+
+| Option | Signification |
+|---|---|
+| `--service <name>` | Nom du service indiqué dans le champ `service.name` de ses spans. Obligatoire. |
+| `--version <version>` | Version déployée, correspondant à `service.version`. Obligatoire pour un déploiement. |
+| `--env <environment>` | Environnement, correspondant à `deployment.environment.name`. |
+| `--namespace <namespace>` | Espace de noms du service, correspondant à `service.namespace`. |
+| `--kind <kind>` | `deployment` (par défaut), `configuration` ou `feature_flag`. |
+| `--status <status>` | `succeeded` (par défaut), `failed` ou `rolled_back` pour un retour à la version indiquée par `--version`. |
+| `--commit`, `--repository`, `--pull-request`, `--author`, `--ci-url` | Remplacent les valeurs fournies par la CI ou git. |
+| `--description <text>` | Texte qui s’affiche au survol du déploiement. |
+| `--time <time>` | Date et heure du déploiement à utiliser à la place de l’heure actuelle. |
+| `--dry-run` | Affiche les données sans les enregistrer. |
+
+Les champs sont les mêmes que dans [Signaler des déploiements depuis la CI](/fr/apm/deployments#signaler-les-déploiements-depuis-la-ci).
+
+## Téléverser des fichiers de mappage de sources
+
+```bash
+molesignal source-maps upload dist/assets --application checkout-web --service web-frontend --release "$VERSION"
+```
+
+La commande téléverse chaque fichier `.map` des dossiers sans le renommer. Le nom doit correspondre à celui du bundle
+déployé, suivi de `.map`. La commande compresse les fichiers avec gzip et les traite quatre à la fois. Modifiez ce nombre avec `--concurrency`.
+La commande refuse les fichiers de même nom pour éviter qu’ils ne s’écrasent.
+`--application`, `--service` et `--release` doivent correspondre aux valeurs transmises par le SDK RUM :
+`applicationId`, `service` et `version`. Pour Flutter Web, ajoutez `--platform flutter` et indiquez avec
+`--debug-id` l’identifiant utilisé pour compiler l’application. Le rôle associé au jeton doit disposer de l’autorisation `debug_artifacts.manage`.
+
+`--dry-run` affiche les fichiers à téléverser. `molesignal source-maps list` liste les fichiers de mappage de sources déjà téléversés,
+et `molesignal source-maps delete <id>` supprime le fichier indiqué.
+
+## Téléverser des symboles mobiles et natifs
+
+```bash
+molesignal symbols upload build/molesignal-symbols --application checkout-app --service checkout --release 2.4.0 --debug-id "$BUILD_ID"
+```
+
+La commande traite chaque fichier selon son type :
+
+| Fichier | Téléversement |
+|---|---|
+| `app.android-arm64.symbols` généré par `--split-debug-info` | Symboles Flutter. La commande déduit la plateforme et l’architecture du nom du fichier. Indiquez avec `--debug-id` la valeur de `MOLESIGNAL_DEBUG_ID` utilisée pour compiler l’application. |
+| `mapping.txt` | Fichier de mappage Android R8. |
+| Bibliothèque ELF telle que `libapp.so` | Symboles natifs Android. La commande lit l’architecture et l’identifiant de compilation dans le fichier. |
+| Fichier `.dSYM` Apple | La commande effectue un téléversement par architecture du binaire et lit l’UUID de chaque architecture dans le fichier. |
+
+`--debug-id`, `--platform` et `--arch` remplacent les valeurs déduites du fichier. Pour un dSYM, `--arch` ne retient qu’une
+architecture. `--dry-run` liste chaque fichier avec les identifiants qu’il contient. `molesignal symbols list`
+liste les téléversements et `molesignal symbols delete <id>` supprime le téléversement indiqué. Le rôle associé au jeton doit disposer de l’autorisation
+`debug_artifacts.manage`. La page [Fichiers de mappage de sources et symboles RUM](/fr/rum/source-maps) explique comment RUM établit la correspondance
+avec les cadres de pile.
+
+## Vérifier une version
+
+`molesignal synthetics run <check> --wait --yes` exécute un test synthétique depuis chacun des emplacements configurés
+et renvoie `1` si une exécution échoue. `molesignal services compare <service> <baseline> <candidate>
+--fail-on-regression` renvoie `1` si la version candidate présente une régression. Consultez
+[Incidents et changements](/fr/cli/changes#exécuter-des-tests-synthétiques) et
+[Métriques, traces et services](/fr/cli/observe#comparer-deux-versions).
+
+## Envoyer des lignes vers un flux
+
+`molesignal send` envoie chaque ligne de l’entrée standard vers un flux de logs. Si la ligne contient un objet JSON,
+la commande utilise ses champs. Sinon, elle place la ligne dans le champ `message`. La commande envoie les logs par lots au fil de leur arrivée, ce qui permet de suivre
+un fichier :
+
+```bash
+tail -f /var/log/app.log | molesignal send app_logs --field service=billing
+```
+
+`--field name=value` ajoute un champ à chaque log et `--raw` envoie chaque ligne comme message.
+`--batch` fixe le nombre maximal de logs par requête, à `500` par défaut. Si le serveur est occupé, la commande réessaie.
+La commande renvoie `1` si MoleSignal rejette des logs. Le rôle associé au jeton doit disposer de l’autorisation `logs.write`,
+comme pour un jeton d’ingestion.
+
+## Conserver la sortie d’une tâche
+
+`molesignal run` exécute une commande, affiche sa sortie normalement et envoie chaque ligne vers un flux de logs.
+La CLI envoie ensuite un dernier log avec le code de sortie et la durée d’exécution. Elle renvoie le même code de sortie que la commande :
+
+```bash
+molesignal run jobs --name nightly-backup -- ./backup.sh --full
+```
+
+Chaque log contient les champs `message`, `output` (`stdout` ou `stderr`), `command`, `run_id` et
+`host`. Le dernier log ajoute les champs `exit_code`, `duration_ms` et `level`. `--quiet` masque la sortie dans le terminal
+et `--field` ajoute un champ.
+
+## GitHub Actions
+
+Enregistrez l’adresse et le jeton dans les secrets du dépôt, puis ajoutez des étapes à la tâche de déploiement.
+`if: always()` signale le déploiement même en cas d’échec :
+
+```yaml
+- name: Upload source maps
+  run: npx -y @molesignal/cli source-maps upload dist/assets --application checkout-web --service web-frontend --release "${{ github.sha }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+
+- name: Report the deployment
+  if: always()
+  run: npx -y @molesignal/cli deploy --service checkout --version "${{ github.sha }}" --env production --status "${{ job.status == 'success' && 'succeeded' || 'failed' }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+```
+
+## GitLab CI/CD
+
+Ajoutez `MOLESIGNAL_URL` et `MOLESIGNAL_TOKEN` comme variables CI/CD masquées, puis exécutez la commande de déploiement
+via la CLI :
+
+```yaml
+deploy:
+  stage: deploy
+  environment: production
+  script:
+    - npx -y @molesignal/cli deploy --service checkout --version "$CI_COMMIT_SHORT_SHA" -- ./scripts/deploy.sh
+```
+
+L’environnement provient de `environment`. GitLab fournit le commit, la demande de fusion et le lien vers la tâche.

@@ -1,0 +1,293 @@
+---
+title: "Webhook 通知連接器"
+description: "設定 Slack、飛書和通用 Webhook 的通知傳送方式，包括覆寫傳送目標、簽章與憑證加密。"
+"en_link": "/en-US/notification-channels/webhooks"
+"zh-Hans_link": "/zh-Hans/notification-channels/webhooks"
+"ja_link": "/ja/notification-channels/webhooks"
+"ko_link": "/ko/notification-channels/webhooks"
+"de_link": "/de/notification-channels/webhooks"
+"es_link": "/es/notification-channels/webhooks"
+"fr_link": "/fr/notification-channels/webhooks"
+"pt-BR_link": "/pt-BR/notification-channels/webhooks"
+---
+
+MoleSignal 目前提供三種 Webhook 連接器：Slack Webhook、飛書 Webhook 和通用 JSON Webhook。請在**設定 → 通知 → 連接器**中建立。
+
+如需綁定使用者、建立策略、設定備援路由或查看傳送記錄，請先閱讀[通知管道與傳送](/zh-Hant/notification-channels)。
+
+## Webhook 類型比較
+
+| 連接器 | 請求格式 | 身分驗證 | 目標類型 |
+|---|---|---|---|
+| `slack_webhook` | `{ "text": "..." }` | 憑證包含在 Webhook URL 中 | `fixed_group`、`webhook` |
+| `lark_webhook` | 飛書 `msg_type: text` | URL 憑證和選用簽章 | `fixed_group`、`webhook` |
+| `webhook` | MoleSignal 事件 JSON，或通知範本的本文 | 自訂 JSON 標頭，可選用簽章 | 所有目標類型 |
+
+`fixed_group` 使用連接器中設定的 URL。`webhook` 要求目標值為絕對 URL，並以目標值覆寫這次傳送使用的已設定 URL。
+
+## Slack Webhook
+
+設定 Incoming Webhook 網址和 1 到 60 秒的逾時時間：
+
+```json
+{
+  "webhookUrl": "https://hooks.slack.com/services/T000/B000/secret",
+  "timeoutSecs": 10
+}
+```
+
+MoleSignal 會串接訊息標題與 Markdown 本文並傳送：
+
+```json
+{
+  "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
+}
+```
+
+2xx HTTP 回應表示成功。收到其他回應或發生逾時時，MoleSignal 會將該次傳送標記為失敗。
+
+## 飛書 Webhook
+
+設定飛書自訂機器人的網址。只有機器人啟用簽章驗證時，才需要填寫簽章金鑰：
+
+```json
+{
+  "webhookUrl": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
+  "secret": "replace-with-signing-secret",
+  "timeoutSecs": 10
+}
+```
+
+未填寫簽章金鑰時，MoleSignal 會傳送：
+
+```json
+{
+  "msg_type": "text",
+  "content": {
+    "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
+  }
+}
+```
+
+填寫簽章金鑰後，MoleSignal 會產生以秒為單位的 Unix 時間戳記，串接 `timestamp + "\n" + secret`，以串接後的值作為 HMAC-SHA256 金鑰，對空訊息計算簽章，再以 Base64 編碼結果。請求會新增：
+
+```json
+{
+  "timestamp": "1599360473",
+  "sign": "base64-signature",
+  "msg_type": "text",
+  "content": {
+    "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
+  }
+}
+```
+
+飛書傳送成功的條件是 HTTP 回應狀態表示成功，且回應中的 `code` 或 `status_code` 為零。
+
+<Note>
+  請保持 MoleSignal 伺服器的時間同步。飛書會拒絕簽章已過期的請求。
+</Note>
+
+## 通用 Webhook
+
+設定預設網址、方法、請求本文、簽章金鑰、標頭和逾時時間：
+
+```json
+{
+  "url": "https://notify.example.com/molesignal",
+  "method": "post",
+  "body": "event",
+  "signingSecret": "<at-least-16-characters>",
+  "headers": {
+    "X-Environment": "production"
+  },
+  "timeoutSecs": 10
+}
+```
+
+方法可以是 `post`、`put` 或 `patch`。標頭名稱和值必須符合 HTTP 語法。請勿使用 `Content-Type` 或下方列出的 `X-MoleSignal-*` 名稱。
+
+### 請求本文
+
+`body` 為 `event`（預設，介面上顯示為 **MoleSignal 事件**）時，請求本文是供程式讀取的 JSON：
+
+```json
+{
+  "version": 2,
+  "event": {
+    "id": "alert.triggered:3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "type": "alert.triggered",
+    "occurredAt": "2026-10-28T08:00:00Z",
+    "organizationId": "<organization-id>"
+  },
+  "alert": {
+    "id": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "status": "open",
+    "severity": "critical",
+    "title": "High error rate · checkout",
+    "url": "https://molesignal.example.com/alerts/incidents/3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "startedAt": "2026-10-28T08:00:00Z",
+    "acknowledgedAt": null,
+    "resolvedAt": null,
+    "acknowledgedBy": null,
+    "resolvedBy": null,
+    "assignees": ["<user-id>"],
+    "teamId": "<team-id>",
+    "service": "checkout",
+    "environment": "production",
+    "affectedServices": ["checkout"],
+    "labels": { "service": "checkout", "env": "production" },
+    "annotations": { "runbook_url": "https://runbooks.example.com/checkout" },
+    "value": 120.0,
+    "threshold": 50.0
+  },
+  "rule": { "id": "<rule-id>", "name": "High error rate", "description": "Share of 5xx answers." },
+  "target": { "type": "fixed_group", "value": "platform-oncall", "metadata": {} },
+  "message": {
+    "title": "[CRITICAL] High error rate · checkout",
+    "text": "The error rate exceeded 5%.",
+    "markdown": "**Checkout** error rate exceeded 5%.",
+    "html": null,
+    "metadata": { "event_type": "alert.triggered", "alert_id": "3KEDNEyqouYJeBDTLTMTBui7XHW" }
+  }
+}
+```
+
+| 欄位 | 內容 |
+|---|---|
+| `version` | 請求本文結構的版本，目前為 `2`：結構本身的鍵採用 camelCase，`data` 內的事件屬性維持原樣。欄位只新增、不修改，只有在發生不相容的變更時才將版本加一。 |
+| `event` | 通知的 `id`、`type`（例如 `alert.triggered`、`alert.escalated`、`oncall.shift.starting`）、`occurredAt` 和 `organizationId`。 |
+| `alert` | 僅出現在警示類通知中：狀態、嚴重程度、標題、事件網址（須設定 `http.external_url`）、開始、確認和解決的時間、負責人、團隊、服務、環境、標籤、註解、觸發值和閾值。時間採用 RFC 3339（UTC），人員和團隊以 ID 表示。 |
+| `rule` | 警示規則：`id`、`name`、`description`。 |
+| `escalation` | 僅出現在升級通知中：`step`、`loop`、`reason`（傳送原因，請參閱[處理事件](/zh-Hant/alerting/incidents#處理事件)）和 `target`（`kind` 與 `id`）。 |
+| `data` | 值班交接、無人值班等非警示類通知會原樣帶入事件屬性。 |
+| `target` | 這次傳送的目標：`type`、`value`、`metadata`。 |
+| `message` | 算繪完成的訊息：`title`、`text`、`markdown`、`html`、`metadata`。 |
+
+`body` 為 `template`（**通知範本的本文**）時，MoleSignal 會將通知策略為 Webhook 管道選取的範本本文原樣當作請求本文傳送：JSON 格式的範本以 `application/json` 傳送，變數值依 JSON 字串規則進行逸出；其餘格式以 `text/plain; charset=utf-8` 傳送。如果策略未為 Webhook 管道選取範本，則傳送通用範本或事件預設訊息的本文。範本語法請參閱[條件](/zh-Hant/notification-channels#條件)。
+
+### 請求標頭與簽章
+
+| 標頭 | 內容 |
+|---|---|
+| `Content-Type` | `application/json`；範本本文不是 JSON 格式時，則為 `text/plain; charset=utf-8`。 |
+| `X-MoleSignal-Event` | 通知類型，與 `event.type` 相同。 |
+| `X-MoleSignal-Delivery` | 這次傳送的 ID，接收端可用來排除重複請求。 |
+| `X-MoleSignal-Timestamp` | 只有填寫簽章金鑰時才會提供：傳送時間的 Unix 時間戳記（以秒為單位）。 |
+| `X-MoleSignal-Sign` | 只有填寫簽章金鑰時才會提供：`sha256=<hex>`，以簽章金鑰對 `<timestamp>.<请求体>` 計算出的 HMAC-SHA256。 |
+
+接收端使用相同的金鑰，依收到的原始請求本文重新計算簽章，並以固定時間比對 `X-MoleSignal-Sign`，再拒絕時間戳記與目前時間相差過久（例如超過 5 分鐘）的請求。請使用原始位元組計算，不要先剖析 JSON 再序列化：
+
+<CodeGroup>
+```python Python
+import hashlib, hmac, time
+
+def verify(secret: str, headers, body: bytes, tolerance: int = 300) -> bool:
+    timestamp = headers.get("X-MoleSignal-Timestamp", "")
+    signature = headers.get("X-MoleSignal-Sign", "")
+    if not timestamp.isdigit() or abs(time.time() - int(timestamp)) > tolerance:
+        return False
+    mac = hmac.new(secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256)
+    return hmac.compare_digest("sha256=" + mac.hexdigest(), signature)
+```
+
+```javascript Node.js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+export function verify(secret, headers, body, toleranceSecs = 300) {
+  const timestamp = headers['x-molesignal-timestamp'] ?? '';
+  const signature = Buffer.from(headers['x-molesignal-sign'] ?? '');
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > toleranceSecs) return false;
+  const expected = Buffer.from(
+    'sha256=' + createHmac('sha256', secret).update(`${timestamp}.`).update(body).digest('hex'),
+  );
+  return expected.length === signature.length && timingSafeEqual(expected, signature);
+}
+```
+
+```go Go
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+func verify(secret string, r *http.Request, body []byte, tolerance time.Duration) bool {
+	timestamp := r.Header.Get("X-MoleSignal-Timestamp")
+	seconds, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil || time.Since(time.Unix(seconds, 0)).Abs() > tolerance {
+		return false
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp + "."))
+	mac.Write(body)
+	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(expected), []byte(r.Header.Get("X-MoleSignal-Sign")))
+}
+```
+</CodeGroup>
+
+簽章金鑰至少須有 16 個字元，例如使用 `openssl rand -hex 32` 產生的金鑰。連接器的 HTTP 目標採用相同的簽章機制，請參閱[連接器](/zh-Hant/connectors)。
+
+### 回應與對外連線
+
+任何 2xx 回應都表示成功。回應包含 `X-Request-ID` 時，MoleSignal 會將標頭值記錄為服務供應商的訊息 ID。MoleSignal 只連線至網址解析出的 IP 位址，拒絕雲端中繼資料位址，也不跟隨重新導向。Webhook 通知不適用[合併通知](/zh-Hant/notification-channels#合併通知)。
+
+## 透過 API 建立與測試
+
+建立通用 Webhook 連接器：
+
+```bash
+curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors" \
+  -H "Authorization: Bearer $MS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "platform webhook",
+    "connectorType": "webhook",
+    "enabled": true,
+    "config": {
+      "url": "https://notify.example.com/molesignal",
+      "method": "post",
+      "body": "event",
+      "signingSecret": "<at-least-16-characters>",
+      "headers": {"Authorization": "Bearer <token>"},
+      "timeoutSecs": 10
+    }
+  }'
+```
+
+儲存 API 傳回的連接器 `id`，再傳送測試通知：
+
+```bash
+curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors/$CONNECTOR_ID/test" \
+  -H "Authorization: Bearer $MS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "targetType": "fixed_group",
+    "target": "platform-oncall",
+    "message": {
+      "title": "MoleSignal connector test",
+      "text": "Webhook delivery is working."
+    }
+  }'
+```
+
+列出、讀取、建立和更新連接器時，API 都會以 `***` 傳回敏感設定。更新現有的連接器時，原樣提交 `***` 即可保留已儲存的金鑰。
+
+## 安全性與限制
+
+- MoleSignal 會加密儲存完整的連接器設定；
+- API 回應會遮蔽 `url`、`webhookUrl`、`headers`、`secret`、`signingSecret`、權杖和密碼；
+- 即使未另外設定金鑰，也要將 Webhook URL 視為憑證；
+- 優先使用 `https`，只在受信任的網路內使用 `http`；
+- 將 MoleSignal 的對外連線限制在連接器確實需要存取的目標；
+- 已停用的連接器無法傳送測試通知或正式通知。
+
+<Note>
+  釘釘、企業微信、Teams、Google Chat、Telegram、Discord、Mattermost、Webex、Matrix、PagerDuty 和 Amazon SNS 各有專用的連接器，請參閱[設定各服務供應商](/zh-Hant/notification-channels#設定各服務供應商)。如果接收端要求其他 JSON 格式，請以 JSON 格式的 Webhook 範本編寫所需的內容，並將請求本文選為**通知範本的本文**，不必另外加入轉換服務。
+</Note>

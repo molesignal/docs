@@ -1,0 +1,127 @@
+---
+title: "CI 與發行"
+description: "使用 MoleSignal 命令列在 CI 中向 APM 回報發行資訊、上傳 RUM 的 Source Map 與行動裝置端的符號、透過合成監控測試與版本比較來檢查發行結果，並將工作輸出傳送至資料流。"
+"en_link": "/en-US/cli/ci"
+"zh-Hans_link": "/zh-Hans/cli/ci"
+"ja_link": "/ja/cli/ci"
+"ko_link": "/ko/cli/ci"
+"de_link": "/de/cli/ci"
+"es_link": "/es/cli/ci"
+"fr_link": "/fr/cli/ci"
+"pt-BR_link": "/pt-BR/cli/ci"
+---
+
+本頁的命令會呼叫 MoleSignal 的 API，需要 API 權杖：在管線中設定 `MOLESIGNAL_URL` 和 `MOLESIGNAL_TOKEN`，或傳入 `--url` 和 `--token`。在 **身分與存取 → API 權杖** 中建立權杖，並確認所用角色具備各命令要求的權限。
+
+## 回報發佈
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production
+```
+
+發佈會顯示在 APM 中該服務的時間軸上，APM 會比較新版本與先前的版本。在 CI 中，提交、程式碼儲存庫、PR、發佈者和 CI 執行連結取自 GitHub Actions、GitLab CI/CD、Jenkins、CircleCI、Buildkite、Bitbucket Pipelines 或 Azure Pipelines 的環境變數；在其他環境中，提交和程式碼儲存庫取自 git。權杖的角色需要 `apm.deploy` 權限。
+
+在 `--` 後指定命令時，CLI 會先執行該命令，依執行結果將發佈記錄為成功或失敗，並以該命令的結束代碼結束：
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production -- ./scripts/deploy.sh
+```
+
+| 選項 | 說明 |
+|---|---|
+| `--service <名称>` | 服務名稱，與 Span 的 `service.name` 一致。必填。 |
+| `--version <版本>` | 發佈版本，與 `service.version` 一致。發佈時必填。 |
+| `--env <环境>` | 環境，即 `deployment.environment.name`。 |
+| `--namespace <Namespace>` | 服務的 `service.namespace`。 |
+| `--kind <类型>` | `deployment`（預設）、`configuration` 或 `feature_flag`。 |
+| `--status <状态>` | `succeeded`（預設）、`failed`，或用 `rolled_back` 表示復原至 `--version`。 |
+| `--commit`、`--repository`、`--pull-request`、`--author`、`--ci-url` | 取代 CI 或 git 提供的值。 |
+| `--description <文本>` | 將滑鼠游標移到發佈項目上時顯示。 |
+| `--time <时间>` | 發佈時間，取代目前時間。 |
+| `--dry-run` | 輸出即將記錄的內容，不實際記錄。 |
+
+欄位與[從 CI 回報發佈](/zh-Hant/apm/deployments#從-ci-回報發佈)相同。
+
+## 上傳 Source Map
+
+```bash
+molesignal source-maps upload dist/assets --application checkout-web --service web-frontend --release "$VERSION"
+```
+
+目錄下的每個 `.map` 檔案都以原檔名上傳。檔名必須是已部署的 Bundle 檔名加上 `.map`。上傳時會以 gzip 壓縮檔案，預設同時上傳四個檔案，可用 `--concurrency` 調整。同名的 Source Map 會互相覆寫，因此命令會拒絕上傳同名檔案。`--application`、`--service` 和 `--release` 必須與 RUM SDK 回報的 `applicationId`、`service` 和 `version` 一致。Flutter Web 需要加上 `--platform flutter`，並指定建置應用程式時使用的 `--debug-id`。權杖的角色需要 `debug_artifacts.manage` 權限。
+
+`--dry-run` 列出即將上傳的檔案。`molesignal source-maps list` 列出已上傳的 Source Map，`molesignal source-maps delete <ID>` 刪除指定的 Source Map。
+
+## 上傳行動平台與原生符號
+
+```bash
+molesignal symbols upload build/molesignal-symbols --application checkout-app --service checkout --release 2.4.0 --debug-id "$BUILD_ID"
+```
+
+依檔案內容辨識類型：
+
+| 檔案 | 上傳類型 |
+|---|---|
+| `--split-debug-info` 產生的 `app.android-arm64.symbols` | Flutter Symbols；平台與架構取自檔名。`--debug-id` 是建置應用程式時使用的 `MOLESIGNAL_DEBUG_ID`。 |
+| `mapping.txt` | Android R8 Mapping。 |
+| `libapp.so` 等 ELF 動態程式庫 | Android 原生符號；從檔案讀取架構與 Build ID。 |
+| Apple `.dSYM` | 上傳二進位檔中的每個架構，每個架構各上傳一次，並附上從檔案讀取的 UUID。 |
+
+`--debug-id`、`--platform` 和 `--arch` 會取代從檔案讀取的值。對於 dSYM，`--arch` 只保留指定的架構。`--dry-run` 列出每個檔案及從中讀取的 ID。使用 `molesignal symbols list` 列出已上傳的檔案，使用 `molesignal symbols delete <ID>` 刪除指定的檔案。權杖的角色需要 `debug_artifacts.manage` 權限。堆疊框架的比對方式請參閱 [RUM Source Maps 與 Symbols](/zh-Hant/rum/source-maps)。
+
+## 檢查發佈
+
+`molesignal synthetics run <检查> --wait --yes` 會在該檢查的每個地點各執行一次，只要有一次執行失敗，就以 `1` 結束。`molesignal services compare <服务> <基线版本> <候选版本> --fail-on-regression` 會在候選版本表現變差時以 `1` 結束。請參閱[事件與變更](/zh-Hant/cli/changes#執行合成監控檢查)與[指標、追蹤與服務](/zh-Hant/cli/observe#比較兩個版本)。
+
+## 將日誌行傳送至資料串流
+
+`molesignal send` 將標準輸入的每一行傳送至日誌資料串流：如果該行是 JSON 物件，就依其欄位傳送；其他行則以 `message` 傳送。收到日誌後會持續分批傳送，因此可持續讀取同一個檔案新增的內容：
+
+```bash
+tail -f /var/log/app.log | molesignal send app_logs --field service=billing
+```
+
+`--field 名称=值` 為每筆日誌新增一個欄位，`--raw` 將每一行都當作訊息傳送，`--batch` 設定每個請求可包含的日誌筆數上限，預設為 `500`。伺服器忙碌時會重試。只要 MoleSignal 拒絕任何一筆日誌，就以 `1` 結束。權杖的角色需要 `logs.write` 權限，接入權杖具備此權限。
+
+## 保留工作輸出
+
+`molesignal run` 會執行命令並照常顯示輸出，同時將每一行傳送至日誌資料串流，最後再傳送一筆日誌，記錄結束代碼與執行時間。`molesignal run` 會以該命令的結束代碼結束：
+
+```bash
+molesignal run jobs --name nightly-backup -- ./backup.sh --full
+```
+
+每筆日誌都有 `message`、`output`（`stdout` 或 `stderr`）、`command`、`run_id` 和 `host` 欄位；最後一筆另有 `exit_code`、`duration_ms` 和 `level`。`--quiet` 不在本機顯示輸出，`--field` 可新增欄位。
+
+## GitHub Actions
+
+將網址和權杖儲存為儲存庫的 Secret，再在負責部署的工作中加入以下步驟。`if: always()` 可確保發佈失敗時也會回報：
+
+```yaml
+- name: Upload source maps
+  run: npx -y @molesignal/cli source-maps upload dist/assets --application checkout-web --service web-frontend --release "${{ github.sha }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+
+- name: Report the deployment
+  if: always()
+  run: npx -y @molesignal/cli deploy --service checkout --version "${{ github.sha }}" --env production --status "${{ job.status == 'success' && 'succeeded' || 'failed' }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+```
+
+## GitLab CI/CD
+
+將 `MOLESIGNAL_URL` 和 `MOLESIGNAL_TOKEN` 新增為隱藏的 CI/CD 變數，再透過命令列執行部署命令：
+
+```yaml
+deploy:
+  stage: deploy
+  environment: production
+  script:
+    - npx -y @molesignal/cli deploy --service checkout --version "$CI_COMMIT_SHORT_SHA" -- ./scripts/deploy.sh
+```
+
+環境取自 `environment`，提交、合併要求和工作連結取自 GitLab。

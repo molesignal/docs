@@ -1,0 +1,60 @@
+---
+title: "已知限制"
+description: "目前版本中可能與部署時的預期不同的行為，以及對應的解決方法。"
+"en_link": "/en-US/limitations"
+"zh-Hans_link": "/zh-Hans/limitations"
+"ja_link": "/ja/limitations"
+"ko_link": "/ko/limitations"
+"de_link": "/de/limitations"
+"es_link": "/es/limitations"
+"fr_link": "/fr/limitations"
+"pt-BR_link": "/pt-BR/limitations"
+---
+
+MoleSignal 目前尚未達到 1.0 版。本頁列出會影響規劃與維運的限制。
+
+## 部署
+
+- **接管延遲。** 預寫日誌儲存在物件儲存中。即使 intake 節點遺失，已確認的資料也不會遺失，但尚未寫入儲存空間的記錄，要等其他 intake 節點在 `[wal].lease_secs`（預設 15 秒）後接管，才能查詢。請參閱[持久性與接管](/zh-Hant/architecture#持久性與接管)。
+- **只在單一節點上執行的工作。** 主 `alert` 節點負責跨叢集事件推送與 gossip、服務圖重新計算、APM 彙總、狀態頁維護、合成監控自動化、慢速查詢分析與事件根本原因分析。這些工作不會隨 `alert` 節點數量增加而擴充。主節點退出成員清單後，這些工作會在另一個節點上繼續執行。請參閱[依角色部署](/zh-Hant/deployment/role-based#alert-節點之間的分工)。
+- **僅支援 PostgreSQL。** PostgreSQL 是唯一支援的中繼資料庫。
+- **設定須重新啟動才會生效。** 執行中的程序不會套用設定檔的變更。請參閱[設定](/zh-Hant/configuration)。
+- **只能向前遷移。** 較舊的組建無法開啟已由較新組建遷移的資料庫，而且 1.0 之前的組建可能會修改基準結構描述。請參閱[升級](/zh-Hant/upgrade)。
+
+## 資料接收
+
+- **請求大小。** 系統會拒絕超過 2 MiB 的請求主體，並傳回 `413`。原生 JSON 資料接收的上限為 16 MiB。
+- **OTLP over HTTP 壓縮。** 系統會拒絕壓縮的請求主體，並傳回 `400`。請在傳送端關閉壓縮。
+- **直方圖分桶。** OTLP 直方圖只儲存 `count`、`sum`、`min` 與 `max`，不儲存分桶邊界、分桶計數及 summary 分位數。
+- **重複的 Span。** 系統會捨棄以相同 `trace_id` 和 `span_id` 重複傳送的 Span。
+- **Loki push。** 此端點只解碼 JSON 格式的請求。使用 snappy 壓縮 protobuf 的傳送端（例如 Promtail 與 Grafana Alloy）無法推送至此端點。
+- **Prometheus remote_write。** 系統會略過原生直方圖與指標中繼資料。
+- **OTLP gRPC 不含 TLS。** 接收端不會終止 TLS。流量離開受信任的網路時，請在接收端前方設置可終止 TLS 的 Proxy。
+- **速率限制。** 只有 `router` 角色會限制請求速率。系統依已驗證的組織計算請求數，各 router 複本分別計數。
+- **平台資料流。** 只有 MoleSignal 能寫入 `_molesignal`、`_synthetic_results`、`_audit`、`_agent_model_traces` 和 `_agent_score_traces`。這些資料流不接受公開寫入。請參閱[平台資料流](/zh-Hant/streams#平台資料串流)。
+
+## 查詢
+
+- **長時間範圍的查詢會非同步執行。** 查詢的估計讀取列數達到 `[querier].auto_async_threshold_rows` 時，系統會傳回 `202` 和可追蹤的工作。預設設定下，這個門檻約對應 13.9 小時的時間範圍。傳送 `Prefer: respond-sync` 即可在同一個請求中執行查詢。請參閱[查詢](/zh-Hant/query#時間範圍與非同步工作)。
+- **PromQL 子集。** 引擎實作了 PromQL 的一個子集。請參閱[PromQL 支援矩陣](/zh-Hant/query/promql-subset)。
+- **單次查詢的列數。** 查詢讀取的列數超過 `[querier].max_scan_rows`（預設 1 億）時，系統會拒絕查詢並傳回 `400`。請縮小時間範圍或增加篩選條件。PromQL 會對每個選取器套用此限制。
+- **依角色部署的叢集中的資料即時性。** 查詢會讀取目錄中列出的檔案，因此 intake 節點仍在緩衝區中的記錄，要等下一次寫入儲存空間後才能查到，等待時間不超過 `[intake].flush_interval_secs`。`standalone` 節點也會讀取自身的緩衝區。警示規則預設會依 **設定 → 警示評估** 的評估延遲（60 秒），將評估時間窗往前移。請參閱[評估延遲](/zh-Hant/alerting/rules#評估延遲)。
+
+## 警示
+
+- **即時規則在記憶體中計數。** `real_time` 規則會在每個接收寫入的節點上計數。負責該規則的 alert 節點每秒擷取一次計數並加總，建立事件最多比記錄寫入晚 1 秒。節點重新啟動時，只會遺失該節點的計數；若無法從某個節點擷取計數，該節點就不納入當秒的加總。節點之間擷取計數須設定叢集 bearer 權杖，不會跨聯邦彙總叢集計數。陳述式限用 `SELECT count(*) FROM <stream> [WHERE <condition>]`。請參閱[即時規則](/zh-Hant/alerting/rules#即時規則)。
+
+## 安全性與身分識別
+
+- **內部 gRPC 不使用驗證。** `5082` 連接埠負責未經驗證的節點間流量。請將此連接埠置於私人網路內。
+- **Passkey 綁定單一網域名稱。** `[http].external_url` 必須使用包含網域名稱的 HTTPS 網址。透過其他主機名稱開啟主控台時，無法使用 Passkey。
+- **密碼重設仰賴電子郵件。** 系統會透過電子郵件傳送密碼重設連結，因此必須設定 `[notify.smtp]` 與 `[http].external_url`。
+- **免審核的自助註冊仰賴電子郵件。** 註冊時須先驗證電子郵件地址的所有權。若未設定 `[notify.smtp]` 與 `[http].external_url`，所有新帳號都須等待管理員審核。
+- **登入速率限制依 IP 位址計數。** 請透過[用戶端 IP 識別](/zh-Hant/settings/platform#用戶端-ip-識別)取得正確的位址。若未設定公用網路的 Proxy 或 CDN，所有使用者會共用同一個位址，導致彼此無法登入。私人 IP 位址預設不計數，因此在內部網路部署或未設定 Proxy 時，只有帳號速率限制會生效。
+- **帳號速率限制不等於帳號鎖定。** 為避免他人鎖住帳號，限制期間每個帳號每天仍可接受約 1,400 次密碼猜測。若帳號已啟用多因素驗證，即使猜對密碼也無法登入。若他人持續用掉嘗試次數，帳號持有人若從未從此位址成功登入，可能一直無法登入。此時請使用 Passkey、單一登入或重設密碼。
+- **LDAP 目錄的鎖定原則。** 目錄服務本身的鎖定原則可能會先觸發，他人仍可藉此鎖住目錄帳號。請將[登入速率限制](/zh-Hant/settings/platform#登入速率限制)的次數上限設得比目錄服務的上限低。
+- **工作階段。** 帳號設定頁面只能管理目前瀏覽器的工作階段。
+
+## 報表
+
+- **PDF 與 PNG 算繪** 需要無頭模式的 Chrome。已發布的容器映像檔內含 Chromium。若使用二進位檔安裝，請在節點上安裝 Chrome，並確認 `[scheduled_reports.renderer].base_url` 可存取網頁介面。

@@ -1,0 +1,324 @@
+---
+title: "RUM 事件格式"
+sidebarTitle: "事件格式"
+description: "RUM SDK 與其他用戶端傳送至 MoleSignal 的 JSON 事件：接收端點、回應、規則，以及各類事件的欄位。"
+"en_link": "/en-US/rum/events"
+"zh-Hans_link": "/zh-Hans/rum/events"
+"ja_link": "/ja/rum/events"
+"ko_link": "/ko/rum/events"
+"de_link": "/de/rum/events"
+"es_link": "/es/rum/events"
+"fr_link": "/fr/rum/events"
+"pt-BR_link": "/pt-BR/rum/events"
+---
+
+所有 RUM SDK 都會將相同的 JSON 事件傳送至同一個端點。未使用 SDK 的用戶端（例如尚無 SDK 可用的原生應用程式）也可以透過 HTTP 請求傳送相同的事件。
+
+事件包含 `type`、`date`，以及所屬的 `session` 和 `view`，另有一個以事件類型命名的物件存放詳細資料。事件的 JSON Schema 隨原始碼發布，位於 `contracts/rum/events/v1.schema.json`，並附上有效與無效的事件範例。
+
+## 傳送事件
+
+```http
+POST /api/v1/rum/events
+Authorization: Bearer mspat-<36>
+Content-Type: application/json
+```
+
+| 部分 | 規則 |
+|---|---|
+| 憑證 | 應用程式的 [Client Token](/zh-Hant/rum/applications#client-token) 僅具備該應用程式的 `rum.write` 權限。使用其他具備 `rum.write` 權限的憑證時，必須在每個事件的 `application.id` 中指定應用程式。 |
+| 請求主體 | 事件的 JSON 陣列；也支援單一事件物件和 NDJSON（`Content-Type: application/x-ndjson`，每行一個事件）。 |
+| 壓縮 | 可選用 `Content-Encoding: gzip`，不接受其他編碼。 |
+| 大小 | 最多 5000 個事件，解壓縮後最多 5 MiB。超出限制時傳回 `413`。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST "http://localhost:5080/api/v1/rum/events" \
+  -H "authorization: Bearer $RUM_CLIENT_TOKEN" \
+  -H "content-type: application/json" \
+  -d '[{
+    "type": "error",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34", "url": "https://shop.example.com/checkout" },
+    "error": {
+      "id": "e7b1c9a2-3d4f-4b65-8a90-1c2d3e4f5a61",
+      "message": "Payment provider timeout",
+      "source": "custom",
+      "handling": "handled"
+    }
+  }]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "accepted": 1,
+  "rejected": []
+}
+```
+</ResponseExample>
+
+## 回應
+
+回應會逐一回報每個事件的處理結果，因此單一無效事件不會導致同一請求中的其他事件一併遭捨棄。
+
+| 欄位 | 意義 |
+|---|---|
+| `accepted` | 接受的事件數：未遭拒絕，也未計入 `sampled`。[即時管線](/zh-Hant/pipelines#rum-資料串流)刻意捨棄的事件雖不會儲存，仍計入此欄位。 |
+| `rejected` | 每個遭拒絕的事件各有一個項目，包含事件在請求中的位置（`index`，從 `0` 起算）與拒絕原因 `reason`。 |
+| `sampled` | 刻意捨棄的事件數：應用程式[只保留部分工作階段](/zh-Hant/rum/sampling#在伺服器端保留部分工作階段)時，這些事件屬於未保留的工作階段。如果應用程式保留所有錯誤，這些工作階段的錯誤事件就不計入。只有在有符合條件的事件時才會出現此欄位。這些事件不算遭拒絕，也不計入 `accepted`。 |
+
+即使請求中的事件全數無效，仍會傳回 `200`，且 `accepted` 為 `0`。完全無法讀取的請求會整筆失敗：請求主體不是 JSON、不支援 `Content-Encoding` 或無法解碼 gzip 資料時，傳回 `400`；Token 缺漏、已撤銷或不具備 `rum.write` 權限時，傳回 `401` 或 `403`；超出上述限制時，傳回 `413`。
+
+下列情況會導致事件遭拒絕：
+
+| 原因 | 說明 |
+|---|---|
+| 指出欄位的訊息 | 事件不符合 Schema：缺少必填欄位、值的類型不正確或不在允許的範圍內，或數值為負。 |
+| `date is more than a day in the future` | 裝置時鐘快了太多。 |
+| `application.id is not the application of the client token` | 事件指定的應用程式不是 Token 繫結的應用程式。 |
+| ``application `<id>` does not exist`` | 應用程式已刪除或從未建立。 |
+| `application.id is required` | 憑證不是 Client Token，且事件未指定應用程式。 |
+| `line is not JSON` | 無法剖析 NDJSON 請求主體中的某一行。 |
+| ``<stream>: realtime transform `<step>` …`` | 該資料流的[即時管線](/zh-Hant/pipelines#rum-資料串流)中，某個步驟無法處理此事件、變更了管線須維持不變的資料欄，或捨棄了頁面或 Web Vitals 事件。 |
+
+SDK 會透過錯誤回呼回報遭拒絕的事件，不會重新傳送。
+
+## 規則
+
+- `date` 是事件的開始時間，以 epoch 毫秒表示。`view` 的 `date` 是檢視的開始時間，不會隨修訂版本變更。
+- 所有持續時間與相對於檢視開始的時間（例如 `performance.lcp.timestamp`、`resource.dns.start`），一律以**整數奈秒**表示。傳送前請先取整數。
+- 每當檢視有變更，就以較高的 `view.revision` 和目前的計數重新傳送。MoleSignal 會保留修訂編號最高的版本。計數是累計值，不是增量。
+- 用戶端不會傳送工作階段事件。MoleSignal 會根據檢視推導工作階段的開始與結束時間、持續時間、各類計數、到達頁面與離開頁面，以及是否有錄製重播。
+- `session.start` 以 epoch 毫秒表示，為選填，但建議提供。尚未辨識某個工作階段的節點會用此欄位區分剛開始的工作階段和已遺失狀態的舊工作階段。
+- `application.id` 為選填。應用程式就是 Client Token 繫結的應用程式；填入其他值會遭拒絕。
+- MoleSignal 會寫入 `geo` 和 `network`，並忽略傳入的值。`retention` 也一樣：`retention.rate` 是這類資料列的保留比例（百分比），`retention.filter` 則指出保留該資料列的依據（[篩選條件](/zh-Hant/rum/sampling#篩選器)的 id、`default`，或未保留工作階段發生錯誤時的 `errors`）。MoleSignal 會根據這些值計算總數。
+- MoleSignal 會接受並保留 Schema 未定義的欄位；如果 Schema 已定義的欄位類型或值不正確，則會拒絕該事件。
+- `error.frames` 存放結構化的堆疊，適用於 Source Map、mapping 檔案和原生符號檔案。`error.stack` 是同一堆疊的文字形式，用於顯示和搜尋。
+
+## 每個事件共有的屬性
+
+| 屬性 | 類型 | 說明 |
+|---|---|---|
+| `type` | string | 必填：`view`、`action`、`error`、`resource`、`long_task`、`vital` 或 `log`。 |
+| `date` | integer | 必填。epoch 毫秒。 |
+| `source` | string | 必填：`browser`、`android`、`ios`、`flutter`、`react-native`、`kotlin-multiplatform`、`unity`、`roku`、`electron` 或 `other`。 |
+| `session` | object | 必填。`id` 必填。`type` 為 `user`（預設）、`synthetics` 或 `ci_test`。`start` 以 epoch 毫秒表示。`has_replay` 為布林值。 |
+| `view` | object | 必填。`id` 必填。`url`、`name`、`referrer` 和 `in_foreground` 為選填。 |
+| `application.id` | string | 選填，請參閱上方規則。 |
+| `service`、`env`、`version` | string | 發布版本的維度。`version` 是查找 Source Map 與 Symbols 的鍵。 |
+| `build_version`、`build_id` | string | 建置編號，以及上傳偵錯成品時使用的建置識別碼。 |
+| `action.id` | string | 觸發該事件的動作（如有）。 |
+| `usr` | object | `id`、`name`、`email` 和 `anonymous_id`，其他鍵會儲存為 `usr.extra`。 |
+| `account` | object | `id` 和 `name`。 |
+| `tab.id` | string | 瀏覽器分頁。 |
+| `connectivity` | object | `status`、`interfaces`、`effective_type` 和 `cellular`（`technology`、`carrier_name`）。 |
+| `display.viewport` | object | `width` 和 `height`。 |
+| `browser`、`os`、`device` | object | 瀏覽器名稱與版本、作業系統，以及裝置類型（`mobile`、`desktop`、`tablet`、`tv`、`gaming_console`、`bot` 或 `other`）、型號、品牌、架構、地區設定、時區、電量和記憶體。 |
+| `sdk` | object | `name`、`version`、`session_sample_rate` 和 `replay_sample_rate`。 |
+| `context` | object | 應用程式自訂的屬性。 |
+| `feature_flags` | object | 自訂的功能旗標值。可用 `feature_flags.<key>` 查詢各個鍵，請參閱[功能旗標](/zh-Hant/rum/feature-flags)。 |
+| `synthetics` | object | 合成監控對其觸發的工作階段所提供的資訊：`test_id`、`result_id` 和 `location_id`。請參閱[測試流量](/zh-Hant/rum/test-traffic)。 |
+| `ci_test` | object | `test_execution_id`，適用於 CI 測試觸發的工作階段。 |
+
+識別碼由 `A-Z`、`a-z`、`0-9`、`.`、`_`、`:` 和 `-` 組成，最長 128 個字元。`usr`、`account` 和裝置的文字屬性最長 256 個字元。
+
+## 檢視
+
+除了上方列出的 `id`、`url` 和 `name`，`view` 事件的 `view` 物件還有下列欄位。
+
+| 欄位 | 說明 |
+|---|---|
+| `revision` | 必填。從 `1` 開始，每次重新傳送時加 1。 |
+| `time_spent` | 必填。檢視保持開啟的奈秒數。 |
+| `url` | 必填。 |
+| `is_active` | 檢視結束後，最後一次修訂中的值為 `false`。 |
+| `loading_type` | `initial_load`、`route_change`、`bf_cache`、`activity_display`、`activity_redisplay`、`fragment_display`、`fragment_redisplay`、`view_controller_display`、`view_controller_redisplay` 或 `session_renewal`。 |
+| `loading_time`、`first_byte`、`dom_interactive`、`dom_content_loaded`、`dom_complete`、`load_event`、`network_settled_time`、`interaction_to_next_view_time` | 導覽耗時，單位為奈秒。 |
+| `performance.fcp`、`performance.lcp`、`performance.fid`、`performance.inp`、`performance.cls`、`performance.fbc` | Web Vitals。LCP 包含 `timestamp`、`target_selector`、`resource_url` 和 `sub_parts`（`load_delay`、`load_time`、`render_delay`）；INP 包含 `duration`、`timestamp`、`target_selector` 和 `sub_parts`（`input_delay`、`processing_duration`、`presentation_delay`）；CLS 包含 `score`。 |
+| `custom_timings` | 存放具名耗時的物件。 |
+| `scroll` | 頁面向下捲動後可見的深度：`max_depth`（從頁面頂端到視窗底部的 CSS 像素數）、`max_depth_scroll_top`、`max_scroll_height` 和 `max_scroll_height_time`（奈秒）。捲動[熱圖](/zh-Hant/rum/heatmaps)的數值取自這些欄位。 |
+| `action`、`error`、`resource`、`long_task`、`frustration`、`crash`、`frozen_frame` | 格式為 `{ "count": n }` 的累計計數物件。 |
+| `memory_average`、`memory_max`、`cpu_ticks_count`、`cpu_ticks_per_second`、`refresh_rate_average`、`refresh_rate_min`、`slow_frames_rate`、`freeze_rate` | 行動裝置指標。 |
+| `flutter_build_time`、`flutter_raster_time` | `{ min, max, average, metric_max }`，單位為奈秒。 |
+
+## 動作
+
+| 欄位 | 說明 |
+|---|---|
+| `id` | 必填。 |
+| `type` | 必填：`custom`、`click`、`tap`、`scroll`、`swipe`、`application_start` 或 `back`。 |
+| `loading_time` | 奈秒。 |
+| `target` | 元素的 `name`、`selector`、`width` 和 `height`；`path` 是元素在頁面中的位置，只包含標籤和序號；`offset` 是點擊位置在元素內的 `x` 和 `y` 座標。 |
+| `position` | 指標的 `x` 和 `y` 座標。 |
+| `page_position` | 點擊位置在頁面上的 `x` 和 `y` 座標，單位為 CSS 像素。 |
+| `name_source` | 名稱的來源：`custom_attribute`、`mask_placeholder`、`standard_attribute`、`text_content`、`mask_disallowed` 或 `blank`。 |
+| `frustration.type` | `rage_click`、`dead_click`、`error_click`、`rage_tap` 或 `error_tap` 的清單。 |
+| `error`、`crash`、`long_task`、`resource` | 格式為 `{ "count": n }` 的物件。 |
+
+## 錯誤
+
+| 欄位 | 說明 |
+|---|---|
+| `id`、`message`、`source` | 必填。`source` 為 `network`、`source`、`console`、`logger`、`agent`、`webview`、`custom` 或 `report`。 |
+| `type` | 錯誤類別，例如 `TypeError`。 |
+| `stack` | 文字形式的堆疊。 |
+| `frames` | 最多 1000 個堆疊框架：`file`、`function`、`class`、`module`、`line`、`column`、`debug_id`、`build_id`、`relative_address`、`instruction_addr`、`image_addr` 和 `artifact_kind`（`javascript_sourcemap`、`flutter_symbols`、`android_native_symbols` 或 `apple_dsym`）。 |
+| `fingerprint` | 選填，最長 128 個字元。同一個應用程式中，指紋相同的錯誤會歸入同一個[問題](/zh-Hant/rum/errors)，不論訊息與堆疊是否相同。若未填寫，MoleSignal 會依類型、訊息和應用程式本身程式碼的前幾個堆疊框架將錯誤分組，並將問題的 id 寫入 `error.issue_id`。MoleSignal 會覆寫透過 `issue_id` 傳入的值。 |
+| `handling` | `handled` 或 `unhandled`。 |
+| `is_crash`、`category`、`source_type` | `category` 為 `ANR`、`App Hang`、`Exception`、`Watchdog Termination`、`Memory Warning` 或 `Network`。 |
+| `resource` | `network` 錯誤中失敗的請求：`method`、`status_code` 和 `url`。 |
+| `causes`、`threads`、`binary_images` | 錯誤因果鏈、執行緒堆疊和已載入的映像。 |
+
+## 資源
+
+| 欄位 | 說明 |
+|---|---|
+| `type`、`url` | 必填。`type` 為 `document`、`xhr`、`beacon`、`fetch`、`css`、`js`、`image`、`font`、`media`、`other` 或 `native`。 |
+| `method`、`status_code` | 請求未收到回應時，`status_code` 為 `0`。 |
+| `duration` | 奈秒。 |
+| `size`、`encoded_body_size`、`decoded_body_size`、`transfer_size` | 位元組數。 |
+| `redirect`、`dns`、`connect`、`ssl`、`first_byte`、`download`、`worker` | 各階段皆以 `{ start, duration }` 表示，單位為奈秒。 |
+| `trace_id`、`span_id` | 請求的 W3C 追蹤內容。MoleSignal 依 `trace_id` 將工作階段與後端追蹤建立關聯。 |
+| `graphql` | `operation_type`、`operation_name`、`payload` 和 `variables`。 |
+| `request.headers`、`response.headers` | 請求標頭與回應標頭物件。 |
+
+## 長任務
+
+| 欄位 | 說明 |
+|---|---|
+| `duration` | 必填。奈秒。 |
+| `entry_type` | `long-task` 或 `long-animation-frame`。 |
+| `start_time`、`blocking_duration`、`render_start`、`style_and_layout_start`、`first_ui_event_timestamp` | 相對於檢視開始時間的奈秒數。 |
+| `is_frozen_frame` | 行動應用程式的畫格凍結時為 `true`。 |
+| `scripts` | 長動畫畫格中的指令碼，每個項目都有 `duration`、`source_url`、`source_function_name`、`invoker` 和 `invoker_type`。 |
+
+## 指標
+
+| 欄位 | 說明 |
+|---|---|
+| `id`、`type` | 必填。`type` 為 `duration`、`app_launch` 或 `operation_step`。 |
+| `name`、`duration` | `duration` 類型必填。 |
+| `app_launch_metric`、`startup_type` | `app_launch` 類型須填寫這兩個欄位及 `duration`：分別填入 `ttid` 或 `ttfd`，以及 `cold_start` 或 `warm_start`。 |
+| `step_type`、`operation_key`、`failure_reason` | 用於 `operation_step`：`start`、`update`、`retry` 或 `end`。 |
+
+## 日誌
+
+`log` 事件將 `level` 和 `message` 放在最上層，讓資料流的讀取方式與其他日誌相同，另外也包含一個 `log` 物件。請參閱[瀏覽器日誌](/zh-Hant/rum/logs)。
+
+| 欄位 | 說明 |
+|---|---|
+| `level` | 必填：`debug`、`info`、`warn` 或 `error`。 |
+| `message` | 必填。 |
+| `log.id` | 必填。 |
+| `log.logger` | logger 的名稱。 |
+| `log.origin` | `logger`、`console`、`report` 或 `sdk`。 |
+| `log.error_type`、`log.stack` | 這筆日誌所記錄的錯誤。 |
+
+## MoleSignal 補充的內容
+
+- **位置：**根據用戶端 IP 位址在 DB-IP City Lite 資料庫中查得的國家、行政區、城市、洲和座標。只有應用程式啟用儲存 IP 位址的設定時，才會儲存位址本身。
+- **瀏覽器、系統和裝置：**瀏覽器事件未包含這些資訊時，MoleSignal 會解析 `User-Agent` 請求標頭以取得資訊。爬蟲會標記為 `device.type: bot`。以 SDK 傳送的值為準。
+- **URL 各部分：**`view.url_host`、`view.url_path` 和 `view.url_path_group`，`resource.url` 也採用相同方式處理。
+- **長任務的指令碼：**`long_task.top_script.source_url`、`long_task.top_script.function` 和 `long_task.top_script.invoker_type` 取自 `long_task.scripts` 中執行時間最長的項目。若瀏覽器未回報指令碼，這些欄位會留空；MoleSignal 會捨棄用戶端在這些欄位中傳送的內容。
+- **工作階段：**從檢視衍生，每個工作階段對應一筆 `rum_sessions` 資料列。
+
+儲存事件前，MoleSignal 會先套用該應用程式的設定，捨棄設定為不保留的工作階段，並取代設定為移除的[敏感文字](/zh-Hant/rum/privacy#在接收事件時移除敏感文字)。
+
+IP 位址與位置依照[應用程式設定](/zh-Hant/rum/applications#收集)處理。
+
+## 事件的儲存位置
+
+每種事件類型都有自己的標準日誌資料流。建立第一個應用程式時，MoleSignal 會建立這些資料流。資料流的結構描述固定，因此型別不符的值不會變更欄位。
+
+| 資料流 | 資料列 |
+|---|---|
+| `rum_sessions` | 每個工作階段一筆，由伺服器端衍生。 |
+| `rum_views` | 每個檢視一筆。 |
+| `rum_actions` | 每個動作一筆。 |
+| `rum_errors` | 每個錯誤一筆。 |
+| `rum_resources` | 每個請求一筆。這個資料流的資料列最多，請在其設定中縮短保留期限。 |
+| `rum_long_tasks` | 每個長任務一筆。 |
+| `rum_vitals` | 每個指標一筆。 |
+| `rum_logs` | 每筆日誌一筆。 |
+
+只有 RUM 資料擷取機制會寫入這些資料流。即時管線可以在事件抵達時修改其自訂部分（`context`、`usr.extra`、`feature_flags` 和 `extra`），排程管線則可以讀取這些資料流。請參閱 [RUM 資料流](/zh-Hant/pipelines#rum-資料串流)。
+
+欄位名稱是事件扁平化後的名稱，例如 `view.performance.lcp.timestamp` 和 `resource.status_code`。可在 [RUM 探索](/zh-Hant/rum/explorer)中瀏覽這些資料流，也可在 **日誌** 中使用 SQL 查詢。
+
+## 範例
+
+以下請求包含重新傳送的檢視、一個失敗的請求，以及該失敗請求引發的錯誤：
+
+```json
+[
+  {
+    "type": "view",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user", "start": 1789999990000 },
+    "view": {
+      "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34",
+      "url": "https://shop.example.com/checkout",
+      "name": "/checkout",
+      "revision": 3,
+      "time_spent": 8200000000,
+      "loading_time": 1200000000,
+      "performance": { "lcp": { "timestamp": 900000000, "target_selector": "img.hero" } },
+      "error": { "count": 1 },
+      "resource": { "count": 22 }
+    },
+    "usr": { "id": "u-42" },
+    "context": { "plan": "pro" }
+  },
+  {
+    "type": "resource",
+    "date": 1790000001500,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "resource": {
+      "type": "fetch",
+      "method": "POST",
+      "url": "https://api.example.com/orders",
+      "status_code": 500,
+      "duration": 482000000,
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "span_id": "00f067aa0ba902b7"
+    }
+  },
+  {
+    "type": "error",
+    "date": 1790000001600,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "error": {
+      "id": "0a9b8c7d-6e5f-4a3b-8c1d-2e3f4a5b6c70",
+      "message": "Failed to fetch https://api.example.com/orders: 500",
+      "source": "network",
+      "type": "ServerError",
+      "handling": "handled",
+      "resource": { "method": "POST", "status_code": 500, "url": "https://api.example.com/orders" }
+    }
+  }
+]
+```
+
+<CardGroup cols={2}>
+  <Card title="RUM 應用程式" icon="grid" href="/zh-Hant/rum/applications">
+    建立要與 Client Token 繫結的應用程式。
+  </Card>
+  <Card title="RUM 探索" icon="magnifying-glass" href="/zh-Hant/rum/explorer">
+    依類型和欄位搜尋事件。
+  </Card>
+</CardGroup>

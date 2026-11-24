@@ -1,0 +1,109 @@
+---
+title: "使用資料庫用戶端連線"
+description: "透過 Arrow Flight SQL，在 DBeaver、JDBC、ADBC 中直接查詢 MoleSignal。"
+"en_link": "/en-US/query/database-clients"
+"zh-Hans_link": "/zh-Hans/query/database-clients"
+"ja_link": "/ja/query/database-clients"
+"ko_link": "/ko/query/database-clients"
+"de_link": "/de/query/database-clients"
+"es_link": "/es/query/database-clients"
+"fr_link": "/fr/query/database-clients"
+"pt-BR_link": "/pt-BR/query/database-clients"
+---
+
+MoleSignal 提供 **Arrow Flight SQL** 端點，標準資料庫工具可以直接連線並對遙測資料執行唯讀 SQL —— 不必再撰寫 HTTP 黏合程式碼。結果以 Arrow record batch 傳輸，結果集較大時明顯比 JSON 快。
+
+<Note>
+Flight SQL 是基於 gRPC 的通訊協定。僅支援 PostgreSQL / MySQL 線路協定的工具（`psql`、`mysql` CLI、Navicat）無法連線；請使用 DBeaver、Arrow Flight SQL JDBC 驅動程式或任何 ADBC 用戶端。
+</Note>
+
+## 啟用端點
+
+接聽程式**預設停用**。在 `config.toml` 中啟用後重新啟動：
+
+```toml
+[flight_sql]
+enabled = true
+bind = "0.0.0.0"
+port = 5083
+# SQL 未携带裁剪信息时的缺省时间窗（见下文）
+default_lookback_hours = 24
+```
+
+Flight SQL 連接埠與內部 gRPC 連接埠（5082）彼此獨立：只對用戶端網路開放 5083，5082 則保留在叢集內部網路。建議在支援 gRPC 的 ingress 終止 TLS。
+
+## 驗證
+
+Flight SQL 直接整合 MoleSignal 現有的驗證機制，標準 basic auth 交握接受兩種憑證：
+
+| | Username | Password | 適用情境 |
+|---|---|---|---|
+| **帳號登入** | 帳號電子郵件地址 | 帳號密碼 | 人工操作（DBeaver、臨時查詢） |
+| **API 權杖** | 任意值（建議使用 `token`） | `mspat-...` 權杖 | 自動化、指令碼、BI 服務 |
+
+帳號登入與 Web 登入使用相同的驗證機制，由伺服器簽發短效工作階段權杖（JWT）；API 權杖則直接使用權杖本身。也支援略過 basic auth、直接附帶 bearer 標頭的用戶端。兩種方式的存取範圍都限於單一組織，只能看到所屬組織的資料流與資料。
+
+**隸屬多個組織時選擇組織**：預設進入第一個組織（與 Web 登入相同）。若要切換，在 username 結尾加上 `@<org>`，例如 `alice@example.com@acme`，其中 `acme` 是組織的 name、slug 或 id。
+
+<Warning>
+資料庫用戶端會將密碼儲存在連線設定、JDBC URL 和指令碼中，外洩風險遠高於存取範圍受限的權杖。**帳號密碼僅供人工操作；所有自動化作業請使用 `mspat-` API 權杖**——API 權杖可以撤銷及設定到期時間，且存取範圍限於單一組織。請在 **個人設定 → API 權杖** 新增，或呼叫 [`POST /api/v1/me/api-tokens`](/zh-Hant/api/auth/issue-token) 建立。
+</Warning>
+
+另有幾點需要注意：
+
+- **SSO 使用者**：透過 OIDC/SAML 登入的使用者沒有本機密碼，因此無法使用帳號登入。請改用 API 權杖。
+- **已啟用多因素驗證的帳號**：除了帳號密碼，沒有欄位可輸入驗證碼，因此伺服器會拒絕交握。請改用 API 權杖。請參閱[多因素驗證](/zh-Hant/identity/mfa)。
+- **有登入要求的工作區**：工作區[要求多因素驗證或只允許單一登入](/zh-Hant/identity/sso#登入要求)時，伺服器會拒絕帳號登入，已連線的用戶端會在下次發出請求時失去存取權。請改用 API 權杖。
+- **密碼輸入錯誤次數過多**：帳號登入和網頁登入共用[登入頻率限制](/zh-Hant/settings/platform#登入速率限制)。達到上限後，交握會傳回 `RESOURCE_EXHAUSTED`。DBeaver 會用儲存的憑證自動重新連線，若仍儲存舊密碼，就會導致該位址遭鎖定。請更新為新密碼，再等候鎖定解除。
+- **工作階段到期**：帳號登入時簽發的 JWT 有效期限由伺服器端的 `[auth].session_ttl_secs` 限制。到期後，伺服器會對請求傳回 `UNAUTHENTICATED`；DBeaver 會用儲存的憑證自動重新連線，人工操作時通常不會察覺。長時間執行的 ADBC 指令碼請改用不會到期的 API 權杖。
+
+## DBeaver
+
+DBeaver Community 未內建 Flight SQL 驅動程式，需要手動註冊一次 Arrow Flight SQL JDBC 驅動程式（約需一分鐘）：
+
+1. **資料庫 → 驅動程式管理員 → 新增**
+2. 切換至 **程式庫（Libraries）** 索引標籤，按一下 **新增 Artifact**，貼上 `org.apache.arrow:flight-sql-jdbc-driver:RELEASE`，再按一下 **下載/更新**（也可以選擇 **新增檔案**，指定已下載到本機的驅動程式 jar 檔）
+3. 回到 **設定** 索引標籤：驅動程式名稱填入 `Arrow Flight SQL`，類別名稱填入 `org.apache.arrow.driver.jdbc.ArrowFlightJdbcDriver`，URL 範本填入 `jdbc:arrow-flight-sql://{host}:{port}/?useEncryption=false`
+4. **新增連線** → 選擇剛新增的驅動程式 → Host 填入伺服器位址，Port 填入 `5083`
+5. Username 填入電子郵件地址（可用 `email@org` 選擇組織），Password 填入帳號密碼；或在 Username 填入 `token`，在 Password 填入 `mspat-...`
+
+導覽樹會顯示一個 catalog（`molesignal`）、四個 schema（`logs`、`metrics`、`traces`、`extend`），以及目前組織的資料流清單（以資料表呈現）。
+
+## JDBC
+
+```text
+jdbc:arrow-flight-sql://molesignal.example.com:5083/?useEncryption=false&user=token&password=mspat-...
+```
+
+驅動程式座標：`org.apache.arrow:flight-sql-jdbc-driver`。
+
+## Python（ADBC）
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+conn = flightsql.connect(
+    "grpc://molesignal.example.com:5083",
+    db_kwargs={"username": "token", "password": "mspat-..."},
+)
+cur = conn.cursor()
+cur.execute("SELECT level, count(*) AS n FROM logs.nginx GROUP BY level")
+print(cur.fetch_arrow_table())   # 也可 fetchall() / .fetch_df()
+```
+
+## 查詢語法
+
+- **以資料流類型限定資料表名稱**：`logs.nginx`、`metrics.cpu_usage`、`traces.checkout`、`extend.lookup_table`。未限定時，預設使用 `logs`。也支援包含 catalog 的完整限定名稱（`molesignal.logs.nginx`，DBeaver 瀏覽資料表內容時會產生這種寫法）。
+- **唯讀**：一律拒絕 `INSERT` / `UPDATE` / `DELETE` / DDL。
+- **稽核資料流**：讀取 `logs._audit` 需要 `audit.read`，請參閱[稽核資料流](/zh-Hant/settings/data-security#稽核資料流)。
+- **時段**：Flight SQL 通訊協定沒有時間範圍參數。伺服器依最近 `default_lookback_hours`（預設 24h）的範圍進行分割區裁剪；`WHERE` 中的 `_timestamp` 條件在該時段內仍有效。若要查詢更早的資料，請調高 `default_lookback_hours`，或改用可明確指定時間範圍的 [HTTP 查詢 API](/zh-Hant/api/query/execute)。
+- `_timestamp` 欄以微秒精度的 timestamp 型別傳回。
+
+## 限制
+
+- 支援預備陳述式，但**不支援參數繫結** —— 請直接在查詢中寫入常值。
+- 不支援交易（唯讀引擎）。
+- Flight SQL 不提供 PromQL；請透過 HTTP API 執行 PromQL 查詢。
+- `FlightInfo` 中的結果 schema 為空，用戶端會採用資料流自帶的 schema（DBeaver 與 ADBC 都會自動處理）。
+
+執行中的 Flight SQL 查詢與 HTTP 查詢一樣會出現在 `GET /api/v1/query/running`，可呼叫 `POST /api/v1/query/{id}/cancel` 取消。

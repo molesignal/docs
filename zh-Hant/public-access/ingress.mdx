@@ -1,0 +1,235 @@
+---
+title: "Kubernetes Ingress"
+description: "使用兩個 ingress-nginx 控制器分別作為內網與公網入口：內網 Ingress 轉送所有路徑，公網 Ingress 則只列出外部回呼與公開頁面。"
+"en_link": "/en-US/public-access/ingress"
+"zh-Hans_link": "/zh-Hans/public-access/ingress"
+"ja_link": "/ja/public-access/ingress"
+"ko_link": "/ko/public-access/ingress"
+"de_link": "/de/public-access/ingress"
+"es_link": "/es/public-access/ingress"
+"fr_link": "/fr/public-access/ingress"
+"pt-BR_link": "/pt-BR/public-access/ingress"
+---
+
+以下設定採用[公用網路存取](/zh-Hant/public-access)建議的做法：在叢集中執行兩個 ingress-nginx 控制器，一個接到內部網路的負載平衡器，另一個接到公用網路的負載平衡器；同一個網域名稱 `molesignal.example.com` 在內部 DNS 和公用 DNS 中分別解析到這兩個負載平衡器。MoleSignal 的 Service 位於命名空間 `molesignal`，名稱為 `molesignal`，連接埠為 `5080`；依角色部署時，改用 router 的 Service。
+
+## 兩個控制器
+
+兩個控制器的 IngressClass 和 `controllerValue` 都必須不同，否則會處理對方的 Ingress。為內部網路控制器的 Service 加上雲端供應商的內部負載平衡器註解：
+
+```yaml
+# ingress-internal-values.yaml
+controller:
+  ingressClassResource:
+    name: nginx-internal
+    controllerValue: k8s.io/ingress-nginx-internal
+  ingressClass: nginx-internal
+  electionID: ingress-nginx-internal-leader
+  service:
+    annotations:
+      # 按云厂商填写，例如阿里云 ACK：
+      service.beta.kubernetes.io/alibaba-cloud-loadbalancer-address-type: intranet
+```
+
+公用網路控制器保留用戶端來源位址，存取日誌只記錄路徑，不記錄查詢字串；心跳簽到、行事曆訂閱、一次性處理連結和華為雲回呼的路徑包含 Token，因此只記錄前綴：
+
+```yaml
+# ingress-public-values.yaml
+controller:
+  ingressClassResource:
+    name: nginx-public
+    controllerValue: k8s.io/ingress-nginx-public
+  ingressClass: nginx-public
+  electionID: ingress-nginx-public-leader
+  service:
+    externalTrafficPolicy: Local
+  config:
+    http-snippet: |
+      map $uri $molesignal_log_uri {
+          ~^(/api/v1/(?:intake/heartbeats|public/calendar|public/notify/actions)/)  $1<token>;
+          ~^(/notify/actions/)                                                      $1<token>;
+          ~^(/api/v1/public/notify/[^/]+/(?:replies|keypress)/)                     $1<token>;
+          default                                                                   $uri;
+      }
+    log-format-upstream: '$remote_addr [$time_local] "$request_method $molesignal_log_uri $server_protocol" $status $body_bytes_sent "$http_user_agent" $request_time'
+```
+
+分別安裝：
+
+```bash
+helm upgrade --install ingress-internal ingress-nginx --repo https://kubernetes.github.io/ingress-nginx --namespace ingress-internal --create-namespace -f ingress-internal-values.yaml
+```
+
+```bash
+helm upgrade --install ingress-public ingress-nginx --repo https://kubernetes.github.io/ingress-nginx --namespace ingress-public --create-namespace -f ingress-public-values.yaml
+```
+
+## 內部網路 Ingress
+
+內部網路 Ingress 轉送所有路徑。即時查詢採串流回應，因此請關閉緩衝並延長逾時時間：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-internal
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: nginx-internal
+  tls:
+    - hosts: [molesignal.example.com]
+      secretName: molesignal-tls
+  rules:
+    - host: molesignal.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: molesignal
+                port:
+                  number: 5080
+```
+
+## 公用網路 Ingress
+
+公用網路 Ingress 只列出要開放的路徑。對於未列出的路徑，控制器的預設後端會傳回 404。只保留實際使用的路徑：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-public
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+spec:
+  ingressClassName: nginx-public
+  tls:
+    - hosts: [molesignal.example.com]
+      secretName: molesignal-tls
+  rules:
+    - host: molesignal.example.com
+      http:
+        paths:
+          # 外部告警
+          - { path: /api/v1/intake/alerts, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # 心跳打卡、Jira 的工单 Webhook、值班日历订阅
+          - { path: /api/v1/intake/heartbeats, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/tickets/jira, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/calendar, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Teams 里的 Mole Agent、自动化的 API 触发、回复短信与电话按键、企业微信和 Mattermost 的按钮、一次性处理链接的接口
+          - { path: /api/v1/public/im/teams, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/automations, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/notify, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # 推送来源
+          - { path: /api/v1/_kinesis_firehose, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/_cloudflare, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/_heroku, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # 用户体验
+          - { path: /api/v1/rum/events, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/rum/replay, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # 拨测 Probe Agent 上传产物
+          - { path: /api/v1/synthetics/artifacts, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # 状态页
+          - { path: /status, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/status-pages, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # 资源共享
+          - { path: /s, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /shared, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/share, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # 一次性处理链接的确认页
+          - { path: /notify/actions, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # 状态页、分享页和一次性处理链接页面的网页文件
+          - { path: /assets, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+```
+
+`Prefix` 依路徑區段比對：`/s` 會比對 `/s/<分享 Token>`，但不會比對 `/shared`；`/api/v1/public/share` 會比對 `/api/v1/public/share/query`。
+
+Ingress 無法依方法篩選，請交由 MoleSignal 處理：上述每個路徑只接受所需的方法，其他方法會收到 `405` 或 `404` 回應。註解會套用到整個 Ingress 物件。若要針對特定路徑另設請求本文大小上限或限制來源位址，請將這些路徑移到另一個 Ingress。例如，只允許 Azure 服務標籤 `AzureBotService` 中的位址範圍存取 Teams 的回呼：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-public-teams
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/whitelist-source-range: "203.0.113.0/24,198.51.100.0/24"
+spec:
+  ingressClassName: nginx-public
+  tls:
+    - hosts: [molesignal.example.com]
+      secretName: molesignal-tls
+  rules:
+    - host: molesignal.example.com
+      http:
+        paths:
+          - { path: /api/v1/public/im/teams, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+```
+
+請從 `molesignal-public` 刪除移出的路徑，不要在兩個 Ingress 中重複列出同一路徑。
+
+## 狀態頁的自訂網域名稱
+
+若狀態頁已繫結 `status.example.org`，請在公用網路控制器上為該網域新增一條規則，只允許存取狀態頁的根路徑、API 和網頁檔案：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-status-domain
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+spec:
+  ingressClassName: nginx-public
+  tls:
+    - hosts: [status.example.org]
+      secretName: status-example-org-tls
+  rules:
+    - host: status.example.org
+      http:
+        paths:
+          - { path: /, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /history, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /uptime, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /incidents, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/status-pages, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /assets, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+```
+
+## 檢查
+
+確認兩個控制器各自接管對應的 Ingress，且每個 Ingress 都取得對應負載平衡器的位址：
+
+```bash
+kubectl -n molesignal get ingress
+```
+
+從公用網路呼叫登入 API 時，應收到 `404`；未附 Token 向警示接收端點發出請求時，應收到 `401`：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://molesignal.example.com/api/v1/auth/signin
+```
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://molesignal.example.com/api/v1/intake/alerts
+```
+
+最後，在 `_sys` 組織的 **設定 → 用戶端 IP 識別** 中，將公用網路控制器 Pod 所在的網段列為受信任的 Proxy。請參閱[用戶端 IP 識別](/zh-Hant/settings/platform#用戶端-ip-識別)。

@@ -1,0 +1,182 @@
+---
+title: "在 Grafana 中查詢"
+description: "使用 MoleSignal 資料來源外掛程式，在 Grafana 的儀表板、Explore 與警示規則中讀取 MoleSignal 的指標、日誌與追蹤。"
+"en_link": "/en-US/query/grafana"
+"zh-Hans_link": "/zh-Hans/query/grafana"
+"ja_link": "/ja/query/grafana"
+"ko_link": "/ko/query/grafana"
+"de_link": "/de/query/grafana"
+"es_link": "/es/query/grafana"
+"fr_link": "/fr/query/grafana"
+"pt-BR_link": "/pt-BR/query/grafana"
+---
+
+MoleSignal 資料來源是 Grafana 外掛程式。Grafana 用 PromQL 讀取指標，用 **日誌** 和 **追蹤** 頁面的欄位查詢讀取日誌和追蹤，用 SQL 讀取任意資料串流。不同訊號之間也能直接跳轉：從日誌列或 exemplar 可開啟對應的追蹤，每個結果都能連回 MoleSignal。
+
+<Note>
+外掛程式的後端在 Grafana 伺服器上執行，由 Grafana 啟動為子程序。Grafana 伺服器會在所有送往 MoleSignal 的請求中附上資料來源的 Token，瀏覽器不會直接存取 MoleSignal。Grafana Cloud 透過 Private data source connect 存取內部網路中的 MoleSignal。
+</Note>
+
+## 先決條件
+
+| 項目 | 需求 |
+|---|---|
+| Grafana | 12.3 或更新版本，包括 13.x。 |
+| MoleSignal | 支援 [`POST /api/v1/query`](/zh-Hant/api/query/execute) 的 `step` 欄位，以及[日誌](/zh-Hant/api/web/logs)和[追蹤](/zh-Hant/api/web/trace)讀取 API 的 `expression` 參數的版本。**Save & test** 會拒絕更早的版本，因為這些版本會傳回未經篩選的欄位查詢結果。 |
+| 網路 | Grafana 伺服器可存取 MoleSignal 的 HTTP 連接埠，預設為 5080。 |
+| Token | 具備 **檢視者** 角色的服務帳號的 API Token。資料來源需要 `streams.read`、`streams.query`、`logs.read`、`traces.read` 和 `metrics.read`，註解和變數需要 `dashboards.read` 和 `dashboards.annotations.read`，部署註解需要 `apm.deployments.read`，事件註解需要 `alerts.incidents.read`。 |
+
+## 為 Grafana 建立 Token
+
+1. 開啟 **身分與存取 → 服務帳號**，按一下 **建立服務帳號**。
+2. 在 **名稱** 輸入 `grafana`，在 **角色** 選取 **檢視者**。
+3. 按一下 **建立帳號和 Token**，複製 Token。Token 會在 365 天後到期，而且只會顯示一次。
+
+若要讓 Grafana 只有讀取權限，可以為該帳號核發權限範圍更小的 Token：開啟 **身分與存取 → API 權杖**，按一下 **為服務帳號核發 Token**，選取該帳號，並在 **權限範圍** 選取 **唯讀觀察者** 原則。請參閱 [API Token 與服務帳號](/zh-Hant/identity/tokens)。
+
+每個資料來源只會讀取其 Token 所屬組織的資料。所有能使用該資料來源的 Grafana 使用者，都能讀取該 Token 有權讀取的資料。使用 Grafana 的資料來源權限限制可使用該來源的使用者，或為各團隊設定各自的資料來源和 Token。
+
+## 安裝外掛程式
+
+用 Grafana CLI 安裝發行套件，或將套件解壓縮到 Grafana 的外掛程式目錄。Linux 安裝套件和 Docker 映像檔中的目錄為 `/var/lib/grafana/plugins`：
+
+```bash
+grafana cli --pluginUrl https://github.com/molesignal/molesignal-grafana-plugin/releases/download/v0.1.0/molesignal-datasource-0.1.0.zip plugins install molesignal-datasource
+```
+
+外掛程式尚未簽署。修改 `grafana.ini` 或設定環境變數 `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=molesignal-datasource`，允許 Grafana 載入外掛程式，然後重新啟動 Grafana：
+
+```ini
+[plugins]
+allow_loading_unsigned_plugins = molesignal-datasource
+```
+
+## 新增資料來源
+
+1. 在 Grafana 中開啟 **Connections → Data sources**，按一下 **Add new data source**，選取 **MoleSignal**。
+2. 填寫 MoleSignal 的 **URL**，例如 `https://molesignal.example.com`，並貼上 **API Token**。
+3. 按一下 **Save & test**。
+
+**Save & test** 會讀取 MoleSignal 的版本，檢查 Token 是否具備 `streams.read` 和 `streams.query` 權限，統計各類型的資料串流數量，並確認 MoleSignal 是否支援欄位查詢。
+
+| 設定 | 預設值 | 說明 |
+|---|---|---|
+| **URL** | | MoleSignal 的位址，不含 `/api/v1`。 |
+| **API Token** | | 以加密方式儲存在 Grafana 伺服器上。 |
+| **略過 TLS 憑證驗證** | 關閉 | 僅用於使用自我簽署憑證的測試執行個體。 |
+| **CA 憑證** | | 核發 MoleSignal 憑證的憑證授權單位所提供的 PEM 格式憑證。 |
+| **日誌資料串流** | | 新增日誌查詢時預設使用的資料串流。Explore 的臨時篩選會從這個串流取得欄位。 |
+| **日誌欄位** | `message`、`level`、`trace_id` | 儲存日誌內文、層級和追蹤 ID 的欄位。 |
+| **收集間隔** | `15s` | 回報指標的間隔。`$__rate_interval` 至少是此間隔的 4 倍。 |
+| **聯邦叢集** | 目前的叢集 | 每次執行 SQL 或 PromQL 查詢時要查詢的叢集，以逗號分隔。 |
+| **MoleSignal 網頁位址** | URL | **Open in MoleSignal** 連結指向的位址。 |
+| **逾時（秒）** | `60` | 每次向 MoleSignal 發出請求的最長等候時間。 |
+| **同時執行的查詢數** | `10` | 單一面板、Explore 窗格或告警規則可同時執行的查詢數。 |
+
+## 查詢類型
+
+| 查詢類型 | 讀取 | 顯示 |
+|---|---|---|
+| **PromQL** | 指標：依面板間隔執行範圍查詢，或執行即時查詢 | 時間序列、表格和 exemplar |
+| **SQL** | 任意資料串流 | 表格、時間序列或日誌列 |
+| **日誌** | 日誌資料串流中符合欄位查詢的最新記錄 | 日誌列 |
+| **追蹤** | 依 ID 讀取單筆追蹤 | 追蹤檢視 |
+| **追蹤搜尋** | 符合欄位查詢的追蹤 | 可開啟各筆追蹤的表格 |
+| **RED** | 符合欄位查詢的 Span 的每秒請求數、每秒錯誤數、錯誤率或指定百分位數的耗時 | 時間序列；若在 **拆分** 指定欄位，每個值各對應一條序列 |
+| **服務拓撲** | 服務之間的呼叫 | 節點圖 |
+
+### PromQL
+
+範圍查詢每個步長讀取一個資料點。步長採用面板的間隔，但不得小於 **最小步長**，且每條序列不超過 11,000 步。**圖例** 為每條序列命名，`{{label}}` 代表指定標籤的值。**Exemplar** 會繪出序列中的 exemplar，每個 exemplar 都能開啟對應的追蹤。MoleSignal 實作的是 [PromQL 的子集](/zh-Hant/query/promql-subset)。
+
+### 欄位查詢
+
+**日誌**、**追蹤搜尋** 和 **RED** 使用 MoleSignal **日誌** 和 **追蹤** 頁面的欄位查詢語法。同一個查詢在兩處的含義相同：
+
+```text
+level = 'error' AND (service.name = 'checkout' OR timeout)
+```
+
+| 寫法 | 含義 |
+|---|---|
+| `AND`、`OR`、括號 | `AND` 的優先順序高於 `OR`，括號用於分組。 |
+| `=`、`!=`、`>`、`>=`、`<`、`<=`、`contains` | 比較欄位與值。 |
+| `field in ('a', 'b')` | 比對多個值中的任一值，用於追蹤查詢。 |
+| `MATCH(field, 'text')`、`MATCH_TEXT(field, 'words')` | 對欄位執行全文搜尋，用於日誌查詢。 |
+| 單一詞彙或引號內的片語 | 要搜尋的文字。 |
+
+在 **新增條件** 這一列，用 **欄位**、**運算子** 和 **值** 組成比較條件，再用 `AND` 加入查詢。**RED** 讀取 **入口 Span**（服務接收請求的位置）或 **所有 Span**。
+
+### SQL
+
+SQL 可讀取任意資料串流。**資料串流** 指定規劃查詢時使用的資料串流，留空時則使用 `FROM` 後面的資料表。**格式** 可選 **表格**、**時間序列** 或 **日誌**。下列巨集會依面板的時間範圍展開：
+
+| 巨集 | 展開為 |
+|---|---|
+| `$__timeFilter(_timestamp)` | `_timestamp >= <from> AND _timestamp < <to>` |
+| `$__timeGroup(_timestamp, $__interval)` | `date_bin(INTERVAL '<interval>', _timestamp)` |
+| `$__timeFrom()`、`$__timeTo()` | 時間範圍起點和終點的時間戳記 |
+
+`$__interval`、`$__rate_interval` 和 `$__range` 都可用於 PromQL、SQL 和告警規則。
+
+## Explore
+
+| 操作 | 效果 |
+|---|---|
+| 執行日誌查詢 | 在日誌列上方依層級繪出日誌量。 |
+| 開啟某一列的上下文 | 顯示該列前後各 50 筆記錄。 |
+| 在某一列的詳細資料中只顯示或排除特定值 | 用 `AND` 將 `field = 'value'` 或 `field != 'value'` 加入查詢。 |
+| 按一下某一列的追蹤 ID 或某個 exemplar | 在查詢旁開啟對應的追蹤。 |
+| 按一下 **Open in MoleSignal** | 在 MoleSignal 中開啟相同的查詢和時間範圍。 |
+
+## 變數與臨時篩選
+
+查詢變數會列出下列其中一類資料：
+
+| 列出 | 取值 |
+|---|---|
+| **資料串流** | 指定類型的資料串流。 |
+| **欄位** | 指定資料串流中的欄位。 |
+| **欄位值** | 日誌資料串流中指定欄位最常見的值。 |
+| **指標** | 指標名稱，可只列出名稱包含指定文字的指標。 |
+| **標籤值** | 指定指標中指定標籤的值。 |
+| **SQL** | 陳述式結果的第一欄。 |
+
+若變數選取了多個值，會依各語言的清單語法寫入查詢：PromQL 使用 `(a|b)` 搭配 `=~`；SQL 使用 `'a', 'b'` 搭配 `IN (...)`；追蹤欄位查詢使用 `'a', 'b'` 搭配 `in (...)`。
+
+臨時篩選（ad hoc filter）會在 PromQL 中成為各選擇器的標籤比對條件，在欄位查詢中則成為 `AND` 條件。篩選欄位和值來自資料來源的 **日誌資料串流**。
+
+## 註解
+
+註解查詢會在儀表板的面板上標示一種 **來源** 的資料：
+
+| 來源 | 標示內容 |
+|---|---|
+| **註解** | MoleSignal 的註解，可只顯示帶有指定 **標籤** 的註解。 |
+| **部署** | [應用程式效能](/zh-Hant/apm/deployments)記錄的部署，可只顯示指定服務的部署。 |
+| **事件** | 事件從開始到解決的時段，可只顯示指定服務的事件。 |
+
+## 告警
+
+Grafana 告警規則透過外掛程式後端執行 PromQL 和 SQL 查詢。[MoleSignal 的告警](/zh-Hant/alerting)功能更完整，包括即時規則、事件、值班和升級。Grafana 中觸發的告警仍可作為[外部告警](/zh-Hant/alerting/sources#grafana)推送到 MoleSignal。
+
+## 儀表板
+
+在資料來源的 **Dashboards** 分頁可匯入兩個儀表板：
+
+| 儀表板 | 內容 |
+|---|---|
+| **MoleSignal · Services** | 各服務的請求數、錯誤和耗時、服務拓撲，以及最慢的追蹤。 |
+| **MoleSignal · Logs** | 指定日誌資料串流的日誌量和最新錯誤。 |
+
+## 限制
+
+| 項目 | 限制 |
+|---|---|
+| 日誌查詢 | 預設傳回最新的 1,000 筆記錄，透過 **列數上限** 最多可調至 5,000 筆。 |
+| 追蹤搜尋 | 預設傳回 100 筆追蹤，透過 **列數上限** 最多可調至 5,000 筆。 |
+| 追蹤 | 只讀取在時間範圍內開始，且開始時間落在該範圍最後 31 天內的追蹤。 |
+| PromQL | 每條序列最多 11,000 步，每次查詢最多 100,000 個資料點。超過上限時，MoleSignal 會從各序列中均勻選取要保留的資料點。 |
+| SQL | 預設傳回 10,000 列，透過 **列數上限** 最多可調至 1,000,000 列。 |
+
+Grafana 的 Logs、Traces、Metrics Drilldown 應用程式只會讀取 Loki、Tempo 和 Prometheus，因此無法開啟這個資料來源。

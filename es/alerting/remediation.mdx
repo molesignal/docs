@@ -1,0 +1,168 @@
+---
+title: "Remediación"
+description: "Define de antemano acciones de remediación de HTTP y Kubernetes, inicia una desde un incidente con un solo clic y ejecútala tras la aprobación. Pasados unos minutos, comprueba si funcionó."
+"en_link": "/en-US/alerting/remediation"
+"zh-Hans_link": "/zh-Hans/alerting/remediation"
+"zh-Hant_link": "/zh-Hant/alerting/remediation"
+"ja_link": "/ja/alerting/remediation"
+"ko_link": "/ko/alerting/remediation"
+"de_link": "/de/alerting/remediation"
+"fr_link": "/fr/alerting/remediation"
+"pt-BR_link": "/pt-BR/alerting/remediation"
+---
+
+Una acción de remediación es una solución definida de antemano: una llamada a Jenkins, GitHub Actions, Argo, Rundeck o a un
+sistema similar, o el reinicio, el escalado o la reversión de una carga de trabajo en un clúster de Kubernetes registrado. Desde
+el incidente, inicia la acción con un clic. Cada ejecución requiere aprobación (si activas la
+[aprobación previa](#aprobación-previa), puedes aprobarla de antemano). La acción se ejecuta en cuanto recibe la aprobación
+y la cronología del incidente registra el resultado y la verificación posterior.
+
+Abre **Alertas → Remediación**. Para ver las acciones necesitas `alerts.remediation.read`; para definirlas y registrar clústeres,
+`alerts.remediation.manage`; para iniciar una ejecución en un incidente, `alerts.incidents.remediate`; y para aprobarla,
+`agent.approve`.
+
+## Define una acción de remediación
+
+Selecciona **Nueva acción de remediación** y completa lo siguiente:
+
+| Sección | Configuración |
+|---|---|
+| **Datos básicos** | **Nombre** y **Descripción**. |
+| **Cómo se ejecuta** | **Solicitud HTTP** o **Kubernetes**. Consulta las secciones siguientes. |
+| **Parámetros que se solicitan al iniciar** | Configura hasta 10 parámetros cuyos valores se ingresan al iniciar la acción: **Nombre** (usa `{{params.name}}` en las plantillas), **Etiqueta**, **Tipo** (**Texto**, **Número** u **Opción**), **Opciones**, **Predeterminado** y **Obligatorio**. |
+| **Alcance y aprobación** | **Servicios** (sepáralos con comas; si dejas el campo vacío, la acción se aplica a todos los incidentes); **Riesgo**: **L2 · una persona para aprobar** o **L3 · dos personas para aprobar**; **Verificar después de**: minutos de espera antes de comprobar el resultado (0 para omitir la verificación); **Criterio de éxito**: **El incidente se resolvió** o **La regla volvió a su estado normal**; y **Activado**. |
+
+La lista muestra los servicios de cada acción (**Todos los incidentes** si no hay restricciones) y su riesgo. Las acciones con la etiqueta
+**Desactivada** no aparecen en los incidentes.
+
+### Solicitud HTTP
+
+| Configuración | Notas |
+|---|---|
+| **Método**, **Dirección** | `GET`, `POST`, `PUT` o `PATCH`, y una dirección que empiece por `http://` o `https://`. |
+| **Encabezados** | Por ejemplo, `Authorization`. MoleSignal cifra los valores al guardarlos y no vuelve a mostrarlos. Si dejas un valor en blanco al editar, conserva el valor guardado. |
+| **Cuerpo** | Escribe el JSON en el editor de JSON. MoleSignal escapa los valores ingresados según las reglas de JSON. Un marcador entre comillas representa una cadena; sin comillas, puede representar un número, como en `{"replicas": {{params.replicas}}}`. El cuerpo debe ser un JSON válido al sustituir cada marcador por 0; de lo contrario, no puedes guardarlo. |
+| **Secreto de firma** | Si lo configuras, la solicitud incluye `X-MoleSignal-Timestamp` y `X-MoleSignal-Sign`, como en la [firma del webhook genérico](/es/notification-channels/webhooks#encabezados-y-firma). Así, el sistema receptor puede verificar que la solicitud proviene de MoleSignal. |
+
+En la dirección, los encabezados y el cuerpo puedes usar `{{incident.id}}`, `{{incident.summary}}`, `{{incident.severity}}`,
+`{{incident.status}}`, `{{incident.service}}`, `{{incident.url}}` y `{{params.name}}`. MoleSignal aplica la codificación porcentual
+a los valores que inserta en la dirección.
+
+La solicitud solo se conecta a las IP a las que resuelve la dirección, nunca a direcciones de metadatos de la nube. No sigue
+redirecciones y agota el tiempo de espera a los 30 segundos. Una respuesta 2xx indica que la ejecución fue exitosa. MoleSignal guarda el inicio de la
+respuesta en el registro de la ejecución.
+
+### Kubernetes
+
+| Configuración | Notas |
+|---|---|
+| **Clúster** | Un clúster registrado. Consulta [Registra un clúster de Kubernetes](#registra-un-clúster-de-kubernetes). |
+| **Operación** | **Reiniciar** (reinicio gradual, como `kubectl rollout restart`), **Escalar** o **Revertir a la revisión anterior** (como `kubectl rollout undo`). |
+| **Tipo de carga de trabajo** | Deployment, StatefulSet o DaemonSet. Solo puedes revertir un Deployment; no puedes escalar un DaemonSet. |
+| **Espacio de nombres**, **Nombre de la carga de trabajo** | Puedes usar plantillas, como `{{incident.service}}`. |
+| **Réplicas** | Número de réplicas que debe tener la carga de trabajo tras el escalado. Puedes usar `{{params.replicas}}` e ingresar el valor al iniciar la acción. |
+
+## Registra un clúster de Kubernetes
+
+En **Clústeres de Kubernetes**, selecciona **Agregar un clúster** e ingresa el **Nombre**, la **Dirección del servidor de la API**,
+el **Certificado de CA** (PEM; si dejas el campo vacío, MoleSignal usa los certificados raíz de confianza del sistema) y un **Token de ServiceAccount**.
+MoleSignal cifra el token al guardarlo y no vuelve a mostrarlo. **Probar conexión** consulta una vez la versión del clúster.
+
+Asigna a MoleSignal un ServiceAccount propio con solo los permisos necesarios: `get` y `patch` en las
+cargas de trabajo de destino, acceso al subrecurso `scale` para escalar y permiso para listar ReplicaSets para revertir. Por ejemplo, para dar acceso
+solo a las cargas de trabajo del espacio de nombres `shop`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: molesignal-remediation
+  namespace: shop
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["list"]
+```
+
+Las conexiones solo van a las IP a las que resuelve la dirección del servidor de la API, nunca a direcciones de metadatos de la nube.
+No puedes eliminar un clúster si alguna acción todavía lo usa.
+
+## Ejecuta una acción en un incidente
+
+La sección **Remediación** de los detalles del incidente muestra las acciones que se aplican: las que no tienen
+restricciones de servicio y las que incluyen el servicio del incidente. Selecciona **Ejecutar** junto a una acción, completa sus
+valores, escribe un **Motivo** (por ejemplo, «El servicio de pago se quedó sin conexiones; primero hay que reiniciarlo») y selecciona
+**Enviar para aprobación**. No puedes iniciar una acción en un incidente resuelto.
+
+La ejecución queda pendiente de aprobación: una persona con `agent.approve` para L2 y dos para L3. Quien solicita la ejecución
+no puede aprobarla. Para aprobar o rechazar una solicitud, selecciona **Aprobar** o **Rechazar** en la misma tarjeta o tramítala desde las
+[aprobaciones de Mole Agent](/es/agent#aprobaciones-y-ejecuciones). La acción se ejecuta en cuanto recibe las aprobaciones
+necesarias.
+
+| Estado | Significado |
+|---|---|
+| **Pendiente de aprobación** | Todavía faltan aprobaciones. |
+| **En ejecución** | MoleSignal envía la solicitud a la dirección o aplica el cambio en el clúster. |
+| **Ejecutada**, **Fallido** | La ejecución terminó. Junto al estado aparece el inicio de la respuesta o el error. |
+| **Sin ejecutar** | La solicitud de aprobación venció, recibió un rechazo o quedó cancelada. |
+| **Pendiente de verificación** | La acción ya se ejecutó. MoleSignal verifica el resultado cuando transcurren los minutos configurados. |
+| **Verificación superada**, **Verificación fallida** | La verificación se supera si, al cumplirse el plazo, el incidente ya se resolvió (o la regla volvió a su estado normal). |
+
+La [cronología](/es/alerting/incidents#detalles-del-incidente) del incidente registra el inicio, la ejecución y la verificación,
+y el registro de auditoría también registra el inicio.
+
+Mole Agent puede listar las acciones de remediación que se aplican a un incidente y proponer una ejecución. Una ejecución que propone
+requiere dos aprobaciones, independientemente del riesgo configurado para la acción, salvo que cuente con aprobación previa.
+
+## Aprobación previa
+
+Una aprobación previa permite ejecutar una acción en algunos incidentes sin esperar una aprobación. La función permanece desactivada hasta que
+actives **Permitir que las acciones aprobadas de antemano se ejecuten sin esperar** en la parte superior de **Alertas → Remediación**.
+Para activarla, desactivarla o aprobar de antemano, necesitas `alerts.remediation.preapprove` (permiso que tienen por defecto los roles de propietario y administrador).
+Para aprobar de antemano también necesitas `agent.approve`, al igual que para dar una aprobación normal. Solo una persona que haya iniciado sesión puede dar una aprobación previa,
+no un token de API.
+
+Selecciona **Aprobar de antemano** junto a una acción y configura lo siguiente:
+
+| Configuración | Significado |
+|---|---|
+| **Servicios** | Incidentes que abarca la aprobación: los de los servicios seleccionados. Si la acción especifica servicios, todos deben estar entre los seleccionados. |
+| **Máximo de ejecuciones**, **En un intervalo de** | Cantidad de ejecuciones permitidas en cualquier intervalo de esa duración: de 1 a 20 ejecuciones en un intervalo de entre 15 minutos y 7 días. |
+| **Vence** | En 1, 7, 30 o 90 días, o **Nunca**. |
+| **Notificar después de la ejecución** | Hasta cinco canales. Cada canal es un grupo o una dirección de un conector de notificaciones. Los canales reciben una notificación por cada ejecución aprobada de antemano, tanto si tiene éxito como si falla. |
+
+Guardar cuenta como una aprobación. Una acción L2 necesita una, por lo que su aprobación previa entra en vigor de inmediato. Una acción L3
+necesita dos. Para que entre en vigor, otra persona con permiso para aprobar de antemano debe seleccionar **Confirmar aprobación previa**.
+Una aprobación previa nunca reduce la cantidad de personas que deben aprobar la acción. Si cambias cómo se ejecuta la acción, qué solicita, los
+servicios o equipos a los que se aplica o su nivel de riesgo, se anulan las aprobaciones y la aprobación previa queda de nuevo
+pendiente de confirmación por parte de quienes deben aprobarla.
+
+Cuando alguien o Mole Agent inicia la acción en un incidente cubierto por la aprobación previa, el sistema registra la solicitud
+como aprobada por quienes dieron su aprobación previa y ejecuta la acción de inmediato con la identidad de quien la inició. Esa persona
+sigue necesitando `alerts.incidents.remediate`. Al igual que en una aprobación normal, nadie puede aprobar su propia solicitud:
+la aprobación previa de quien hace la solicitud no cuenta. Si no hay suficientes aprobaciones previas de otras personas
+(una para L2, dos para L3), la solicitud queda pendiente de aprobación como antes. También queda pendiente si la organización tiene
+desactivada la aprobación previa, si esta venció o está pendiente de confirmación por otra persona, si el incidente no corresponde a ninguno de los
+servicios cubiertos o si se alcanzó el máximo de ejecuciones del intervalo. En el incidente, la ejecución aparece como **Aprobada de antemano**.
+La cronología y el registro de auditoría indican que la acción se ejecutó con aprobación previa, y los canales reciben una notificación con el resultado.
+
+| Estado junto a la acción | Significado |
+|---|---|
+| **Sin aprobación previa** | La acción no tiene aprobación previa. |
+| **Aprobada de antemano · N/M ejecuciones en el intervalo** | La aprobación está vigente. Ya se realizaron N ejecuciones en el intervalo. |
+| **Con aprobación previa · pendiente de confirmación por otra persona** | Una sola persona ha aprobado de antemano la acción L3. |
+| **Aprobada de antemano · se alcanzó el máximo de ejecuciones** | No se permiten más ejecuciones hasta que las anteriores queden fuera del intervalo. |
+| **La aprobación previa venció** | La aprobación ya no está vigente. Para renovarla, vuelve a configurarla. |
+| **Con aprobación previa · desactivada para la organización** | El interruptor de la parte superior está desactivado. |
+
+## API
+
+| Operación | Endpoint |
+|---|---|
+| Administrar acciones y clústeres | [`/api/v1/alerts/remediation/actions`, `/clusters`](/es/api/alerting/remediation) |
+| Iniciar una ejecución en un incidente | [`POST /api/v1/alerts/incidents/{id}/remediations`](/es/api/alerting/remediation#ejecutar-una-acción-en-un-incidente) |
+| Consultar, activar o desactivar la aprobación previa | `GET`, `PUT /api/v1/alerts/remediation/preapproval` |
+| Configurar, quitar o confirmar la aprobación previa de una acción | `PUT`, `DELETE /api/v1/alerts/remediation/actions/{id}/preapproval`, `POST /api/v1/alerts/remediation/actions/{id}/preapproval/confirm` |

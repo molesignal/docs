@@ -1,0 +1,298 @@
+---
+title: "クエリ"
+sidebarTitle: "概要"
+description: "組織のストリームを対象に、SQL クエリ、PromQL 互換のメトリクスクエリ、ストリーミング検索、非同期ジョブを実行します。"
+"en_link": "/en-US/query"
+"zh-Hans_link": "/zh-Hans/query"
+"zh-Hant_link": "/zh-Hant/query"
+"ko_link": "/ko/query"
+"de_link": "/de/query"
+"es_link": "/es/query"
+"fr_link": "/fr/query"
+"pt-BR_link": "/pt-BR/query"
+---
+
+MoleSignal は、**DataFusion** を基盤とする単一のクエリエンドポイントを公開します。このエンドポイントは、結合、CTE、ウィンドウ関数を含む SQL の全機能と、メトリクス向けの **PromQL のサブセット**をサポートします。どちらも同じデータストアをクエリします。
+
+## クエリエンドポイント
+
+```http
+POST /api/v1/query
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+このエンドポイントには `streams.query` 権限が必要です。
+
+### リクエストボディ
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `orgId` | string | はい | フィールドは必須ですが、値は無視します。認証に紐づく組織を使用します。 |
+| `language` | string | はい | `sql` または `promql`。 |
+| `statement` | string | はい | クエリのテキストです。 |
+| `timeRange` | object | はい | `{ "start": <microseconds>, "end": <microseconds> }`。Unix エポックからの経過時間をマイクロ秒で指定します。 |
+| `stream` | object | SQL の場合 | `{ "name": "app", "streamType": "logs" }`。クエリの主テーブルを指定します。両方のフィールドが必須です。 |
+| `limit` | integer | いいえ | 行数の上限です。 |
+
+クエリ文字列パラメーター `clusters` で、[フェデレーション検索](#フェデレーション検索)の対象となるリモートクラスターを指定します。
+
+### レスポンス
+
+レスポンスには `columns`、配列形式の `rows`、`scannedRows`、`tookMs` が含まれます。
+
+```json
+{
+  "columns": ["level", "n"],
+  "rows": [["error", 2], ["info", 2]],
+  "scannedRows": 4,
+  "tookMs": 155
+}
+```
+
+各セルの値は、列の型に応じて次のようになります。
+
+| 列の型 | JSON 値 |
+|---|---|
+| 欠損値 | `null`。 |
+| 整数、浮動小数点数 | 数値。`NaN` と無限大は `null` を返します。 |
+| 固定小数点数 | 精度が 15 桁以下の場合は数値、それを超える場合はすべての桁を保持する文字列です。 |
+| テキスト | 文字列。 |
+| バイナリ | 小文字の 16 進文字列。 |
+| タイムスタンプ | 元の時間単位やタイムゾーンにかかわらず、Unix エポックからの経過時間をマイクロ秒単位の整数で返します。 |
+| 日付、時刻 | `2022-01-08` や `01:01:01.500` などの文字列。 |
+| リスト、構造体、マップ | 順に、配列、オブジェクト、オブジェクト。 |
+| その他の型 | 文字列。 |
+
+フェデレーション検索のレスポンスには、フェデレーションのメタデータが含まれることもあります。
+
+<Note>
+  `Accept: application/x-ndjson` を送信すると、各行を 1 つの JSON オブジェクトとしてストリーミングします。最後に、 `scannedRows` と `tookMs` を含む `{"__meta__": {...}}` レコードを返します。ストリーミングでは結果キャッシュを使用しません。
+</Note>
+
+## 時間範囲と非同期ジョブ
+
+対話型クエリでは、開始と終了を指定した `timeRange` を使用してください。MoleSignal は、範囲の長さを秒単位で求め、`[querier].estimate_throughput_per_sec` を掛けてクエリのサイズを推定します。推定値が `[querier].auto_async_threshold_rows` に達すると、クエリを永続化された検索ジョブとして実行します。デフォルト設定では、50,000 秒（約 13.9 時間）の範囲がこのしきい値に相当します。
+
+非同期クエリは `202` と、進行状況を追跡するためのジョブ情報を返します。
+
+```json
+{
+  "jobId": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+`Prefer` リクエストヘッダーで実行モードを指定します。
+
+| ヘッダー | 動作 |
+|---|---|
+| `Prefer: respond-async` | 常に検索ジョブを作成します。 |
+| `Prefer: respond-sync` | 時間範囲が長い場合でも、リクエスト内でクエリを実行します。 |
+
+`_audit` に対するクエリは、時間範囲や `Prefer` ヘッダーにかかわらず、常にリクエスト内で実行します。検索ジョブとして送信すると `400` を返します。[監査ストリーム](/ja/settings/data-security#監査ストリーム)を参照してください。
+
+ジョブの追跡と操作には、次のエンドポイントを使用します。
+
+| エンドポイント | 用途 |
+|---|---|
+| `POST /api/v1/query/jobs` | ジョブを直接送信します。 |
+| `GET /api/v1/query/jobs` | ジョブを新しい順に一覧表示します。`state`（`pending,running` などのカンマ区切り）、`limit`（デフォルトは 100）、`offset` を指定できます。不明なステータス名を指定すると `400` を返します。 |
+| `GET /api/v1/query/jobs/summary` | ステータスごとのジョブ数と合計を返します。 |
+| `GET /api/v1/query/jobs/{id}` | ステータス、タイムスタンプ、`resultRows`、`error`、`expiresAt` を返します。 |
+| `GET /api/v1/query/jobs/{id}/results` | 各行をオブジェクトとして返します。`page`、`pageSize`（デフォルトは 1000）、`hasMore` も含みます。 |
+| `POST /api/v1/query/jobs/{id}/cancel` | 実行中のジョブをキャンセルします。 |
+| `POST /api/v1/query/jobs/{id}/retry` | 失敗またはキャンセルされたジョブを再実行します。 |
+| `DELETE /api/v1/query/jobs/{id}` | ジョブを削除します。 |
+
+ジョブの結果は 7 日間保持します。ジョブのステータスは `pending`、`running`、`done`、`failed`、`cancelled` のいずれかです。
+
+ジョブは、`kind`（`query` または `backfill`。バックフィルの場合は `pipelineId` も含みます）、`attempt`、送信された `request`、送信元の情報を示す `userId` と `submittedBy` も返します。
+
+呼び出し元は、自身が送信したジョブを参照、変更できます。`org.running_queries.cancel` 権限がある場合は、組織内のすべてのジョブを参照、変更できます。別のユーザーのジョブにアクセスする権限がない場合は、ジョブが存在しない場合と同様に `404` を返します。一覧と集計には、呼び出し元が参照できるジョブのみが含まれます。**ストリーム**配下の**検索ジョブ**ページにも同じジョブが表示されます。[ストリーム](/ja/streams#検索ジョブ)を参照してください。
+
+## SQL
+
+SQL ステートメントの `FROM` にプライマリストリームを指定し、リクエストの `stream` フィールドにも同じストリームを指定します。
+
+```bash
+NOW=$(date +%s)000000
+curl -X POST http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"timeRange\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
+       \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+```
+
+### シグナルをまたいだ結合
+
+ログ、メトリクス、トレースは同じストアにあるため、1 つのクエリで結合できます。`stream` にプライマリストリームを指定し、ほかのストリームは名前で参照します。たとえば、`trace_id` を使ってエラーログを対応するスパンと結合します。
+
+```sql
+SELECT l.msg, t.name, t.duration_ns
+FROM app AS l
+JOIN traces AS t ON l.trace_id = t.trace_id
+WHERE l.level = 'error'
+```
+
+### RUM の行の最新バージョン
+
+`rum_views_latest` と `rum_sessions_latest` は、それぞれ `rum_views` と `rum_sessions` から各ビューまたはセッションの最新バージョンだけを読み取ります。`stream` にはストリーム名またはこれらのビュー名を指定します。リクエストの時間範囲で対象行を絞り込むため、`SELECT count(*) FROM rum_views_latest WHERE "application.id" = 'shop'` は、その範囲内に開始したビューを数えます。ストリームの[フィールドマスキング](/ja/settings)は、これらの行にも適用されます。
+
+### テキスト検索
+
+| 関数 | 動作 |
+|---|---|
+| `MATCH(field, 'text')` | 任意のフィールドで、大文字と小文字を区別せずに部分一致を検索します。`%`、`_`、`*` は文字どおりに扱います。 |
+| `MATCH_TEXT(field, 'query')` | `indexType` が `full_text` のフィールドを全文検索します。このインデックスがないフィールドを指定すると、`MATCH_TEXT: field ... has no full-text index configured` エラーが発生します。 |
+
+`MATCH_TEXT` では、スペースで区切ったすべての単語が、大文字と小文字を区別せず、値のどこかに部分文字列として含まれている必要があります。`"a b"` はフレーズで、記述どおりの文字列が含まれている必要があります。`*` を含む単語は値全体に対して照合するため、`error*` は error で始まる値に、`*error` は error で終わる値に一致します。`a OR b` や、語句を除外する `-a` も使用できます。日中韓（CJK）のテキストでは単語を区切る必要はありません。`登录超时` は、この 4 文字が連続する値に一致します。ストリームの作成時またはスキーマの編集時にインデックスを追加してください。[ストリーム](/ja/streams#スキーマとフィールド)を参照してください。
+
+```sql
+SELECT * FROM app WHERE MATCH(msg, 'timeout');
+SELECT * FROM app WHERE MATCH_TEXT(msg, 'panic "disk full" -debug');
+```
+
+### IP ネットワーク
+
+| 関数 | 動作 |
+|---|---|
+| `CIDR_MATCH(field, 'network')` | アドレスが指定したネットワーク内にあれば true を返します。ネットワークは `10.0.0.0/8`、`2001:db8::/32`、または単一のアドレスとして指定します。IPv4 は IPv6 にマッピングして比較するため、`10.0.0.0/8` は `::ffff:10.1.2.3` にも一致します。値がアドレスでなければ false を返し、ネットワークの形式が不正ならクエリは失敗します。 |
+
+```sql
+SELECT client_ip, count(*) FROM access WHERE CIDR_MATCH(client_ip, '10.0.0.0/8') GROUP BY client_ip
+```
+
+### ファイルをスキップする条件
+
+MoleSignal は `WHERE` に指定したフィールドのインデックスを使い、一致する行を含み得ないファイルをスキップします。各ファイルについて、条件ごとに対応するインデックスで一致する可能性を除外できるか判定し、その結果を記述どおりに組み合わせます。`AND` で結んだ条件のうち 1 つでも除外できるか、`OR` のすべての分岐を除外できれば、ファイルをスキップします。`OR` の分岐ごとに異なるインデックスを使う場合も同じです。`NOT` の内側にある条件や計算結果に対する条件など、どのインデックスでも判定できない条件では、ファイルを除外しません。読み取るファイルが増えるだけで、結果は変わりません。
+
+| 条件 | 使用するインデックス |
+|---|---|
+| `=`, `IN` | `exact`、`bloom`（テキストと `int64`）、`skip` |
+| `<`, `<=`, `>`, `>=`, `BETWEEN`, `!=`, `NOT IN`, `LIKE 'abc%'` | `exact`、`bloom`、`skip`、`range` の最小値と最大値、および `skip` の値の集合 |
+| `MATCH`、`MATCH_TEXT`、`LIKE`、`ILIKE` のリテラル | `full_text`、`ngram`、および `exact` の値 |
+| アドレスに対する `CIDR_MATCH`、`=` | `ip` |
+| `IS NULL`, `IS NOT NULL` | 任意のインデックス：インデックス付きの各フィールドで、値が空の行を数えます |
+| `json_text(field, 'key') = 'value'`, `IN`, `IS NOT NULL` | `key_value` |
+| 分割に使うフィールドに対する `=`、`IN`、`LIKE 'abc%'` | [フィールドによる分割](/ja/streams#フィールドで分割)：`=` と `IN` にはハッシュを使い、3 つの条件すべてに先頭文字を使います |
+
+読み取り対象のファイルでは、`ngram` フィールドに対する `LIKE`、`ILIKE`、`MATCH` にリテラルを指定すると、5 バイトの断片から一致の可能性があると判定した 1,024 行単位のブロックだけを読み取ります（リテラルが 5 バイト未満の場合は、すべてのブロックを読み取ります）。`exact` フィールドに対する `=` または `IN` に一致する行が少ない場合は、その行を含むページだけを読み取ります。行を[クラスタリング](/ja/streams#フィールドでクラスタリング)したファイルでは、クラスタリングに使うフィールドに `=` または `IN` を適用すると、時間スライスごとに指定値を含み得るページだけを読み取ります。
+
+### SQL のタイムスタンプ
+
+`_timestamp` は `Timestamp(µs, "UTC")` 型のカラムです。`_timestamp` と比較する整数リテラルは Unix エポックからの経過時間をマイクロ秒単位で表します。そのため、次の 2 つのフィルターは同じ行を選択します。
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= 1790000000000000
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= to_timestamp_micros(1790000000000000)
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+マイクロ秒として解釈するのはリテラルだけです。`_timestamp` を式や別のカラムと比較するには、`to_timestamp_micros(...)` で値を変換してください。行のタイムスタンプをマイクロ秒単位で取得するには、`CAST(_timestamp AS BIGINT)` を使います。
+
+### 暗号化されたフィールド
+
+`decrypt(field)` は、暗号化対象に指定したフィールドを復号して平文を返します。[ストリーム](/ja/streams#暗号化フィールド)を参照してください。
+
+## PromQL
+
+メトリクスストリームに対して PromQL を実行するには、`language` を `promql` に設定します。メトリクスセレクターでメトリクス名を指定すると、そのメトリクスを含むすべてのメトリクスストリームがクエリの対象になります。`metric_name` にはメトリクス名、`value` カラムにはサンプル値が入り、ほかのカラムはラベルです。`step` を指定しない場合、MoleSignal は `time_range.end` 時点のインスタントクエリとして式を評価し、系列ごとに 1 行を返します。先頭に `value`、続いてラベルが並びます。`step` をマイクロ秒単位で指定すると、`time_range.start` から `time_range.end` までの範囲クエリとして評価し、系列とステップの組み合わせごとに 1 行を返します。先頭には `_timestamp` と `value` が並びます。1 系列あたり最大 11,000 ステップで、`limit` を指定すると各系列を均等にサンプリングして行数を制限します。
+
+```json
+{
+  "orgId": "<org>",
+  "language": "promql",
+  "statement": "sum by (service) (http_requests_total)",
+  "timeRange": { "start": 1790000000000000, "end": 1790003600000000 }
+}
+```
+
+幅広い機能に対応しています。対応機能には、rate 系とすべての `*_over_time` 関数、`topk` と `limitk` を含む標準の集約演算、`histogram_quantile`、`label_replace` と `label_join`、数学関数と三角関数が含まれます。また、集合演算子 `and`、`or`、`unless` と、`on`、`ignoring`、`group_left`、`group_right` によるマッチング、セレクター修飾子 `@` と `offset`、サブクエリにも対応しています。
+
+<Card title="PromQL 対応一覧" icon="table-list" href="/ja/query/promql-subset">
+  対応する関数、演算子、修飾子をすべて確認できます。既知の未対応機能も記載しています（ネイティブヒストグラム関数と、欠損値を補う二項演算子 `default`）。
+</Card>
+
+## イベント前後の検索
+
+`POST /api/v1/query/search_around` は、指定したイベントの直前と直後のイベントを返します。これにより、調査時にログ行の前後関係を確認できます。[イベント前後の検索](/ja/api/query/search-around)を参照してください。
+
+## クエリの確認と制御
+
+- `POST /api/v1/query/inspect` は、クエリを実行せずに実行計画を作成し、クエリのメタデータと論理計画を返します。
+- `POST /api/v1/query/recommendations` は、クエリを実行せずにクエリプロファイルを分析します。
+- 組織管理者は、`GET /api/v1/query/running` で実行中のクエリを確認し、`POST /api/v1/query/{id}/cancel` でキャンセルできます。
+- `GET /api/v1/query/sql/capabilities` と `GET /api/v1/query/promql/capabilities` は、エディターで使用できる関数の一覧を返します。
+
+標準クエリには `streams.query` が必要です。実行中のクエリを管理するには `org.running_queries.read` または `org.running_queries.cancel` が必要です。
+
+## フェデレーション検索
+
+フェデレーション検索を行うには、クエリエンドポイントに `?clusters=local,cluster-name` を追加します。接続できないリモートクラスターは、フェデレーションのメタデータで機能低下として表示されます。通知なしにローカルデータに置き換わることはありません。[ロールベースのデプロイ](/ja/deployment/role-based#フェデレーションクエリ)を参照してください。
+
+## 保存されるフィールド
+
+ストリームのフィールドは、送信元が提供するデータによって異なります。以下に、OTLP の取り込みで生成されるフィールドを示します。リソースとレコードの属性は、`service.name` などの元のキーを使ってトップレベルのフィールドになり、数値型も維持します。
+
+### OTLP ログのフィールド
+
+| フィールド | 内容 |
+|---|---|
+| `_timestamp` | `timeUnixNano` から取得したイベント時刻（マイクロ秒）。 |
+| `body` | ログ本文。 |
+| `severity_text`, `severity_number` | OTLP の重大度。 |
+| `trace_id`, `span_id` | 相関 ID（小文字の 16 進数）。 |
+| `scope_name`, `scope_version` | インストルメンテーションスコープ。 |
+| リソースとレコードの属性 | 属性ごとに 1 つのトップレベルフィールド。 |
+
+### トレーススパンのフィールド
+
+| フィールド | 内容 |
+|---|---|
+| `_timestamp` | スパンの開始時刻（マイクロ秒）。 |
+| `trace_id`, `span_id`, `parent_span_id` | トレース、スパン、親スパンの ID。 |
+| `name`, `kind` | スパンの名前と種別。 |
+| `start_time_unix_nano`, `end_time_unix_nano`, `duration_ns` | 開始時刻、終了時刻、継続時間（ナノ秒）。 |
+| `status_code`, `status_message` | `OK`、`ERROR`、`UNSET` のいずれかと、ステータスメッセージ。 |
+| `attributes`, `resource`, `scope`, `events`, `links` | OTLP の構造全体を表す JSON テキスト。 |
+| `http.method` や `service.name` などの属性キー | フラット化した属性のコピー。 |
+| `sampling_reason` と管理用フィールド | テールサンプリングでトレースを保持した理由と、`partial`、`late`、`duplicate`、`conflict` の各フラグ。 |
+
+MoleSignal は `trace_id` と `span_id` の組み合わせでスパンを識別します。同じスパンを再度受信すると、重複として破棄します。
+
+### OTLP メトリクスのフィールド
+
+MoleSignal は、各 OTLP データポイントを 1 つのメトリクスイベントにフラット化します。リソース、スコープ、データポイントの属性は、クエリ可能なフィールドとして保持します。以下の予約済みフィールドは、同じ名前の属性より優先します。
+
+| フィールド | 意味 |
+|---|---|
+| `metric_name` | OTLP メトリクス名。PromQL では `{"http.server.duration"}` のように指定します。 |
+| `metric_kind` | `gauge`、`counter`、`up_down_counter`、`histogram`、`exponential_histogram`、`summary` のいずれか。 |
+| `metric_description`, `metric_unit` | 値が空でない場合に含まれます。 |
+| `metric_temporality` | `delta`、`cumulative`、`unspecified`、`unknown:<value>` のいずれか。ゲージには含まれません。 |
+| `metric_monotonic` | 合計が単調増加するかどうか。単調増加する合計は `counter` として保存します。 |
+| `metric_start_time_unix_nano` | 集計区間の開始時刻。値が 0 でない場合に含まれます。 |
+| `value` | ゲージまたは合計のデータポイントのスカラー値。 |
+| `count`, `sum`, `min`, `max` | ヒストグラムのデータポイントにはこの 4 つの値を保存します。指数ヒストグラムとサマリーには `count` と `sum` を保存します。 |
+
+ヒストグラムのバケット境界とバケットごとのカウント、およびサマリーの分位数は保存しません。
+
+デルタのデータポイントは受信したまま保存します。PromQL のレート関連関数は、保存した時間集計方式を参照します。`increase` はウィンドウ内のデルタ値を合計し、`rate` はその合計をウィンドウの長さで割り、`irate` は最新のデルタ値を対応する区間の長さで割ります。累積の単調増加合計では、カウンターのリセットを考慮します。エクスポーターが同じウィンドウ内で時間集計方式を変更した場合は、同じ方式が連続する最新の区間だけを評価します。
+
+HTTP 経由の OTLP は、メトリクス、ログ、トレースに protobuf（`http/protobuf`）と JSON を受け付けます。JSON エンコードでは、64 ビット整数を `"asInt": "340"` や `"count": "4"` のように文字列で表します。MoleSignal は、文字列で表した整数も、数値として記述した整数も読み取ります。
+
+## キャッシュ
+
+クエリは、開いているインデックスハンドル、終了済みの時間ウィンドウのクエリ結果、検索語の件数、インデックスフッターにプロセス内キャッシュを使用します。リモートオブジェクトストレージを使用する場合は、オブジェクトのバイト範囲を `./data/cache/objects` 配下のディスクキャッシュに保存します。デフォルトの容量は 10 GiB です。キャッシュの有無でレスポンスの仕様は変わりません。キャッシュの動作を計測するには `/metrics` を使用し、キャッシュ容量の設定については[設定](/ja/configuration#キャッシュ)を参照してください。

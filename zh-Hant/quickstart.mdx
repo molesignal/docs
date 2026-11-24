@@ -1,0 +1,204 @@
+---
+title: "快速入門"
+description: "使用 Docker Compose 啟動本機 MoleSignal 沙箱，傳送一筆日誌事件，並在網頁介面中找到它。"
+"en_link": "/en-US/quickstart"
+"zh-Hans_link": "/zh-Hans/quickstart"
+"ja_link": "/ja/quickstart"
+"ko_link": "/ko/quickstart"
+"de_link": "/de/quickstart"
+"es_link": "/es/quickstart"
+"fr_link": "/fr/quickstart"
+"pt-BR_link": "/pt-BR/quickstart"
+---
+
+本指南說明如何啟動本機 MoleSignal 沙箱、傳送一筆日誌事件，並透過網頁介面和查詢 API 找到這筆事件。沙箱僅供評估使用。
+
+## 先決條件
+
+- **Docker** 與 **Docker Compose** v2。
+- 約 2 GB 可用記憶體。
+- 本機未使用的連接埠：`5080`（網頁介面與 API）、`5082`、`5432`（PostgreSQL）、`9000` 與 `9001`（RustFS）。
+
+## 啟動沙箱
+
+<Steps>
+  <Step title="複製儲存庫並啟動">
+    ```bash
+    git clone https://github.com/molesignal/molesignal
+    cd molesignal
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
+    ```
+
+    首次啟動時需要下載或建置映像檔，可能需要幾分鐘。沙箱包含用來儲存中繼資料的 PostgreSQL 17、相容於 S3 的物件儲存 RustFS，以及一個執行所有角色並提供網頁介面的 MoleSignal 程序。
+
+    確認服務已就緒：
+
+    ```bash
+    curl http://localhost:5080/api/v1/healthz
+    ```
+
+    服務運作正常時會傳回 `{"status":"ok"}`。
+  </Step>
+
+  <Step title="登入網頁介面">
+    開啟 [http://localhost:5080](http://localhost:5080)，使用下列帳號登入：
+
+    - **電子郵件：** `admin@example.com`
+    - **密碼：** `admin`
+
+    <Warning>
+      沙箱設定只會在首次啟動時建立這個 root 帳號。若要用於本機評估以外的任何情境，請先更換該帳號。請參閱[正式環境檢查清單](/zh-Hant/deployment/production-checklist)。
+    </Warning>
+
+    RustFS 主控台位於 [http://localhost:9001](http://localhost:9001)，帳號和密碼為 `rustfsadmin` / `rustfsadmin`。這些沙箱憑證並不安全。
+  </Step>
+
+  <Step title="取得存取權杖">
+    透過 API 登入時，服務會設定網頁介面使用的工作階段 Cookie，`curl` 會將 Cookie 儲存至 `ms-cookies.txt`。API 使用 API 權杖做為 Bearer 權杖。使用這個工作階段簽發有效期限為 7 天的個人 API 權杖，並記下組織 ID。這個權杖擁有與登入帳號相同的權限。
+
+    ```bash
+    RESP=$(curl -s -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+      -H 'content-type: application/json' \
+      -d '{"email":"admin@example.com","password":"admin"}')
+
+    export MS_ORG=$(echo "$RESP" | jq -r .login.orgId)
+
+    export MS_TOKEN=$(curl -s -b ms-cookies.txt -X POST http://localhost:5080/api/v1/me/api-tokens \
+      -H 'content-type: application/json' \
+      -d '{"name":"quickstart","expiresInDays":7}' | jq -r .token)
+    ```
+
+    若沒有 `jq`，請從登入回應中複製 `orgId`，再從最後一個回應中複製 `token`，然後手動匯出。
+
+    <Note>
+      工作階段 Cookie 預設在 24 小時後到期。API 權杖在到期或於 **個人設定 → API 權杖** 中撤銷前皆有效。請參閱 [API 權杖](/zh-Hant/identity/tokens)。
+    </Note>
+  </Step>
+
+  <Step title="傳送一筆日誌事件">
+    原生 HTTP JSON 擷取介面接受由記錄組成的陣列。`_timestamp` 是從 Unix 紀元起算的微秒數。系統會在首次寫入時建立資料流 `app`。
+
+    ```bash
+    curl -X POST http://localhost:5080/api/v1/intake/logs/app \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+    ```
+
+    回應會列出已接收的記錄筆數：
+
+    ```json
+    {"accepted":1,"rejected":0,"errors":[]}
+    ```
+  </Step>
+
+  <Step title="在網頁介面中找到這筆事件">
+    1. 開啟 **日誌**。
+    2. 在資料流選擇器中選取 `app`。
+    3. 將時間範圍維持在 **近 1 小時**，然後選取 **查詢**。
+
+    結果表格會顯示這筆事件。選取該列即可查看原始欄位。
+  </Step>
+
+  <Step title="使用 API 查詢這筆事件">
+    透過查詢 API 執行相同的查詢。務必傳入以微秒為單位且有起訖界限的 `timeRange`。時間範圍過大時，規劃器會將查詢轉為非同步搜尋工作。
+
+    ```bash
+    NOW=$(date +%s)000000
+
+    curl -X POST http://localhost:5080/api/v1/query \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+           \"statement\":\"SELECT level, msg, trace_id FROM app WHERE trace_id = 'abc123'\",
+           \"timeRange\":{\"start\":$((NOW - 3600000000)),\"end\":$((NOW + 60000000))},
+           \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+    ```
+
+    回應包含 `columns`、`rows`、`scannedRows` 與 `tookMs`：
+
+    ```json
+    {"columns":["level","msg","trace_id"],"rows":[["error","db pool exhausted","abc123"]],"scannedRows":1,"tookMs":120}
+    ```
+  </Step>
+</Steps>
+
+## 載入範例資料
+
+沒有資料的工作區會顯示空白頁面。載入一小組相互關聯的範例資料（日誌、指標與追蹤共用 `trace_id`），即可體驗跨訊號調查：
+
+```bash
+curl -X POST http://localhost:5080/api/v1/onboarding/sample-data \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+
+此請求會建立資料流 `sample_app_logs`、`sample_app_metrics` 與 `sample_app_traces`。尚未有自己的資料流的工作區，也可以在網頁介面中執行相同操作：按一下 **首頁** 頂端的設定步驟按鈕，再選取 **載入範例資料** 旁的 **載入**。上述步驟建立的資料流 `app` 就是工作區自己的資料流，因此完成上述步驟後，請使用此請求。清單中的所有步驟都完成後，這個按鈕就會消失。
+
+回應會列出寫入各資料流的列數，以及範例儀表板和已儲存檢視的 ID：
+
+```json
+{
+  "loaded": true,
+  "totalRows": 196,
+  "streams": [
+    { "stream": "sample_app_traces", "rows": 24 },
+    { "stream": "sample_app_logs", "rows": 24 },
+    { "stream": "sample_app_metrics", "rows": 148 }
+  ],
+  "dashboardId": "<仪表盘 ID>",
+  "savedViewIds": ["<保存的视图 ID>", "<保存的视图 ID>", "<保存的视图 ID>", "<保存的视图 ID>"]
+}
+```
+
+只有在三個資料流、儀表板和四個已儲存的檢視都存在時，`GET /api/v1/onboarding/sample-data` 才會傳回 `{"loaded":true}`。這不代表目前的時間範圍內仍有範例資料。若要了解載入時會建立哪些資源、再次載入的效果，以及所需的權限，請參閱[首頁的快速入門](/zh-Hant/home#快速開始)。
+
+## 傳送 OpenTelemetry 資料
+
+任何 OpenTelemetry SDK 或 Collector 都可以透過 HTTP 傳送 OTLP 資料。將匯出端指向基礎路徑 `/api`，匯出端就會自動附加 `/v1/logs`、`/v1/metrics` 與 `/v1/traces`：
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer $MS_TOKEN"
+export OTEL_SERVICE_NAME=checkout
+```
+
+除非使用 `stream-name` 請求標頭指定其他資料流，否則系統會將遙測資料寫入各訊號類型中名為 `default` 的資料流。關於 Collector、Vector、Fluent Bit、Prometheus 與 SDK 的設定，請參閱[資料來源](/zh-Hant/intake)和[整合指南](/zh-Hant/intake/integrations)。
+
+## 停止沙箱
+
+```bash
+# 停止容器并保留数据
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down
+
+# 停止容器并删除全部沙箱数据
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down -v
+```
+
+## 疑難排解
+
+| 現象 | 原因與處理方式 |
+|---|---|
+| `healthz` 傳回 `503` 與 `"status":"degraded"` | 某個子系統運作異常，例如物件儲存探查失敗。查看 `reason` 欄位，並檢查 `rustfs` 容器。 |
+| 登入時傳回 `401` | 系統只會在首次啟動時建立 root 帳號，先前執行留下的資料庫磁碟區會保留舊密碼。執行 `down -v` 重設沙箱。 |
+| 查詢傳回 `202` 與 `jobId` | 時間範圍過大（預設設定下約 13.9 小時或更長），規劃器已啟動非同步搜尋工作。縮小範圍、傳送 `Prefer: respond-sync`，或輪詢 `GET /api/v1/query/jobs/{id}`。請參閱[查詢](/zh-Hant/query#時間範圍與非同步工作)。 |
+| 查詢傳回 `422 missing field orgId` 或 `400 query.stream hint is required` | 同時傳入 `orgId` 與 `stream` 物件。 |
+| 連接埠已被占用 | 停止占用連接埠的其他程序，或修改 `deploy/docker/docker-compose.yaml` 中發布的連接埠。 |
+| 主機無法存取 `4317` 上的 OTLP gRPC | 沙箱的 Compose 檔案未發布 `4317`。在 `molesignal` 服務中新增 `4317:4317` 連接埠對應。 |
+
+## 下一步
+
+<CardGroup cols={2}>
+  <Card title="接收自己的資料" icon="inbox" href="/zh-Hant/intake">
+    使用資料來源頁面、資料擷取權杖及相容的通訊協定。
+  </Card>
+  <Card title="整合指南" icon="plug" href="/zh-Hant/intake/integrations">
+    設定 OpenTelemetry Collector、Vector、Fluent Bit、Filebeat 與 Prometheus。
+  </Card>
+  <Card title="核心概念" icon="book" href="/zh-Hant/concepts">
+    瞭解訊號、資料流、工作區與權限。
+  </Card>
+  <Card title="正式部署" icon="server" href="/zh-Hant/deployment">
+    從沙箱移轉至正式環境。
+  </Card>
+</CardGroup>

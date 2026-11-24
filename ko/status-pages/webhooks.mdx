@@ -1,0 +1,450 @@
+---
+title: "상태 페이지 웹훅 구독"
+description: "HTTPS 엔드포인트에서 공개 상태 페이지의 알림을 구독하는 방법을 안내합니다. 구독 확인, 요청 형식, 페이로드 필드, 재시도 및 구독 해제를 다룹니다."
+"en_link": "/en-US/status-pages/webhooks"
+"zh-Hans_link": "/zh-Hans/status-pages/webhooks"
+"zh-Hant_link": "/zh-Hant/status-pages/webhooks"
+"ja_link": "/ja/status-pages/webhooks"
+"de_link": "/de/status-pages/webhooks"
+"es_link": "/es/status-pages/webhooks"
+"fr_link": "/fr/status-pages/webhooks"
+"pt-BR_link": "/pt-BR/status-pages/webhooks"
+---
+
+웹훅 구독은 공개 상태 페이지에 게시되는 변경 사항을 HTTPS 엔드포인트에
+JSON `POST` 요청으로 전송합니다. 웹훅 구독을 사용해 서비스 상태를 채팅방, 티켓 관리
+시스템 또는 내부 상태 보드에 반영합니다.
+
+컴포넌트, 인시던트, 유지보수, 구독자 관리 화면에 대한 내용은
+[상태 페이지](/ko/status-pages)를 먼저 참조합니다.
+
+## 구독 작동 방식
+
+<Steps>
+  <Step title="엔드포인트 등록">
+    공개 페이지 또는 API에서 엔드포인트 URL을 제출합니다. 구독은
+    대기 상태로 시작합니다.
+  </Step>
+  <Step title="확인 요청 수신">
+    MoleSignal은 엔드포인트에 `status_page_subscription_confirmation` 요청을 한 번 보냅니다.
+    엔드포인트가 2xx 상태 코드로 응답하지 않으면 등록에 실패합니다.
+  </Step>
+  <Step title="토큰으로 확인">
+    요청의 `confirmUrl`을 열거나 확인 엔드포인트에 `token`을 전송합니다.
+    그러면 구독이 활성화됩니다.
+  </Step>
+  <Step title="업데이트 수신">
+    확인 후 게시되는 변경 사항마다 요청을 한 번 보냅니다. 확인 전에
+    게시한 변경 사항은 전송하지 않습니다.
+  </Step>
+</Steps>
+
+## 엔드포인트 요구 사항
+
+| 요구 사항 | 규칙 |
+|---|---|
+| 페이지 공개 여부 | 공개 페이지에서만 사용할 수 있습니다. 비공개 페이지는 인증된 이메일 구독만 허용합니다. |
+| 스킴 | `https`만 허용합니다. |
+| 인증 정보 | URL에 사용자 이름이나 비밀번호를 포함할 수 없습니다. |
+| 호스트 | `localhost`, `*.localhost`, `*.local`은 허용하지 않습니다. 호스트는 공인 IP 주소로 해석되어야 합니다. 사설, 루프백, 링크 로컬, 통신사급 NAT, 문서용 주소 범위는 허용하지 않습니다. |
+| 길이 | 제어 문자 없이 3~2048자여야 합니다. |
+| 응답 | 10초 이내에 2xx 상태 코드로 응답해야 합니다. 리디렉션을 따르지 않으므로 3xx 응답은 실패로 처리합니다. |
+
+MoleSignal은 요청을 전송할 때마다 호스트를 다시 해석하고
+동일한 주소 규칙을 적용합니다.
+
+## 구독
+
+공개 페이지에서 **구독**을 선택하고 **수신 채널**을 **웹훅**으로 설정합니다.
+엔드포인트 URL을 입력하고 **확인 요청 보내기**를 선택합니다.
+
+API를 사용하는 경우 상태 페이지를 제공하는 오리진으로 요청을 보냅니다.
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<slug>/subscriptions" \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "webhook", "target": "https://hooks.example.com/status"}'
+```
+
+일부 컴포넌트의 변경 사항만 받으려면 `componentIds`에 각 컴포넌트의 `id`를 추가합니다.
+컴포넌트의 `id`는 `GET /api/v1/public/status-pages/<slug>`에서 확인합니다. 페이지 전체를 구독하려면 `componentIds`를 생략하거나 빈
+목록을 보냅니다. 그룹은 선택할 수 있는 컴포넌트가 아니므로 그룹에 속한 컴포넌트를 개별적으로 지정합니다.
+
+이 호출에는 인증이 필요하지 않습니다. 등록에 성공하면 `202 Accepted`를 반환합니다.
+
+```json
+{
+  "accepted": true,
+  "confirmationRequired": true
+}
+```
+
+| 상황 | 결과 |
+|---|---|
+| 새 엔드포인트 | 확인 요청을 보냅니다. |
+| 이미 활성화된 엔드포인트 | `202`를 반환하고 `status_page_subscription_manage` 요청을 보냅니다. 선택한 컴포넌트와 토큰은 그대로 유지합니다. |
+| 확인 요청을 받은 지 10분이 지나지 않은 엔드포인트 | `202`를 반환하고 확인 요청을 다시 보내지 않습니다. |
+| 확인 요청을 받은 지 10분이 지난 대기 상태 또는 구독 해지 상태의 엔드포인트 | 새 토큰을 담은 확인 요청을 보냅니다. 이전 토큰은 더 이상 사용할 수 없습니다. |
+| 확인 요청에 2xx로 응답하지 않은 엔드포인트 | 호출에 실패하고 `503`과 오류 코드 `unavailable`을 반환합니다. 엔드포인트를 수정한 뒤 다시 등록합니다. |
+| 엔드포인트 요구 사항을 충족하지 않는 URL | 호출에 실패하고 `400`과 오류 코드 `invalid_argument`를 반환합니다. |
+| 대기 또는 활성 상태인 구독자가 10,000명인 페이지 | 호출에 실패하고 `429`와 오류 코드 `resource_exhausted`를 반환합니다. |
+
+<Note>
+  MoleSignal은 `http.external_url`을 기준으로 구독 링크를 생성합니다. 페이지에 활성 사용자 지정 도메인이 있으면
+  해당 도메인을 사용합니다. `http.external_url`이 비어 있으면 등록에 실패하고 `503`을 반환합니다.
+</Note>
+
+## 요청 형식
+
+엔드포인트로 보내는 모든 요청은 구조가 같습니다.
+
+| 속성 | 값 |
+|---|---|
+| 메서드 | `POST` |
+| `Content-Type` | `application/json` |
+| `User-Agent` | `MoleSignal-Status-Page/1.0` |
+| 본문 | JSON 객체 하나를 포함합니다. `type` 필드는 페이로드의 유형을 나타냅니다. |
+| 제한 시간 | 10초 |
+| 성공 | 모든 2xx 상태 코드입니다. 응답 본문은 무시합니다. |
+
+요청에는 서명 헤더가 없습니다. 정상 요청을 식별하려면 등록한 URL의 경로나
+쿼리 문자열에 추측하기 어려운 값을 넣고, 해당 값이 없는 요청은 거부합니다.
+관리 화면에는 다음과 같이 웹훅 대상의 스킴과 호스트만 표시합니다.
+`https://hooks.example.com/***`.
+
+`type`에 따라 요청을 분기합니다. 알 수 없는 필드와 `type` 값은 무시하도록 설정합니다. 이렇게 하면
+페이로드에 필드를 추가해도 엔드포인트가 계속 작동합니다.
+
+## 확인 요청
+
+MoleSignal은 등록할 때마다 다음 페이로드를 한 번 보냅니다.
+
+```json
+{
+  "type": "status_page_subscription_confirmation",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "confirmUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=confirm&subscriptionToken=<token>",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>",
+  "components": ["Public API"],
+  "token": "<token>"
+}
+```
+
+| 필드 | 유형 | 설명 |
+|---|---|---|
+| `type` | string | 항상 `status_page_subscription_confirmation`입니다. |
+| `pageName` | string | 상태 페이지의 이름입니다. |
+| `pageSlug` | string | 상태 페이지의 슬러그입니다. 아래 API 경로에서 이 값을 사용합니다. |
+| `confirmUrl` | string | 브라우저에서 열면 구독을 확인하는 페이지의 주소입니다. |
+| `manageUrl` | string | 구독할 컴포넌트를 변경할 수 있는 **구독 관리** 페이지의 주소입니다. |
+| `unsubscribeUrl` | string | 브라우저에서 열면 구독을 해지하는 페이지의 주소입니다. |
+| `components` | array of strings | 구독 대상 컴포넌트의 이름입니다. 페이지 전체를 구독하면 비어 있습니다. |
+| `token` | string | 구독 토큰입니다. 구독을 확인하고 나중에 해지할 때 사용합니다. |
+
+구독을 확인하려면 `confirmUrl`을 열거나 토큰을 전송합니다.
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/confirm" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+구독 확인에 성공하면 `200 OK`를 반환합니다.
+
+```json
+{
+  "accepted": true,
+  "confirmationRequired": false
+}
+```
+
+알 수 없는 토큰, 이후 등록에서 교체한 토큰 또는 이미 구독 해지에 사용한 토큰을 보내면
+`400`과 오류 코드 `invalid_argument`를 반환합니다.
+
+<Warning>
+  토큰을 보관합니다. 업데이트 페이로드에는 토큰을 포함하지 않으며, 엔드포인트 소유자가
+  구독을 해지할 때 사용할 수 있는 유일한 인증 정보입니다.
+</Warning>
+
+## 관리 요청
+
+이미 활성화된 엔드포인트를 다시 등록하면 MoleSignal은 새 확인 요청 대신
+구독 관리 링크를 보냅니다. 이 요청은 10분에 최대 한 번 보냅니다.
+
+```json
+{
+  "type": "status_page_subscription_manage",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>",
+  "components": [],
+  "token": "<token>"
+}
+```
+
+확인 요청과 동일한 필드를 사용하되 `confirmUrl`은 포함하지 않습니다.
+
+## 업데이트 페이로드
+
+모든 타임스탬프는 UTC 기준으로 Unix 에포크 이후 경과한 시간을 마이크로초 단위의 정수로 나타냅니다. 컴포넌트 이름, 인시던트
+제목, 메시지는 페이지 운영팀이 작성한 그대로 전송하며 번역하지 않습니다.
+
+컴포넌트를 선택한 구독에는 선택한 컴포넌트 중 하나 이상을 명시한 업데이트만 전송합니다. 업데이트를
+게시할 때 **구독자에게 알림 보내기**를 끄면 아무것도 전송하지 않습니다. 모든 업데이트 페이로드에는 다음 구독 링크도
+포함됩니다.
+
+| 필드 | 유형 | 설명 |
+|---|---|---|
+| `manageUrl` | 문자열 | **구독 관리**를 여는 페이지 주소입니다. |
+| `unsubscribeUrl` | 문자열 | 구독을 해지하는 페이지 주소입니다. |
+
+### 인시던트 및 유지 관리 업데이트
+
+MoleSignal은 인시던트 또는 유지 관리에 게시하는 모든 업데이트에 대해 `incident_update`를 전송합니다.
+예정된 유지 관리에는 `incidentKind`를 `maintenance`로 설정한 동일한 페이로드를 사용합니다. 초안은
+전송하지 않습니다.
+
+| 이벤트 | 요청 전송 시점 | `status` |
+|---|---|---|
+| 인시던트 | 인시던트를 게시할 때 | 게시할 때 선택한 상태입니다. 일반적으로 `investigating`입니다. |
+| 인시던트 | 후속 업데이트를 게시할 때마다 | `investigating`, `identified`, `in_progress` 또는 `monitoring`입니다. |
+| 인시던트 | 인시던트를 해결할 때 | `resolved` |
+| 유지 관리 | 유지 관리를 게시할 때 | 일반적으로 `scheduled`입니다. |
+| 유지 관리 | 예정된 유지 관리의 제목, 예정 시간, 컴포넌트 또는 메시지를 수정할 때 | `scheduled` |
+| 유지 관리 | 예정된 시작 시간에 작업이 자동으로 시작되거나 운영팀이 작업을 시작한 것으로 표시할 때 | `in_progress` |
+| 유지 관리 | 운영팀이 작업을 완료하거나 취소할 때 | `completed` 또는 `cancelled` |
+
+인시던트 업데이트 예시:
+
+```json
+{
+  "type": "incident_update",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "incidentKind": "incident",
+  "title": "Elevated error rates on the public API",
+  "impact": "major",
+  "status": "identified",
+  "message": "A configuration change to the edge proxies is rejecting a share of requests. The change is being rolled back.",
+  "occurredAt": 1779529680000000,
+  "nextUpdateAt": 1779531480000000,
+  "startedAt": 1779529260000000,
+  "endedAt": null,
+  "componentNames": ["Public API", "Web dashboard"]
+}
+```
+
+유지 관리 공지 예시:
+
+```json
+{
+  "type": "incident_update",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "incidentKind": "maintenance",
+  "title": "Database upgrade in the EU region",
+  "impact": "maintenance",
+  "status": "scheduled",
+  "message": "The primary database of the EU region is upgraded on May 25 from 10:00 to 10:30 UTC. Writes can take a few seconds longer during the switch-over.",
+  "occurredAt": 1779443280000000,
+  "nextUpdateAt": null,
+  "startedAt": 1779703200000000,
+  "endedAt": null,
+  "componentNames": ["EU region"]
+}
+```
+
+| 필드 | 유형 | 설명 |
+|---|---|---|
+| `type` | 문자열 | 항상 `incident_update`입니다. |
+| `pageName` | 문자열 | 상태 페이지 이름입니다. |
+| `pageSlug` | 문자열 | 상태 페이지 슬러그입니다. |
+| `incidentId` | 문자열 | 인시던트 또는 유지 관리의 식별자입니다. 모든 업데이트에서 동일한 값을 사용합니다. |
+| `incidentKind` | 문자열 | 예정되지 않은 이벤트는 `incident`, 예정된 작업은 `maintenance`를 사용합니다. |
+| `title` | 문자열 | 업데이트를 게시할 당시의 인시던트 또는 유지 관리 제목입니다. |
+| `impact` | 문자열 | 인시던트는 `minor`, `major` 또는 `critical`을 사용합니다. 예정된 작업은 `maintenance`를 사용합니다. |
+| `status` | 문자열 | 이 업데이트에서 설정하는 상태입니다. 아래 표를 참조합니다. |
+| `message` | 문자열 | 업데이트 본문입니다. |
+| `occurredAt` | 정수 | 업데이트를 게시한 시간입니다. |
+| `nextUpdateAt` | 정수 또는 null | 다음 업데이트를 제공하기로 안내한 시한입니다. 안내한 시한이 없으면 `null`입니다. |
+| `startedAt` | 정수 | 유지 관리의 예정된 시작 시간 또는 인시던트의 시작 시간입니다. |
+| `endedAt` | 정수 또는 null | 인시던트를 해결했거나 유지 관리를 완료 또는 취소한 시간입니다. 그전에는 `null`입니다. |
+| `componentNames` | 문자열 배열 | 영향을 받은 컴포넌트 중 상태 페이지에 표시하는 컴포넌트의 이름을 페이지 표시 순서대로 나열합니다. 숨기거나 보관 처리한 컴포넌트는 제외합니다. 나열할 컴포넌트가 없으면 빈 배열입니다. |
+
+| `incidentKind` | `status` 값 | 최종 상태 |
+|---|---|---|
+| `incident` | `investigating`, `identified`, `in_progress`, `monitoring`, `resolved` | `resolved` |
+| `maintenance` | `scheduled`, `in_progress`, `completed`, `cancelled` | `completed` 또는 `cancelled` |
+
+유지 관리의 경우 모든 업데이트에서 `startedAt`은 예정된 시작 시간을 나타냅니다. 운영팀이
+유지 관리 일정을 변경하면 이 값도 바뀝니다. 작업을 시작한 후에도 이 필드는 예정 시간을 유지합니다. 실제
+시작 시간은 `in_progress` 업데이트의 `occurredAt`입니다. 유지 관리에는 예정된 종료 시간이 없으므로
+작업을 완료하거나 취소할 때까지 `endedAt`은 `null`입니다.
+
+<Note>
+  기본값인 자동 시작을 사용하면 MoleSignal은 예정된 시작 시간에 `in_progress` 업데이트를
+  게시하고 `incident_update`로 전송합니다. 자동 시작을 끄면 해당 시간에는 아무것도 전송하지
+  않습니다. 운영팀이 다음 업데이트를 게시하면 다음 요청을 전송합니다.
+</Note>
+
+### 유지 관리 미리 알림
+
+MoleSignal은 예정된 유지 관리를 시작하기 전에 `maintenance_reminder`를 전송합니다. 시작 몇 분 전에 전송할지는
+유지 관리별로 설정하며, 기본값은 60분 전입니다. 미리 알림은 업데이트가 아니므로
+유지 관리 타임라인에 표시하지 않습니다.
+
+```json
+{
+  "type": "maintenance_reminder",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "title": "Database upgrade in the EU region",
+  "occurredAt": 1779699600000000,
+  "startedAt": 1779703200000000,
+  "componentNames": ["EU region"]
+}
+```
+
+| 필드 | 유형 | 설명 |
+|---|---|---|
+| `type` | 문자열 | 항상 `maintenance_reminder`입니다. |
+| `pageName` | 문자열 | 상태 페이지 이름입니다. |
+| `pageSlug` | 문자열 | 상태 페이지 슬러그입니다. |
+| `incidentId` | 문자열 | 유지 관리의 식별자입니다. 해당 유지 관리의 `incident_update` 페이로드에 포함된 값과 동일합니다. |
+| `title` | 문자열 | 미리 알림을 전송할 당시의 유지 관리 제목입니다. |
+| `occurredAt` | 정수 | 미리 알림을 전송한 시간입니다. |
+| `startedAt` | 정수 | 유지 관리의 예정된 시작 시간입니다. |
+| `componentNames` | 문자열 배열 | 영향을 받은 컴포넌트 중 상태 페이지에 표시하는 컴포넌트의 이름을 페이지 표시 순서대로 나열합니다. 숨기거나 보관 처리한 컴포넌트는 제외합니다. |
+
+예정된 시작 시간마다 미리 알림을 한 번씩 전송합니다. 유지 관리 일정을 변경하면
+새 시작 시간 전에 미리 알림을 다시 전송합니다. 미리 알림을 보낼 시간이 지난 후에 유지 관리를 공지하거나 일정을 변경한 경우,
+미리 알림 시간이 `0`이거나 유지 관리가 더 이상 `scheduled` 상태가 아닌 경우에는 미리 알림을 전송하지 않습니다.
+
+### 컴포넌트 상태 변경
+
+MoleSignal은 상태 페이지에 표시하는 컴포넌트의 상태가 바뀌면 `component_status_changed`를
+전송합니다. 컴포넌트를 생성할 때 지정한 초기 상태에 대해서는 아무것도 전송하지 않습니다. 숨기거나 보관 처리한 컴포넌트에 대해서도
+아무것도 전송하지 않습니다.
+
+```json
+{
+  "type": "component_status_changed",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "componentId": "2xZqD1hWk9TfM5vBn7QsR3yLgUe",
+  "componentName": "Public API",
+  "status": "degraded_performance",
+  "occurredAt": 1779529440000000
+}
+```
+
+| 필드 | 유형 | 설명 |
+|---|---|---|
+| `type` | 문자열 | 항상 `component_status_changed`입니다. |
+| `pageName` | 문자열 | 상태 페이지 이름입니다. |
+| `pageSlug` | 문자열 | 상태 페이지 슬러그입니다. |
+| `componentId` | 문자열 | 컴포넌트의 식별자입니다. 컴포넌트 이름을 변경해도 동일한 값을 사용합니다. |
+| `componentName` | 문자열 | 상태가 변경될 당시의 컴포넌트 이름입니다. |
+| `status` | 문자열 | 새 상태입니다. `operational`, `degraded_performance`, `partial_outage`, `major_outage` 또는 `maintenance`입니다. |
+| `occurredAt` | 정수 | 새 상태가 적용된 시간입니다. |
+
+인시던트의 영향을 받은 컴포넌트에 대해서는 `component_status_changed`를 전송하지 않습니다.
+`incident_update` 페이로드의 `componentNames`에 해당 컴포넌트 이름을 포함합니다.
+
+<Note>
+  변경 사항을 게시할 때 숨겨진 컴포넌트의 이름은 구독자에게 알리지 않습니다. 해당 컴포넌트의 상태가
+  바뀌어도 아무것도 전송하지 않으며, `incident_update`의 `componentNames`에서도 해당 컴포넌트를 제외합니다. 인시던트나
+  유지 관리가 숨겨진 컴포넌트에만 영향을 주더라도 `componentNames`를 빈 배열로 두고 전송합니다.
+  컴포넌트를 숨기거나 다시 표시하는 것만으로는 아무것도 전송하지 않습니다.
+</Note>
+
+### 사후 분석 보고서
+
+MoleSignal은 해결한 인시던트의 사후 분석 보고서나
+수정본을 **구독자에게 알림 보내기**를 켠 상태로 게시하면 `postmortem_published`를 전송합니다.
+
+```json
+{
+  "type": "postmortem_published",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "title": "Elevated error rates on the public API",
+  "impact": "major",
+  "revision": false,
+  "occurredAt": 1779616080000000,
+  "startedAt": 1779529260000000,
+  "endedAt": 1779533520000000,
+  "componentNames": ["Public API"],
+  "postmortem": "## What happened\n\nA configuration change to the edge proxies rejected a share of requests.",
+  "incidentUrl": "https://status.example.com/status/acme-cloud/incidents/2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>"
+}
+```
+
+| 필드 | 유형 | 설명 |
+|---|---|---|
+| `type` | 문자열 | 항상 `postmortem_published`입니다. |
+| `incidentId` | 문자열 | 인시던트의 식별자입니다. 해당 인시던트의 `incident_update` 페이로드에 포함된 값과 동일합니다. |
+| `title` | 문자열 | 인시던트 제목입니다. |
+| `impact` | 문자열 | `minor`, `major` 또는 `critical`입니다. |
+| `revision` | 불리언 | 수정한 본문으로 이미 게시한 본문을 교체하면 `true`입니다. |
+| `occurredAt` | 정수 | 사후 분석 보고서를 게시한 시간입니다. |
+| `postmortem` | 문자열 | Markdown으로 작성한 사후 분석 보고서 원문입니다. |
+| `incidentUrl` | 문자열 | 공개 페이지의 인시던트 주소입니다. |
+
+`pageName`, `pageSlug`, `startedAt`, `endedAt`, `componentNames`는 `incident_update`와 동일합니다.
+
+## 전송 및 재시도
+
+| 동작 | 세부 정보 |
+|---|---|
+| 지연 시간 | 일반적으로 변경 후 30초 이내에 전송을 시작합니다. |
+| 시도 횟수 | 업데이트당 최대 5회 시도합니다. |
+| 재시도 간격 | 전송에 실패할 때마다 순서대로 1분, 5분, 30분, 2시간 후에 재시도합니다. |
+| 실패 조건 | 10초 이내에 2xx 상태 코드로 응답하지 않으면 실패로 처리합니다. 리디렉션도 실패에 포함됩니다. |
+| 전송 중단 | 다섯 번째 시도까지 실패하면 전송을 실패로 표시하고 더 이상 재시도하지 않습니다. |
+| 전송 보장 | 최소 한 번 전송합니다. 같은 메시지가 여러 번 도착하거나 업데이트가 순서와 다르게 도착할 수 있습니다. |
+
+재시도 시 동일한 본문을 전송합니다. 페이로드에 전송 식별자가 없으므로 다음 필드를 기준으로 중복을 제거합니다.
+`type`, `incidentId` 또는 `componentId`, `occurredAt`을 기준으로 삼습니다. 동일한 인시던트의 업데이트를 정렬하는 기준은
+`occurredAt`입니다.
+
+구독이 종료되거나, 페이지를 보관 처리하거나,
+페이지를 비공개로 전환하면 해당 엔드포인트의 대기열에 새 업데이트를 추가하지 않습니다.
+
+페이지 관리자는 **상태 페이지 → 구독자 → 전송 내역**에서 각 전송의
+시도 내역, 상태, 마지막 오류를 확인할 수 있습니다. 전송 성공 및 실패 기록은 페이지에 설정된
+전송 내역 보존 기간(30일, 60일, 90일, 180일 또는 365일)이 지나면 삭제됩니다.
+
+## 구독 해지
+
+확인 요청의 `unsubscribeUrl`을 열거나 토큰을 전송합니다.
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/unsubscribe" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+호출은 `200 OK`와 함께 `"accepted": true`를 반환합니다. 해당 엔드포인트로 전송하기 위해 아직 대기 중인
+메시지는 취소됩니다.
+
+`status_pages.subscribers.manage` 권한이 있으면 **상태 페이지 → 구독자**에서 구독을 해지하거나,
+확인 대기 중인 구독자에 대해 **확인 메시지 다시 보내기**를 선택할 수 있습니다. 다시 보내면 새 토큰을 발급합니다.
+
+<CardGroup cols={2}>
+  <Card title="상태 페이지" icon="signal" href="/ko/status-pages">
+    페이지를 만들고, 인시던트와 유지보수 정보를 게시하고, 구독자를 관리합니다.
+  </Card>
+  <Card title="웹훅 알림 커넥터" icon="webhook" href="/ko/notification-channels/webhooks">
+    Slack, Lark 또는 일반 웹훅으로 경보 알림을 전송합니다.
+  </Card>
+</CardGroup>

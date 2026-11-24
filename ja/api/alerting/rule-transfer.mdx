@@ -1,0 +1,90 @@
+---
+title: "ルールのインポートとエクスポート"
+description: "アラートルールを参照先の名前を含むバンドルとしてエクスポートするか、バンドルまたは Prometheus のアラートルールファイルをインポートします。"
+"en_link": "/en-US/api/alerting/rule-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/rule-transfer"
+"zh-Hant_link": "/zh-Hant/api/alerting/rule-transfer"
+"ko_link": "/ko/api/alerting/rule-transfer"
+"de_link": "/de/api/alerting/rule-transfer"
+"es_link": "/es/api/alerting/rule-transfer"
+"fr_link": "/fr/api/alerting/rule-transfer"
+"pt-BR_link": "/pt-BR/api/alerting/rule-transfer"
+---
+
+```http
+GET  /api/v1/alerts/rules/export
+POST /api/v1/alerts/rules/import
+```
+
+## エクスポート
+
+`alerts.rules.read` 権限が必要です。クエリパラメーター `ids` にはルール ID をカンマ区切りで指定します。空の場合はすべてのルールをエクスポートします。レスポンスはバンドルです。
+
+```json
+{
+  "format": "molesignal.alert-rules/v1",
+  "exportedAt": "2026-10-28T08:00:00Z",
+  "rules": [
+    {
+      "name": "High error rate",
+      "description": "",
+      "enabled": true,
+      "kind": "scheduled",
+      "query": {"language": "promql", "statement": "sum(rate(http_requests_total{code=~\"5..\"}[5m]))", "periodSecs": 60, "stream": {"name": "http_requests_total", "streamType": "metrics"}},
+      "trigger": {"operator": "gt", "threshold": 5, "forPeriods": 2, "silenceSecs": 300},
+      "thresholds": [],
+      "severity": "error",
+      "escalationPolicy": "Payments on-call",
+      "labels": {"service": "checkout"},
+      "annotations": {}
+    }
+  ]
+}
+```
+
+バンドルにはルールの定義全体が含まれますが、ID、組織、評価状態、時刻は含まれません。 `escalationPolicy` にはエスカレーションポリシー名が入り、デフォルトのポリシーを使用する場合は省略されます。複合ルールの `query.composite.rules` には子ルールの名前が入ります。ハートビートルールのチェックイン先アドレスはバンドルに含まれません。
+
+## インポート
+
+`alerts.rules.manage` 権限が必要です。
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `content` | string | はい | バンドル（`format` を含む JSON または YAML）、または Prometheus のアラートルールファイル（トップレベルの `groups`、または `PrometheusRule` の `spec.groups`）です。上限は 4 MiB、ルール 500 件です。 |
+| `dryRun` | boolean | いいえ | デフォルトは `true` で、試行のみ行います。`false` にすると書き込みます。 |
+| `createOnly` | boolean | いいえ | `true` にすると、同じ名前の既存ルールは変更しません。 |
+
+各ルールを名前で照合します。新しい名前ならルールを作成し、同じ名前の既存ルールが 1 件ならフィールドごとに比較します。同じ名前の既存ルールが複数ある場合や、ファイル内に同じ名前が 2 回出現する場合は失敗します。各ルールには保存時と同じ検証を行います。いずれかのルールが失敗した場合は、何も書き込みません。すべて成功した場合は、1 回のトランザクションで書き込み、ルールごとにフェデレーションの変更イベントを送信し、監査イベント `alert_rules.imported` を 1 件記録します。Prometheus のルールを MoleSignal のルールに変換する方法については、[インポートとエクスポート](/ja/alerting/rules#インポートとエクスポート)を参照してください。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content rules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "prometheus",
+  "items": [
+    {"name": "HighErrorRate", "action": "create", "ruleId": "3KF1..."},
+    {"name": "DiskFull", "action": "update", "changes": ["query", "trigger"], "ruleId": "3KC9..."},
+    {"name": "TargetDown", "action": "error", "error": "no escalation policy is named `ops`"}
+  ],
+  "notes": ["recording rule `job:errors:rate5m` in group `api` is not imported"],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` は `create`、`update`、`unchanged`、`skip`（`createOnly` を指定した場合の既存ルール）、`error` のいずれかです。 `applied` は、書き込みが行われたかどうかを示します。
+
+**エラー**
+
+| ステータス | 理由 |
+|---|---|
+| `400` | コンテンツがバンドルでも Prometheus のルールファイルでもないか、別の形式を指定しているか、サイズやルール数が上限を超えています。 |
+| `403` | トークンに必要な権限がありません。 |

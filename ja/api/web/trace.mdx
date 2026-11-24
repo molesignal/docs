@@ -1,0 +1,390 @@
+---
+title: "トレースの一覧と詳細"
+description: "トレースの概要とスパンを一覧表示し、トレース件数を時系列で集計します。個別のトレースのスパンを取得し、そのトレースにリンクしているスパンを検索できます。"
+"en_link": "/en-US/api/web/trace"
+"zh-Hans_link": "/zh-Hans/api/web/trace"
+"zh-Hant_link": "/zh-Hant/api/web/trace"
+"ko_link": "/ko/api/web/trace"
+"de_link": "/de/api/web/trace"
+"es_link": "/es/api/web/trace"
+"fr_link": "/fr/api/web/trace"
+"pt-BR_link": "/pt-BR/api/web/trace"
+---
+
+すべての呼び出しは、組織内のトレースストリームを1つだけ読み取ります。対象は、`trace_id`、`span_id`、`service.name`、`name`、`start_time_unix_nano`、`end_time_unix_nano`、`status_code` のすべてのフィールドを持つストリームです。条件を満たすストリームのうち、`default` という名前のストリームを優先します。それ以外に候補が複数ある場合は、ストリーム名で選択します。該当するストリームがない組織では、空の結果を返します。[テールサンプリング](/ja/configuration#トレースのキャプチャとテールサンプリング)で保持したトレースのみ読み取れます。
+
+すべての呼び出しには、`traces.read`、またはシステムスコープの `sys.telemetry.read` が必要です。
+
+## トレースサマリーを一覧表示する
+
+```http
+GET /api/v1/web/traces
+```
+
+トレースごとに1件のサマリーを返します。ページネーションにはカーソルを使用します。トレースサマリーがまだないストリームの場合は、空のページを返します。
+
+**クエリパラメーター**
+
+| パラメーター | 型 | 説明 |
+|---|---|---|
+| `from`, `to` | 整数 | マイクロ秒単位の時間範囲です。デフォルトは現在までの過去24時間です。`to` は `from` より大きい値にしてください。 |
+| `q` | 文字列 | スパンの `trace_id`、`span_id`、サービス、オペレーション、ステータスのいずれかに含まれる必要があるテキストです。大文字と小文字は区別しません。最大256文字です。 |
+| `filters` | 文字列 | フィルターのJSON配列です。下記を参照してください。 |
+| `where` | 文字列 | フィルターとテキストを AND と OR で組み合わせたJSON条件ツリーです。下記を参照してください。 |
+| `expression` | 文字列 | **トレース**ページと同じ形式のフィールドクエリです。`q`、`filters`、`where` の代わりに使用します。両方の形式を同時に送信しないでください。下記を参照してください。 |
+| `sort` | 文字列 | `latest`（デフォルト）、`earliest`、`duration_desc`、`duration_asc`、`span_count_desc`、`errors_desc` のいずれかです。 |
+| `limit` | 整数 | ページサイズです。デフォルトは `20` です。値は1〜5000の範囲に収めます。 |
+| `cursor` | 文字列 | 先に取得したページの `nextCursor` または `previousCursor` です。 |
+| `fields` | 文字列 | 各トレースとともに返すルートスパンのフィールドです。ストリーム上のフィールド名をカンマ区切りで指定します。最大12個です。不明なフィールド、JSONフィールド、`molesignal.trace.*` フィールドを指定すると `400` を返します。 |
+
+フィルターは `field`、`op`、`value` を持つオブジェクトです。1リクエストで最大32個のフィルターを指定できます。すべてのフィルターに一致する必要があります。`in` 演算子では、`value` の代わりに値のリスト `values` を指定します。
+
+| フィールド | 型 | 演算子 |
+|---|---|---|
+| `trace_id` | テキスト | `=`, `!=`, `contains`, `in` |
+| `duration_ns`, `span_count`, `error_count` | 整数 | `=`, `!=`, `>`, `>=`, `<`, `<=`, `in` |
+| トレースストリームのその他のスカラーフィールド | フィールドの型による | テキスト: `=`, `!=`, `contains`, `in`。数値とタイムスタンプ: `=`, `!=`, `>`, `>=`, `<`, `<=`, `in`。ブール値: `=`, `!=`, `in`。 |
+
+フィルターには、`service.name` や `name` のように、ストリーム上のフィールド名をそのまま指定します。別名は使用できません。演算子 `eq`、`ne`、`like` は、それぞれ `=`、`!=`、`contains` の別名です。JSONフィールドではフィルタリングできません。
+
+`trace_id`、`duration_ns`、`span_count`、`error_count` はトレース単位で比較します。その他のフィールドはスパンに属します。スパンフィールドのフィルターでは、少なくとも1つのスパンが条件を満たすトレースが一致します。ただし `!=` では、指定値を持つスパンが1つもないトレースが一致します。フィールドがないスパンは、指定値を持たないものとして扱います。
+
+`in` は `values` のいずれかの値に一致します。フィールドと同じ型の値を1〜64個指定でき、各値は最大512バイトです。同じ値を2回指定しても1個として数えます。スパンフィールドでは、いずれかのスパンがリスト内の値を1つでも持つトレースが `in` に一致します。
+
+`where` では、フィルターのリストだけでは表せない OR 条件を指定できます。次の4つの形式のいずれかを取るJSONオブジェクトです。
+
+| 形式 | 一致条件 |
+|---|---|
+| `filters` と同じ形式のフィルター | フィルターに一致します。 |
+| `{"text": "..."}` | `q` と同じ方法でテキストに一致します。 |
+| `{"and": [...]}` | リスト内のすべての条件に一致します。 |
+| `{"or": [...]}` | リスト内のいずれかの条件に一致します。 |
+
+`filters`、`q`、`where` のすべてを満たす必要があります。ツリー内でもフィルターの評価方法は変わりません。スパンフィールドのフィルターでは、少なくとも1つのスパンが条件を満たすトレースが一致します。ただし `!=` では、指定値を持つスパンが1つもないトレースが一致します。`{"or": [A, B]}` には、`A` または `B` に一致するトレースが一致します。`filters` と `where` のフィルターは合計で最大32個です。1つのツリーには、テキスト検索条件を最大8個指定できます。グループのネストは最大8階層で、各グループに少なくとも1つの条件が必要です。
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'filters=[{"field":"status_code","op":"=","value":"ERROR"}]' \
+  --data-urlencode 'where={"or":[{"field":"service.name","op":"=","value":"checkout"},{"field":"span_count","op":">","value":"50"}]}'
+```
+
+このリクエストは、`checkout` のスパンを含むか、スパン数が50を超える失敗トレースを一覧表示します。
+
+`expression` には、代わりに **トレース**ページのクエリテキストを指定します。`=`、`!=`、`>`、`>=`、`<`、`<=`、`contains`、`field in ('a', 'b')` による比較、検索語、引用符で囲んだフレーズ、`AND` と `OR`、括弧を使用できます。`AND` と `OR` は大文字と小文字を区別せず、`AND` を優先します。サーバーはテキストを解析して、ページが送信する `q`、`filters`、`where` に変換し、上記のルールに従って検証します。テキストは最大8 KiBで、括弧のネストは最大32階層です。閉じていない括弧や比較対象のない比較など、解析できない箇所がある場合は `400` を返し、該当箇所を示します。
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode "expression=status_code = 'ERROR' AND (service.name = 'checkout' OR span_count > 50)"
+```
+
+このリクエストは、上記のリクエストと同じトレースを一覧表示します。
+
+`cursor` は、ページと、そのカーソルを発行したクエリを関連付けます。カーソルを指定して再度リクエストする際に、`limit`、`sort`、`q`、`filters`、`where` のいずれかを変更すると `400` を返します。
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'sort=duration_desc' \
+  --data-urlencode 'limit=2' \
+  --data-urlencode 'fields=http.route' \
+  --data-urlencode 'filters=[{"field":"service.name","op":"in","values":["checkout","payments"]}]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    {
+      "traceId": "0af7651916cd43dd8448eb211c80319c",
+      "service": "checkout",
+      "operation": "GET /checkout",
+      "startNs": 1790000000000000000,
+      "durationMs": 180.0,
+      "spanCount": 3,
+      "errorCount": 1,
+      "status": "ERROR",
+      "httpStatusCode": 502,
+      "fields": { "http.route": "/checkout" }
+    }
+  ],
+  "nextCursor": null,
+  "previousCursor": null,
+  "hasMore": false
+}
+```
+</ResponseExample>
+
+各項目には、ルートスパンの `service` と `operation`、ナノ秒単位の開始時刻、ミリ秒単位の継続時間、スパン数、エラースパン数が含まれます。`nextCursor` が設定されている場合、`hasMore` は `true` です。
+
+| フィールド | 説明 |
+|---|---|
+| `status` | ルートスパンのステータスです。`OK`、`ERROR`、`UNSET` のいずれかです。 |
+| `httpStatusCode` | ルートスパンの `http.response.status_code` または `http.status_code` に100〜599のコードがある場合に、その値を返します。該当するコードがない場合や、サマリーがこの値を保持するようになる前に保存したトレースでは、このフィールドを省略します。 |
+| `fields` | `fields` で指定したフィールドのうち、ルートスパンに値があるものを返します。値が1つもない場合は、このフィールドを省略します。値の読み取りに失敗した場合も、このフィールドを含めずにページを返します。 |
+
+## 時間ごとにトレースを集計する
+
+```http
+GET /api/v1/web/traces/histogram
+```
+
+一覧クエリに一致するすべてのトレースを、開始時刻に基づいて時間バケットごとに集計します。一覧取得と同じ時間範囲、`q`、`filters`、`where` を受け取り、同じトレースに一致します。バケットは呼び出し側で指定します。
+
+**クエリパラメーター**
+
+| パラメーター | 型 | 説明 |
+|---|---|---|
+| `from`, `to` | 整数 | マイクロ秒単位の時間範囲です。両方とも必須です。`to` は `from` より大きい値にしてください。 |
+| `q`, `filters`, `where`, `expression` | 文字列 | 一覧取得と同じです。 |
+| `bucketTime` | 整数 | 1バケットの長さです。マイクロ秒単位で、最小値は `1000` です。 |
+| `originTime` | 整数 | 最初のバケットの開始時刻です。マイクロ秒単位で、`from` 以下の値を指定してください。 |
+
+1リクエストで `originTime` から `to` までの最大512バケットを対象にできます。
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces/histogram" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'from=1790000100000000' \
+  --data-urlencode 'to=1790003700000000' \
+  --data-urlencode 'bucketTime=900000000' \
+  --data-urlencode 'originTime=1790000100000000' \
+  --data-urlencode 'filters=[{"field":"service.name","op":"=","value":"checkout"}]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "bucketTime": 900000000,
+  "originTime": 1790000100000000,
+  "buckets": [
+    { "startTime": 1790000100000000, "total": 42, "errors": 3, "p50Ns": 41000000, "p95Ns": 180000000, "p99Ns": 320000000 },
+    { "startTime": 1790001900000000, "total": 17, "errors": 0, "p50Ns": 38000000, "p95Ns": 95000000, "p99Ns": 120000000 }
+  ],
+  "split": true
+}
+```
+</ResponseExample>
+
+`buckets` は、トレースを1件以上含むバケットのみを古い順に返します。`total` は、そのバケット内で開始したトレースの数です。`errors` は、そのうちエラースパンが1つ以上あるトレースの数です。`p50Ns`、`p95Ns`、`p99Ns` は、それぞれ対象トレースの継続時間の中央値、95パーセンタイル、99パーセンタイルをナノ秒単位で示します。これらは推定値です。集計対象の継続時間がない場合は省略します。
+
+集計ではトレースサマリーを読み取り、スパンフィールドを対象とするフィルターがある場合はスパンも読み取ります。一覧取得ではトレースごとに1件のサマリーを返します。書き込みの再試行で同じサマリーを2回保存した場合、集計では2件として数えます。
+
+集計結果を取得できない場合も `200` を返します。その場合、`buckets` は空になり、`unavailable` に理由が入ります。
+
+| `unavailable` | 原因 |
+|---|---|
+| `time_budget` | 集計に20秒を超える時間がかかりました。 |
+| `busy` | ロールのクエリが [`[search.admission]`](/ja/configuration#クエリの受付制御) の枠を使い切り、`max_wait_secs` 以内に空きが出ませんでした。 |
+| `scan_limit` | 時間範囲内の行数が、`[querier].max_scan_rows` で定めた1クエリあたりの読み取り上限を超えています。 |
+
+## リクエストの統計を取得する
+
+```http
+GET /api/v1/web/traces/red
+GET /api/v1/web/traces/red/breakdown
+```
+
+一覧クエリに一致するリクエストについて、リクエストレート、エラー数、所要時間を取得します。全体の集計、バケットごとの集計、所要時間別の分布を返します。内訳では、1 つのフィールドの値ごとに同じ統計を取得します。リクエストはスパンとして扱います。デフォルトでは、サービスがリクエストを受け付けた箇所のスパン、つまりサーバースパン、コンシューマースパン、またはトレースのルートスパンを対象とします。`scope=all` を指定すると、すべてのスパンを対象とします。
+
+スパンフィールドのフィルターはスパン自体に適用します。たとえば、`service.name = 'api'` は `api` が処理したリクエストを取得します。`trace_id` と `duration_ns` はスパンから取得し、`span_count` と `error_count` はそのスパンが属するトレースから取得します。
+
+**クエリパラメーター**
+
+| パラメーター | 型 | 備考 |
+|---|---|---|
+| `from`, `to`, `bucketTime`, `originTime` | 整数 | トレース数の時系列と同じです。 |
+| `q`, `filters`, `where`, `expression` | 文字列 | 一覧の取得と同じです。 |
+| `scope` | 文字列 | `entry`（デフォルト）または `all` です。 |
+| `by` | 文字列 | 内訳の取得時にのみ使用し、その場合は必須です。リクエストのグループ化に使うフィールドを、ストリームで定義された名前で指定します。 |
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces/red" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'from=1790000100000000' \
+  --data-urlencode 'to=1790003700000000' \
+  --data-urlencode 'bucketTime=60000000' \
+  --data-urlencode 'originTime=1790000100000000' \
+  --data-urlencode "expression=service.name = 'checkout'"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "bucketTime": 60000000,
+  "originTime": 1790000100000000,
+  "scope": "entry",
+  "total": { "requests": 1840, "errors": 12, "p50Ns": 41000000.0, "p95Ns": 180000000.0, "p99Ns": 320000000.0 },
+  "buckets": [
+    { "startTime": 1790000100000000, "requests": 31, "errors": 0, "p50Ns": 40000000.0, "p95Ns": 150000000.0, "p99Ns": 210000000.0 }
+  ],
+  "latency": [
+    { "fromNs": 0, "toNs": 50000000, "requests": 1203, "errors": 2 },
+    { "fromNs": 50000000, "toNs": null, "requests": 637, "errors": 10 }
+  ]
+}
+```
+</ResponseExample>
+
+`buckets` は、リクエストが 1 件以上あるバケットを古い順に並べます。`latency` は、リクエストを所要時間の範囲別に短い順で示します。最後の範囲に上限はありません。失敗を判定できない場合、`errors` は `null` です。所要時間の単位はナノ秒です。リクエストがない場合や所要時間がマスクされている場合、所要時間は `null` です。
+
+内訳は `field`、`bucketTime`、`originTime`、`scope`、`groups` を返します。`groups` には出現頻度の高い順に最大 50 個の値を並べ、各値の統計と、`requests`、`errors`、`p95Ns` を含むバケットの時系列 `series` を返します。値のないリクエストでは `value` は `null` です。一覧に含まれない値がある場合、`more` は `true` です。
+
+統計を取得できない場合も、API は `unavailable` とともに `200` を返します。理由は、トレース数の取得と同じ `time_budget`、`busy`、`scan_limit` のほか、閲覧者に対して時刻がマスクされている場合は `timestamp_masked`、内訳のフィールドがマスクまたは暗号化されている場合は `field_protected` です。
+
+## スパンを一覧表示する
+
+```http
+GET /api/v1/web/traces/spans
+```
+
+クエリに一致するスパンごとに 1 行を返します。ページネーションにはカーソルを使用します。トレース一覧と同じ時間範囲、`q`、`filters`、`where` を受け取り、スパンごとに評価します。スパンフィールドのフィルターはスパン自体に適用し、`!=` は該当フィールドを持たないスパンも結果に含めます。`duration_ns` はスパン自体の所要時間です。`span_count` と `error_count` は、スパンが属するトレースの値です。スパンは、`A` または `B` に一致すれば `{"or": [A, B]}` に一致します。
+
+**クエリパラメーター**
+
+| パラメーター | 型 | 備考 |
+|---|---|---|
+| `from`, `to` | 整数 | マイクロ秒単位の時間範囲です。デフォルトは現在までの直近 24 時間です。`to` は `from` より大きい値を指定してください。 |
+| `q`, `filters`, `where`, `expression` | 文字列 | トレース一覧の取得と同じです。 |
+| `sort` | 文字列 | `latest`（デフォルト）、`earliest`、`duration_desc`、`duration_asc` のいずれかです。 |
+| `limit` | 整数 | ページサイズです。デフォルトは `100` です。値は 1～5000 の範囲に収めます。 |
+| `cursor` | 文字列 | 先に取得したページの `nextCursor` または `previousCursor` です。カーソルにはそのページのクエリが含まれます。異なる `limit` を指定すると、`400` を返します。 |
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    {
+      "traceId": "0af7651916cd43dd8448eb211c80319c",
+      "spanId": "53995c3f42cd8ad8",
+      "parentSpanId": "b7ad6b7169203331",
+      "service": "payments",
+      "operation": "POST /pay",
+      "startNs": 1790000000020000000,
+      "durationNs": 140000000,
+      "status": "ERROR",
+      "kind": 2,
+      "httpStatusCode": 502
+    }
+  ],
+  "nextCursor": null,
+  "previousCursor": null,
+  "hasMore": false
+}
+```
+</ResponseExample>
+
+`status` は `OK`、`ERROR`、`UNSET` のいずれかです。`kind` は OTLP と同じ数値でスパンの種類を表します。`1` は内部、`2` はサーバー、`3` はクライアント、`4` はプロデューサー、`5` はコンシューマーです。スパンに値がない場合、該当する `parent_span_id`、`kind`、`http_status_code` はレスポンスに含まれません。この呼び出しは追跡対象のクエリとして実行し、他のクエリと同じ基準で実行を許可します。
+
+## 1 件のトレースを取得する
+
+```http
+GET /api/v1/web/trace/{traceId}
+```
+
+トレース内のすべてのスパンを開始時刻順に返します。`trace_id` は `A-Z`、`a-z`、`0-9`、`-`、`_` の文字を使用した 1～128 文字の文字列です。
+
+**クエリパラメーター**
+
+| パラメーター | 型 | 備考 |
+|---|---|---|
+| `from`, `to` | 整数 | トレース内のスパンが開始した時間範囲をマイクロ秒単位で指定します。両方を指定するか、両方を省略してください。最大 31 日間です。省略した場合は、直近 24 時間からトレースを検索します。 |
+
+レスポンスの上限は 100,000 スパンかつ 32 MiB です。上限に達してスパン一覧の一部を省略した場合、`truncated` は `true` です。
+
+<ResponseExample>
+```json 200
+{
+  "traceId": "0af7651916cd43dd8448eb211c80319c",
+  "rootSpanId": "b7ad6b7169203331",
+  "spans": [
+    {
+      "spanId": "53995c3f42cd8ad8",
+      "parentSpanId": "b7ad6b7169203331",
+      "service": "payments",
+      "operation": "POST /pay",
+      "startNs": 1790000000020000000,
+      "endNs": 1790000000160000000,
+      "durationNs": 140000000,
+      "kind": 2,
+      "status": "ERROR",
+      "statusMessage": "upstream timeout",
+      "attributes": { "http.method": "POST", "http.status_code": "502" },
+      "events": [],
+      "links": [],
+      "samplingReason": "error",
+      "partial": false,
+      "late": false,
+      "duplicate": false,
+      "conflict": false
+    }
+  ],
+  "truncated": false,
+  "partial": false,
+  "partialReasons": [],
+  "samplingReasons": ["error"],
+  "lateSpanCount": 0,
+  "duplicateSpanCount": 0,
+  "conflictSpanCount": 0
+}
+```
+</ResponseExample>
+
+例では、1 つのスパンの主要なフィールドを示しています。実際のスパンには、`traceFlags`、`traceState`、`resource`、`scope`、`dropped_*_count` カウンター、`schemaVersion`、`semanticConventionsVersion` も含まれます。
+
+| フィールド | 備考 |
+|---|---|
+| `rootSpanId` | 親を持たない最初のスパンの ID です。`span_id` と `parent_span_id` からツリーを構築してください。 |
+| `spans[].status` | `OK`、`ERROR`、`UNSET` のいずれかです。 |
+| `spans[].attributes` | スパン属性を、ストリームでフラット化された属性カラムとマージしたものです。 |
+| `spans[].sampling_reason` | テールサンプラーがトレースを保持した理由です。たとえば `error` です。 |
+| `partial`, `partialReasons` | スパンが欠けているかどうかと、その理由です。 |
+| `lateSpanCount`, `duplicateSpanCount`, `conflictSpanCount` | 遅れて到着したスパン、重複したスパン、競合したスパンの件数です。 |
+
+## トレースにリンクするスパンを検索する
+
+```http
+GET /api/v1/web/trace/{traceId}/linked
+```
+
+スパンは、そのスパンの前段にあたるスパンへのリンクを保持します。トレース詳細では、スパンとともにこれらのリンクを返します。この呼び出しでは、逆方向のリンクを検索します。つまり、対象トレース内のスパンをリンク先に指定している、別のトレースのスパンを探します。トレース詳細と同じ `from` と `to` を受け取り、その時間範囲内を検索します。
+
+<ResponseExample>
+```json 200
+{
+  "spans": [
+    {
+      "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "spanId": "00f067aa0ba902b7",
+      "service": "billing-worker",
+      "operation": "process invoice",
+      "startNs": 1790000005000000000,
+      "durationNs": 30000000,
+      "status": "OK",
+      "linkedSpanId": "53995c3f42cd8ad8",
+      "attributes": { "messaging.operation": "process" }
+    }
+  ],
+  "more": false
+}
+```
+</ResponseExample>
+
+`spans` は、リンク元のスパンを新しい順に最大 200 件並べます。対象トレースにリンクするスパンがほかにもある場合、`more` は `true` です。`linkedSpanId` は対象トレース内のリンク先スパンの ID で、`attributes` にはリンクの属性が含まれます。
+
+トレース数の取得と同じ制限時間内で、指定範囲にあるすべてのスパンのリンクをテキストとして読み取ります。検索を完了できない場合も、API は空の `spans` と `unavailable` の理由を添えて `200` を返します。理由はトレース数の取得と同じく、`time_budget`、`busy`、`scan_limit` のいずれかです。
+
+**エラー**
+
+| ステータス | 原因 |
+|---|---|
+| `400` | パラメーターが無効です。`to` が `from` 以下、フィルターに不明なフィールドまたは演算子がある（`unsupported trace filter field: nope`）、`in` フィルターの値が 0 件または 65 件以上、`where` が条件ツリーではないか制限を超えている、`expression` を `q`、`filters`、`where` のいずれかと併用しているか解析できない部分がある、カーソルがクエリと一致しない、`fields` に不明なフィールドまたはドキュメント型のフィールドがある、あるいは `trace_id` の文字や長さが無効です。トレース数の取得では、時間範囲かバケットパラメーターが指定されていない、`bucketTime` が `1000` 未満、`originTime` が `from` より後、またはリクエストの範囲が 512 バケットを超えています。トレース詳細とリンク元スパンの取得では、`from` と `to` の一方しか指定していないか、時間範囲が 31 日間を超えています。 |
+| `403` | トークンに `traces.read` 権限がありません。 |
+| `404` | 時間範囲内にトレースが見つからないか、サンプリングで除外されています。 |

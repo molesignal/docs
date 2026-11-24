@@ -1,0 +1,300 @@
+---
+title: "Consultas"
+sidebarTitle: "Visão geral"
+description: "Execute consultas SQL, consultas de métricas compatíveis com PromQL, buscas em tempo real e tarefas assíncronas nos fluxos de dados da organização."
+"en_link": "/en-US/query"
+"zh-Hans_link": "/zh-Hans/query"
+"zh-Hant_link": "/zh-Hant/query"
+"ja_link": "/ja/query"
+"ko_link": "/ko/query"
+"de_link": "/de/query"
+"es_link": "/es/query"
+"fr_link": "/fr/query"
+---
+
+O MoleSignal oferece um único endpoint de consulta com **DataFusion**. O endpoint oferece suporte completo a SQL, incluindo junções, CTEs e funções de janela, além de um **subconjunto de PromQL** para métricas. Todas as consultas usam o mesmo armazenamento.
+
+## Endpoint de consulta
+
+```http
+POST /api/v1/query
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+O endpoint exige a permissão `streams.query`.
+
+### Corpo da solicitação
+
+| Campo | Tipo | Obrigatório | Observações |
+|---|---|---|---|
+| `orgId` | string | Sim | Inclua o campo. O endpoint ignora o valor e usa a organização autenticada. |
+| `language` | string | Sim | `sql` ou `promql`. |
+| `statement` | string | Sim | Texto da consulta. |
+| `timeRange` | objeto | Sim | `{ "start": <microseconds>, "end": <microseconds> }`, em microssegundos desde a época Unix. |
+| `stream` | objeto | Para SQL | `{ "name": "app", "streamType": "logs" }`. Identifica a tabela principal da consulta. Inclua os dois campos. |
+| `limit` | inteiro | Não | Limite de linhas. |
+
+O parâmetro de consulta `clusters` seleciona clusters remotos para uma [busca federada](#busca-federada).
+
+### Resposta
+
+A resposta inclui `columns`, `rows` no formato de array, `scannedRows` e `tookMs`:
+
+```json
+{
+  "columns": ["level", "n"],
+  "rows": [["error", 2], ["info", 2]],
+  "scannedRows": 4,
+  "tookMs": 155
+}
+```
+
+Cada célula segue o tipo da coluna:
+
+| Tipo de coluna | Valor JSON |
+|---|---|
+| Valor ausente | `null`. |
+| Inteiro, ponto flutuante | Número. `NaN` e infinito retornam `null`. |
+| Decimal | Número para precisão de até 15 dígitos. Acima disso, uma string preserva todos os dígitos. |
+| Texto | String. |
+| Binário | String hexadecimal em minúsculas. |
+| Carimbo de data e hora | Número inteiro de microssegundos desde a época Unix, independentemente da unidade de tempo ou do fuso horário. |
+| Data, hora | String como `2022-01-08` ou `01:01:01.500`. |
+| Lista, estrutura, mapa | Array, objeto, objeto. |
+| Outros tipos | String. |
+
+As respostas federadas também podem incluir metadados de federação.
+
+<Note>
+  Envie `Accept: application/x-ndjson` para receber um objeto JSON por linha em streaming, seguido de um registro final
+  `{"__meta__": {...}}` com `scannedRows` e `tookMs`. O streaming não usa o cache de resultados.
+</Note>
+
+## Intervalos de tempo e tarefas assíncronas
+
+Use um `timeRange` com início e fim definidos para consultas interativas. Para estimar o tamanho de uma consulta, o MoleSignal multiplica a duração do intervalo em segundos por `[querier].estimate_throughput_per_sec`. Quando a estimativa atinge `[querier].auto_async_threshold_rows`, o MoleSignal executa a consulta como uma tarefa de busca persistente. Com os valores padrão, isso corresponde a um intervalo de 50.000 segundos, ou cerca de 13,9 horas.
+
+Uma consulta assíncrona retorna `202` com a tarefa para acompanhamento:
+
+```json
+{
+  "jobId": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+Controle o modo com o cabeçalho de solicitação `Prefer`:
+
+| Cabeçalho | Efeito |
+|---|---|
+| `Prefer: respond-async` | Sempre cria uma tarefa de busca. |
+| `Prefer: respond-sync` | Executa a consulta na própria solicitação, mesmo com um intervalo longo. |
+
+O MoleSignal sempre executa consultas ao fluxo `_audit` na própria solicitação, independentemente do intervalo ou do cabeçalho `Prefer`. O envio de uma tarefa de busca para esse fluxo retorna `400`. Consulte [Fluxo de auditoria](/pt-BR/settings/data-security#fluxo-de-auditoria).
+
+Acompanhe as tarefas com estes endpoints:
+
+| Endpoint | Finalidade |
+|---|---|
+| `POST /api/v1/query/jobs` | Envie uma tarefa diretamente. |
+| `GET /api/v1/query/jobs` | Liste as tarefas, das mais recentes às mais antigas. Aceita `state` (valores separados por vírgulas, como `pending,running`), `limit` (padrão: 100) e `offset`. Um estado desconhecido retorna `400`. |
+| `GET /api/v1/query/jobs/summary` | Consulte a quantidade de tarefas em cada estado e o total. |
+| `GET /api/v1/query/jobs/{id}` | Consulte o estado, os carimbos de data e hora, `resultRows`, `error` e `expiresAt`. |
+| `GET /api/v1/query/jobs/{id}/results` | Consulte as linhas como objetos, com `page`, `pageSize` (padrão: 1000) e `hasMore`. |
+| `POST /api/v1/query/jobs/{id}/cancel` | Cancele uma tarefa em execução. |
+| `POST /api/v1/query/jobs/{id}/retry` | Execute novamente uma tarefa que falhou ou foi cancelada. |
+| `DELETE /api/v1/query/jobs/{id}` | Remova uma tarefa. |
+
+A tarefa mantém o resultado por sete dias. As tarefas informam os estados `pending`, `running`, `done`, `failed` e `cancelled`.
+
+A tarefa também informa o tipo em `kind` (`query` ou `backfill`, com o `pipelineId` no caso de `backfill`), a tentativa em `attempt`, a solicitação enviada em `request` e o usuário responsável pelo envio em `userId` e `submittedBy`.
+
+Cada usuário pode consultar e alterar as próprias tarefas. Com a permissão `org.running_queries.cancel`, o usuário pode consultar e alterar todas as tarefas da organização. A API retorna `404` tanto para tarefas de outro usuário quanto para tarefas inexistentes. A lista e o resumo incluem apenas as tarefas que o usuário pode consultar. A página **Tarefas de busca**, em **Fluxos**, exibe as mesmas tarefas. Consulte [Fluxos](/pt-BR/streams#tarefas-de-busca).
+
+## SQL
+
+Uma instrução SQL indica um fluxo em `FROM`, e o campo `stream` da solicitação indica o mesmo fluxo principal:
+
+```bash
+NOW=$(date +%s)000000
+curl -X POST http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"timeRange\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
+       \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+```
+
+### Junção entre sinais
+
+Logs, métricas e rastreamentos ficam no mesmo armazenamento, o que permite combiná-los em uma única consulta. Indique o fluxo principal em `stream` e faça referência aos outros fluxos pelo nome. Por exemplo, use `trace_id` para juntar os logs de erro aos spans correspondentes:
+
+```sql
+SELECT l.msg, t.name, t.duration_ns
+FROM app AS l
+JOIN traces AS t ON l.trace_id = t.trace_id
+WHERE l.level = 'error'
+```
+
+### Versões atuais das linhas de RUM
+
+`rum_views_latest` e `rum_sessions_latest` leem `rum_views` e `rum_sessions` e retornam apenas a versão mais recente de cada visualização ou sessão. Indique o fluxo em `stream` ou especifique a própria view. O intervalo de tempo da solicitação limita as linhas, de modo que `SELECT count(*) FROM rum_views_latest WHERE "application.id" = 'shop'` conta as visualizações que começaram no intervalo. O [mascaramento de campos](/pt-BR/settings) do fluxo se aplica a essas linhas.
+
+### Busca de texto
+
+| Função | Comportamento |
+|---|---|
+| `MATCH(field, 'text')` | Busca uma substring em qualquer campo, sem diferenciar maiúsculas de minúsculas. `%`, `_` e `*` são caracteres literais. |
+| `MATCH_TEXT(field, 'query')` | Faz uma busca de texto completo em um campo com `indexType` definido como `full_text`. Se o campo não tiver esse índice, a consulta falha com `MATCH_TEXT: field ... has no full-text index configured`. |
+
+Em `MATCH_TEXT`, cada palavra separada por espaços deve aparecer como substring em qualquer parte do valor, sem diferenciar maiúsculas de minúsculas. `"a b"` é uma frase que deve aparecer como foi escrita. Uma palavra com `*` corresponde ao valor inteiro: `error*` corresponde a um valor que começa com error, e `*error`, a um que termina com error. A busca também aceita `a OR b` e `-a`, que exclui um termo. Textos em CJK não precisam de separadores entre palavras: `登录超时` corresponde a um valor com esses quatro caracteres consecutivos. Adicione o índice ao criar um fluxo ou editar seu esquema. Consulte [Fluxos](/pt-BR/streams#esquema-e-campos).
+
+```sql
+SELECT * FROM app WHERE MATCH(msg, 'timeout');
+SELECT * FROM app WHERE MATCH_TEXT(msg, 'panic "disk full" -debug');
+```
+
+### Redes IP
+
+| Função | Comportamento |
+|---|---|
+| `CIDR_MATCH(field, 'network')` | Retorna verdadeiro quando o endereço pertence à rede, especificada como `10.0.0.0/8`, `2001:db8::/32` ou como um único endereço. A função mapeia IPv4 para IPv6 antes da comparação, então `10.0.0.0/8` também corresponde a `::ffff:10.1.2.3`. Se o valor não for um endereço, a função retorna falso. Se a rede estiver em um formato inválido, a consulta falha. |
+
+```sql
+SELECT client_ip, count(*) FROM access WHERE CIDR_MATCH(client_ip, '10.0.0.0/8') GROUP BY client_ip
+```
+
+### Condições que ignoram arquivos
+
+O MoleSignal usa os índices dos campos em `WHERE` para ignorar arquivos que não podem conter uma linha correspondente. Para cada condição, o MoleSignal usa o índice aplicável para verificar se nenhuma linha do arquivo pode satisfazê-la. Depois, combina as condições conforme a consulta: ignora o arquivo se qualquer condição ligada por `AND` não puder ser satisfeita ou se nenhum ramo de um `OR` puder ser satisfeito, mesmo que use índices diferentes para cada ramo. Uma condição sem índice aplicável, como uma condição sob `NOT` ou sobre um valor calculado, não elimina nenhum arquivo. O resultado continua correto, mas a consulta lê mais arquivos.
+
+| Condição | Índices usados |
+|---|---|
+| `=`, `IN` | `exact`, `bloom` (texto e `int64`), `skip` |
+| `<`, `<=`, `>`, `>=`, `BETWEEN`, `!=`, `NOT IN`, `LIKE 'abc%'` | Os valores mínimos e máximos de `exact`, `bloom`, `skip` e `range`, e os conjuntos de valores de `skip` |
+| Literais de `MATCH`, `MATCH_TEXT`, `LIKE` e `ILIKE` | `full_text`, `ngram` e os valores de `exact` |
+| `CIDR_MATCH`, `=` em um endereço | `ip` |
+| `IS NULL`, `IS NOT NULL` | Qualquer índice: cada campo indexado contabiliza as linhas em que está vazio |
+| `json_text(field, 'key') = 'value'`, `IN`, `IS NOT NULL` | `key_value` |
+| `=`, `IN`, `LIKE 'abc%'` no campo usado para divisão | [Divisão por campo](/pt-BR/streams#particionar-por-campo): hash para `=` e `IN`, primeiro caractere para as três condições |
+
+Ao ler um arquivo, uma consulta com um literal em `LIKE`, `ILIKE` ou `MATCH` em um campo com índice `ngram` lê apenas os blocos de 1.024 linhas cujos fragmentos de cinco bytes podem conter o literal (se o literal tiver menos de cinco bytes, a consulta lê todos os blocos). Se `=` ou `IN` em um campo com índice `exact` corresponder a poucas linhas, a consulta lê apenas as páginas dessas linhas. Se o arquivo tiver linhas [agrupadas](/pt-BR/streams#agrupar-por-campo), `=` ou `IN` em um campo de agrupamento lê apenas as páginas de cada intervalo de tempo que podem conter o valor.
+
+### Carimbos de data e hora em SQL
+
+`_timestamp` é uma coluna do tipo `Timestamp(µs, "UTC")`. Ao comparar um literal inteiro com `_timestamp`, o SQL interpreta o inteiro como o número de microssegundos desde a época Unix. Por isso, os dois filtros abaixo selecionam as mesmas linhas:
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= 1790000000000000
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+```sql
+SELECT msg FROM app
+WHERE _timestamp <= to_timestamp_micros(1790000000000000)
+ORDER BY _timestamp DESC
+LIMIT 5
+```
+
+O SQL só interpreta literais como microssegundos. Para comparar `_timestamp` com uma expressão ou outra coluna, converta o valor com `to_timestamp_micros(...)`. Leia o valor em microssegundos de uma linha com `CAST(_timestamp AS BIGINT)`.
+
+### Campos criptografados
+
+`decrypt(field)` recupera o texto simples de um campo marcado como criptografado. Consulte [Fluxos](/pt-BR/streams#campos-criptografados).
+
+## PromQL
+
+Defina `language` como `promql` para executar consultas PromQL em fluxos de métricas. Um seletor de métricas indica uma métrica, e todos os fluxos que a contêm respondem à consulta: `metric_name` armazena o nome da métrica, a coluna `value` armazena a amostra e as demais colunas são rótulos. Sem `step`, o MoleSignal avalia a expressão como uma consulta instantânea em `time_range.end` e retorna uma linha por série, com `value` primeiro e os rótulos em seguida. Com `step` em microssegundos, o MoleSignal avalia uma consulta de intervalo de `time_range.start` a `time_range.end` e retorna uma linha por série e por passo, com `_timestamp` e `value` nas primeiras colunas. Cada série tem no máximo 11.000 passos, e `limit` limita o número de linhas por meio de amostragem uniforme em cada série:
+
+```json
+{
+  "orgId": "<org>",
+  "language": "promql",
+  "statement": "sum by (service) (http_requests_total)",
+  "timeRange": { "start": 1790000000000000, "end": 1790003600000000 }
+}
+```
+
+O suporte é amplo. Inclui a família de funções de taxa e todas as funções `*_over_time`, as agregações padrão, como `topk` e `limitk`, `histogram_quantile`, `label_replace` e `label_join`, funções matemáticas e trigonométricas, os operadores de conjunto `and`, `or` e `unless` com correspondência por `on`, `ignoring`, `group_left` e `group_right`, os modificadores de seletor `@` e `offset` e subconsultas.
+
+<Card title="Matriz de suporte a PromQL" icon="table-list" href="/pt-BR/query/promql-subset">
+  Lista completa das funções, dos operadores e dos modificadores compatíveis, além das lacunas conhecidas
+  (funções para histogramas nativos e preenchimento com o operador binário `default`).
+</Card>
+
+## Busca no contexto de um evento
+
+`POST /api/v1/query/search_around` retorna os eventos imediatamente anteriores e posteriores a um evento específico para facilitar a análise do contexto de uma linha de log durante uma investigação. Consulte [Busca no contexto de um evento](/pt-BR/api/query/search-around).
+
+## Inspeção e controle
+
+- `POST /api/v1/query/inspect` planeja uma consulta sem executá-la e retorna os metadados da consulta e o plano lógico.
+- `POST /api/v1/query/recommendations` analisa o perfil de uma consulta sem executá-la.
+- `GET /api/v1/query/running` e `POST /api/v1/query/{id}/cancel` permitem que administradores da organização inspecionem e cancelem consultas em andamento.
+- `GET /api/v1/query/sql/capabilities` e `GET /api/v1/query/promql/capabilities` listam as funções compatíveis para uso em editores.
+
+As consultas padrão exigem `streams.query`. A administração de consultas em andamento exige `org.running_queries.read` ou `org.running_queries.cancel`.
+
+## Busca federada
+
+Adicione `?clusters=local,cluster-name` ao endpoint de consulta para fazer uma busca federada. Quando um cluster remoto está inacessível, os metadados da federação o indicam como degradado. O MoleSignal nunca substitui seus dados por dados locais sem avisar. Consulte [Implantação baseada em funções](/pt-BR/deployment/role-based#consulta-federada).
+
+## Campos armazenados
+
+Os campos de um fluxo dependem dos dados enviados. A ingestão via OTLP gera os campos abaixo. Os atributos de recurso e de registro viram campos de nível superior com as chaves originais, como `service.name`, e mantêm os tipos numéricos.
+
+### Campos de logs OTLP
+
+| Campo | Conteúdo |
+|---|---|
+| `_timestamp` | Horário do evento em microssegundos, obtido de `timeUnixNano`. |
+| `body` | Corpo do log. |
+| `severity_text`, `severity_number` | Severidade do OTLP. |
+| `trace_id`, `span_id` | Identificadores de correlação em hexadecimal minúsculo. |
+| `scope_name`, `scope_version` | Escopo da instrumentação. |
+| Atributos de recurso e de registro | Um campo de nível superior por atributo. |
+
+### Campos de spans de traces
+
+| Campo | Conteúdo |
+|---|---|
+| `_timestamp` | Início do span em microssegundos. |
+| `trace_id`, `span_id`, `parent_span_id` | Identificadores do span e do span pai. |
+| `name`, `kind` | Nome e tipo do span. |
+| `start_time_unix_nano`, `end_time_unix_nano`, `duration_ns` | Tempos em nanossegundos. |
+| `status_code`, `status_message` | `OK`, `ERROR` ou `UNSET`, com a mensagem. |
+| `attributes`, `resource`, `scope`, `events`, `links` | Estruturas completas do OTLP como texto JSON. |
+| Chaves de atributos como `http.method` e `service.name` | Cópias dos atributos em campos de nível superior. |
+| `sampling_reason` e campos de controle | Motivo pelo qual a amostragem ao final do trace o manteve, além dos sinalizadores `partial`, `late`, `duplicate` e `conflict`. |
+
+Os campos `trace_id` e `span_id` identificam o span. O MoleSignal descarta spans reenviados como duplicatas.
+
+### Campos de métricas OTLP
+
+O MoleSignal converte cada ponto de dados OTLP em um único evento de métrica. Os atributos de recurso, de escopo e do ponto de dados continuam disponíveis para consulta. Os campos reservados abaixo têm prioridade sobre atributos com o mesmo nome.
+
+| Campo | Significado |
+|---|---|
+| `metric_name` | Nome da métrica OTLP, usado para selecioná-la em PromQL: `{"http.server.duration"}`. |
+| `metric_kind` | `gauge`, `counter`, `up_down_counter`, `histogram`, `exponential_histogram` ou `summary`. |
+| `metric_description`, `metric_unit` | Presentes quando não estão vazios. |
+| `metric_temporality` | `delta`, `cumulative`, `unspecified` ou `unknown:<value>`. Ausente em métricas do tipo `gauge`. |
+| `metric_monotonic` | Indica se a soma é monotônica. O MoleSignal armazena somas monotônicas como `counter`. |
+| `metric_start_time_unix_nano` | Início do intervalo de agregação, quando diferente de zero. |
+| `value` | Valor escalar de um ponto de uma métrica do tipo `gauge` ou de uma soma. |
+| `count`, `sum`, `min`, `max` | O MoleSignal armazena os quatro valores para pontos de histogramas. Para histogramas exponenciais e resumos, armazena apenas `count` e `sum`. |
+
+O MoleSignal não armazena os limites nem as contagens dos buckets de histogramas, nem os quantis de resumos.
+
+O MoleSignal armazena os pontos delta sem alterações. As funções de taxa do PromQL consultam a temporalidade armazenada: `increase` soma os valores delta na janela, `rate` divide essa soma pela duração da janela e `irate` divide o valor delta mais recente pelo intervalo correspondente. Para somas monotônicas cumulativas, as funções levam em conta as reinicializações dos contadores. Se um exportador mudar a temporalidade dentro de uma janela, as funções avaliam apenas a sequência mais recente de pontos com a mesma semântica.
+
+O OTLP sobre HTTP aceita protobuf (`http/protobuf`) e JSON para métricas, logs e traces. A codificação JSON representa inteiros de 64 bits como strings, por exemplo, `"asInt": "340"` e `"count": "4"`. O MoleSignal lê tanto strings quanto números sem aspas.
+
+## Cache
+
+As consultas usam caches no próprio processo para manter referências a índices abertos, resultados de janelas de tempo já encerradas, contagens de termos de busca e rodapés dos índices. Para o armazenamento remoto de objetos, um cache em disco guarda intervalos de bytes dos objetos em `./data/cache/objects`, com capacidade padrão de 10 GiB. O cache não altera o contrato de resposta. Use `/metrics` para medir o comportamento dos caches e consulte [Configuração](/pt-BR/configuration#caches) para dimensioná-los.

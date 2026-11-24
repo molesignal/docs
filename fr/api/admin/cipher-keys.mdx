@@ -1,0 +1,110 @@
+---
+title: "Clés de chiffrement"
+description: "Listez, créez, renouvelez et supprimez les clés de chiffrement des champs d’une organisation."
+"en_link": "/en-US/api/admin/cipher-keys"
+"zh-Hans_link": "/zh-Hans/api/admin/cipher-keys"
+"zh-Hant_link": "/zh-Hant/api/admin/cipher-keys"
+"ja_link": "/ja/api/admin/cipher-keys"
+"ko_link": "/ko/api/admin/cipher-keys"
+"de_link": "/de/api/admin/cipher-keys"
+"es_link": "/es/api/admin/cipher-keys"
+"pt-BR_link": "/pt-BR/api/admin/cipher-keys"
+---
+
+Les clés de chiffrement chiffrent les champs que les flux marquent comme chiffrés. Chaque clé AES-256-GCM comporte 32 octets. MoleSignal encapsule le matériel de clé à l’aide de la clé racine fournie par `MS_CIPHER_KEY` et ne renvoie jamais ce matériel. Consultez la section [Sécurité](/fr/security#chiffrement-au-niveau-des-champs).
+
+Le chiffrement des nouvelles valeurs utilise toujours la version la plus récente de la clé par défaut `__field_default__`. MoleSignal crée cette clé dès qu’un flux en a besoin. Les autres clés nommées et les versions antérieures de chaque clé restent utilisables pour déchiffrer les valeurs écrites avec ces clés.
+
+| Opération | Point de terminaison | Autorisation |
+|---|---|---|
+| Lister les clés | `GET /api/v1/cipher_keys` | `org.cipher_keys.read` |
+| Récupérer une clé | `GET /api/v1/cipher_keys/{name}` | `org.cipher_keys.read` |
+| Créer une clé | `POST /api/v1/cipher_keys` | `org.cipher_keys.manage` |
+| Effectuer la rotation d’une clé | `POST /api/v1/cipher_keys/{name}/rotate` | `org.cipher_keys.rotate` |
+| Supprimer une clé | `DELETE /api/v1/cipher_keys/{name}` | `org.cipher_keys.manage` |
+| Effectuer la rotation de la clé par défaut | `POST /api/v1/field_encryption/rotate` | `org.cipher_keys.rotate` |
+
+## Métadonnées des clés
+
+Les appels de listage, de récupération, de création et de rotation renvoient les métadonnées des versions des clés. Le listage renvoie toutes les versions de chaque clé, de la plus récente à la plus ancienne pour chaque nom.
+
+```json
+{
+  "id": "3KEZizkQsvBwoWQihNO6OdxRiSf",
+  "name": "payments-key",
+  "alg": "aes-256-gcm",
+  "version": 1,
+  "createdAt": 1790000000000000,
+  "rotatedAt": null
+}
+```
+
+Le champ `rotatedAt` vaut `null` pour une clé qui n’a jamais fait l’objet d’une rotation. L’appel de récupération renvoie la version la plus récente.
+
+## Créer une clé
+
+```http
+POST /api/v1/cipher_keys
+```
+
+| Champ | Type | Obligatoire | Remarques |
+|---|---|---|---|
+| `name` | chaîne | Oui | Nom de la clé. Si le nom existe déjà, l’appel renvoie `409` et le message indique d’utiliser l’appel de rotation. |
+| `keyMaterialB64` | chaîne | Oui | 32 octets aléatoires encodés en base64 standard avec remplissage. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/cipher_keys \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"name\": \"payments-key\", \"key_material_b64\": \"$(openssl rand -base64 32)\"}"
+```
+</RequestExample>
+
+La réponse contient les métadonnées de la clé présentées ci-dessus.
+
+## Effectuer la rotation d’une clé
+
+```http
+POST /api/v1/cipher_keys/{name}/rotate
+```
+
+Le corps de la requête contient `keyMaterialB64`, comme pour l’appel de création. L’appel ajoute une version avec le nouveau matériel de clé et conserve les versions antérieures pour le déchiffrement. Si aucune clé ne porte ce nom, l’appel renvoie `404`. Créez d’abord la clé avec l’appel de création.
+
+## Supprimer une clé
+
+```http
+DELETE /api/v1/cipher_keys/{name}
+```
+
+L’appel supprime toutes les versions de la clé indiquée et renvoie `{"deleted": true}`. Si aucune clé ne porte ce nom, l’appel renvoie `404`. L’appel ne vérifie pas si des données stockées dépendent encore de la clé.
+
+<Warning>
+  La suppression d’une clé rend impossible le déchiffrement des valeurs chiffrées avec cette clé. Vérifiez les champs chiffrés
+  qui dépendent de la clé avant de la supprimer.
+</Warning>
+
+## Effectuer la rotation de la clé par défaut
+
+```http
+POST /api/v1/field_encryption/rotate
+```
+
+L’appel génère un nouveau matériel de clé sur le serveur, ajoute une version de `__field_default__` et actualise immédiatement le cache de déchiffrement. Les nouvelles écritures utilisent la nouvelle version et les valeurs existantes restent lisibles. Si l’organisation ne dispose pas encore de clé par défaut, l’appel la crée en version 1. Le corps de la requête est vide et la réponse contient l’identifiant et la version de la nouvelle clé :
+
+```json
+{
+  "keyId": "3KEZj3uxMx5OOFX6NiYv3VFnfmD",
+  "version": 2
+}
+```
+
+**Erreurs**
+
+| Statut | Cause |
+|---|---|
+| `400` | La valeur de `keyMaterialB64` n’est pas encodée en base64 valide ou son décodage ne donne pas exactement 32 octets (`key_material must be 32 bytes, got 5`). |
+| `403` | Le jeton ne dispose pas de l’autorisation requise pour cet appel. |
+| `404` | L’appel de récupération, de rotation ou de suppression n’a trouvé aucune clé portant ce nom. |
+| `409` | Une clé porte déjà ce nom. |
+| `422` | Un champ obligatoire manque. La réponse est au format texte brut. |

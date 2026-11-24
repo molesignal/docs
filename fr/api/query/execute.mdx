@@ -1,0 +1,126 @@
+---
+title: "Exécuter une requête"
+description: "Exécutez des requêtes SQL ou PromQL sur les flux d’une organisation."
+"en_link": "/en-US/api/query/execute"
+"zh-Hans_link": "/zh-Hans/api/query/execute"
+"zh-Hant_link": "/zh-Hant/api/query/execute"
+"ja_link": "/ja/api/query/execute"
+"ko_link": "/ko/api/query/execute"
+"de_link": "/de/api/query/execute"
+"es_link": "/es/api/query/execute"
+"pt-BR_link": "/pt-BR/api/query/execute"
+---
+
+```http
+POST /api/v1/query
+GET  /api/v1/query
+```
+
+Exécute une requête et renvoie les lignes, ou lance une tâche de recherche asynchrone pour une requête volumineuse. L’appel nécessite `streams.query`, ou `sys.telemetry.read` pour la télémétrie système.
+
+**Corps**
+
+| Champ | Type | Obligatoire | Remarques |
+|---|---|---|---|
+| `orgId` | chaîne | Oui | Le champ est obligatoire, mais l’API ignore sa valeur. L’API utilise l’organisation associée à l’authentification. |
+| `language` | chaîne | Oui | `sql` ou `promql`. |
+| `statement` | chaîne | Oui | Texte de la requête. |
+| `timeRange` | objet | Oui | `{ "start": <microseconds>, "end": <microseconds> }`. |
+| `stream` | objet | Pour SQL | `{ "name": "app", "streamType": "logs" }` désigne la table principale. Les deux champs sont obligatoires et le type doit être `logs`, `metrics`, `traces`, `profiles` ou `extend`. |
+| `limit` | entier | Non | Nombre maximal de lignes. Pour respecter cette limite, une requête PromQL sur une plage temporelle échantillonne chaque série à intervalles réguliers. |
+| `step` | entier | Non | PromQL uniquement. Pas d’une requête sur une plage temporelle, en microsecondes. Avec `step`, PromQL renvoie une valeur par série à chaque pas de `start` à `end` ; sans ce paramètre, PromQL renvoie la valeur à `end`. Une série compte au maximum 11 000 pas : un pas plus petit entraîne une réponse `400`. |
+
+**Paramètres de requête d’un GET**
+
+`GET /api/v1/query` accepte la même requête dans les paramètres de l’URL. Pour relancer la lecture,
+copiez et rouvrez cette URL. L’API répond comme pour `POST`, respecte les mêmes en-têtes et exige
+la même permission. Si le texte de la requête est trop long pour une URL, utilisez `POST` : un proxy devant le
+serveur peut refuser une ligne de requête de plus de 8 KB.
+
+| Paramètre | Obligatoire | Remarques |
+|---|---|---|
+| `language` | Oui | `sql` ou `promql`. |
+| `statement` | Oui | Texte de la requête, encodé pour l’URL. |
+| `start`, `end` | Oui | Plage temporelle en microsecondes. |
+| `stream`, `streamType` | Pour SQL | Table principale et son type. Indiquez les deux ensemble. |
+| `limit` | Non | Nombre maximal de lignes. |
+| `step` | Non | Pas d’une requête PromQL sur une plage temporelle, en microsecondes. |
+
+**En-têtes et paramètres de requête**
+
+| Nom | Effet |
+|---|---|
+| `Prefer: respond-async` | Crée une tâche de recherche et renvoie `202`. Une requête sur `_audit` reste synchrone. |
+| `Prefer: respond-sync` | Exécute la requête de façon synchrone, même sur une longue plage temporelle. |
+| `Accept: application/x-ndjson` | Renvoie en flux un objet JSON par ligne, puis un enregistrement `{"__meta__": ...}`. |
+| `?clusters=local,remote` | Inclut les clusters distants dans une recherche fédérée. |
+
+<RequestExample>
+```bash cURL
+NOW=$(date +%s)000000
+
+curl -X POST http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"timeRange\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
+       \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+```
+
+```bash cURL (GET)
+NOW=$(date +%s)000000
+
+curl -G http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'language=promql' \
+  --data-urlencode 'statement=sum(rate(http_requests_total[5m]))' \
+  --data-urlencode "start=$((NOW-3600000000))" \
+  --data-urlencode "end=$NOW" \
+  --data-urlencode 'step=60000000'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "columns": ["level", "n"],
+  "rows": [["error", 12], ["info", 40]],
+  "scannedRows": 10432,
+  "tookMs": 18
+}
+```
+</ResponseExample>
+
+Une réponse PromQL contient une ligne par valeur. Une requête sur une plage temporelle renvoie les colonnes `_timestamp` (en microsecondes) et `value`, ainsi qu’une colonne par étiquette, avec une ligne par série et par pas. Une requête sans `step` renvoie `value` et les colonnes des étiquettes, avec une ligne par série.
+
+```json
+{
+  "columns": ["_timestamp", "value", "service.name"],
+  "rows": [[1761638400000000, 0.42, "checkout"], [1761638460000000, 0.40, "checkout"]],
+  "scannedRows": 2,
+  "tookMs": 6
+}
+```
+
+L’API renvoie `202` si le nombre estimé de lignes d’une requête atteint `[querier].auto_async_threshold_rows` :
+
+```json
+{
+  "jobId": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+Consultez [Requêtes](/fr/query#plages-temporelles-et-tâches-asynchrones) pour connaître les seuils et les points de terminaison des tâches.
+
+**Erreurs**
+
+| Statut | Cause |
+|---|---|
+| `400` | L’API ne peut pas établir de plan d’exécution, l’indication `stream` manque pour SQL (`query.stream hint is required`), le pas PromQL `step` n’est pas strictement positif ou donne plus de 11 000 pas pour une série, ou la requête lirait plus de lignes que ne l’autorise `[querier].max_scan_rows`. Pour une requête `GET`, l’API renvoie aussi `400` si un paramètre obligatoire manque ou si `stream` figure sans `streamType`. |
+| `503` | Dans un cluster dont les rôles sont répartis, aucun nœud `querier` n’est actif (`no querier node is available`). |
+| `403` | Le flux n’existe pas dans l’organisation (`stream not found: <name>`), le jeton n’a pas la permission `streams.query`, ou la requête lit `_audit` et le jeton n’a pas la permission `audit.read`. |
+| `422` | Un champ du corps manque ou n’a pas le bon type, par exemple `orgId` ou `streamType`. La réponse est en texte brut. |
+| `429` | Les requêtes du groupe de travail saturent le nœud et aucune place ne s’est libérée pour cette requête dans le délai [`[search.admission].max_wait_secs`](/fr/configuration#contrôle-d’admission), ou le groupe de travail a atteint sa limite à l’échelle du cluster. |

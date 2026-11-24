@@ -1,0 +1,119 @@
+---
+title: "정책·일정·라우팅 규칙 가져오기 및 내보내기"
+description: "에스컬레이션 정책, 온콜 일정, 라우팅 규칙을 참조 대상의 이름이 포함된 번들로 내보내고, 이러한 번들을 조직으로 가져옵니다."
+"en_link": "/en-US/api/alerting/oncall-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/oncall-transfer"
+"zh-Hant_link": "/zh-Hant/api/alerting/oncall-transfer"
+"ja_link": "/ja/api/alerting/oncall-transfer"
+"de_link": "/de/api/alerting/oncall-transfer"
+"es_link": "/es/api/alerting/oncall-transfer"
+"fr_link": "/fr/api/alerting/oncall-transfer"
+"pt-BR_link": "/pt-BR/api/alerting/oncall-transfer"
+---
+
+```http
+GET  /api/v1/alerts/escalations/export
+POST /api/v1/alerts/escalations/import
+GET  /api/v1/schedules/export
+POST /api/v1/schedules/import
+GET  /api/v1/alerts/routing/rules/export
+POST /api/v1/alerts/routing/rules/import
+```
+
+| 종류 | 내보내기 | 가져오기 | 형식 | 목록 키 |
+|---|---|---|---|---|
+| 에스컬레이션 정책 | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.escalation-policies/v1` | `policies` |
+| 온콜 일정 | `schedules.read` | `schedules.create` | `molesignal.schedules/v1` | `schedules` |
+| 라우팅 규칙 | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.routing-rules/v1` | `rules` |
+
+## 내보내기
+
+쿼리 매개변수 `ids`에 쉼표로 구분한 ID를 지정합니다. 비워 두면 모든 항목을 내보냅니다. 응답은 다음과 같은
+번들입니다.
+
+```json
+{
+  "format": "molesignal.escalation-policies/v1",
+  "policies": [
+    {
+      "name": "Payments on-call",
+      "steps": [
+        {"targets": [{"kind": "schedule", "schedule": "Payments primary"}], "ackTimeoutSecs": 300, "minSeverity": null},
+        {"targets": [{"kind": "user", "user": "lead@example.com"}], "ackTimeoutSecs": 600, "minSeverity": null}
+      ],
+      "repeat": false,
+      "maxLoops": 1,
+      "urgencyRule": {"mode": "by_severity"}
+    }
+  ]
+}
+```
+
+각 항목에는 정의가 포함되지만 ID와 조직은 포함되지 않습니다. 참조에는 이름을 사용합니다. `user`는 사용자
+이메일 주소이고, `team`, `schedule`, `policy`, `calendar`는 각각 팀, 온콜 일정,
+에스컬레이션 정책, 공휴일 캘린더의 이름입니다. 로테이션의 `members`에는 이메일 주소를 사용합니다. 일정에서는
+임시 대체 근무와 시간 정보를 제외하고, 라우팅 규칙에서는 순서상의 위치와 시간 정보를 제외합니다.
+
+## 가져오기
+
+| 필드 | 유형 | 필수 | 설명 |
+|---|---|---|---|
+| `content` | string | 예 | 해당 종류의 JSON 또는 YAML 번들입니다. 최대 크기는 4 MiB이며 최대 500개 항목을 포함할 수 있습니다. 일정은 [Opsgenie 또는 PagerDuty에서 일정 마이그레이션](/ko/alerting/schedule-migration)에서 설명하는 파일로도 가져올 수 있습니다. |
+| `dryRun` | boolean | 아니요 | 기본값은 `true`이며, 실제로 저장하지 않고 가져오기를 테스트합니다. `false`로 설정하면 저장합니다. |
+| `createOnly` | boolean | 아니요 | `true`로 설정하면 이름이 같은 기존 항목을 변경하지 않습니다. |
+
+이름을 기준으로 각 항목을 찾습니다. 같은 이름의 항목이 없으면 새로 만들고, 하나만 있으면 필드별로 비교합니다.
+같은 이름의 항목이 여러 개 있거나 파일에 같은 이름이 두 번 나오면 실패합니다. 모든 참조는 해당 조직에 있는 대상을 가리켜야
+하며, 각 항목은 저장할 때와 동일한 방식으로 검증합니다. 항목 하나라도 실패하면 아무것도
+저장하지 않습니다. 모두 통과하면 항목을 하나씩 저장하고, 동기화된 항목마다 페더레이션 변경 이벤트를 전송하며,
+감사 이벤트 하나를 기록합니다. 이벤트는 `escalation_policies.imported`, `schedules.imported`,
+`routing_rules.imported` 중 하나입니다.
+
+- 기존 일정을 가져올 때는 임시 대체 근무, 교대 근무 맞교환, 파일에 없는 설정을 그대로 유지합니다.
+- 가져온 라우팅 규칙은 파일에 나온 순서대로 맨 앞에 배치합니다. 나머지 규칙은 기존 순서를 유지한 채 그 뒤에 배치합니다.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content schedules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "molesignal.schedules/v1",
+  "items": [
+    {"name": "Payments primary", "action": "update", "changes": ["rotations"], "id": "3KC9..."},
+    {"name": "Payments nights", "action": "create"},
+    {"name": "Search", "action": "error", "error": "no user is named `ann@example.com`"}
+  ],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action`의 값은 `create`, `update`, `unchanged`, `skip`(`createOnly`가 설정된 상태에서 이미 존재하는 항목이거나 파일에 이름만 있는 PagerDuty
+교대 근무 기반 일정인 경우), `error` 중 하나입니다. `id`는 저장 후 생성하거나 업데이트한 항목의 ID입니다. `applied`는
+저장한 항목이 있는지 나타냅니다.
+
+`format`은 읽어 들인 형식을 나타냅니다. 값은 번들 형식, `pagerduty`, `opsgenie` 중 하나입니다. 일정에는 다음
+필드도 포함될 수 있습니다.
+
+| 필드 | 위치 | 설명 |
+|---|---|---|
+| `unknownMembers` | 항목 | 조직 내 멤버와 일치하지 않는 모든 이메일 주소입니다. |
+| `blockers` | 항목 | 이전할 수 없어 온콜 담당자가 달라지는 요소입니다. 하나라도 있으면 해당 항목을 `error`로 처리합니다. |
+| `findings` | 항목, 보고서 | 누락된 내용과 해당 항목이 원본 시스템에 표시되는 내용과 어떻게 다른지 보여 줍니다. |
+
+차단 요소와 발견 사항은 `{"code": "...", "params": {...}}` 형식으로 표시합니다. `code`는 메시지를 지정하고, `params`는
+메시지에 들어갈 값을 제공합니다.
+
+**오류**
+
+| 상태 | 이유 |
+|---|---|
+| `400` | 콘텐츠가 해당 종류의 번들이나 일정 가져오기에서 지원하는 파일이 아니거나, 다른 형식을 지정하거나, 크기 또는 항목 수 제한을 초과합니다. |
+| `403` | 토큰에 필요한 권한이 없습니다. |

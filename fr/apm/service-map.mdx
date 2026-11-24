@@ -1,0 +1,149 @@
+---
+title: "Carte des services"
+sidebarTitle: "Carte des services"
+description: "Visualisez en temps réel la topologie des appels entre services, générée automatiquement à partir des spans des traces."
+"en_link": "/en-US/apm/service-map"
+"zh-Hans_link": "/zh-Hans/apm/service-map"
+"zh-Hant_link": "/zh-Hant/apm/service-map"
+"ja_link": "/ja/apm/service-map"
+"ko_link": "/ko/apm/service-map"
+"de_link": "/de/apm/service-map"
+"es_link": "/es/apm/service-map"
+"pt-BR_link": "/pt-BR/apm/service-map"
+---
+
+La **Carte des services** affiche les appels entre services et leur état de santé à travers le débit de requêtes, le taux d’erreur
+et la latence (les métriques **RED**). MoleSignal construit automatiquement la carte à partir des traces existantes :
+le traçage standard ne nécessite aucune instrumentation supplémentaire.
+
+<Info>
+  La carte des services et l’[APM](/fr/apm) exploitent les mêmes traces, mais en proposent des vues différentes. La carte des services
+  associe les spans parents et enfants de services différents pour construire la topologie. L’APM produit des agrégats bornés par service,
+  transaction, dépendance, erreur et version.
+</Info>
+
+## Construction de la carte
+
+À mesure que les spans arrivent, MoleSignal associe chaque span à son parent. Les spans de **services
+différents** forment un lien d’appel — *service parent → service enfant* — qui reprend
+la durée et le statut d’erreur du span enfant (le service appelé). Les spans parents et enfants d’un même service sont internes et
+n’apparaissent pas sur la carte. Le lien relève de l’environnement du service appelant (`deployment.environment.name` ou
+`deployment.environment`) ou, à défaut, de celui du service appelé. MoleSignal n’associe pas les spans qu’un
+[pipeline en temps réel](/fr/pipelines#traces) écarte.
+
+MoleSignal regroupe les liens par paire de services dans des **intervalles d’une minute** et les enregistre en
+arrière-plan. La carte reflète ainsi le trafic récent avec un décalage d’environ 30 secondes.
+
+### Mode en mémoire ou mode stockage
+
+Par défaut (mode `intake`), le nœud qui reçoit les spans les associe **en mémoire**, ce qui réduit la
+latence. Dans un déploiement multinœud, si plusieurs nœuds reçoivent les spans d’un même appel, ils ne peuvent pas les associer
+en mémoire. La carte peut donc sous-estimer le nombre de liens. Elle n’ajoute jamais de lien qui n’existe pas.
+
+Pour obtenir une carte complète sur l’ensemble des nœuds, accédez à **Paramètres → Général → Source de données de la carte des services** et sélectionnez le
+mode **stockage**. Un seul nœud reconstruit alors périodiquement le graphe à partir des **traces stockées**. Il traite
+tous les spans, quel que soit le nœud qui les a reçus, avec un délai de 1 à 2 minutes. MoleSignal enregistre le paramètre
+dans la base de données et l’applique sans redémarrage.
+
+## Données de trace requises
+
+Pour construire la carte, les traces doivent contenir :
+
+- un attribut de ressource **`service.name`** sur chaque span (les exportateurs OTLP renseignent cet attribut) ;
+- des **relations parent-enfant entre spans** qui franchissent les limites d’un service : par exemple, un span client dans un
+  service dont le span enfant, côté serveur, s’exécute dans un autre.
+
+L’instrumentation OpenTelemetry standard fournit ces deux éléments. Configurez le traceur pour envoyer les traces à un
+[point de terminaison d’ingestion des traces](/fr/intake). MoleSignal alimente automatiquement la carte.
+
+## Topologie
+
+Le point de terminaison de topologie agrège les données d’une fenêtre temporelle en nœuds (services) et en liens (appels) :
+
+```http
+GET /api/v1/web/topology?from=2026-06-14T00:00:00Z&to=2026-06-14T01:00:00Z
+Authorization: Bearer <jwt>
+```
+
+```json
+{
+  "nodes": [
+    { "id": "checkout", "name": "checkout", "rps": 42.0, "errorRate": 0.01, "p95Ms": 120.0, "spanCount": 151200 }
+  ],
+  "edges": [
+    { "source": "checkout", "target": "payments", "rps": 41.0, "errRate": 0.02, "p95Ms": 95.0 }
+  ]
+}
+```
+
+| Champ | Signification |
+|---|---|
+| `rps` | Nombre de requêtes par seconde sur la fenêtre. |
+| `errorRate` / `errRate` | Proportion de requêtes avec le statut `ERROR` (0–1). |
+| `p95Ms` | Valeur maximale du 95e percentile de latence calculé par minute sur la fenêtre, en millisecondes. |
+| `spanCount` | Nombre total de spans observés pour le nœud sur la fenêtre. |
+
+## Graphe de services brut
+
+Pour obtenir les données de chaque lien minute par minute, par exemple pour tracer l’évolution d’une seule dépendance dans
+le temps, interrogez directement le graphe de services :
+
+```http
+GET /api/v1/traces/service_graph?from=1717200000000000&to=1717286400000000&service=checkout
+Authorization: Bearer <jwt>
+```
+
+`from` et `to` s’expriment en microsecondes depuis l’époque Unix. Le filtre facultatif `service` renvoie les liens
+où le service sélectionné est appelant ou appelé. Chaque ligne contient `environment`,
+`request_count`, `error_count` et `p50_us` / `p95_us` / `p99_us` pour une paire de services sur une minute.
+
+## Dans l’interface
+
+- **APM → Carte des services** affiche les services d’un environnement, les appels entre eux, leurs cibles d’appel et les
+  topics dans lesquels ils publient ou dont ils consomment les messages. Consultez la [carte des services de l’APM](#la-carte-des-services-de-l’apm).
+- Sur la page APM d’un service, **Dépendances** affiche le service avec ses appelants et ses cibles, comme sur
+  la carte de l’APM, et répertorie les appels entrants. Cliquez sur un appel pour l’ouvrir dans le même panneau latéral.
+- L’onglet **Graphe de services** de la page Traces affiche la carte des traces qui correspondent à la requête.
+
+Toutes les cartes utilisent la même représentation : un anneau coloré selon l’état de santé du nœud entoure son type, son
+nom, son débit de requêtes par seconde, son taux d’erreur et sa latence P95. Chaque appel apparaît sous forme de flèche dont l’épaisseur dépend du trafic : rouge
+à partir de 5 % d’échecs et orange à partir de 1 %.
+
+Depuis un service ou un lien, accédez directement aux traces et aux logs sous-jacents grâce à la
+[corrélation entre signaux](/fr/correlation).
+
+## La carte des services de l’APM
+
+**APM → Carte des services** combine le graphe de services et les vues de l’APM pour l’environnement et
+l’espace de noms sélectionnés dans la barre de filtres :
+
+| Nœud | Source |
+|---|---|
+| Service | Le graphe de services, avec les métriques RED et l’état de santé issus du récapitulatif APM. |
+| Base de données, cache, service HTTP ou RPC externe | Les appels sortants recensés dans les dépendances APM, regroupés par cible. |
+| Service sans télémétrie | Un appel qui indique son nom dans `peer.service` lorsque le service n’envoie aucun span. |
+| Topic | Les appels de publication vers une destination de messagerie et les points de terminaison qui en consomment les messages. |
+
+L’épaisseur d’une flèche dépend du trafic et sa couleur du taux d’échec. Par rapport à la période précédente de même
+durée, un appel présent uniquement dans la période actuelle porte le libellé **Nouveau**. Un appel qui n’a plus lieu porte le libellé **Disparu** et s’affiche en pointillés, avec
+son nœud. Sélectionnez un nœud pour mettre en évidence ses appelants, ses cibles et le **chemin le plus lent** à partir de
+ce nœud : à chaque étape, le chemin suit l’appel dont la latence P95 est la plus élevée. La fiche au-dessus de la carte répertorie les appels du nœud. Cliquez sur un appel
+pour ouvrir un panneau latéral qui affiche l’évolution des requêtes, des erreurs et de la latence, ainsi que le détail des opérations :
+
+- vers un service, les points de terminaison sollicités, tous appelants confondus, et leurs groupes d’erreurs ;
+- vers une base de données, un cache ou un point de terminaison externe, les opérations effectuées ;
+- via un topic, le temps d’attente des messages entre la fin de la publication et le début de la
+  consommation. MoleSignal utilise les spans de consommation les plus récents dans le stockage des traces (200 au maximum) et associe chacun au
+  span référencé dans ses liens ou, à défaut, à son parent.
+
+Au-delà de 60 nœuds, la carte regroupe initialement chaque espace de noms en un seul nœud. Sélectionnez ce nœud pour déplier
+l’espace de noms. **Replier les espaces de noms** replie ou déplie tous les espaces de noms. La carte affiche au maximum les 400 nœuds les plus actifs.
+
+<CardGroup cols={2}>
+  <Card title="API de topologie et de graphe de services" icon="diagram-project" href="/fr/api/web/topology">
+    Interrogez les points de terminaison de topologie et de graphe de services brut via HTTP.
+  </Card>
+  <Card title="Surveillance des performances des applications" icon="gauge-high" href="/fr/apm">
+    Tenez à jour le catalogue des services et analysez leurs points de terminaison, dépendances, erreurs et déploiements.
+  </Card>
+</CardGroup>

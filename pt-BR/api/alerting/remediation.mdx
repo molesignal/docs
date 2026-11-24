@@ -1,0 +1,258 @@
+---
+title: "API de remediação"
+sidebarTitle: "Remediação"
+description: "Defina ações de remediação via HTTP e Kubernetes, registre clusters e execute uma ação em um incidente. Cada execução requer aprovação ou aprovação prévia e é verificada depois."
+"en_link": "/en-US/api/alerting/remediation"
+"zh-Hans_link": "/zh-Hans/api/alerting/remediation"
+"zh-Hant_link": "/zh-Hant/api/alerting/remediation"
+"ja_link": "/ja/api/alerting/remediation"
+"ko_link": "/ko/api/alerting/remediation"
+"de_link": "/de/api/alerting/remediation"
+"es_link": "/es/api/alerting/remediation"
+"fr_link": "/fr/api/alerting/remediation"
+---
+
+Uma ação de remediação é uma correção definida com antecedência, como acionar uma tarefa de rollback do Jenkins ou reiniciar um
+Deployment. A execução de uma ação em um incidente passa por [aprovação](/pt-BR/agent#aprovações-e-execuções):
+L2 exige uma pessoa aprovadora e L3 exige duas. Quem solicita não pode aprovar. Quando a organização
+ativa a [pré-aprovação](#pré-aprovação), é possível conceder o mesmo número de aprovações com antecedência. Após a aprovação, a ação é executada
+imediatamente, e o resultado e a verificação posterior ficam registrados na
+[linha do tempo](/pt-BR/api/alerting/incident-timeline) do incidente. Para saber como usar esse recurso nas telas, consulte
+[Remediação](/pt-BR/alerting/remediation).
+
+| Método e caminho | O que faz | Permissão |
+|---|---|---|
+| `GET /api/v1/alerts/remediation/actions` | Lista as ações de remediação da organização. | `alerts.remediation.read` |
+| `POST /api/v1/alerts/remediation/actions` | Cria uma ação de remediação. | `alerts.remediation.manage` |
+| `PUT /api/v1/alerts/remediation/actions/{id}` | Substitui uma ação de remediação. | `alerts.remediation.manage` |
+| `DELETE /api/v1/alerts/remediation/actions/{id}` | Exclui uma ação de remediação. | `alerts.remediation.manage` |
+| `GET /api/v1/alerts/remediation/clusters` | Lista os clusters Kubernetes cadastrados. | `alerts.remediation.read` |
+| `POST /api/v1/alerts/remediation/clusters` | Cadastra um cluster. | `alerts.remediation.manage` |
+| `PUT /api/v1/alerts/remediation/clusters/{id}` | Altera um cluster. | `alerts.remediation.manage` |
+| `DELETE /api/v1/alerts/remediation/clusters/{id}` | Exclui um cluster. | `alerts.remediation.manage` |
+| `POST /api/v1/alerts/remediation/clusters/{id}/test` | Testa a conexão e retorna `{ "ok": true, "version": "v1.30.2" }`. | `alerts.remediation.manage` |
+| `GET /api/v1/alerts/incidents/{id}/remediations` | Lista as ações aplicáveis ao incidente e as execuções nesse incidente. | `alerts.incidents.read` no incidente |
+| `POST /api/v1/alerts/incidents/{id}/remediations` | Solicita uma execução no incidente e a envia para aprovação. | `alerts.incidents.remediate` no incidente |
+| `GET /api/v1/alerts/remediation/preapproval` | Indica se a pré-aprovação está ativa na organização e informa, para cada ação pré-aprovada, o número de execuções na janela e o status atual. | `alerts.remediation.read` |
+| `PUT /api/v1/alerts/remediation/preapproval` | Ativa ou desativa a pré-aprovação na organização. Corpo: `{ "enabled": true }`. | `alerts.remediation.preapprove` |
+| `PUT /api/v1/alerts/remediation/actions/{id}/preapproval` | Define ou substitui a pré-aprovação de uma ação. | `alerts.remediation.preapprove` e `agent.approve` |
+| `DELETE /api/v1/alerts/remediation/actions/{id}/preapproval` | Remove a pré-aprovação de uma ação. | `alerts.remediation.preapprove` |
+| `POST /api/v1/alerts/remediation/actions/{id}/preapproval/confirm` | Permite que uma segunda pessoa confirme a pré-aprovação de uma ação L3. | `alerts.remediation.preapprove` e `agent.approve` |
+
+O log de auditoria registra criações, alterações, exclusões e solicitações de execução. Também registra a ativação e a desativação do recurso de pré-aprovação, além da definição, confirmação e remoção de pré-aprovações.
+
+## Ações de remediação
+
+**Corpo da solicitação**
+
+| Campo | Tipo | Obrigatório | Observações |
+|---|---|---|---|
+| `name` | string | Sim | De 1 a 120 caracteres. |
+| `description` | string | Não | Uma descrição. |
+| `target` | object | Sim | Define como executar a ação. Use `http` ou `kubernetes` em `kind`. Consulte os demais campos abaixo. |
+| `parameters` | array | Não | Até 10 parâmetros para preencher na execução. Consulte os detalhes abaixo. |
+| `services` | array | Não | Serviços aos quais a ação se aplica. Se este campo e `teamIds` estiverem vazios, a ação se aplica a todos os incidentes. Caso contrário, um dos serviços ou a equipe do incidente deve corresponder aos valores configurados. |
+| `teamIds` | array | Não | Equipes às quais a ação se aplica. |
+| `risk` | string | Não | `l2` (padrão, uma pessoa aprovadora) ou `l3` (duas pessoas aprovadoras). |
+| `verifyAfterSecs` | integer | Não | Segundos de espera após uma execução bem-sucedida antes da verificação, de 0 a 86400. Padrão: `0` (sem verificação). |
+| `verifyBy` | string | Não | Critério de sucesso: `incidentResolved` (padrão, incidente resolvido ou encerrado) ou `rule_healthy` (a regra do incidente voltou ao estado normal). |
+| `enabled` | boolean | Não | Padrão: `true`. Não é possível executar uma ação desativada. |
+
+**`target`: uma solicitação HTTP**
+
+| Campo | Tipo | Observações |
+|---|---|---|
+| `kind` | string | `http`. |
+| `method` | string | `GET`, `POST` (padrão), `PUT` ou `PATCH`. |
+| `url` | string | Modelo do endereço, que começa com `http://` ou `https://`. |
+| `headers` | object | Cabeçalhos da solicitação. Os valores são modelos, e o MoleSignal os armazena criptografados. |
+| `body` | string | Modelo do corpo em JSON, com até 16384 caracteres. Um marcador sem aspas pode representar um número. Substitua todos os marcadores por `0` para validar o JSON. Se o resultado for inválido, a chamada retorna `400`. O MoleSignal envia o corpo como `application/json`. Deixe o campo vazio para não enviar um corpo. |
+| `signingSecret` | string | Segredo de assinatura que o MoleSignal armazena criptografado. Ao configurar o segredo, a solicitação inclui `X-MoleSignal-Timestamp` e `X-MoleSignal-Sign`, calculados da mesma forma que na [assinatura genérica de webhook](/pt-BR/notification-channels/webhooks#cabeçalhos-e-assinatura). |
+
+A solicitação se conecta apenas aos IPs resultantes da resolução do endereço, recusa endereços de metadados da nuvem, não segue
+redirecionamentos e expira após 30 segundos. Uma resposta 2xx indica sucesso.
+
+**`target`: Kubernetes**
+
+| Campo | Tipo | Observações |
+|---|---|---|
+| `kind` | string | `kubernetes`. |
+| `clusterId` | string | Um cluster cadastrado. |
+| `operation` | string | `restart` (reinicialização gradual, como em `kubectl rollout restart`), `scale` (altera o número de réplicas) ou `rollback` (volta à versão anterior, como em `kubectl rollout undo`). |
+| `workloadKind` | string | `Deployment`, `StatefulSet` ou `DaemonSet`. O rollback só se aplica a Deployment, e o dimensionamento não se aplica a DaemonSet. |
+| `namespace`, `workloadName` | string | O namespace e o nome da carga de trabalho. Ambos aceitam modelos. |
+| `replicas` | string | Número desejado de réplicas. Aceita um modelo como `{{params.replicas}}`. |
+
+**`parameters[]`**
+
+| Campo | Tipo | Observações |
+|---|---|---|
+| `key` | string | Use `{{params.<key>}}` nos modelos. |
+| `label` | string | Nome exibido ao executar a ação. |
+| `kind` | string | `text` (padrão), `number` ou `select`. |
+| `options` | array | Opções de um `select`. |
+| `required` | boolean | Padrão: `false`. |
+| `default` | string | Valor usado quando nenhum outro é informado. |
+
+**Variáveis do modelo**: `{{incident.id}}`, `{{incident.summary}}`, `{{incident.severity}}`,
+`{{incident.status}}`, `{{incident.service}}` (o rótulo `service` ou, na ausência dele, o primeiro serviço afetado),
+`{{incident.url}}` (a página do incidente) e `{{params.<key>}}`. O MoleSignal aplica codificação percentual aos valores no endereço
+e escapa os valores como strings JSON no corpo JSON. Variáveis desconhecidas viram strings vazias.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/remediation/actions \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "Roll back checkout",
+    "target": {
+      "kind": "http",
+      "method": "POST",
+      "url": "https://jenkins.example.com/job/rollback/buildWithParameters?service={{incident.service}}",
+      "headers": { "Authorization": "Bearer <jenkins-token>" },
+      "body": "{\"reason\": \"{{params.reason}}\", \"incident\": \"{{incident.url}}\"}"
+    },
+    "parameters": [{ "key": "reason", "label": "Why", "required": true }],
+    "services": ["checkout"],
+    "risk": "l3",
+    "verifyAfterSecs": 600,
+    "verifyBy": "incident_resolved"
+  }'
+```
+</RequestExample>
+
+A resposta retorna a ação salva. O MoleSignal nunca retorna os valores dos cabeçalhos nem o segredo de assinatura. Os valores em
+`headers` ficam vazios, e `secretsSet` lista os segredos configurados, por exemplo,
+`["header:Authorization", "signing_secret"]`. Ao editar, deixe um cabeçalho vazio ou omita
+`signingSecret` para manter os respectivos valores. Envie `signingSecret` vazio para remover a assinatura.
+
+## Clusters Kubernetes
+
+| Campo | Tipo | Obrigatório | Observações |
+|---|---|---|---|
+| `name` | string | Sim | Um nome. |
+| `apiServer` | string | Sim | Endereço do servidor da API, que começa com `https://`. |
+| `caCert` | string | Não | Certificado de CA no formato PEM. Deixe o campo vazio para usar os certificados raiz confiáveis do sistema. |
+| `token` | string | Na criação | Token de ServiceAccount. O MoleSignal o armazena criptografado e nunca o retorna. Deixe o campo vazio ao editar para manter o valor atual. |
+
+O token precisa das permissões `get` e `patch` nas cargas de trabalho de destino. O rollback também exige permissão para listar ReplicaSets.
+As conexões usam apenas os IPs resultantes da resolução do endereço do servidor da API, recusam endereços de metadados da nuvem e
+expiram após 30 segundos. Não é possível excluir um cluster que alguma ação ainda usa.
+
+## Pré-aprovação
+
+Quando a organização ativa a pré-aprovação (desativada por padrão), é possível pré-aprovar uma ação. Nos serviços listados, a ação pode ser executada até o limite definido para a janela, sem aguardar aprovação a cada execução. A pré-aprovação de uma ação L2 entra em vigor assim que é definida. Para uma ação L3, ela só entra em vigor depois que uma segunda pessoa a confirma com `confirm`. A pré-aprovação antecipa a aprovação sem reduzir o número de pessoas que precisam aprovar. Só usuários autenticados podem definir e confirmar pré-aprovações. Não use tokens de API para essas operações.
+
+**Corpo da solicitação** (`PUT /api/v1/alerts/remediation/actions/{id}/preapproval`)
+
+| Campo | Tipo | Obrigatório | Descrição |
+|---|---|---|---|
+| `services` | array | Sim | Até 20 serviços cobertos pela pré-aprovação, todos dentro do escopo da ação. |
+| `maxRuns` | inteiro | Sim | Número máximo de execuções na janela, de 1 a 20. |
+| `windowSecs` | inteiro | Sim | Duração da janela, de 300 a 604800 segundos. |
+| `expiresAt` | inteiro | Não | Momento da expiração, em microssegundos desde a época Unix. Se omitir o campo, a pré-aprovação não expira. |
+| `channels` | array | Não | Até 5 destinos para enviar uma notificação após a execução. Use `connectorId`, `targetType` e `target`, como nos destinos de uma política de notificação. |
+
+A resposta é `{ "preapproval": { ... } }` e acrescenta `approvers` (`[{ "userId", "at" }]`), `setBy` e `setAt` ao corpo. Quem define a pré-aprovação é a primeira pessoa a aprová-la. Ao substituir a pré-aprovação, só quem a redefiniu fica na lista de aprovadores. Se o destino, os parâmetros, os serviços, as equipes ou o risco da ação mudarem, o MoleSignal limpa a lista de aprovadores e exige uma nova confirmação.
+
+`GET /api/v1/alerts/remediation/preapproval` retorna `{ "enabled": true, "actions": { "<action-id>": { "used": 1, "state": "active" } } }`. Os valores de `state` são `off` (a organização desativou a pré-aprovação), `expired`, `awaiting_approver` (a ação L3 ainda precisa de uma segunda pessoa para aprová-la), `used_up` (o limite de execuções da janela foi atingido) ou `active`.
+
+Quando a pré-aprovação se aplica, solicitar a ação em um incidente de um serviço coberto registra como aprovadores quem definiu e quem confirmou a pré-aprovação. A execução começa imediatamente, mas quem solicita ainda precisa da permissão `alerts.incidents.remediate`. A pré-aprovação de quem solicita não conta para a própria solicitação. Se não houver pré-aprovações suficientes de outras pessoas, a solicitação aguarda aprovação normalmente. Quem solicita nunca aparece entre as revisões registradas. Se o limite de execuções da janela for atingido, a pré-aprovação expirar ou a organização desativar o recurso, a solicitação segue o fluxo normal de aprovação. Após a execução, com ou sem sucesso, o MoleSignal envia uma notificação aos destinos de `channels`.
+
+## Executar uma ação em um incidente
+
+```http
+GET /api/v1/alerts/incidents/{id}/remediations
+```
+
+Retorna `{ "actions": [ ... ], "runs": [ ... ] }`: as ações ativas que se aplicam ao incidente (sem os
+segredos) e as execuções do incidente. Se a aprovação de uma execução for rejeitada, expirar ou for cancelada, o status será
+`declined`.
+
+```http
+POST /api/v1/alerts/incidents/{id}/remediations
+```
+
+| Campo | Tipo | Obrigatório | Observações |
+|---|---|---|---|
+| `actionId` | string | Sim | A ação a executar. Ela deve se aplicar a este incidente. |
+| `inputs` | objeto | Não | Valores dos parâmetros, indexados pela `key` de cada parâmetro. Inclua os parâmetros obrigatórios, envie números como valores numéricos, use apenas as opções disponíveis e não inclua parâmetros extras. Os parâmetros omitidos usam os valores padrão. Cada valor pode ter até 500 caracteres. |
+| `reason` | string | Não | Motivo registrado na aprovação, com até 2000 caracteres. Se omitir o campo, o MoleSignal gera um motivo. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/remediations \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"actionId": "<action-id>", "inputs": {"reason": "pool exhausted after v2026.10.28"}}'
+```
+</RequestExample>
+
+A resposta é `{ "run": { ... }, "approval": { ... } }`: a execução e a solicitação de aprovação correspondente. O
+risco da aprovação segue o `risk` da ação, e o impacto indica qual endereço a ação chama ou o que ela
+faz em qual carga de trabalho e em qual cluster. Para aprovar ou rejeitar a solicitação, use
+`POST /api/v1/agent/approvals/{approvalId}/review` com o corpo `{ "approve": true, "comment": "…" }`.
+Esse endpoint exige `agent.approve`. A execução começa assim que recebe o número necessário de aprovações. Quando a
+[pré-aprovação](#pré-aprovação) da ação se aplica, a execução termina antes da resposta, que também inclui
+`"preapproved": true` e `execution`. Na execução, `preapproved` é `true`.
+
+<ResponseExample>
+```json 200
+{
+  "run": {
+    "id": "3KJ0f2R9cWm1Xa8LpV4sNq7TbYe",
+    "orgId": "<organization-id>",
+    "incidentId": "<incident-id>",
+    "actionId": "<action-id>",
+    "actionName": "Roll back checkout",
+    "approvalId": "<approval-id>",
+    "inputs": { "reason": "pool exhausted after v2026.10.28" },
+    "status": "awaiting_approval",
+    "output": "",
+    "verifyAt": null,
+    "verification": "",
+    "requestedBy": "<user-id>",
+    "executedBy": null,
+    "createdAt": 1790000000000000,
+    "updatedAt": 1790000000000000
+  },
+  "approval": {
+    "id": "<approval-id>",
+    "orgId": "<organization-id>",
+    "investigationId": null,
+    "action": "run_remediation_action",
+    "target": "<incident-id>",
+    "parameters": { "actionId": "<action-id>", "action": "Roll back checkout", "inputs": { "reason": "pool exhausted after v2026.10.28" } },
+    "reason": "Run `Roll back checkout` on incident: High error rate · checkout",
+    "impact": "HTTP POST https://jenkins.example.com/job/rollback/buildWithParameters?service={{incident.service}} (reason=pool exhausted after v2026.10.28)",
+    "risk": "l3",
+    "status": "pending",
+    "requestedBy": "<user-id>",
+    "requiredApprovals": 2,
+    "reviews": [],
+    "expiresAt": 1790003600000000,
+    "decidedAt": null,
+    "createdAt": 1790000000000000,
+    "updatedAt": 1790000000000000
+  }
+}
+```
+</ResponseExample>
+
+| `status` | Significado |
+|---|---|
+| `awaiting_approval` | Aguardando aprovação. |
+| `running` | Em execução. |
+| `succeeded`, `failed` | A execução foi bem-sucedida ou falhou. `output` contém o início da resposta ou o erro. |
+| `declined` | A aprovação foi rejeitada, expirou ou foi cancelada. Nenhuma ação foi executada. |
+| `verifying` | A execução foi bem-sucedida. O MoleSignal faz a verificação no horário indicado em `verifyAt`. |
+| `verified`, `verification_failed` | A verificação foi bem-sucedida ou falhou. `verification` informa o que a verificação encontrou. |
+
+**Erros**
+
+| Status | Motivo |
+|---|---|
+| `400` | Um campo é inválido, o cluster não pertence à organização, a ação não se aplica ao incidente ou está desativada, um valor de entrada é inválido ou o incidente já foi resolvido. |
+| `403` | Falta uma permissão ou o incidente está fora do escopo de acesso. |
+| `404` | A ação, o cluster ou o incidente não existe. |

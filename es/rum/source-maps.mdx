@@ -1,0 +1,225 @@
+---
+title: "Mapas de código fuente y símbolos en RUM"
+sidebarTitle: "Mapas de código fuente y símbolos"
+description: "Sube mapas de código fuente del navegador, símbolos de Flutter, archivos de mapeo y símbolos nativos de Android o archivos dSYM de Apple para reconstruir las trazas de pila en RUM."
+"en_link": "/en-US/rum/source-maps"
+"zh-Hans_link": "/zh-Hans/rum/source-maps"
+"zh-Hant_link": "/zh-Hant/rum/source-maps"
+"ja_link": "/ja/rum/source-maps"
+"ko_link": "/ko/rum/source-maps"
+"de_link": "/de/rum/source-maps"
+"fr_link": "/fr/rum/source-maps"
+"pt-BR_link": "/pt-BR/rum/source-maps"
+---
+
+MoleSignal usa artefactos de depuración para restaurar los marcos de pila de JavaScript minificado, de Dart o Android ofuscados y
+de código nativo de Android o iOS. Administra todos los tipos de artefactos mediante
+`/api/v1/debug-artifacts`.
+
+## Selecciona un tipo de artefacto
+
+| Entorno de ejecución | `kind` | `platform` | Archivo |
+|---|---|---|---|
+| JavaScript del navegador | `javascript_sourcemap` | `web` | Archivo `.map` externo |
+| Flutter Web | `javascript_sourcemap` | `flutter` | `main.dart.js.map` u otro archivo `.map` generado |
+| Flutter AOT para Android o iOS | `flutter_symbols` | `android` o `ios` | Archivo `.symbols` de Flutter generado con `--split-debug-info` |
+| Android R8 | `android_mapping` | `android` | `mapping.txt` de la versión |
+| Android NDK | `android_native_symbols` | `android` | Objeto compartido ELF con símbolos intactos |
+| Código nativo de Apple | `apple_dsym` | `ios` | Binario DWARF dentro del paquete `.dSYM` correspondiente |
+
+Puedes subir archivos sin comprimir o comprimidos con gzip. El límite de carga es de 50 MiB. Un artefacto gzip puede
+ocupar hasta 256 MiB al descomprimirse.
+
+## Haz coincidir la identidad de compilación
+
+MoleSignal selecciona un artefacto según la identidad de compilación del error de RUM:
+
+| Campo de carga | Valor correspondiente en RUM | Regla |
+|---|---|---|
+| `applicationId` | `application.id`, la aplicación asociada al token de cliente | Debe coincidir exactamente |
+| `service` | `service` del evento | Debe coincidir exactamente, incluidas las mayúsculas y minúsculas |
+| `release` | `version` del evento | Debe coincidir exactamente, incluidas las mayúsculas y minúsculas |
+| `kind` | `artifact_kind` del marco. Si el marco no tiene `artifact_kind`, pero tiene `file` y `line`, es un marco de JavaScript | Selecciona un tipo de la tabla de artefactos compatibles |
+| `platform` | `os.name` del evento, o `source` si no tiene `os.name` | Usa `web`, `flutter`, `android` o `ios`, según la tabla anterior |
+| `architecture` | `device.architecture` del evento | Indica la arquitectura para los artefactos móviles y nativos, por ejemplo, `arm64` o `x86_64` |
+| `debugId` | `debug_id` del marco o, en su defecto, `build_id` del evento | Usa el mismo ID de compilación de Flutter, ID de compilación de ELF o UUID de Mach-O |
+| Nombre de archivo | Módulo o paquete del entorno de ejecución | Los mapas del navegador deben usar `<deployed bundle basename>.map` |
+
+MoleSignal normaliza los alias de ABI comunes. Por ejemplo, convierte `arm64-v8a` y `aarch64` en `arm64`, y
+`amd64` y `x64` en `x86_64`. Al comparar UUID e ID de depuración hexadecimales, no distingue entre mayúsculas y minúsculas e ignora las llaves,
+los guiones y el prefijo `0x`.
+
+<Warning>
+  Mantén `applicationId`, `service`, `release`, `architecture` y `debugId` en el mismo flujo
+  de compilación que genera el artefacto. Una identidad desactualizada o ambigua deja intacto el evento, pero
+  da lugar a una simbolización `missing` o `partial`.
+</Warning>
+
+### Ejemplo para el navegador
+
+Asigna valores estables a `service` y `version` en cada compilación:
+
+```ts
+import { init } from '@molesignal/browser-rum';
+
+init({
+  applicationId: 'checkout-web',
+  clientToken: 'mspat-your-client-token',
+  site: 'https://molesignal.example.com',
+  service: 'web-frontend',
+  version: '2026.08.04.1',
+});
+```
+
+Sube el mapa con la misma identidad y el nombre exacto del paquete desplegado:
+
+| Campo de carga | Campo del SDK | Ejemplo |
+|---|---|---|
+| ID de aplicación | `applicationId` | `checkout-web` |
+| Servicio | `service` | `web-frontend` |
+| Versión | `version` | `2026.08.04.1` |
+| Archivo | Archivo `.map` generado | `app.8f312.js.map` |
+
+Si la URL de un marco desplegado termina en `/assets/app.8f312.js`, sube `app.8f312.js.map`. Sube los mapas de todos
+los fragmentos que se cargan bajo demanda, no solo el mapa del paquete principal.
+
+## Sube artefactos desde la interfaz
+
+<Steps>
+  <Step title="Compila con los mapas de código fuente habilitados">
+    Genera mapas de código fuente externos en la compilación de producción. Mantén los mapas de código fuente fuera del despliegue
+    público cuando la política de seguridad exija que el código fuente sea privado.
+  </Step>
+  <Step title="Abre la página de carga">
+    Ve a **RUM → Configuración de RUM → Mapas de código fuente y símbolos** y haz clic en **Subir artefacto de depuración**.
+  </Step>
+  <Step title="Ingresa la identidad de compilación">
+    Selecciona el tipo de artefacto y la plataforma. Ingresa los valores exactos de la aplicación, el servicio y la versión.
+    Agrega la arquitectura y el ID de depuración para los artefactos móviles y selecciona el archivo generado.
+  </Step>
+  <Step title="Verifica la simbolización">
+    Envía un error desde la versión, abre **RUM → Explorador**, selecciona **Errores**, abre el error y confirma que la
+    pila muestra las ubicaciones originales del código fuente.
+  </Step>
+</Steps>
+
+## Prepara los artefactos de la versión
+
+<Tabs>
+  <Tab title="Web">
+    Genera mapas externos a partir del paquete exacto que desplegaste para el navegador. Mantén los archivos `.map` en privado
+    si la política no permite exponer el código fuente.
+
+    Compila Flutter Web con los mapas de código fuente habilitados:
+
+    ```bash
+    flutter build web \
+      --release \
+      --source-maps \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=javascript \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Sube `main.dart.js.map` con `kind=javascript_sourcemap`, `platform=flutter` y
+    `architecture=javascript`.
+  </Tab>
+  <Tab title="Flutter para Android">
+    Genera un archivo de símbolos de Flutter por cada ABI de producción:
+
+    ```bash
+    flutter build apk \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/android-arm64 \
+      --target-platform=android-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Sube `app.android-arm64.symbols` con `kind=flutter_symbols`, `platform=android`,
+    `architecture=arm64` y `debugId=${BUILD_ID}`.
+  </Tab>
+  <Tab title="Flutter para iOS">
+    Genera los símbolos AOT de Flutter a partir de la compilación del IPA de la versión:
+
+    ```bash
+    flutter build ipa \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/ios-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Sube `app.ios-arm64.symbols` con `kind=flutter_symbols`, `platform=ios`,
+    `architecture=arm64` y `debugId=${BUILD_ID}`.
+  </Tab>
+  <Tab title="Android nativo">
+    Conserva `app/build/outputs/mapping/release/mapping.txt` de cada versión compilada con R8. Sube el archivo con
+    `kind=android_mapping` y `platform=android`.
+
+    Conserva un archivo `.so` en formato ELF con los símbolos intactos para cada ABI de NDK. Extrae su ID de compilación con las
+    herramientas de la plataforma y sube el archivo con `kind=android_native_symbols`, `platform=android`, la arquitectura
+    canónica y el mismo ID de compilación que envía el marco del fallo.
+  </Tab>
+  <Tab title="iOS nativo">
+    Lee el UUID del dSYM archivado y comprime el binario DWARF si es necesario:
+
+    ```bash
+    dwarfdump --uuid Checkout.app.dSYM
+    gzip -k Checkout.app.dSYM/Contents/Resources/DWARF/Checkout
+    ```
+
+    Sube el archivo DWARF o `.gz` con `kind=apple_dsym`, `platform=ios`, la arquitectura
+    correspondiente y el UUID de Mach-O normalizado como `debugId`.
+  </Tab>
+</Tabs>
+
+## Sube artefactos desde CI
+
+Usa un token de administración con `debug_artifacts.manage`. No incluyas este token en una aplicación web o
+móvil ni uses el token público de cliente para administrar artefactos.
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${MOLESIGNAL_TOKEN}" \
+  -F "applicationId=${APPLICATION_ID}" \
+  -F "service=${SERVICE}" \
+  -F "release=${RELEASE_VERSION}" \
+  -F "kind=${ARTIFACT_KIND}" \
+  -F "platform=${PLATFORM}" \
+  -F "architecture=${ARCHITECTURE}" \
+  -F "debugId=${DEBUG_ID}" \
+  -F "file=@${ARTIFACT_PATH}" \
+  "${MOLESIGNAL_SITE}/api/v1/debug-artifacts"
+```
+
+Deja `architecture` o `debugId` en blanco solo si el artefacto debe servir como alternativa cuando no haya una coincidencia exacta. Una identidad
+de compilación móvil exacta evita coincidencias ambiguas.
+
+Enumera los artefactos con `GET /api/v1/debug-artifacts`. Filtra por `applicationId`, `service`, `kind` o
+`platform`. Elimina un artefacto con `DELETE /api/v1/debug-artifacts/{id}`. Para enumerar los artefactos, necesitas
+`debug_artifacts.read`; para subirlos o eliminarlos, necesitas `debug_artifacts.manage`.
+
+## Lista de verificación de la versión
+
+- Conserva los artefactos del binario o paquete exacto que desplegaste.
+- Configura un valor de versión inmutable en el SDK antes de que se registre cualquier error.
+- Mantén la aplicación, el servicio, la versión, la arquitectura y el ID de depuración alineados con la compilación.
+- Sube los mapas de todos los fragmentos web y los artefactos de todas las arquitecturas móviles que distribuyas.
+- Conserva el token de administración solo en el flujo de publicación.
+- Verifica un error controlado después del despliegue y confirma que la simbolización restauró los campos `original_*` del marco.
+- Sube los artefactos antes de que la versión llegue a los usuarios. Los marcos restaurados determinan a qué [problema](/es/rum/errors#cómo-se-agrupan-los-errores-en-problemas) pertenece
+  un error. Si el mismo error llega antes y después de subir su mapa de código fuente, MoleSignal lo agrupa en problemas distintos.
+
+<CardGroup cols={2}>
+  <Card title="SDK de RUM para navegadores" icon="code" href="/es/rum/browser-sdk">
+    Configura la identidad de la aplicación, el servicio y la versión para el navegador.
+  </Card>
+  <Card title="SDK de RUM para aplicaciones Flutter" icon="mobile" href="/es/rum/flutter-sdk">
+    Configura la identidad de compilación de Flutter y la recopilación de errores.
+  </Card>
+</CardGroup>

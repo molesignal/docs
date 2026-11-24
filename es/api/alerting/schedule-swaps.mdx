@@ -1,0 +1,92 @@
+---
+title: "Intercambios de turnos"
+description: "Pide a otra persona del calendario de guardias que cubra parte de un turno. Acepta, rechaza o retira solicitudes y, si administras el calendario, apruébalas o recházalas."
+"en_link": "/en-US/api/alerting/schedule-swaps"
+"zh-Hans_link": "/zh-Hans/api/alerting/schedule-swaps"
+"zh-Hant_link": "/zh-Hant/api/alerting/schedule-swaps"
+"ja_link": "/ja/api/alerting/schedule-swaps"
+"ko_link": "/ko/api/alerting/schedule-swaps"
+"de_link": "/de/api/alerting/schedule-swaps"
+"fr_link": "/fr/api/alerting/schedule-swaps"
+"pt-BR_link": "/pt-BR/api/alerting/schedule-swaps"
+---
+
+Un intercambio de turno permite pedir a otra persona del calendario que cubra un período de guardia. Cuando la persona que recibe la solicitud acepta,
+se agrega una [cobertura temporal](/es/alerting/on-call#cobertura-temporal) al calendario y el intercambio entra en vigor. Si el
+calendario tiene activada la opción **Los intercambios de turno requieren aprobación** (`swapNeedsApproval`), alguien con permisos para administrarlo debe
+aprobarlo también. Si el período termina sin que se resuelva el intercambio, la solicitud vence. Cada paso notifica a las personas
+involucradas mediante la política integrada
+[Intercambio de turno: notificar a las personas involucradas](/es/notification-channels#políticas-integradas) y queda registrado en
+el registro de auditoría.
+
+| Método y ruta | Función | Permiso |
+|---|---|---|
+| `GET /api/v1/schedules/swaps` | Devuelve los intercambios que el usuario actual solicitó o recibió, en todos los calendarios. | `schedules.read` |
+| `GET /api/v1/schedules/{id}/swaps` | Devuelve los intercambios de un calendario, del más reciente al más antiguo. | `schedules.read` en el calendario |
+| `POST /api/v1/schedules/{id}/swaps` | Solicita un intercambio. | `schedules.swaps.request` en el calendario |
+| `POST /api/v1/schedules/{id}/swaps/{swapId}/accept` | Acepta el intercambio. Solo puede hacerlo quien recibió la solicitud. | `schedules.swaps.request` en el calendario |
+| `POST /api/v1/schedules/{id}/swaps/{swapId}/decline` | Declina el intercambio. Solo puede hacerlo quien recibió la solicitud. | `schedules.swaps.request` en el calendario |
+| `POST /api/v1/schedules/{id}/swaps/{swapId}/cancel` | Retira la solicitud. Solo puede hacerlo quien la presentó, en cualquier momento antes de que se resuelva. | `schedules.swaps.request` en el calendario |
+| `POST /api/v1/schedules/{id}/swaps/{swapId}/approve` | Aprueba un intercambio aceptado. La cobertura temporal entra en vigor de inmediato. | `schedules.swaps.approve` en el calendario |
+| `POST /api/v1/schedules/{id}/swaps/{swapId}/reject` | Rechaza un intercambio aceptado. | `schedules.swaps.approve` en el calendario |
+
+## Solicita un intercambio de turno
+
+**Cuerpo de la solicitud**
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `targetId` | cadena | Sí | Persona que cubrirá el turno: debe pertenecer al calendario y no puede ser quien solicita el intercambio. |
+| `startAt`, `endAt` | entero | Sí | Período que se va a intercambiar, en microsegundos desde la época Unix. Debe empezar en el futuro y terminar después de su inicio. |
+| `note` | cadena | No | Nota de hasta 500 caracteres. |
+
+Quien solicita el intercambio debe ser la única persona de guardia en el calendario durante todo el período. No solicites un período que
+se superponga con un intercambio sin resolver en el mismo calendario.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/$SCHEDULE_ID/swaps \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"targetId": "<user-id>", "startAt": 1790060400000000, "endAt": 1790146800000000, "note": "Travelling on Friday"}'
+```
+</RequestExample>
+
+Cada llamada devuelve el intercambio. Las consultas de listas devuelven `{ "swaps": [ ... ] }`.
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KHq2nB7yZ0d4kVwXc1sPa9LmQe",
+  "orgId": "<organization-id>",
+  "scheduleId": "<schedule-id>",
+  "scheduleName": "Payments primary",
+  "requesterId": "<user-id>",
+  "targetId": "<another-user-id>",
+  "startAt": 1790060400000000,
+  "endAt": 1790146800000000,
+  "note": "Travelling on Friday",
+  "status": "pending",
+  "overrideId": null,
+  "decidedBy": null,
+  "decidedAt": null,
+  "createdAt": 1790000000000000,
+  "updatedAt": 1790000000000000
+}
+```
+</ResponseExample>
+
+| Campo | Notas |
+|---|---|
+| `status` | `pending` (en espera de respuesta), `awaiting_approval` (aceptado, en espera de aprobación), `accepted` (en vigor), `declined` (declinado), `rejected` (rechazado por quien administra el calendario), `cancelled` (retirado) o `expired` (vencido). |
+| `overrideId` | Cobertura temporal que se agregó cuando el intercambio entró en vigor. |
+| `decidedBy`, `decidedAt` | Quién fue la última persona en responder, aprobar, rechazar o retirar la solicitud y cuándo lo hizo. |
+
+**Errores**
+
+| Estado | Motivo |
+|---|---|
+| `400` | El período no es válido, la persona que recibió la solicitud no pertenece al calendario, hay otra persona de guardia durante el período además de quien solicita el intercambio o el período se superpone con un intercambio sin resolver. |
+| `403` | Falta un permiso o quien realiza la llamada no puede ejecutar este paso. |
+| `404` | El calendario o el intercambio no existe. |
+| `409` | El intercambio ya pasó de este paso (por ejemplo, ya se aceptó o venció) o alguien lo modificó mientras tanto. Vuelve a consultarlo e inténtalo de nuevo. |

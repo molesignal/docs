@@ -1,0 +1,106 @@
+---
+title: "Diseña flujos y campos que sigan siendo útiles"
+sidebarTitle: "Diseño de flujos y campos"
+description: "Antes de incorporar la primera fuente de gran volumen, decide cómo dividir los datos en flujos, usa nombres de campo coherentes, indexa los campos que se usan para filtrar y protege los valores sensibles."
+"en_link": "/en-US/best-practices/stream-design"
+"zh-Hans_link": "/zh-Hans/best-practices/stream-design"
+"zh-Hant_link": "/zh-Hant/best-practices/stream-design"
+"ja_link": "/ja/best-practices/stream-design"
+"ko_link": "/ko/best-practices/stream-design"
+"de_link": "/de/best-practices/stream-design"
+"fr_link": "/fr/best-practices/stream-design"
+"pt-BR_link": "/pt-BR/best-practices/stream-design"
+---
+
+Es difícil cambiar los flujos y campos cuando los datos, los paneles y las reglas de alerta dependen de ellos. El tipo de un campo
+queda fijo tras la primera escritura, no puedes activar el cifrado más adelante y cambiar el nombre de un campo rompe todas las
+consultas guardadas. Dedica una hora al diseño antes de conectar la primera fuente de alto volumen.
+
+## Separa los flujos según sus requisitos
+
+Crea un flujo independiente solo cuando los datos requieran condiciones distintas: otro periodo de retención, otra
+regla de acceso, otro esquema o un límite distinto para el intervalo de consulta. Si no, mantén los datos juntos y
+distínguelos mediante campos.
+
+| Situación | Recomendación | Contrapartida |
+|---|---|---|
+| Logs de depuración que se conservan 3 días y logs de auditoría que se conservan un año | Dos flujos `logs`, cada uno con su propio periodo de retención. | Las consultas que necesitan ambos tipos de logs usan dos flujos. |
+| Muchos servicios con la misma estructura de logs | Un flujo con `service.name` en cada evento. | La retención y el acceso no pueden variar por servicio. |
+| Un flujo de datos sin procesar de alto volumen que una canalización distribuye entre varios flujos | Un flujo de origen con **Permitir consultas** desactivado y una canalización de enrutamiento. | Los eventos sin procesar se conservan hasta que vence su periodo de retención, así que configúralo para que sea corto. |
+| Cada servidor de Prometheus | Un flujo `metrics` por fuente. | Una consulta que abarca varias fuentes debe indicar varios flujos. |
+| Un flujo por pod, versión o cliente | Evítalo. Usa campos en su lugar. | Muchos flujos pequeños multiplican los archivos y dejan de funcionar los paneles con cada cambio. |
+
+MoleSignal crea un flujo con la primera escritura, así que un error tipográfico en el emisor crea un flujo nuevo sin avisar.
+Revisa la [lista de flujos](/es/streams#lista-de-flujos) después de conectar cada fuente y crea con antelación los
+flujos importantes con su periodo de retención y sus campos cifrados.
+
+## Acuerda los nombres de los campos antes de enviar datos
+
+Usa los nombres de OpenTelemetry cuando existan y designa el mismo concepto con el mismo nombre en todas las
+señales. La navegación entre señales y APM dependen de esos nombres.
+
+| Campo | Contenido | Motivo |
+|---|---|---|
+| `service.name` | El nombre del servicio, idéntico en logs, trazas y métricas. | Vincula todas las señales con el mismo servicio. |
+| `deployment.environment.name` | `production`, `staging`, etc. | Permite filtrar cada página por entorno. |
+| `service.version` | La versión publicada. | Permite comparar despliegues en APM. |
+| `trace_id`, `span_id` | Incluye ambos valores en cada línea de log que se genere durante una solicitud. | Permite ir de una línea de log a su traza. |
+| `level` | Una forma de escribir cada nivel, por ejemplo, en minúsculas: `error`, `warn`, `info`. | El histograma de logs cuenta las entradas por nivel a partir del índice. |
+| `host.name`, `k8s.pod.name` | Dónde ocurrió el evento. | Permite acotar el problema a un solo equipo. |
+
+Mantén el mismo tipo de dato para cada campo en todos los emisores: si un servicio envía un campo como número y
+otro lo envía como texto, MoleSignal lo rechaza con `type mismatch on field`. Normaliza esos campos en una
+canalización con **Convertir el tipo de dato** antes de almacenarlos. No reutilices un nombre de campo existente con otro
+significado; agrega un campo nuevo.
+
+## Indexa los campos que usas para filtrar
+
+El [tipo de índice](/es/streams#esquema-y-campos) determina la velocidad del filtrado. Los campos nuevos no tienen índice,
+salvo los que usan ciertos nombres conocidos. Revisa los campos que los paneles y las alertas usan para filtrar:
+
+- **Coincidencia exacta** para identificadores que se comparan en su totalidad: `trace_id`, `user_id`, `order_id`,
+  `service.name`.
+- **Búsqueda de texto completo** para buscar palabras en campos de texto como `message`.
+- **Índice de omisión** para números y valores temporales que se comparan con `<` y `>`, como `duration_ms`.
+- Sin índice para los campos que solo se muestran.
+
+Los cambios de índice se aplican a los datos nuevos. El compactador aplica el cambio a los archivos anteriores al fusionarlos. Cambia el índice en
+**Flujos → Campos e índices** y luego haz clic en **Guardar y aplicar**.
+
+## Evita la cardinalidad alta en las etiquetas
+
+Una etiqueta de métrica con un conjunto ilimitado de valores posibles, como un ID de usuario, un ID de solicitud o una URL completa, crea una
+serie por cada valor. Al alcanzar los [límites de cardinalidad](/es/settings/platform#cardinalidad-de-métricas), MoleSignal deja de aceptar
+series nuevas en toda la organización. Guarda esos valores en logs o atributos de spans, donde no generan un costo
+por valor, y limita las etiquetas de las métricas a conjuntos acotados, como el servicio, la plantilla de ruta, el método y la
+clase de código de estado.
+
+Guarda los datos de referencia que, de otro modo, copiarías en cada evento, como el equipo responsable de un servicio o el
+plan de un cliente, en una [tabla de extensión](/es/extend-tables). La canalización los consulta mientras
+procesa el evento.
+
+## Protege los valores sensibles desde el principio
+
+| Necesidad | Herramienta | Cuándo se aplica |
+|---|---|---|
+| No almacenar nunca un valor, como un número de tarjeta | Un [patrón de expresión regular](/es/settings/data-security#patrones-de-expresiones-regulares) con **Ocultar datos durante la ingesta** o un paso de la canalización que elimine el campo. | Durante la ingesta, de forma definitiva. |
+| Almacenar un valor y limitar quién puede leerlo | Un campo cifrado que declaras al crear el flujo y lees con `decrypt()`. | Desde la creación del flujo. |
+| Ocultar un valor en la mayoría de los resultados de consulta | [Enmascaramiento de campos](/es/settings/data-security#enmascaramiento-de-campos). | Al ejecutar la consulta, sobre el resultado. |
+
+Siempre que sea posible, elimina el valor en el emisor o en el recolector. Si el valor nunca sale de la fuente, no puede
+filtrarse desde MoleSignal.
+
+## Criterios de aceptación
+
+- Cada flujo tiene un responsable, un propósito y un periodo de retención definido según sus necesidades.
+- Es posible seguir una solicitud conocida desde su línea de log hasta su traza con un solo clic.
+- Los campos que los paneles y las reglas usan para filtrar tienen un índice adecuado.
+- Ninguna etiqueta de métrica admite un conjunto ilimitado de valores y **Cardinalidad**, en Métricas, muestra recuentos de series estables.
+- Los eventos de prueba con marcadores sensibles llegan con los valores ocultos, enmascarados o cifrados según lo previsto.
+
+## Guías relacionadas
+
+- [Flujos](/es/streams)
+- [Canalizaciones](/es/pipelines)
+- [Configuración de seguridad de los datos](/es/settings/data-security)
+- [Implementa la telemetría para un servicio nuevo](/es/best-practices/service-onboarding)

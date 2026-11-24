@@ -1,0 +1,346 @@
+---
+title: "RUM-Ereignisformat"
+sidebarTitle: "Ereignisformat"
+description: "So senden RUM-SDKs und andere Clients JSON-Ereignisse an MoleSignal: Die Referenz beschreibt den Empfangsendpunkt, seine Antwort, die Regeln und die Felder für jeden Ereignistyp."
+"en_link": "/en-US/rum/events"
+"zh-Hans_link": "/zh-Hans/rum/events"
+"zh-Hant_link": "/zh-Hant/rum/events"
+"ja_link": "/ja/rum/events"
+"ko_link": "/ko/rum/events"
+"es_link": "/es/rum/events"
+"fr_link": "/fr/rum/events"
+"pt-BR_link": "/pt-BR/rum/events"
+---
+
+Jedes RUM-SDK sendet dieselben JSON-Ereignisse an einen gemeinsamen Endpunkt. Ein Client ohne SDK, etwa eine native
+App, für die es noch kein SDK gibt, sendet dieselben Ereignisse per HTTP-Anfrage.
+
+Ein Ereignis enthält `type`, `date`, die zugehörige `session` und `view` sowie ein Objekt,
+das den Namen des Ereignistyps trägt und die Details enthält. Der Quellcode enthält das JSON-Schema für Ereignisse unter
+`contracts/rum/events/v1.schema.json` sowie Beispiele für gültige und ungültige Ereignisse.
+
+## Ereignisse senden
+
+```http
+POST /api/v1/rum/events
+Authorization: Bearer mspat-<36>
+Content-Type: application/json
+```
+
+| Bestandteil | Regel |
+|---|---|
+| Anmeldedaten | Das [Client-Token](/de/rum/applications#client-token) der Anwendung gewährt `rum.write` nur für diese Anwendung. Verwenden Sie andere Anmeldedaten mit `rum.write`, geben Sie die Anwendung im Feld `application.id` jedes Ereignisses an. |
+| Anfrageinhalt | Ein JSON-Array mit Ereignissen. Ein einzelnes Ereignisobjekt oder NDJSON (`Content-Type: application/x-ndjson`, ein Ereignis pro Zeile) sind ebenfalls möglich. |
+| Komprimierung | `Content-Encoding: gzip` ist optional. Der Endpunkt akzeptiert keine andere Kodierung. |
+| Größe | Höchstens 5000 Ereignisse und 5 MiB nach der Dekomprimierung. Überschreitet eine Anfrage eines dieser Limits, antwortet der Endpunkt mit `413`. |
+
+<RequestExample>
+```bash cURL
+curl -X POST "http://localhost:5080/api/v1/rum/events" \
+  -H "authorization: Bearer $RUM_CLIENT_TOKEN" \
+  -H "content-type: application/json" \
+  -d '[{
+    "type": "error",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34", "url": "https://shop.example.com/checkout" },
+    "error": {
+      "id": "e7b1c9a2-3d4f-4b65-8a90-1c2d3e4f5a61",
+      "message": "Payment provider timeout",
+      "source": "custom",
+      "handling": "handled"
+    }
+  }]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "accepted": 1,
+  "rejected": []
+}
+```
+</ResponseExample>
+
+## Antwort
+
+Die Antwort weist das Ergebnis für jedes Ereignis einzeln aus. Ein fehlerhaftes Ereignis macht den Rest der Anfrage daher nicht ungültig.
+
+| Feld | Bedeutung |
+|---|---|
+| `accepted` | Anzahl der angenommenen Ereignisse: Der Endpunkt zählt alle Ereignisse, die er weder ablehnt noch unter `sampled` erfasst. Dazu zählen auch Ereignisse, die eine [Echtzeit-Pipeline](/de/pipelines#rum-streams) absichtlich verwirft, obwohl MoleSignal sie nicht speichert. |
+| `rejected` | Ein Eintrag pro abgelehntem Ereignis mit seiner Position in der Anfrage (`index`, beginnend bei `0`) und dem Ablehnungsgrund (`reason`). |
+| `sampled` | Anzahl der absichtlich ausgelassenen Ereignisse. Die Anwendung [behält nur einen Teil ihrer Sitzungen](/de/rum/sampling#anteil-der-sitzungen-serverseitig-speichern), und diese Ereignisse gehören zu Sitzungen, die sie nicht behält. Wenn die Anwendung alle Fehler behält, zählen die Fehler dieser Sitzungen nicht dazu. Das Feld erscheint nur, wenn Ereignisse ausgelassen wurden. Der Endpunkt lehnt diese Ereignisse nicht ab und zählt sie nicht unter `accepted`. |
+
+Auch wenn alle Ereignisse einer Anfrage ungültig sind, antwortet der Endpunkt mit `200` und setzt `accepted` auf `0`. Kann der Endpunkt
+eine Anfrage nicht lesen, schlägt die gesamte Anfrage fehl: `400` bei einem Anfrageinhalt, der kein JSON ist, einem nicht unterstützten
+`Content-Encoding` oder einem gzip-Stream, den der Endpunkt nicht dekodieren kann; `401` oder `403` bei einem fehlenden oder
+widerrufenen Token oder einem Token ohne `rum.write`; `413` bei einer Anfrage, die eines der oben genannten Limits überschreitet.
+
+Der Endpunkt lehnt ein Ereignis aus einem der folgenden Gründe ab:
+
+| Grund | Ursache |
+|---|---|
+| Eine Meldung, die das Feld nennt | Das Ereignis entspricht nicht dem Schema: Ein Pflichtfeld fehlt, ein Wert hat den falschen Typ oder steht nicht in der Liste zulässiger Werte, oder eine Zahl ist negativ. |
+| `date is more than a day in the future` | Die Geräteuhr geht deutlich vor. |
+| `application.id is not the application of the client token` | Das Ereignis gibt eine andere Anwendung an als die, an die das Token gebunden ist. |
+| ``application `<id>` does not exist`` | Die Anwendung wurde gelöscht oder nie erstellt. |
+| `application.id is required` | Die Anmeldedaten sind kein Client-Token, und das Ereignis gibt keine Anwendung an. |
+| `line is not JSON` | Der Endpunkt kann eine Zeile des NDJSON-Anfrageinhalts nicht parsen. |
+| ``<stream>: realtime transform `<step>` …`` | Ein Schritt der [Echtzeit-Pipeline](/de/pipelines#rum-streams) des Streams ist bei der Verarbeitung des Ereignisses fehlgeschlagen, hat eine Spalte geändert, die die Pipeline beibehält, oder hat eine Ansicht oder eine Vitalmetrik verworfen. |
+
+Das SDK meldet abgelehnte Ereignisse über seinen Fehler-Callback und sendet sie nicht erneut.
+
+## Regeln
+
+- `date` gibt den Beginn des Ereignisses in Millisekunden seit der Unix-Epoche an. `date` gibt bei einer `view` den Beginn der
+  Ansicht an und bleibt über alle Revisionen hinweg unverändert.
+- Geben Sie jede Dauer und jeden Zeitpunkt relativ zum Beginn einer Ansicht, etwa `performance.lcp.timestamp`
+  oder `resource.dns.start`, als **ganzzahligen Wert in Nanosekunden** an. Runden Sie den Wert vor dem Senden.
+- Senden Sie eine Ansicht bei jeder Änderung erneut, mit einer höheren `view.revision` und den bisherigen Zählerständen.
+  MoleSignal behält die höchste Revision. Zählerstände sind kumulativ, keine Differenzwerte.
+- Der Client sendet kein Sitzungsereignis. MoleSignal leitet die Sitzungsdaten aus den Ansichten ab: Beginn und Ende,
+  Dauer, Zählerstände, Einstiegs- und Ausstiegsseite sowie die Angabe, ob eine Sitzungsaufzeichnung vorliegt.
+- `session.start` in Millisekunden seit der Unix-Epoche ist optional, sollte aber angegeben werden. Kennt ein Knoten eine Sitzung noch nicht,
+  unterscheidet er anhand dieses Felds zwischen einer gerade begonnenen und einer Sitzung, die er aus den Augen verloren hat.
+- `application.id` ist optional. Die Anwendung ergibt sich aus der Bindung des Client-Tokens. Einen abweichenden
+  Wert lehnt der Endpunkt ab.
+- MoleSignal setzt `geo` und `network` selbst und ignoriert mitgesendete Werte. Das gilt auch für `retention`: `retention.rate` gibt an, welchen Anteil solcher
+  Zeilen MoleSignal behalten hat (in Prozent). `retention.filter` gibt den Grund dafür an (die ID eines [Filters](/de/rum/sampling#filter),
+  `default` oder `errors` bei einem Fehler aus einer nicht beibehaltenen Sitzung). MoleSignal berechnet damit die Gesamtzahlen.
+- MoleSignal akzeptiert und speichert Felder, die das Schema nicht kennt. Hat ein im Schema definiertes Feld einen falschen Typ oder
+  Wert, lehnt MoleSignal das Ereignis ab.
+- `error.frames` enthält den strukturierten Stacktrace, auf den MoleSignal Source Maps, Mapping-Dateien und native Symboldateien
+  anwendet. `error.stack` enthält denselben Stacktrace als Text für die Anzeige und Suche.
+
+## Attribute jedes Ereignisses
+
+| Attribut | Typ | Hinweise |
+|---|---|---|
+| `type` | Zeichenfolge | Pflichtfeld: `view`, `action`, `error`, `resource`, `long_task`, `vital` oder `log`. |
+| `date` | Ganzzahl | Pflichtfeld. Millisekunden seit der Unix-Epoche. |
+| `source` | Zeichenfolge | Pflichtfeld: `browser`, `android`, `ios`, `flutter`, `react-native`, `kotlin-multiplatform`, `unity`, `roku`, `electron` oder `other`. |
+| `session` | Objekt | Pflichtfeld. `id` ist Pflicht. `type` ist `user` (Standard), `synthetics` oder `ci_test`. `start` ist ein Zeitstempel in Millisekunden seit der Unix-Epoche. `has_replay` ist ein boolescher Wert. |
+| `view` | Objekt | Pflichtfeld. `id` ist Pflicht. `url`, `name`, `referrer` und `in_foreground` sind optional. |
+| `application.id` | Zeichenfolge | Optional. Siehe die Regeln oben. |
+| `service`, `env`, `version` | Zeichenfolge | Die Dimensionen eines Releases. MoleSignal sucht anhand von `version` nach Source Maps und Symbolen. |
+| `build_version`, `build_id` | Zeichenfolge | Die Build-Nummer und die Build-ID, unter der die Debug-Artefakte hochgeladen wurden. |
+| `action.id` | Zeichenfolge | Die ID der Aktion, die das Ereignis ausgelöst hat, falls vorhanden. |
+| `usr` | Objekt | `id`, `name`, `email` und `anonymous_id`. MoleSignal speichert weitere Schlüssel unter `usr.extra`. |
+| `account` | Objekt | `id` und `name`. |
+| `tab.id` | Zeichenfolge | Die ID des Browser-Tabs. |
+| `connectivity` | Objekt | `status`, `interfaces`, `effective_type` und `cellular` (`technology`, `carrier_name`). |
+| `display.viewport` | Objekt | `width` und `height`. |
+| `browser`, `os`, `device` | Objekt | Browsername und -version, Betriebssystem sowie Gerätetyp (`mobile`, `desktop`, `tablet`, `tv`, `gaming_console`, `bot` oder `other`), Modell, Marke, Architektur, Sprache und Region, Zeitzone, Akku und Speicher. |
+| `sdk` | Objekt | `name`, `version`, `session_sample_rate` und `replay_sample_rate`. |
+| `context` | Objekt | Frei definierbare Attribute der Anwendung. |
+| `feature_flags` | Objekt | Auswertungsergebnisse frei definierbarer Feature Flags. Fragen Sie einzelne Schlüssel als `feature_flags.<key>` ab. Siehe [Feature Flags](/de/rum/feature-flags). |
+| `synthetics` | Objekt | Angaben eines synthetischen Checks zu der Sitzung, die er ausführt: `test_id`, `result_id` und `location_id`. Siehe [Test-Traffic](/de/rum/test-traffic). |
+| `ci_test` | Objekt | `test_execution_id` für eine Sitzung, die ein CI-Test ausführt. |
+
+IDs dürfen nur `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` und `-` enthalten und höchstens 128 Zeichen lang sein. Für Textattribute von
+`usr`, `account` und dem Gerät gilt eine Obergrenze von 256 Zeichen.
+
+## Ansicht
+
+Ein `view`-Ereignis enthält ein `view`-Objekt mit den folgenden Feldern zusätzlich zu den oben genannten Feldern `url`, `name` und `id`.
+
+| Feld | Hinweise |
+|---|---|
+| `revision` | Pflichtfeld. Beginnt bei `1` und erhöht sich bei jedem erneuten Senden der Ansicht um eins. |
+| `time_spent` | Pflichtfeld. Dauer in Nanosekunden, für die die Ansicht geöffnet war. |
+| `url` | Pflichtfeld. |
+| `is_active` | `false` in der letzten Revision einer beendeten Ansicht. |
+| `loading_type` | `initial_load`, `route_change`, `bf_cache`, `activity_display`, `activity_redisplay`, `fragment_display`, `fragment_redisplay`, `view_controller_display`, `view_controller_redisplay` oder `session_renewal`. |
+| `loading_time`, `first_byte`, `dom_interactive`, `dom_content_loaded`, `dom_complete`, `load_event`, `network_settled_time`, `interaction_to_next_view_time` | Navigationszeiten in Nanosekunden. |
+| `performance.fcp`, `performance.lcp`, `performance.fid`, `performance.inp`, `performance.cls`, `performance.fbc` | Web Vitals. LCP enthält `timestamp`, `target_selector`, `resource_url` und `sub_parts` (`load_delay`, `load_time`, `render_delay`). INP enthält `duration`, `timestamp`, `target_selector` und `sub_parts` (`input_delay`, `processing_duration`, `presentation_delay`). CLS enthält `score`. |
+| `custom_timings` | Objekt mit benannten Zeitmesswerten. |
+| `scroll` | Scrolltiefe auf der Seite: `max_depth` (CSS-Pixel vom oberen Seitenrand bis zum unteren Fensterrand), `max_depth_scroll_top`, `max_scroll_height` und `max_scroll_height_time` (Nanosekunden). Diese Werte bilden die Grundlage der Scroll-[Heatmap](/de/rum/heatmaps). |
+| `action`, `error`, `resource`, `long_task`, `frustration`, `crash`, `frozen_frame` | Objekte der Form `{ "count": n }` mit den kumulierten Anzahlen. |
+| `memory_average`, `memory_max`, `cpu_ticks_count`, `cpu_ticks_per_second`, `refresh_rate_average`, `refresh_rate_min`, `slow_frames_rate`, `freeze_rate` | Messwerte für mobile Geräte. |
+| `flutter_build_time`, `flutter_raster_time` | `{ min, max, average, metric_max }` in Nanosekunden. |
+
+## Aktion
+
+| Feld | Hinweise |
+|---|---|
+| `id` | Pflichtfeld. |
+| `type` | Pflichtfeld: `custom`, `click`, `tap`, `scroll`, `swipe`, `application_start` oder `back`. |
+| `loading_time` | Nanosekunden. |
+| `target` | `name`, `selector`, `width` und `height` des Elements, `path` für die Position auf der Seite allein anhand von Tags und ihren Positionen sowie `offset` mit `x` und `y` des Klicks innerhalb des Elements. |
+| `position` | `x` und `y` des Zeigers. |
+| `page_position` | `x` und `y` des Klicks auf der Seite in CSS-Pixeln. |
+| `name_source` | Quelle des Namens: `custom_attribute`, `mask_placeholder`, `standard_attribute`, `text_content`, `mask_disallowed` oder `blank`. |
+| `frustration.type` | Liste mit Werten aus `rage_click`, `dead_click`, `error_click`, `rage_tap` und `error_tap`. |
+| `error`, `crash`, `long_task`, `resource` | Objekte der Form `{ "count": n }`. |
+
+## Fehler
+
+| Feld | Hinweise |
+|---|---|
+| `id`, `message`, `source` | Pflichtfelder. `source` ist `network`, `source`, `console`, `logger`, `agent`, `webview`, `custom` oder `report`. |
+| `type` | Fehlerklasse, zum Beispiel `TypeError`. |
+| `stack` | Stacktrace als Text. |
+| `frames` | Bis zu 1000 Stackframes: `file`, `function`, `class`, `module`, `line`, `column`, `debug_id`, `build_id`, `relative_address`, `instruction_addr`, `image_addr` und `artifact_kind` (`javascript_sourcemap`, `flutter_symbols`, `android_native_symbols` oder `apple_dsym`). |
+| `fingerprint` | Optional, bis zu 128 Zeichen. Fehler derselben Anwendung mit demselben Fingerprint bilden unabhängig von ihren Meldungen und Stacktraces ein [Problem](/de/rum/errors). Ohne Fingerprint gruppiert MoleSignal die Fehler nach Typ, Meldung und den ersten Stackframes aus dem anwendungseigenen Code und schreibt die Problem-ID in `error.issue_id`. MoleSignal ersetzt einen als `issue_id` gesendeten Wert. |
+| `handling` | `handled` oder `unhandled`. |
+| `is_crash`, `category`, `source_type` | `category` ist `ANR`, `App Hang`, `Exception`, `Watchdog Termination`, `Memory Warning` oder `Network`. |
+| `resource` | Fehlgeschlagene Anfrage bei einem `network`-Fehler: `method`, `status_code` und `url`. |
+| `causes`, `threads`, `binary_images` | Ursachenketten, Stacktraces der Threads und geladene Binärmodule. |
+
+## Ressource
+
+| Feld | Hinweise |
+|---|---|
+| `type`, `url` | Pflichtfelder. `type` ist `document`, `xhr`, `beacon`, `fetch`, `css`, `js`, `image`, `font`, `media`, `other` oder `native`. |
+| `method`, `status_code` | `status_code` ist `0`, wenn auf die Anfrage keine Antwort kam. |
+| `duration` | Nanosekunden. |
+| `size`, `encoded_body_size`, `decoded_body_size`, `transfer_size` | Bytes. |
+| `redirect`, `dns`, `connect`, `ssl`, `first_byte`, `download`, `worker` | Phasen, jeweils mit `{ start, duration }` in Nanosekunden. |
+| `trace_id`, `span_id` | W3C-Trace-Kontext der Anfrage. MoleSignal verknüpft die Sitzung anhand von `trace_id` mit dem Backend-Trace. |
+| `graphql` | `operation_type`, `operation_name`, `payload` und `variables`. |
+| `request.headers`, `response.headers` | Objekte mit Headern. |
+
+## Lang laufende Aufgabe
+
+| Feld | Hinweise |
+|---|---|
+| `duration` | Pflichtfeld. Nanosekunden. |
+| `entry_type` | `long-task` oder `long-animation-frame`. |
+| `start_time`, `blocking_duration`, `render_start`, `style_and_layout_start`, `first_ui_event_timestamp` | Nanosekunden relativ zum Beginn der Ansicht. |
+| `is_frozen_frame` | `true` bei einem eingefrorenen Frame einer mobilen App. |
+| `scripts` | Skripte eines lang laufenden Animationsframes, jeweils mit `duration`, `source_url`, `source_function_name`, `invoker` und `invoker_type`. |
+
+## Vitalmetrik
+
+| Feld | Hinweise |
+|---|---|
+| `id`, `type` | Pflichtfelder. `type` ist `duration`, `app_launch` oder `operation_step`. |
+| `name`, `duration` | Pflichtfelder für `duration`. |
+| `app_launch_metric`, `startup_type` | Zusammen mit `duration` Pflichtfelder für `app_launch`: `ttid` oder `ttfd` sowie `cold_start` oder `warm_start`. |
+| `step_type`, `operation_key`, `failure_reason` | Für `operation_step`: `start`, `update`, `retry` oder `end`. |
+
+## Log
+
+Ein `log`-Ereignis enthält `level` und `message` auf oberster Ebene, damit der Stream wie ein gewöhnlicher Logstream lesbar ist. Es enthält außerdem ein `log`-Objekt. Siehe [Browser-Logs](/de/rum/logs).
+
+| Feld | Hinweise |
+|---|---|
+| `level` | Pflichtfeld: `debug`, `info`, `warn` oder `error`. |
+| `message` | Pflichtfeld. |
+| `log.id` | Pflichtfeld. |
+| `log.logger` | Name des Loggers. |
+| `log.origin` | `logger`, `console`, `report` oder `sdk`. |
+| `log.error_type`, `log.stack` | Fehler, auf den sich der Logeintrag bezieht. |
+
+## Was MoleSignal hinzufügt
+
+- **Standort:** Land, Region, Stadt, Kontinent und Koordinaten zur Client-IP-Adresse. MoleSignal ermittelt diese Angaben anhand
+  der Datenbank DB-IP City Lite. MoleSignal speichert die Adresse selbst nur, wenn die Anwendung sie speichert.
+- **Browser, System und Gerät:** Fehlen diese Angaben in Browserereignissen, ermittelt MoleSignal sie aus dem `User-Agent`-Header.
+  MoleSignal klassifiziert Crawler als `device.type: bot`. Vom SDK gesendete Werte haben Vorrang.
+- **URL-Bestandteile:** `view.url_host`, `view.url_path` und `view.url_path_group` sowie die entsprechenden Felder für `resource.url`.
+- **Skripte lang laufender Aufgaben:** `long_task.top_script.source_url`, `long_task.top_script.function` und `long_task.top_script.invoker_type` aus dem Eintrag in `long_task.scripts` mit der längsten Laufzeit. Meldet der Browser keine Skripte, lässt MoleSignal diese Felder leer. MoleSignal verwirft alle Werte, die ein Client in diesen Feldern sendet.
+- **Sitzungen:** Für jede Sitzung leitet MoleSignal aus den zugehörigen Ansichten eine Zeile in `rum_sessions` ab.
+
+Vor dem Speichern eines Ereignisses wendet MoleSignal die Einstellungen der Anwendung an: MoleSignal lässt alle Sitzungen aus, die laut Konfiguration nicht gespeichert werden sollen, und ersetzt
+[vertraulichen Text](/de/rum/privacy#sensible-texte-beim-empfang-bereinigen), den die Konfiguration zur Entfernung vorsieht.
+
+Für IP-Adresse und Standort gelten die [Einstellungen der Anwendung](/de/rum/applications#datenerfassung).
+
+## Wo die Ereignisse gespeichert werden
+
+Für jeden Typ gibt es einen eigenen regulären Log-Stream. MoleSignal legt die Streams mit der ersten Anwendung an. Die Streams haben ein festes
+Schema. Ein Wert mit falschem Datentyp ändert daher keine Spalte.
+
+| Stream | Zeilen |
+|---|---|
+| `rum_sessions` | Eine abgeleitete Zeile pro Sitzung. |
+| `rum_views` | Eine Zeile pro Ansicht. |
+| `rum_actions` | Eine Zeile pro Aktion. |
+| `rum_errors` | Eine Zeile pro Fehler. |
+| `rum_resources` | Eine Zeile pro Anfrage. Dieser Stream enthält die meisten Zeilen. Legen Sie daher in den Stream-Einstellungen eine kürzere Aufbewahrungsdauer fest. |
+| `rum_long_tasks` | Eine Zeile pro lang laufender Aufgabe. |
+| `rum_vitals` | Eine Zeile pro Vitalwert. |
+| `rum_logs` | Eine Zeile pro Log. |
+
+Nur die RUM-Datenerfassung schreibt in diese Streams. Eine Echtzeit-Pipeline kann die benutzerdefinierten Felder eines eingehenden Ereignisses ändern: `context`, `usr.extra`, `feature_flags` und `extra`. Eine zeitgesteuerte Pipeline kann die Streams lesen. Siehe [RUM-Streams](/de/pipelines#rum-streams).
+
+Die Spaltennamen entsprechen den im Ereignis verschachtelten Feldnamen in abgeflachter Form, etwa `view.performance.lcp.timestamp` und `resource.status_code`.
+Sehen Sie sich die Spalten im [RUM-Explorer](/de/rum/explorer) an oder fragen Sie die Streams unter **Logs** mit SQL ab.
+
+## Beispiel
+
+Eine Anfrage mit einer erneut gesendeten Ansicht, eine fehlgeschlagene Anfrage und der dadurch verursachte Fehler:
+
+```json
+[
+  {
+    "type": "view",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user", "start": 1789999990000 },
+    "view": {
+      "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34",
+      "url": "https://shop.example.com/checkout",
+      "name": "/checkout",
+      "revision": 3,
+      "time_spent": 8200000000,
+      "loading_time": 1200000000,
+      "performance": { "lcp": { "timestamp": 900000000, "target_selector": "img.hero" } },
+      "error": { "count": 1 },
+      "resource": { "count": 22 }
+    },
+    "usr": { "id": "u-42" },
+    "context": { "plan": "pro" }
+  },
+  {
+    "type": "resource",
+    "date": 1790000001500,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "resource": {
+      "type": "fetch",
+      "method": "POST",
+      "url": "https://api.example.com/orders",
+      "status_code": 500,
+      "duration": 482000000,
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "span_id": "00f067aa0ba902b7"
+    }
+  },
+  {
+    "type": "error",
+    "date": 1790000001600,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "error": {
+      "id": "0a9b8c7d-6e5f-4a3b-8c1d-2e3f4a5b6c70",
+      "message": "Failed to fetch https://api.example.com/orders: 500",
+      "source": "network",
+      "type": "ServerError",
+      "handling": "handled",
+      "resource": { "method": "POST", "status_code": 500, "url": "https://api.example.com/orders" }
+    }
+  }
+]
+```
+
+<CardGroup cols={2}>
+  <Card title="RUM-Anwendungen" icon="grid" href="/de/rum/applications">
+    Erstellen Sie die Anwendung, an die ein Client-Token gebunden ist.
+  </Card>
+  <Card title="RUM-Explorer" icon="magnifying-glass" href="/de/rum/explorer">
+    Durchsuchen Sie die Ereignisse nach Typ und Feld.
+  </Card>
+</CardGroup>

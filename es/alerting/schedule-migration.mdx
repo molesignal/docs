@@ -1,0 +1,224 @@
+---
+title: "Migra calendarios desde Opsgenie o PagerDuty"
+description: "Importa los calendarios de guardia mediante la API REST de Opsgenie o PagerDuty y compáralos con los que muestra el sistema de origen antes de guardar nada. Consulta qué se importa y qué queda fuera."
+"en_link": "/en-US/alerting/schedule-migration"
+"zh-Hans_link": "/zh-Hans/alerting/schedule-migration"
+"zh-Hant_link": "/zh-Hant/alerting/schedule-migration"
+"ja_link": "/ja/alerting/schedule-migration"
+"ko_link": "/ko/alerting/schedule-migration"
+"de_link": "/de/alerting/schedule-migration"
+"fr_link": "/fr/alerting/schedule-migration"
+"pt-BR_link": "/pt-BR/alerting/schedule-migration"
+---
+
+**Importar horarios de guardia…** lee los turnos de guardia tal como los devuelven las API REST de Opsgenie y PagerDuty, para que el equipo que migra no tenga que reconstruir sus rotaciones a mano. Un script usa la clave de API del servicio de origen para obtener los turnos y guardarlos en un archivo. El archivo sigue el mismo proceso de importación que un [paquete](/es/alerting/on-call#importación-y-exportación): primero se prueba la importación y luego se guardan todos los turnos de una sola vez. MoleSignal no guarda la clave ni hace solicitudes al servicio de origen. Para importar, se requiere `schedules.create`.
+
+Una regla determina qué se importa: a partir de ahora, en cada momento debe quedar de guardia la misma persona que en el servicio de origen. Si MoleSignal no puede representar una configuración del turno y eso cambia quién queda de guardia, la importación se detiene. Si la configuración no afecta a las guardias de aquí en adelante, la importación la omite y el resultado indica cuál se omitió.
+
+## Pasos
+
+<Steps>
+  <Step title="Agrega a las personas">
+    Agrega al espacio de trabajo a todas las personas de las rotaciones con la misma dirección de correo electrónico que en el servicio de origen. Consulta [Miembros](/es/identity/members). MoleSignal identifica a los miembros por su dirección de correo electrónico, sin distinguir entre mayúsculas y minúsculas.
+  </Step>
+  <Step title="Obtén los turnos de guardia">
+    Ejecuta el script de [Opsgenie](#opsgenie) o [PagerDuty](#pagerduty) en un equipo con `curl` y `jq`. El script genera un solo archivo.
+  </Step>
+  <Step title="Prueba la importación">
+    Abre **Alertas → Turnos de guardia**, selecciona **Importar/exportar → Importar horarios de guardia…**, haz clic en **Seleccionar un archivo** y luego en **Probar**. El resultado indica qué ocurriría con cada turno de guardia. Consulta [Lee el resultado](#lee-el-resultado).
+  </Step>
+  <Step title="Corrige los errores que impiden la importación">
+    Haz los cambios en el servicio de origen y vuelve a obtener los turnos, o edita el archivo. Si algún turno de guardia tiene un error, MoleSignal no guarda ninguno.
+  </Step>
+  <Step title="Importar">
+    Selecciona **Importar**, abre uno de los turnos de guardia importados y verifica quién está de guardia. Configura una [política de escalamiento](/es/alerting/on-call#políticas-de-escalamiento) para que use ese turno y notifique a quien esté de guardia.
+  </Step>
+</Steps>
+
+## Opsgenie
+
+Configura una clave de API con permiso para leer los turnos de guardia y ejecuta el script. Las cuentas de la UE usan `api.eu.opsgenie.com`.
+
+```bash
+export OPSGENIE_API_KEY=<api key>
+```
+
+```bash
+API=https://api.opsgenie.com   # EU accounts: https://api.eu.opsgenie.com
+DAYS=200
+
+get() { curl -fsS -H "Authorization: GenieKey $OPSGENIE_API_KEY" "$API$1"; }
+
+get /v2/schedules | jq -r '.data[].id' | while read -r id; do
+  get "/v2/schedules/$id"
+  get "/v2/schedules/$id/timeline?expand=base&interval=$DAYS&intervalUnit=days"
+done | jq -s '{
+  data: map(.data | select(has("rotations"))),
+  timelines: map(.data | select(has("baseTimeline"))
+    | {_parent, startDate, endDate, baseTimeline}
+    | .baseTimeline.rotations[].periods |= map({startDate, endDate, type, recipient}))
+}' > opsgenie-schedules.json
+```
+
+El archivo contiene, en `data`, cada turno de guardia devuelto por `GET /v2/schedules/{id}` y, en `timelines`, su cronograma devuelto por `GET /v2/schedules/{id}/timeline`. `DAYS` indica cuántos días futuros abarca el cronograma.
+
+| En Opsgenie | En MoleSignal |
+|---|---|
+| Nombre, descripción, zona horaria, estado de activación | Se conservan sin cambios. |
+| Equipo propietario | MoleSignal asigna el turno de guardia al equipo del mismo nombre, si existe. De lo contrario, lo deja sin equipo y lo indica en el resultado. |
+| `type` y `length` de la rotación | **Diaria** y **Semanal** cuando `length` es 1. En los demás casos, MoleSignal usa un período personalizado, como 6 horas si el tipo es `hourly` y `length` es 6. |
+| `startDate`, `endDate` | El inicio y el fin de la rotación. MoleSignal omite las rotaciones que ya terminaron. |
+| `timeRestriction` | Intervalos semanales en la zona horaria del turno de guardia, incluidos los que abarcan varios días. |
+| Varias rotaciones que no se superponen | Varias rotaciones, por ejemplo, una para el horario laboral y otra para fuera de ese horario. |
+| Usuarios como participantes | Miembros en el mismo orden, identificados por `username`, que corresponde a la dirección de correo electrónico. |
+
+Estas configuraciones impiden la importación mientras la rotación esté activa:
+
+| En Opsgenie | Motivo |
+|---|---|
+| Un equipo o un escalamiento como participante | En MoleSignal, las rotaciones solo admiten personas. |
+| Un participante **No-One** | En MoleSignal, una rotación no puede dejar un período de guardia sin cubrir. |
+| Rotaciones que se superponen | Opsgenie pone de guardia a las personas de todas las rotaciones superpuestas al mismo tiempo. En MoleSignal, cada turno de guardia admite una sola persona a la vez. Mueve las rotaciones a turnos de guardia separados en el archivo, dales nombres distintos e incluye ambos turnos en un mismo paso de una política de escalamiento. |
+
+MoleSignal no importa las sustituciones de guardia, las reglas de reenvío, los escalamientos ni el enrutamiento.
+
+## PagerDuty
+
+Configura una clave de API con permisos de lectura para las programaciones de guardia y los usuarios. Luego ejecuta el script. Las cuentas de la UE usan `api.eu.pagerduty.com`.
+
+```bash
+export PAGERDUTY_API_KEY=<api key>
+```
+
+```bash
+API=https://api.pagerduty.com   # EU accounts: https://api.eu.pagerduty.com
+DAYS=200
+since=$(jq -rn 'now | todate')
+until=$(jq -rn "now + $DAYS * 86400 | todate")
+
+get() {
+  curl -fsSg -H "Authorization: Token token=$PAGERDUTY_API_KEY" \
+    -H 'Accept: application/vnd.pagerduty+json;version=2' "$API$1"
+}
+pages() {
+  offset=0
+  while page=$(get "$1?limit=100&offset=$offset"); do
+    printf '%s\n' "$page"
+    [ "$(printf '%s' "$page" | jq .more)" = true ] || break
+    offset=$((offset + 100))
+  done
+}
+shift_based=$(pages /v3/schedules)
+
+{
+  pages /users
+  printf '%s\n' "$shift_based"
+  printf '%s\n' "$shift_based" | jq -r '.schedules[].id' | while read -r id; do
+    get "/v3/schedules/$id?since=$since&until=$until&include[]=final_schedule"
+  done
+  pages /schedules | jq -r '.schedules[].id' | while read -r id; do
+    get "/schedules/$id?since=$since&until=$until&include[]=final_schedule&include[]=overrides_subschedule"
+  done
+} | jq -s --arg since "$since" --arg until "$until" '{
+  since: $since,
+  until: $until,
+  users: (map(.users // []) | add // [] | map({id, email})),
+  shift_based_schedules: (map(.schedules // []) | add // [] | map({id, type, summary})),
+  schedules: map(.schedule // empty
+    | del(.users, .escalation_policies)
+    | if .type == "schedule_v3" then
+        .final_schedule.computed_shift_assignments[]? |= {start_time, end_time, member, source: {type: .source.type}}
+      else
+        del(.schedule_layers[].rendered_schedule_entries)
+        | .final_schedule.rendered_schedule_entries |= map({start, end, user: (.user | select(.) | {id})})
+        | .overrides_subschedule.rendered_schedule_entries |= map({start, end})
+      end)
+}' > pagerduty-schedules.json
+```
+
+El archivo guarda en `schedules` cada programación de `GET /schedules/{id}` y `GET /v3/schedules/{id}`; en `users`, los correos electrónicos de `GET /users`, ya que las programaciones identifican a las personas sin incluir su correo; y en `shift_based_schedules`, la lista de `GET /v3/schedules`. `since` y `until` delimitan el intervalo que genera PagerDuty, y `DAYS` indica cuántos días se proyecta hacia el futuro.
+
+Obtén las programaciones una por una, sin `time_zone`. `GET /schedules` muestra las restricciones en la zona horaria de quien hace la solicitud, no en la de la programación. La importación detecta y rechaza las programaciones generadas en otra zona horaria.
+
+### Programaciones por capas
+
+| En PagerDuty | En MoleSignal |
+|---|---|
+| Nombre, descripción y zona horaria | Sin cambios. Una programación en pausa sigue en pausa después de actualizarla. |
+| Equipos | El primer equipo que tenga un equivalente con el mismo nombre en MoleSignal. El resultado enumera los demás. |
+| Capas | Rotaciones con el mismo orden de prioridad: la capa más reciente tiene prioridad y determina quién está de guardia. Fuera de los intervalos que cubre, toman el relevo las capas inferiores. |
+| `rotation_turn_length_seconds` | **Diaria** para exactamente 24 horas y **Semanal** para exactamente 7 días. En los demás casos, se usa un período personalizado. |
+| `rotation_virtual_start` | El inicio de la rotación, que determina la hora del relevo y a quién le toca el turno. |
+| `start` | El momento en que entra en vigor la capa. Si ya pasó, no hace falta ningún ajuste. Si aún no llega, la rotación se desplaza hasta ese momento y comienza con la persona a la que le corresponde el turno. |
+| `end` | El final de la rotación. La importación omite las capas que ya terminaron y las versiones anteriores de las capas editadas. |
+| `restrictions` | Intervalos semanales en la zona horaria de la programación, tanto para `daily_restriction` como para `weekly_restriction`. |
+| `users` | Miembros en el mismo orden, identificados por el correo electrónico de `users`. |
+
+### Programaciones por turnos
+
+Una programación devuelta por la API V3 de PagerDuty consta de eventos. Los eventos no tienen prioridad: si se superponen, todas las personas asignadas a esos eventos están de guardia al mismo tiempo.
+
+| En PagerDuty | En MoleSignal |
+|---|---|
+| Nombre, descripción y equipos | Igual que en una programación por capas. |
+| La zona horaria de los eventos | Se usa como zona horaria de la programación porque los relevos conservan la hora local del evento. Si el valor de `time_zone` de la programación indica otra zona, el resultado lo señala. |
+| Cada evento | Una rotación con el nombre del evento. Los eventos que no se superponen, como uno para el horario laboral y otro para fuera de ese horario, pueden aparecer en cualquier orden. |
+| `start_time`, `end_time`, `recurrence` | El primer turno y cómo se repite, según la tabla siguiente. |
+| `shifts_per_member` | Cuánto dura el turno de cada persona. Cuenta las repeticiones desde `start_time`, y cada día de `BYDAY` cuenta como una repetición. |
+| `effective_since` | El momento en que entra en vigor el evento. Si ya pasó, no hace falta ningún ajuste y no determina a quién le toca el turno. Si aún no llega, la rotación se desplaza hasta ese momento y comienza con la persona a la que le corresponde el turno. |
+| `effective_until` | El final de la rotación. La importación omite los eventos que ya terminaron. |
+| `members` | Miembros en el mismo orden, identificados por el correo electrónico de `users`. |
+
+| `recurrence` | Primer turno | En MoleSignal |
+|---|---|---|
+| `RRULE:FREQ=WEEKLY` | 7 días | Siempre activa. **Semanal** si `shifts_per_member` vale 1; de lo contrario, usa un período personalizado. |
+| `RRULE:FREQ=DAILY` | 24 horas | Siempre activa. **Diaria** si `shifts_per_member` vale 1 y **Semanal** si vale 7. En los demás casos, usa un período personalizado. |
+| `FREQ=WEEKLY`, `FREQ=DAILY` o `FREQ=HOURLY` con un `INTERVAL` | La misma duración que el intervalo | Siempre activa, con un período personalizado, como 12 horas para `RRULE:FREQ=HOURLY;INTERVAL=12`. |
+| `RRULE:FREQ=DAILY` | Parte de un día | Intervalos semanales para cada día. |
+| `RRULE:FREQ=WEEKLY` o con un solo día en `BYDAY` | Parte de una semana | Un intervalo semanal que puede abarcar varios días. |
+| `RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` | Parte de un día | Intervalos semanales para esos días. Un valor de `shifts_per_member` de 5 equivale a una semana por persona; un valor de 10, a dos semanas. |
+
+Los siguientes casos detienen la importación mientras el evento está activo:
+
+| En PagerDuty | Motivo |
+|---|---|
+| `every_member_assignment_strategy` con varios miembros | Todos están de guardia al mismo tiempo. Una programación en MoleSignal solo permite una persona a la vez. Asigna a cada persona una programación con un nombre distinto en el archivo e incluye todas esas programaciones en un mismo paso de una política de escalamiento. |
+| `empty_member` entre otros miembros | Una rotación en MoleSignal no puede dejar un turno sin asignar. |
+| Eventos que se superponen | Las personas asignadas a esos eventos están de guardia al mismo tiempo. Separa los eventos en distintas programaciones, igual que con Opsgenie. |
+| `EXDATE` o `RDATE` | Una rotación en MoleSignal no puede omitir ni agregar una ocurrencia individual, y PagerDuty no documenta si esas ocurrencias cuentan para `shifts_per_member`. |
+| Cualquier otra regla, como `FREQ=MONTHLY`, `COUNT`, `UNTIL` o un `INTERVAL` con un turno más corto que el intervalo | Los turnos o la cobertura no se repiten en los mismos días y horarios cada semana. |
+| `BYDAY` con varios miembros y un valor de `shifts_per_member` que no es múltiplo del número de días | Los relevos no ocurren a intervalos fijos: el turno que sigue al del viernes es el del lunes. |
+| Un turno personalizado que aún no ha ocurrido | Una rotación en MoleSignal no admite turnos únicos. Importa la programación cuando termine el turno, o elimínalo de `final_schedule` en el archivo y agrega una sustitución después de la importación. |
+| Eventos en distintas zonas horarias | Una programación en MoleSignal solo admite una zona horaria. |
+
+Si el archivo solo menciona una programación por turnos en `shift_based_schedules`, la importación la omite y la identifica en el resultado. Esto puede ocurrir si el script no pudo obtenerla. Vuelve a ejecutar el script para importarla. La importación del resto del archivo continúa.
+
+La importación no incluye sustituciones, políticas de escalamiento ni servicios.
+
+## Lee el resultado
+
+| Etiqueta | Significado |
+|---|---|
+| **Crear**, **Actualizar**, **Sin cambios** | La importación busca coincidencias por nombre, igual que con un paquete. **Actualizar** indica qué campos cambian. |
+| **Omitir** | La importación omite una programación por turnos de PagerDuty que el archivo solo menciona, o una programación existente si seleccionas **Solo crear reglas nuevas; no modificar las que ya tienen el mismo nombre**. |
+| **Error** | Detiene la importación de todo el archivo. El resultado muestra cada motivo en una línea y enumera todos los correos electrónicos que no tienen un miembro asociado. |
+
+Las demás líneas de cada programación indican qué se omitió y cómo se compara con el origen.
+
+### Comparación con el origen
+
+El archivo contiene los datos que genera el sistema de origen: `final_schedule` de PagerDuty y la línea de tiempo de Opsgenie. La prueba de importación calcula quién está de guardia en ese intervalo y compara ambos resultados a partir del momento actual. Si hay una diferencia, el error indica los horarios y las dos personas, y la importación no guarda ningún cambio.
+
+- Como la importación no incluye las sustituciones, la comparación excluye los intervalos que cubren.
+- Si `final_schedule` muestra a varias personas de guardia al mismo tiempo en una programación por turnos, la importación se detiene, aunque los eventos no se superpongan.
+- La importación deja en pausa las programaciones desactivadas en Opsgenie y no las compara.
+- Si la comparación no abarca un cambio de hora en una zona con horario de verano, el resultado lo indica. En MoleSignal, los relevos conservan la misma hora local. Aumenta `DAYS` para comparar los relevos antes y después del próximo cambio de hora.
+- Si el archivo no incluye la programación generada por el origen, el resultado indica que no se comparó y la importación continúa. Para importar una programación que difiere intencionalmente del origen, elimina `final_schedule` o `timelines` del archivo.
+
+### Límites
+
+Cada archivo admite hasta 4 MiB y 500 programaciones. Cada programación admite hasta 60 rotaciones activas. Reduce `DAYS` si el archivo supera el tamaño máximo.
+
+## Vuelve a importar
+
+La importación busca coincidencias por nombre. Si vuelves a ejecutarla, actualiza las rotaciones de las programaciones que cambiaron en el origen y deja las demás sin cambios. La importación conserva las sustituciones y los intercambios de turno que hayas hecho en MoleSignal, así como los ajustes que no figuren en el archivo, como el equipo o **Los intercambios de turno requieren aprobación**.

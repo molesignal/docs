@@ -1,0 +1,105 @@
+---
+title: "Upgrade"
+description: "Aktualisieren Sie Ihre MoleSignal-Installation auf eine neue Version. Hier finden Sie Informationen zu Backups, Schemamigrationen, zum Vorgehen je nach Bereitstellungsart und zum Rollback."
+"en_link": "/en-US/upgrade"
+"zh-Hans_link": "/zh-Hans/upgrade"
+"zh-Hant_link": "/zh-Hant/upgrade"
+"ja_link": "/ja/upgrade"
+"ko_link": "/ko/upgrade"
+"es_link": "/es/upgrade"
+"fr_link": "/fr/upgrade"
+"pt-BR_link": "/pt-BR/upgrade"
+---
+
+MoleSignal hat Version 1.0 noch nicht erreicht. Die Release Notes auf der Seite [Änderungsprotokoll](/de/changelog) führen die Änderungen jeder Version auf. Lesen Sie sie vor dem Upgrade und erstellen Sie vor jedem Upgrade ein Backup.
+
+## Vor dem Upgrade
+
+1. Lesen Sie die Release Notes aller Versionen nach der aktuellen Version bis einschließlich der Zielversion.
+2. Sichern Sie PostgreSQL und den Objektspeicher. Siehe [Backup und Wiederherstellung](/de/backup-restore).
+3. Notieren Sie die laufende Version. `molesignal --version` gibt die Version aus. `GET /api/v1/version` liefert die Version, den Commit, die Build-ID, den Release-Kanal und die Edition. Die Anfrage erfordert ein Bearer-Token.
+4. Testen Sie bei einem kritischen Deployment das Upgrade mit einer wiederhergestellten Kopie der Datenbank.
+
+## So werden Schemaänderungen angewendet
+
+Die Binärdatei enthält die Datenbankmigrationen und wendet sie bei jedem Start auf PostgreSQL an, bevor sie Anfragen verarbeitet. Schlägt eine Migration fehl, beendet sich der Prozess. Eine Sperre in PostgreSQL verhindert, dass Migrationen parallel laufen. Dadurch können mehrere Knoten sicher gleichzeitig starten. PostgreSQL speichert die angewendeten Versionen in der Tabelle `_molesignal_schema_meta`.
+
+Migrationen lassen sich nicht rückgängig machen:
+
+- Eine Binärdatei, die älter als die Datenbank ist, verweigert den Start mit der Meldung `migration <version> was previously applied but is missing in the resolved migrations`.
+- Eine Binärdatei, die eine geänderte Fassung einer bereits angewendeten Migration enthält, verweigert den Start mit der Meldung `migration <version> was previously applied but has been modified`. Das Ausgangsschema kann sich zwischen Vorab-Builds ändern. Ein anderer Build kann eine so erstellte Datenbank deshalb möglicherweise nicht öffnen.
+
+Um zu einer älteren Version zurückzukehren, stellen Sie die Datenbank und die Objekte aus einem Backup wieder her, das Sie vor dem Upgrade erstellt haben.
+
+## Vorgehensweisen
+
+<Tabs>
+  <Tab title="Docker Compose">
+    Ändern Sie den `image`-Tag in der Compose-Datei, laden Sie dann das Image herunter und erstellen Sie den Container neu:
+
+    ```bash
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone pull
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up -d
+    ```
+
+    Behalten Sie die benannten Volumes bei. Sie enthalten die Daten von PostgreSQL und RustFS, einschließlich des WAL von RustFS.
+  </Tab>
+  <Tab title="Binärdatei und systemd">
+    Stoppen Sie den Dienst, ersetzen Sie die Binärdatei und die GeoIP-Datenbank und starten Sie den Dienst erneut:
+
+    ```bash
+    sudo systemctl stop molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo install -Dm644 mmdb/dbip-city-lite.mmdb \
+      /usr/share/molesignal/mmdb/dbip-city-lite.mmdb
+    sudo systemctl start molesignal
+    sudo journalctl -u molesignal -n 50
+    ```
+
+    Ältere Versionen haben `/usr/share/molesignal/mmdb/GeoLite2-City.mmdb` installiert. Löschen Sie die Datei. Falls `[mmdb].db_path` in `/etc/molesignal/config.toml` noch darauf verweist, ändern Sie den Eintrag so, dass er auf `dbip-city-lite.mmdb` verweist.
+
+    Vergleichen Sie `conf/config.toml` aus der neuen Version mit der installierten Datei. Fehlen neue Einstellungen in der Datei, verwendet MoleSignal die integrierten Standardwerte. Ein geänderter Standardwert kann sich jedoch auf den Betrieb auswirken.
+  </Tab>
+  <Tab title="Helm">
+    Lesen Sie das [Änderungsprotokoll des Charts](https://github.com/molesignal/molesignal-helm/blob/main/CHANGELOG.md) und führen Sie das Upgrade dann mit derselben Values-Datei durch:
+
+    ```bash
+    helm repo update
+    helm upgrade molesignal molesignal/molesignal --namespace molesignal --values values.yaml
+    ```
+
+    Ohne `image.tag` verwendet das Chart den Image-Tag `latest`. Legen Sie `image.tag` in der Values-Datei fest, um zu einer bestimmten MoleSignal-Version zu wechseln.
+
+    Generierte Secrets bleiben bei Upgrades unverändert. Die Pods `standalone` und `intake` haben für das Herunterfahren standardmäßig 60 Sekunden Zeit. Halten Sie `terminationGracePeriodSeconds` über `[node].drain_timeout_secs`.
+
+    Im Modus `distributed` ersetzt `helm upgrade` die Pods aller Workloads gleichzeitig und hält damit die Reihenfolge unter [Cluster mit getrennten Rollen](#cluster-mit-getrennten-rollen) nicht ein.
+  </Tab>
+  <Tab title="Kubernetes-Manifeste">
+    Ändern Sie den Image-Tag in den Manifesten und wenden Sie die Manifeste an:
+
+    ```bash
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    kubectl -n molesignal rollout status deployment/intake
+    ```
+
+    Setzen Sie `terminationGracePeriodSeconds` höher als `[node].drain_timeout_secs`, damit die Pods vor dem Herunterfahren ausstehende Daten schreiben können.
+  </Tab>
+</Tabs>
+
+Wenn ein Prozess `SIGTERM` oder `SIGINT` empfängt, wartet er bis zu `[node].drain_timeout_secs` darauf, dass ausstehende Daten geschrieben werden, und beendet sich dann. Noch nicht geschriebene Datensätze verbleiben im WAL im Objektspeicher. Ein anderer Intake-Knoten veröffentlicht sie, oder derselbe Knoten veröffentlicht sie nach dem Neustart.
+
+## Cluster mit getrennten Rollen
+
+Alle Knoten eines Clusters mit getrennten Rollen verwenden dasselbe Schema. Ein laufender Knoten mit einer älteren Version verwendet bis zum Neustart weiterhin das neue Schema. Die Kompatibilität zwischen den Versionen ist nicht garantiert. Führen Sie das Upgrade für alle Knoten im selben Wartungsfenster durch:
+
+1. Stoppen Sie zuerst die `router`-Knoten, danach die `intake`- und `querier`-Knoten und zuletzt `compactor` und `alert`.
+2. Starten Sie einen Knoten mit der neuen Version und warten Sie, bis `GET /api/v1/healthz` den Statuscode `200` zurückgibt. Dieser Knoten wendet die Migrationen an.
+3. Starten Sie die übrigen Knoten.
+
+## Upgrade überprüfen
+
+- Das Log enthält keine Migrationsfehler und `GET /api/v1/healthz` gibt `200` zurück.
+- `GET /api/v1/version` gibt die neue Version zurück.
+- Eine Abfrage aktueller Daten liefert Zeilen und neue Datensätze treffen ein.
+- Der Wert von `storage_reconciler_issues_total` unter `/metrics` steigt nicht.

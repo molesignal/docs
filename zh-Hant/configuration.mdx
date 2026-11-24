@@ -1,0 +1,604 @@
+---
+title: "設定"
+description: "說明 MoleSignal 如何載入設定、有哪些環境變數，並提供各設定項目及其預設值的參考資訊。"
+"en_link": "/en-US/configuration"
+"zh-Hans_link": "/zh-Hans/configuration"
+"ja_link": "/ja/configuration"
+"ko_link": "/ko/configuration"
+"de_link": "/de/configuration"
+"es_link": "/es/configuration"
+"fr_link": "/fr/configuration"
+"pt-BR_link": "/pt-BR/configuration"
+---
+
+MoleSignal 讀取一個 TOML 檔案和 `MS_` 環境變數。請從每個發行版本隨附的範例檔案 `conf/config.toml` 開始。範例檔案列出所有設定項目，本頁逐一說明。
+
+```bash
+molesignal --config /etc/molesignal/config.toml
+```
+
+## 如何載入設定
+
+設定項目依下列順序套用，後面的來源會覆寫前面的來源。
+
+1. 內建預設值。
+2. 透過 `--config` 傳入的 TOML 檔案。
+3. `MS_` 環境變數。
+
+修改設定後，必須重新啟動處理程序。執行中的處理程序只會在記錄中記下檔案變更，不會套用變更。
+
+<Note>
+  大多數設定區段會忽略未定義的鍵，因此拼錯的鍵不會生效，也不會觸發警告。`[meta_database]`、`[object_store]`（包括 `[object_store.retry]`）、`[telemetry]`（包括 `[telemetry.trace]` 與 `[telemetry.self_collect]`）、`[apm]`、`[probe]`、`[otlp_grpc]`、`[notify]` 與 `[scheduled_reports.renderer]` 則不同：遇到未知的鍵時，處理程序會在啟動時結束。
+</Note>
+
+參考表中的 **預設值** 欄取自範例檔案 `conf/config.toml`。如果未設定某個鍵時使用的內建值與表中不同，說明欄會註明。
+
+## 環境變數
+
+每個設定項目都有對應的環境變數：先加上 `MS_` 前綴，再將設定路徑的各層轉成大寫，並用單一底線連接。
+
+| 設定項目 | 環境變數 |
+|---|---|
+| `[http].port` | `MS_HTTP_PORT` |
+| `[meta_database].dsn` | `MS_META_DATABASE_DSN` |
+| `[cluster].advertise_addr` | `MS_CLUSTER_ADVERTISE_ADDR` |
+| `[node].roles` | `MS_NODE_ROLES` |
+
+清單使用 TOML 語法，例如 `MS_NODE_ROLES='["intake","querier"]'`。MoleSignal 不會辨識含有句點或雙底線的名稱。
+
+MoleSignal 會獨立於設定項目讀取下列變數：
+
+| 變數 | 用途 |
+|---|---|
+| `MS_CIPHER_KEY` | MoleSignal 用來加密儲存在 PostgreSQL 中的密文的根金鑰。取 32 個隨機位元組，並以 base64 編碼。未設定時，處理程序會改用全為零的開發用金鑰，並記錄警告。更換金鑰前必須執行 `rewrap-kek`，請參閱[正式環境檢查清單](/zh-Hant/deployment/production-checklist)。 |
+| `MS_AUTH_JWT_SECRET_OVERRIDE` | 固定的 JWT 簽署金鑰，用來取代首次啟動時在 PostgreSQL 中產生的金鑰。 |
+| `MS_SELF_TELEMETRY_CLUSTER_TOKEN` | 用於驗證依角色部署的節點之間轉送的候選追蹤資料與自身遙測資料的共用金鑰。啟用[追蹤擷取](#追蹤擷取與尾端取樣)（預設啟用）或 `[telemetry.self_collect]` 時，每個依角色部署的節點都必須設定相同的值。未設定時，沒有 `intake` 角色的節點會拒絕啟動。 |
+| `MS_TRACE_FINGERPRINT_KEY` | HMAC-SHA-256 指紋使用的金鑰。指紋會取代下列一律不儲存的原始值：[MoleSignal 自身的 Span](/zh-Hant/self-observability#後端分散式追蹤) 中的 SQL 陳述式型態和物件鍵，以及 [APM 相依性](/zh-Hant/apm#相依性)中的資料庫名稱。金鑰至少要有 16 個位元組，MoleSignal 會忽略更短的值。每個節點都必須設定相同的值；金鑰不同，指紋也不同。未設定金鑰時，MoleSignal 不會寫入指紋，也不會改用無金鑰的雜湊。MoleSignal 只從環境變數讀取金鑰，不會將金鑰寫入 API 回應、記錄或 Span。 |
+| `MS_AGENT_OPENAI_API_KEY`、`MS_AGENT_ANTHROPIC_API_KEY`、`MS_AGENT_COMPATIBLE_API_KEY` | Mole Agent 模型服務供應商的開發用備援 API 金鑰，各自有對應的 `_BASE_URL` 變數。正式環境請在產品中設定服務供應商。 |
+| `RELEASE_CHANNEL` | 標記部署成熟度：`alpha`、`beta`、`rc` 或 `stable`。 |
+| `RUST_LOG` | 設定後會覆寫 `[telemetry].log_level`。 |
+| `AZURE_STORAGE_ACCOUNT`、`AZURE_STORAGE_ACCESS_KEY` | `azure` 物件儲存後端的 Azure Blob 認證資訊。 |
+| `GOOGLE_APPLICATION_CREDENTIALS` | `gcs` 物件儲存後端使用的服務帳號 JSON 檔案路徑。 |
+
+## 正式環境的最低設定
+
+正式環境的節點至少需要下列設定。檔案中的其餘項目可保留預設值。
+
+```toml
+[http]
+external_url = "https://molesignal.example.com"
+
+[meta_database]
+dsn = "postgres://molesignal:<password>@db.internal:5432/molesignal"
+
+[object_store]
+backend = "s3"
+bucket = "molesignal"
+region = "us-east-1"
+endpoint = ""          # AWS S3 留空，兼容 S3 的服务填写服务地址
+access_key = ""        # 建议改用 MS_OBJECT_STORE_ACCESS_KEY
+secret_key = ""        # 建议改用 MS_OBJECT_STORE_SECRET_KEY
+
+[wal]
+dir = "/var/lib/molesignal/wal"
+
+[auth]
+root_email = "admin@example.com"
+root_password = "<初始密码>"
+```
+
+另請在環境中設定 `MS_CIPHER_KEY`。上線前的完整步驟請參閱[正式環境檢查清單](/zh-Hant/deployment/production-checklist)。
+
+## 節點
+
+使用 `[node]` 選擇處理程序要執行的角色，請參閱[依角色部署](/zh-Hant/deployment/role-based)。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `roles` | `["standalone"]` | 要執行的角色：`standalone`、`router`、`intake`、`querier`、`compactor`、`alert`。`standalone` 會在同一個處理程序中執行所有角色。 |
+| `id` | 空白 | 節點 id，最長 64 個字元。留空時使用作業系統的主機名稱。同一台主機執行多個處理程序時，必須為每個處理程序設定不同的 id。 |
+| `drain_timeout_secs` | `30` | 收到 `SIGTERM` 或 `SIGINT` 後，等待 intake 將待處理資料寫入完畢的時間。逾時後，處理程序會結束，其他 intake 節點會接手尚未寫入的資料。 |
+
+## 接聽連接埠
+
+### HTTP
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `bind` | `0.0.0.0` | 接聽位址。 |
+| `port` | `5080` | 未啟用 `[http.tls]` 時使用的 HTTP 連接埠。 |
+| `gzip` | `true` | 如果用戶端接受 gzip，處理程序會以 gzip 壓縮提供的網頁檔案，但不會壓縮 API 回應。如果反向代理伺服器已負責壓縮，請設為 `false`。 |
+| `external_url` | 空白 | 供外部存取的來源網址，例如 `https://molesignal.example.com`。留空時，網頁介面會使用瀏覽器目前的來源網址。產生的整合程式碼片段會使用此值，狀態頁的自訂網域也會以此值作為 CNAME 目標。Mole Agent 在即時通訊中的繫結連結和對話連結會使用此網址。Microsoft Teams 的回呼網址也以此網址為基礎，此時必須使用 HTTPS，請參閱[在即時通訊中使用 Mole Agent](/zh-Hant/im#teams-的安全措施)。[Passkey](/zh-Hant/identity/mfa#執行個體的要求) 也會繫結此網址的主機名稱，因此必須使用具備網域名稱的 HTTPS 網址。修改後必須重新啟動。 |
+
+### HTTP TLS 與 ACME
+
+`[http.tls]` 會啟動 TLS 接聽程式，並透過 Let's Encrypt 等 ACME 服務自動簽發憑證。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `enabled` | `false` | 總開關。設為 `false` 時，MoleSignal 會忽略其餘所有鍵。 |
+| `plain_port` | `80` | 用於 ACME HTTP-01 驗證和重新導向至 HTTPS 的純文字 HTTP 連接埠。 |
+| `port` | `443` | HTTPS 連接埠。 |
+| `acme_directory` | `production` | `production`、`staging`（Let's Encrypt 測試環境）或自訂目錄 URL。 |
+| `account_email` | 空白 | ACME 帳號的電子郵件地址。Let's Encrypt 要求提供此值。 |
+| `key_storage_dir` | `/var/lib/molesignal/acme` | 儲存 ACME 帳號金鑰與各網域金鑰的目錄。 |
+| `issue_poll_secs` | `60` | 掃描等待簽發憑證的網域的間隔。 |
+| `renewal_retry_secs` | `21600` | 重試續期與檢查到期狀態的間隔。 |
+
+### 內部 gRPC
+
+`[grpc]` 處理節點之間的流量。請僅在受信任的網路內開放此連接埠。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `bind` | `0.0.0.0` | 接聽位址。 |
+| `port` | `5082` | 連接埠。對端節點透過 `[cluster].advertise_addr` 使用此連接埠。 |
+| `max_message_size` | `32` | 單則 gRPC 訊息的大小上限，單位為 MiB。 |
+
+### OTLP gRPC
+
+`[otlp_grpc]` 用來設定 OTLP gRPC 接收端。接收端沒有啟用開關，會在每個執行 `intake` 角色的節點（包括 `standalone`）上接聽。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `bind` | `0.0.0.0` | 接聽位址。 |
+| `port` | `4317` | 連接埠。 |
+| `max_message_size` | `32` | 單則 gRPC 訊息的大小上限，單位為 MiB。 |
+
+### Arrow Flight SQL
+
+`[flight_sql]` 為 DBeaver、JDBC、ADBC 等 SQL 用戶端提供服務。每次呼叫都需要 API 權杖，請參閱[使用資料庫用戶端連線](/zh-Hant/query/database-clients)。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `enabled` | `false` | 啟動接聽程式。 |
+| `bind` | `0.0.0.0` | 接聽位址。 |
+| `port` | `5083` | 連接埠。 |
+| `default_lookback_hours` | `24` | SQL 未指定時間篩選條件時，預設往回查詢的小時數。 |
+| `max_message_size` | `32` | 單則訊息的大小上限，單位為 MiB。 |
+
+### Probe Agent
+
+`[probe]` 用來設定 Probe Agent 的註冊與控制端點。這些端點會在 `standalone` 與 `alert` 節點上啟動。註冊使用驗證伺服器身分的 TLS，控制串流則使用短效的雙向 TLS 身分。請參閱[合成監控](/zh-Hant/synthetics)。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `bind` | `0.0.0.0` | 接聽位址。 |
+| `register_port` | `5084` | 註冊連接埠，必須與 `control_port` 不同。 |
+| `control_port` | `5085` | 控制串流的連接埠。 |
+| `register_endpoint` | `https://localhost:5084` | Agent 註冊時使用的對外 `https://` 位址。一次性註冊指令會輸出此位址。部署在代理伺服器或負載平衡器後方時，必須設定此值。 |
+| `control_endpoint` | `https://localhost:5085` | 控制串流的對外 `https://` 位址。 |
+| `server_names` | `["localhost", "127.0.0.1"]` | 伺服器憑證中的 DNS 名稱與 IP 位址，應包含端點的對外主機名稱。 |
+| `certificate_days` | `30` | 簽發憑證的有效天數，範圍為 1 到 365。 |
+| `max_message_size` | `32` | 單則訊息的大小上限，單位為 MiB。 |
+
+### pprof
+
+`[profiling]` 會在節點本機啟動用於診斷的 pprof 接聽程式。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `enabled` | `false` | 啟動接聽程式。 |
+| `bind` | `127.0.0.1` | 接聽位址。除非將 `allow_remote` 設為 `true`，否則必須使用回送位址。 |
+| `port` | `5086` | 連接埠。必須與其他已啟用的接聽程式使用的連接埠不同，即使對應的角色未在此節點上執行也一樣。 |
+| `allow_remote` | `false` | 允許將 `bind` 設為非回送位址。開放外部存取可能會洩漏執行階段資訊。 |
+
+## 儲存
+
+### 中繼資料庫
+
+`[meta_database]` 設定用來儲存中繼資料、身分、檔案目錄與產品資源的 PostgreSQL 資料庫。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `dsn` | `postgres://molesignal:molesignal@localhost:5432/molesignal` | PostgreSQL 連線字串。請替換範例中的憑證。 |
+| `min_connections` | `2` | 啟動時建立的連線數，不超過 `max_connections`。 |
+| `max_connections` | `16` | 連線池上限。 |
+
+MoleSignal 啟動時會將內建的結構描述遷移套用至該資料庫，請參閱[升級](/zh-Hant/upgrade)。
+
+### 物件儲存
+
+`[object_store]` 設定用來儲存 Parquet 檔案、搜尋索引與 Profile 資料區塊的儲存空間。支援 `local`、`s3`、`azure`、`gcs` 後端。AWS S3 以及 RustFS、Cloudflare R2、阿里雲 OSS 等相容於 S3 的服務使用 `s3`。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `backend` | `local` | `local`、`s3`、`azure` 或 `gcs`。 |
+| `root` | `./data/objects` | `local` 後端的目錄，其他後端會忽略此設定。 |
+| `bucket` | 空白 | `s3` 與 `gcs` 的儲存貯體名稱，或 `azure` 的容器名稱。使用這些後端時必填。 |
+| `region` | 空白 | S3 區域。請依相容於 S3 的服務要求填寫。 |
+| `endpoint` | 空白 | S3 端點 URL。使用 AWS S3 時請留空。RustFS 等服務使用 `http://host:9000` 格式的位址。 |
+| `path_style` | `false` | `false` 使用虛擬主機定址，AWS S3 與華為雲 OBS 需要此模式。`true` 使用路徑定址，RustFS 與大多數自架服務需要此模式。 |
+| `access_key` | 空白 | S3 的存取金鑰，或 Azure 的儲存體存取金鑰。 |
+| `secret_key` | 空白 | S3 的秘密金鑰。 |
+| `credentials_file` | 空白 | 憑證檔案的路徑，檔案包含 `access_key=<值>` 與 `secret_key=<值>` 兩行。優先順序見下文。 |
+| `multipart_threshold_size` | `32` | 物件大小達到此值（MiB）時，採用分段上傳。資訊清單物件與帶有版本條件的寫入一律透過單一請求上傳。最小值為 1。 |
+| `multipart_part_size` | `8` | 分段上傳中每個分段的大小（MiB），範圍為 5 到 1024。較大的物件會使用較大的分段，確保單次上傳不超過 10000 個分段。 |
+| `range_threshold_size` | `16` | 位元組範圍讀取的大小達到此值（MiB）時，拆成平行執行的區塊請求。最小值為 1。 |
+| `range_chunk_size` | `8` | 單一區塊請求的大小（MiB），範圍為 1 到 1024。 |
+| `max_concurrency` | `8` | 每個程序可同時執行的物件儲存操作數。 |
+| `op_timeout_secs` | `30` | 等待並行操作許可與執行單次後端操作的逾時時間。 |
+| `health_probe_interval_secs` | `30` | 背景寫入、讀取與刪除探查的間隔，最小值為 5。 |
+
+S3 與 Azure 用戶端會從下列來源中，選擇第一個同時提供存取金鑰與秘密金鑰的來源讀取憑證：
+
+1. 變數 `MS_OBJECT_STORE_ACCESS_KEY` 與 `MS_OBJECT_STORE_SECRET_KEY`。
+2. `credentials_file` 指向的檔案。
+3. 設定鍵 `access_key` 與 `secret_key`。
+
+啟動日誌會在 `object_store_credentials_source` 中記錄採用的來源：`env`、`file`、`inline` 或 `none`。建議透過環境變數或憑證檔案提供秘密金鑰，不要寫入 `config.toml`。
+
+分段上傳的每個分段與分段讀取的每個區塊，都是各占用一個並行名額的物件儲存操作：各自獨立重試，並計入 `object_store_*` 指標。單次傳輸最多占用一半的並行名額，因此大型物件不會讓其他操作無法執行。
+
+雲端後端發生暫時性錯誤時，會採用指數退避重試：
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `[object_store.retry].max_attempts` | `4` | 單次操作的總嘗試次數。 |
+| `[object_store.retry].base_backoff_ms` | `100` | 首次等待時間。 |
+| `[object_store.retry].max_backoff_ms` | `5000` | 等待時間上限。 |
+| `[object_store.retry].jitter_ratio` | `0.2` | 每次等待時間的隨機抖動比例，範圍為 0 到 1。 |
+
+### 預寫日誌
+
+`[wal]` 設定預寫日誌（WAL）。每個節點都將 WAL 儲存在物件儲存中：節點要等 WAL 物件寫入完成才確認寫入，因此不需要持久性磁碟區。請參閱[架構](/zh-Hant/architecture#持久性與接管)。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `lease_secs` | `15` | 寫入端的租用期限，單位為秒，最小值為 `3`。節點停止續租後，其他 intake 節點會在這段時間加上最多一個 `takeover_interval_secs` 後接管。僅在啟動時讀取。 |
+| `max_group_size` | `8` | 單一 WAL 物件的大小上限，單位為 MiB。同一資料集在寫入上一個物件期間收到的寫入會併入下一個物件，但不得超過此大小。 |
+| `put_timeout_secs` | `10` | 單次物件寫入的逾時時間。 |
+| `put_attempts` | `3` | 每個物件的寫入嘗試次數。若全部失敗，系統會以 `503` 拒絕該物件中的寫入，仍可重試。 |
+| `takeover_interval_secs` | `5` | intake 節點檢查是否有寫入端需要接管的間隔。 |
+| `encrypt` | `false` | 使用根金鑰（`MS_CIPHER_KEY`）加密每個 WAL 物件。 |
+| `max_takeover_size` | `512` | 接管時，記憶體中的資料累積到此大小便發佈一個區段，單位為 MiB。`0` 視為 `1`。 |
+
+### 資料接收緩衝
+
+`[intake]` 控制 intake 節點的記憶體緩衝區。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `buffer_max_size` | `256` | 單一資料流的原始資料緩衝區大小上限，單位為 MiB。自適應臨界值不得超過此上限。 |
+| `max_buffer_memory_size` | `1024` | 程序內使用中與已分離的緩衝區可占用的記憶體總上限，單位為 MiB。 |
+| `flush_interval_secs` | `30` | 兩次將緩衝資料寫出之間的最長間隔。 |
+| `flush_parallelism` | `4` | 可同時執行的緩衝資料寫出操作數。 |
+
+`[intake.rotation]` 自適應調整 Parquet 檔案大小：
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `adaptive_enabled` | `true` | 根據已完成的檔案編碼後大小與原始大小的比值，調整各資料流下一次的原始資料大小臨界值。 |
+| `target_file_size` | `128` | 編碼後 Parquet 檔案的目標大小，單位為 MiB。 |
+| `min_buffer_size` | `16` | 自適應臨界值的下限，單位為 MiB。 |
+| `ewma_alpha` | `0.2` | 該比值的平滑係數，大於 0 且不超過 1。 |
+
+`[intake.prometheus]` 限制 Prometheus `remote_write` 的輸入：
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `max_labels_per_series` | `64` | 每個時間序列的標籤數，不含 `__name__`。 |
+| `max_label_name_length` | `128` | 標籤名稱的最大長度，以 UTF-8 位元組計。 |
+| `max_label_value_length` | `2048` | 標籤值的最大長度，以 UTF-8 位元組計。 |
+| `max_samples_per_batch` | `16384` | 單一內部批次可容納的樣本數。 |
+
+`[intake.prometheus.cardinality]` 讓接收 `remote_write` 請求的程序在將批次轉送至 intake 節點前，先判斷是否接受時間序列。各程序會統計自身收到的時間序列；有多個 router 時，各自套用這些限制：
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `enabled` | `true` | 套用這些限制。 |
+| `max_active_series_per_process` | `1000000` | 每個程序的活躍時間序列數。 |
+| `max_new_series_per_minute` | `20000` | 程序每分鐘可接受的新時間序列數。 |
+| `idle_ttl_secs` | `900` | 時間序列閒置超過這段時間後，會釋出占用的容量。 |
+
+各組織與各指標的上限由平台設定控制：在 `_sys` 組織的 **設定 → 指標基數** 中修改。各節點每 30 秒重新讀取一次，並套用於自身統計的時間序列。
+
+### 合併與保留
+
+`[compactor]` 負責合併檔案並執行保留原則，在 `standalone` 與 `compactor` 節點上執行。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `interval_secs` | `300` | 兩輪合併之間的間隔。 |
+| `target_size` | `512` | 單次合併的輸入檔案總大小上限，單位為 MiB，範圍為 `1`–`65536`。合併後的檔案大小約等於或小於此上限。合併時會分段讀取輸入、分段上傳輸出，記憶體用量不會隨此上限增加。單次合併最多讀取 128 個檔案，其餘檔案會在下一輪與合併結果一起合併。若某個檔案大於同一輪其他檔案的大小總和，這次會跳過該檔案，等新檔案的總大小達到該檔案的大小時再一起合併，避免為了少量新資料反覆重寫大型檔案。 |
+| `max_concurrent_groups` | `4` | 每個節點在一輪內同時處理的資料流數。 |
+
+未個別設定保留期限的資料流採用平台設定的期限：在 `_sys` 組織的 **設定 → 資料保留** 中修改，預設為 30 天。在各指標資料流的 **保留原則** 分頁中設定降採樣，請參閱[資料流](/zh-Hant/streams)。
+
+### 目錄維護
+
+`[storage.*]` 各設定區段控制檔案目錄與物件儲存的背景維護。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `[storage.catalog].seal_after_hours` | `48` | 分割區結束後超過指定時數即封存：寫入不可變的資訊清單及用於精確比對欄位的 Bloom 篩選器，依精確值搜尋時即可略過整個分割區的檔案。封存後不再合併該分割區；這段時間讓一天內各小時的資料先合併成全天資料。`0` 表示不封存。 |
+| `[storage.catalog].manifest_cache_size` | `256` | 資訊清單快取的記憶體大小，單位為 MiB。 |
+| `[storage.catalog].interval_secs` | `300` | 封存工作執行的間隔。 |
+| `[storage.catalog].batch_size` | `64` | 每輪處理的分割區數。 |
+| `[storage.index].enabled` | `true` | 建立缺少的搜尋索引，並在每輪重建幾個舊格式的索引。目錄維護工作會重建已封存分割區的索引，並隨下一版分割區資訊清單一併發佈。 |
+| `[storage.index].interval_secs` | `30` | 工作執行的間隔。 |
+| `[storage.index].batch_size` | `64` | 每輪處理的檔案數。 |
+| `[storage.index].max_concurrency` | `2` | 可同時建立的索引數。 |
+| `[storage.index].retry_after_secs` | `300` | 建立失敗後、重試前的等待時間。 |
+| `[storage.gc].enabled` | `true` | 刪除目錄不再參照的物件。 |
+| `[storage.gc].interval_secs` | `30` | 工作執行的間隔。 |
+| `[storage.gc].grace_period_secs` | `3600` | 每個物件都會先在刪除佇列中等待這段時間。系統會在最終刪除前再次檢查目錄參照與總和檢查碼。 |
+| `[storage.gc].lease_secs` | `900` | 已領取的刪除批次的租用期限。 |
+| `[storage.gc].batch_size` | `128` | 每輪處理的物件數。 |
+| `[storage.gc].max_concurrency` | `4` | 可同時刪除的物件數。 |
+| `[storage.reconciler].enabled` | `true` | 比對目錄與物件儲存。 |
+| `[storage.reconciler].interval_secs` | `300` | 工作執行的間隔。 |
+| `[storage.reconciler].batch_size` | `256` | 每輪處理的物件數。 |
+| `[storage.reconciler].orphan_grace_secs` | `86400` | 未受參照的物件存在超過這段時間後，才視為孤立物件。 |
+| `[storage.reconciler].verify_checksums` | `true` | 比對時驗證物件的總和檢查碼。 |
+
+## 查詢
+
+### 限制與非同步任務
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `[querier].concurrency` | `0` | SQL 查詢的平行度。`0` 表示使用 CPU 數量。單一查詢同時讀取的資料檔案數也以此值為上限。 |
+| `[querier].max_scan_rows` | `100000000` | 單一查詢最多可讀取的列數：查詢需要讀取的檔案所含列數，加上記憶體緩衝區中的列數。若查詢超出上限，系統會在讀取資料前拒絕查詢並傳回 `400`。PromQL 會對每個選擇器套用此限制，計算該選擇器讀取的指標列數，超出上限時停止。`0` 表示不限制。 |
+| `[querier].auto_async_threshold_rows` | `50000000` | 估計列數超過此值的查詢會轉為非同步搜尋任務。`0` 表示停用自動轉換。 |
+| `[querier].estimate_throughput_per_sec` | `1000` | 估算查詢規模時使用的保守每秒列數。 |
+| `[search].max_result_rows` | `0` | 對不含 `LIMIT` 且未進行彙總的查詢加上的列數上限。`0` 表示不限制。範例檔案未包含此鍵。 |
+| `[search_jobs].workers` | `2` | 單一節點同時執行的搜尋任務數。 |
+| `[search_jobs].idle_poll_secs` | `2` | 備援輪詢的初始間隔，閒置時會拉長間隔。 |
+| `[search_jobs].cleanup_interval_secs` | `3600` | 清理過期任務的間隔。 |
+
+### 准入控制
+
+`[search.admission]` 限制每個工作群組在單一節點上同時執行的查詢數。工作群組達上限時，新查詢會排入佇列，依到達順序開始執行；等候超過 `max_wait_secs` 的查詢會收到 `429`。命中結果快取的查詢不必排隊。此限制適用於透過查詢 API 和 Flight SQL 發起的查詢、探索工具中的圖表與欄位統計、公開分享，以及搜尋任務；警示評估等背景工作不會排隊。範例檔案未包含此設定區段。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `default_max_concurrent` | CPU 數量的 2 倍 | 未在 `groups` 中設定的工作群組在單一節點上同時執行的查詢數上限。`0` 表示不限制。 |
+| `groups` | 空 | 工作群組名稱與各節點同時執行的查詢數上限之間的對應表。 |
+| `role_map` | 空 | 角色（`owner`、`admin`、`editor`、`viewer`）與工作群組的對應表。未設定對應的角色使用 `default`。 |
+| `max_wait_secs` | `60` | 查詢等待可用執行名額的最長時間，逾時則傳回 `429`。`0` 表示工作群組一達上限就傳回 `429`。 |
+| `cluster_default_max_concurrent` | `0` | 未在 `cluster_groups` 中設定的工作群組在叢集層級的軟性上限。達上限時，查詢會立即收到 `429`。`0` 表示不限制。 |
+| `cluster_groups` | 空 | 工作群組名稱與叢集層級軟性上限的對應表。 |
+| `cluster_sync_interval_secs` | `0` | 發布節點負載的間隔。`0` 表示使用 5。 |
+| `cluster_stale_secs` | `0` | 節點若超過此期間未更新，就會從叢集檢視中移除。`0` 表示使用 30。 |
+
+`/metrics` 依工作群組提供排隊狀況：`query_admission_running`、`query_admission_waiting`、`query_admission_wait_seconds` 和 `query_admission_refusals_total`。
+
+### 快取
+
+每一層都是設有存留時間的 LRU 快取，容量設為 `0` 即停用該層。`/metrics` 透過 `cache_<layer>_hit_ratio` 提供命中率。
+
+| 設定區段 | 預設容量 | 預設存留時間 | 快取內容 |
+|---|---|---|---|
+| `[cache.index_handle]` | `10000` | `600` 秒 | 已開啟的搜尋索引控制代碼。 |
+| `[cache.query_result]` | `1000` | `60` 秒 | 已關閉的時間視窗所對應的 SQL 查詢結果。 |
+| `[cache.tantivy_result]` | `1000000` | `600` 秒 | 用於排除不必讀取的檔案的詞項計數。 |
+| `[cache.tantivy_footer]` | `100000` | `3600` 秒 | 索引頁尾，可省去範圍讀取。 |
+
+每個設定區段都接受 `capacity` 與 `ttl_secs`。
+
+`[cache.parquet_metadata]` 在記憶體中保留剖析後的 Parquet 頁尾，其中包含頁面索引。查詢開啟已快取的檔案時，不必再讀取頁尾。此區段只有 `max_size` 一個鍵，單位為 MiB，預設為 `256`。`0` 表示停用。
+
+`[cache.object]` 將遠端物件的位元組範圍快取在本機磁碟上。`local` 物件儲存後端會略過此快取。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `enabled` | `true` | 啟用快取。`max_size` 為 `0` 時也會停用快取。 |
+| `root` | `./data/cache/objects` | 快取目錄。 |
+| `max_size` | `10240` | 快取大小上限，單位為 MiB，即 10 GiB。 |
+| `block_size` | `4` | 區塊大小，單位為 MiB，範圍為 1 至 16。 |
+| `memory_size` | `256` | 記憶體中保留的已驗證區塊大小，單位為 MiB。之後讀取同一區塊時，不必再存取磁碟。`0` 表示只使用磁碟。 |
+| `min_free_size` | `1024` | 磁碟必須保留的可用空間，單位為 MiB，即 1 GiB。 |
+| `max_concurrent_fetches` | `16` | 同時擷取的區塊數，必須大於 0。 |
+| `max_concurrent_fetches_per_object` | `4` | 單一物件可同時進行的擷取數，必須大於 0。 |
+
+快取超過 `max_size`，或磁碟可用空間低於 `min_free_size` 時，系統會優先逐出最久未使用的區塊。垃圾回收刪除物件時，只要執行刪除的節點在啟動後曾讀取該物件，就會一併刪除其快取區塊；其他節點上的這些區塊會和其他區塊一樣等待逐出。
+
+### 範圍查詢增量快取
+
+`[search.stream_agg_cache]` 會快取 `rate(metric[5m])` 這類 PromQL 範圍查詢中已封存的時間視窗。儀表板重新整理時，只需重新計算最新的視窗。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `max_size` | `256` | 快取的記憶體用量上限，單位為 MiB，依各查詢快取的時間序列與時間視窗估算。`0` 表示停用快取。 |
+| `ttl_secs` | `300` | 項目的存留時間，用於處理延遲超過 `safe_lookback_secs` 才到達的資料。 |
+| `safe_lookback_secs` | `300` | 只快取結束時間早於「目前時間減去此值」的視窗。 |
+| `max_series_per_query` | `10000` | 每個指紋可快取的時間序列數量。`0` 表示不限制。 |
+
+## 叢集與速率限制
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `[cluster].advertise_addr` | `127.0.0.1:5082` | 其他節點用來連線至內部 gRPC 連接埠的位址，會寫入 `cluster_nodes` 資料表。請設為所有其他節點都能連線的位址。 |
+| `[cluster].heartbeat_interval_secs` | `5` | 心跳間隔。 |
+| `[cluster].peer_timeout_secs` | `15` | 若超過此期間未收到其他節點的心跳，系統會將該節點視為離線。新加入的 compactor 節點也必須等待這段時間，才會開始處理工作。 |
+| `[router.rate_limit].intake_qps` | `1000` | `router` 角色中，每個組織每秒可發出的資料擷取請求數。`0` 表示不限制。 |
+| `[router.rate_limit].query_qps` | `100` | `router` 角色中，每個組織每秒可發出的查詢請求數。`0` 表示不限制。 |
+| `[router.rate_limit].burst_multiplier` | `2` | 權杖桶容量相對於速率的倍數。 |
+
+速率限制只適用於 `router` 角色，各 router 複本獨立計數。請參閱[依角色部署](/zh-Hant/deployment/role-based#速率限制)。
+
+## 警示與郵件
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `[alert].eval_interval_secs` | `30` | 規則評估間隔。 |
+| `[alert].dispatch_interval_secs` | `10` | 升級派送器的執行間隔。 |
+| `[alert].eval_timeout_secs` | `10` | 評估單一規則的逾時時間。逾時會計入 `alert_rule_eval_timeout_total`，不會阻礙下一輪評估。 |
+| `[alert].default_ack_timeout_secs` | `300` | 升級步驟省略 `ack_timeout_secs` 時採用的值。系統會將此值隨步驟一併儲存，之後修改此值不會影響已儲存的步驟。 |
+
+`[notify.smtp]` 用於設定平台郵件，例如註冊審核郵件。郵件類型的通知管道各自使用儲存在加密連接器中的憑證。`host` 留空時，SMTP 維持停用。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `host` | 空 | SMTP 伺服器。填入值即啟用 SMTP。 |
+| `port` | `587` | 連接埠。內建值 `0` 會改用 `587`。 |
+| `username` | 空 | 登入使用者名稱。留空表示不進行驗證。 |
+| `password` | 空 | 登入密碼，僅在設定 `username` 時使用。 |
+| `from` | `molesignal@example.com` | 寄件者地址。啟用 SMTP 時必填，內建值為空。 |
+| `tls` | `starttls` | `none`、`starttls` 或 `tls`。 |
+| `timeout_secs` | `10` | 連線與傳送的逾時時間。內建值 `0` 會視為 1 秒。 |
+
+## 驗證
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `session_ttl_secs` | `86400` | 單次登入的持續時間為 24 小時，即 Refresh Token 的有效期。在此期間，Access Token 每 15 分鐘續期一次。`_sys` 組織中的工作階段最長為 1 小時。 |
+| `root_email` | `admin@example.com` | root 帳號的電子郵件地址。內建值為空。 |
+| `root_password` | `admin` | root 帳號的密碼。內建值為空。請替換範例值。 |
+
+若資料庫中沒有任何使用者，且兩個值都已設定，MoleSignal 會在首次啟動時建立 root 帳號。之後修改 `root_password` 不會變更既有帳號的密碼，請在網頁介面中修改。每次啟動時，電子郵件地址與 `root_email` 相符的帳號都會成為平台管理員，因此 `root_email` 必須是現有使用者的電子郵件地址。
+
+MoleSignal 在首次啟動時產生 JWT 簽署金鑰，並將其儲存在 PostgreSQL 中。使用 `MS_AUTH_JWT_SECRET_OVERRIDE` 固定金鑰，使用 `POST /api/v1/auth/jwt/rotate` 輪替金鑰。
+
+## 自身可觀測性
+
+程序日誌與自行收集的遙測資料使用 `[telemetry]`，請參閱[自身可觀測性](/zh-Hant/self-observability)。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `[telemetry].log_level` | `info,tantivy=warn` | 使用 `EnvFilter` 語法的日誌篩選規則。內建值為 `info`。若設定 `RUST_LOG`，則以 `RUST_LOG` 為準。 |
+| `[telemetry].log_format` | `text` | `text` 或 `json`。 |
+| `[telemetry].log_output` | `console` | `console` 或 `file`。 |
+| `[telemetry].log_directory` | `logs` | `log_output` 為 `file` 時的日誌檔案目錄。 |
+| `[telemetry].log_rotation` | `daily` | `minutely`、`hourly`、`daily` 或 `never`。 |
+| `[telemetry].log_max_files` | `7` | 輪替後保留的檔案數量。 |
+
+範例檔案將最後三個鍵註解掉。表中列出 `log_output` 為 `file` 時的值。
+
+### 自行收集遙測資料
+
+`[telemetry.self_collect]` 將程序本身的指標、追蹤與 Profile 寫入保留的 `_molesignal` 資料流。這項設定只控制程序本身的訊號：無論是否啟用，租戶送來的追蹤都會照常寫入。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `enabled` | `true` | 總開關。內建值為 `false`。收集追蹤還需要啟用 `[telemetry.trace].enabled`。 |
+| `metrics_enabled` | `true` | 收集程序指標。 |
+| `metrics_interval_secs` | `15` | 指標收集間隔。 |
+| `queue_capacity` | `8192` | 每類訊號各自使用的有界記憶體佇列容量。 |
+| `batch_max_events` | `256` | 每批最多包含的事件數。 |
+| `batch_max_delay_ms` | `1000` | 等待批次填滿的最長時間。 |
+| `flush_timeout_secs` | `5` | 結束時將佇列中的資料寫出的時間。 |
+| `profiles_enabled` | `false` | 收集程序的 Profile。 |
+| `profile_kinds` | `["cpu"]` | 選擇 `cpu`、`heap`，或兩者都選。 |
+| `profile_interval_secs` | `600` | Profile 收集間隔。 |
+| `profile_duration_secs` | `10` | 每次收集 CPU Profile 的持續時間，範圍為 1 到 120。 |
+
+`_molesignal` 資料流建立時的保留期限為 7 天。在 `_sys` 組織中，前往該資料流的 **保留原則** 分頁修改；重新啟動後仍會保留修改後的設定。
+
+### 追蹤擷取與尾端取樣
+
+`[telemetry.trace]` 控制服務如何記錄自身的 Span，以及尾端取樣器如何決定要保留哪些追蹤。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `enabled` | `true` | 擷取與尾端取樣的預設開關。`force_disabled` 為 `false` 時，仍可透過執行階段原則調整。 |
+| `force_disabled` | `false` | 部署層級優先順序最高的開關，`/api/v1/system/telemetry` 的執行階段原則無法覆寫。 |
+| `filter` | `info` | 僅用於 Span 擷取與匯出的 `EnvFilter`，獨立於 `RUST_LOG` 和 `log_level`。 |
+| `deployment_environment` | `production` | 環境識別值。`development`、`dev`、`test` 使用 `development_sample_ratio`，其餘使用 `normal_sample_ratio`。 |
+| `normal_sample_ratio` | `0.10` | 非開發環境中正常追蹤的基礎取樣比例，範圍為 0.0 到 1.0。 |
+| `development_sample_ratio` | `1.0` | 開發環境中的基礎取樣比例，範圍為 0.0 到 1.0。 |
+| `decision_window_secs` | `30` | 取樣器彙整一筆追蹤後做出決定的時間窗口，範圍為 5 到 120。 |
+| `root_grace_millis` | `1000` | 根 Span 結束後，繼續等待延遲抵達的子 Span 的時間。 |
+| `decision_cache_secs` | `300` | 快取取樣決定的時間，不得小於 `decision_window_secs`。 |
+| `tail_max_traces` | `10000` | 取樣器可同時保留的待決追蹤數量。 |
+| `tail_memory_size` | `256` | 待決追蹤的記憶體上限，單位為 MiB。 |
+| `max_spans_per_trace` | `1000` | 每筆追蹤最多保留的 Span 數量。 |
+| `max_attributes_per_span` | `128` | 每個 Span 最多保留的屬性數量。 |
+| `max_events_per_span` | `128` | 每個 Span 最多保留的事件數量。 |
+| `max_links_per_span` | `128` | 每個 Span 最多保留的連結數量。 |
+| `max_string_length` | `4096` | 單一屬性、事件或連結字串的長度上限，以 UTF-8 位元組為單位。 |
+| `shutdown_timeout_secs` | `10` | 結束時等候收集管線停止的時間。 |
+
+`[telemetry.trace.slow_thresholds]` 以毫秒為單位判定哪些 Span 過慢：`http_ms = 1000`、`query_ms = 5000`、`batch_intake_ms = 2000`、`database_ms = 200`、`object_store_ms = 500`、`external_ms = 1000`、`background_ms = 30000`。
+
+`[telemetry.trace.external]` 將追蹤匯出至外部 OTLP 接收端。`endpoint` 留空時不啟用匯出。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `endpoint` | 空白 | OTLP 接收端位址。 |
+| `protocol` | `grpc` | `grpc` 或 `http/protobuf`，不會依 URL 推斷。 |
+| `timeout_ms` | `5000` | 連線與匯出的逾時時間。 |
+| `queue_capacity` | `8192` | 匯出佇列容量。 |
+| `batch_size` | `256` | 每批的追蹤數量。 |
+| `gzip` | `false` | 壓縮承載資料。 |
+| `allow_self_export` | `false` | 允許匯出至目前的 MoleSignal 叢集。預設禁止，以免形成迴圈。 |
+| `headers` | 無 | OTLP 請求標頭。請使用 `env:NAME` 或 `secret:NAME` 參照敏感值，不要直接寫入。 |
+| `custom_ca_file` | 無 | HTTPS 伺服器憑證使用的 CA 檔案。 |
+| `client_certificate_file` | 無 | mTLS 用戶端憑證，必須與 `client_key_file` 一併設定。 |
+| `client_key_file` | 無 | mTLS 用戶端私密金鑰，必須與 `client_certificate_file` 一併設定。 |
+
+### APM
+
+`[apm]` 控制應用程式效能監控的彙總投影功能。此功能會在持有候選追蹤或執行警示彙總的節點上啟動。請參閱[應用程式效能監控](/zh-Hant/apm)。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `queue_capacity` | `65536` | 輸入佇列容量，範圍為 1024 到 1048576。 |
+| `flush_interval_ms` | `5000` | 寫出彙總資料的間隔，範圍為 100 到 60000。 |
+| `flush_max_snapshots` | `10000` | 每次最多寫出的快照數量，範圍為 1 到 100000。 |
+| `shutdown_drain_secs` | `10` | 結束時清空佇列的時間，範圍為 1 到 300。 |
+| `late_grace_secs` | `300` | 仍接受延遲抵達的追蹤資料的時間，必須大於 0 且短於熱資料的保留時間。 |
+| `hot_retention_hours` | `24` | 高解析度資料的保留時間，範圍為 1 到 168。 |
+| `rollup_retention_days` | `30` | 彙總資料的保留天數，範圍為 1 到 3650。 |
+| `max_query_range_days` | `30` | 單次 APM 查詢的最大時間範圍，不得超過 `rollup_retention_days`。 |
+| `max_exemplars_per_bucket` | `3` | 每個彙總區間保留的 exemplar 數量，範圍為 1 到 16。 |
+| `max_error_samples_per_group` | `8` | 每個錯誤群組保留的樣本數量，範圍為 1 到 64。 |
+| `[apm.histogram].schema_version` | `2` | 延遲值分組方式的版本號。修改 `buckets_per_octave` 時請一併遞增。至少為 `2`：版本 `1` 使用早期彙總的固定區間，仍可讀取。 |
+| `[apm.histogram].buckets_per_octave` | `8` | 延遲值每增加一倍所劃分的區間數，範圍為 1 到 16，涵蓋 125 微秒到約 131 秒，系統會自動加上 `+Inf`。設為 `8` 時，相鄰區間的上限相差約 9%，分位數誤差約為 ±4%。 |
+| `[apm.version_comparison].min_requests_per_version` | `1000` | 將版本納入版本比較所需的最少請求數。 |
+
+APM 每小時分別記錄的服務、端點、相依項目、操作、錯誤群組、版本和執行個體，其數量上限屬於平台設定。具備 `sys.settings.limits.manage` 權限的使用者可在 **APM → 設定 → 基數上限** 中修改。每個節點每 30 秒重新讀取一次。請參閱 [APM 設定](/zh-Hant/apm/settings#基數上限)。系統無法載入仍含有 `[apm.cardinality]` 區段的設定檔。
+
+## 功能與整合
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `[functions].llm_eval_enabled` | `false` | 允許 `POST /api/v1/functions/run` 執行 LLM 函式，每次執行會呼叫模型一次。請參閱[函式](/zh-Hant/functions#語言)。[警示管線](/zh-Hant/pipelines/alert-events#ai-摘要)的 **AI 摘要** 步驟不受此設定影響。 |
+| `[mmdb].db_path` | `/usr/share/molesignal/mmdb/dbip-city-lite.mmdb` | DB-IP City Lite 資料庫。容器映像檔和二進位套件都在 `mmdb/` 下附上建置當月的版本（請參閱[部署 MoleSignal](/zh-Hant/deployment)）。寫入 RUM 資料時，會依用戶端 IP 查出每筆事件的國家；若沒有此檔案，事件會保留用戶端回報的國家。VRL 函式 [`geoip_lookup`](/zh-Hant/functions#查詢擴充表與-ip-位址) 讀取同一個檔案；若沒有此檔案，則傳回 `null`。 |
+
+IP 地理位置資料由 [DB-IP](https://db-ip.com) 提供，依 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 授權使用。
+
+發行版的二進位檔內建 JavaScript 函式執行環境與 VRL，兩者都不需要額外設定。請參閱[函式](/zh-Hant/functions)。
+
+PDF 或 PNG 格式的排程報告使用無頭 Chrome 算繪頁面：
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `[scheduled_reports.renderer].base_url` | `http://127.0.0.1:5173` | 無頭 Chrome 載入報告頁面的來源位址，必須是絕對的 `http` 或 `https` URL。預設值指向網頁介面的開發伺服器，請設定為節點可存取的網頁介面位址。 |
+| `[scheduled_reports.renderer].concurrent_renders` | `2` | 同時算繪的數量。`0` 視為 1，大於 4 時以 4 為上限。 |
+| `[scheduled_reports.renderer].render_timeout_secs` | `30` | 單次算繪的逾時時間。`0` 視為 30，大於 60 時以 60 為上限。 |
+| `[scheduled_reports.renderer].viewport_width` | `1280` | 載入報告頁面時的檢視區寬度，單位為像素。PDF 頁面或圖片的寬度與檢視區相同。 |
+| `[scheduled_reports.renderer].viewport_height` | `800` | 載入報告頁面時的檢視區高度，單位為像素。PDF 頁面或圖片的高度等於頁面內容的高度。 |
+
+Chrome 無法使用時，匯出 PDF 或 PNG 會傳回錯誤，不會產生預留位置檔案。
+
+具備 `alert` 角色的節點會執行排程日誌巡檢，請參閱[日誌巡檢](/zh-Hant/logs/inspections)：
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `[log_inspection].min_interval_secs` | `3600` | 同一項巡檢兩次執行之間的最短間隔。小於 60 時視為 60。 |
+| `[log_inspection].max_per_org` | `20` | 每個組織可儲存的排程巡檢數量。`0` 表示不允許建立。 |
+| `[log_inspection].concurrent_runs` | `2` | 單一節點同時執行的巡檢數量。`0` 視為 1。 |
+| `[log_inspection].run_timeout_secs` | `300` | 單次執行的時間上限，包含所有模型呼叫和查詢。小於 30 時視為 30，大於 480 時以 480 為上限。 |
+| `[log_inspection].report_retention_days` | `30` | 報告的保留天數。系統每小時清理一次過期報告。`0` 視為 1。 |
+
+Mole Agent 的每日 token 預算適用於每個組織。組織管理員可在 **Mole Agent → 設定 → 用量** 中另行設定所屬組織的上限，請參閱 [Mole Agent](/zh-Hant/agent#用量與預算)。技能目錄適用於所有組織，請參閱[技能](/zh-Hant/agent#技能)：
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `[agent].daily_token_budget` | `0` | 每個組織每天可用的模型 token 數量（輸入與輸出合計，按 UTC 日曆日計算）。`0` 表示不限。 |
+| `[agent].budget_warning_percent` | `80` | 用量達到上限的這個百分比時，會在對話中提醒。小於 1 時視為 1，大於 100 時視為 100。 |
+| `[agent].mcp_stdio_commands` | `[]` | 列出組織的 stdio MCP 伺服器可在 MoleSignal 伺服器上啟動的程式。系統會將清單項目與伺服器命令列的第一個字詞原樣比對，例如 `npx` 或 `/opt/mcp/bin/server`。留空時不會啟動任何 stdio 伺服器。命令會以 MoleSignal 程序的使用者權限執行，請只列出可信任的程式。環境變數寫法：`MS_AGENT_MCP_STDIO_COMMANDS='["npx","uvx"]'`。 |
+| `[agent].skill_paths` | `[]` | 伺服器上的技能目錄：每個含有 `SKILL.md` 的子目錄各代表一項技能，所有組織都可使用，在產品中為唯讀。各節點會在啟動時讀取，並在檔案變更時重新讀取。環境變數寫法：`MS_AGENT_SKILL_PATHS='["/var/lib/molesignal/skills"]'`。 |
+
+## 儲存在資料庫中的設定
+
+以下設定儲存在 PostgreSQL 中，可透過網頁介面或 API 修改，沒有對應的 TOML 鍵：
+
+- SSO 服務供應商（OIDC、OAuth 2.0、SAML 與 LDAP）。
+- 聯邦查詢使用的遠端叢集。
+- 狀態頁的網域名稱與憑證，以及訪客將頁面加入 Slack 時使用的 Slack App。
+- 通知管道、排班與升級原則。
+- Mole Agent 的模型服務供應商、提示詞、工具與核准原則。
+- 組織的加密金鑰、欄位遮罩規則與共用原則。

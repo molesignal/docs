@@ -1,0 +1,161 @@
+---
+title: "重大事件"
+description: "將事件宣告為重大事件：指派指揮官、溝通負責人和記錄人員，建立作戰室並安排會議，依清單分工，統一發布進度。"
+"en_link": "/en-US/api/alerting/major-incidents"
+"zh-Hans_link": "/zh-Hans/api/alerting/major-incidents"
+"ja_link": "/ja/api/alerting/major-incidents"
+"ko_link": "/ko/api/alerting/major-incidents"
+"de_link": "/de/api/alerting/major-incidents"
+"es_link": "/es/api/alerting/major-incidents"
+"fr_link": "/fr/api/alerting/major-incidents"
+"pt-BR_link": "/pt-BR/api/alerting/major-incidents"
+---
+
+影響範圍廣、需要多人協作的事件，可以宣告為重大事件。重大事件有三種角色，可設立應變室（飛書或 Slack 群組）、召開會議，並使用一份任務清單。進度會統一發布到應變室，並通知相關人員。組織也可以設定自動規則，讓符合條件的新事件在建立時就宣告為重大事件。介面操作方式請參閱[重大事件與事後檢討](/zh-Hant/alerting/major-incidents)。
+
+| 方法與路徑 | 用途 | 權限 |
+|---|---|---|
+| `GET /api/v1/alerts/incidents/{id}/response` | 取得事件的重大事件應變資訊與任務。 | 該事件的 `alerts.incidents.read` |
+| `POST /api/v1/alerts/incidents/{id}/declare` | 宣告為重大事件。 | 該事件的 `alerts.incidents.escalate` |
+| `PUT /api/v1/alerts/incidents/{id}/roles` | 指派或取消指派一個角色。 | 該事件的 `alerts.incidents.update` |
+| `POST /api/v1/alerts/incidents/{id}/tasks` | 新增一項任務。 | 該事件的 `alerts.incidents.update` |
+| `PUT /api/v1/alerts/incidents/{id}/tasks/{taskId}` | 更新任務的標題、負責人或完成狀態。 | 該事件的 `alerts.incidents.update` |
+| `DELETE /api/v1/alerts/incidents/{id}/tasks/{taskId}` | 刪除任務。 | 該事件的 `alerts.incidents.update` |
+| `POST /api/v1/alerts/incidents/{id}/status-updates` | 發布一則進度更新。 | 該事件的 `alerts.incidents.update` |
+| `GET /api/v1/alerts/response/settings` | 取得組織的重大事件設定。 | `alerts.response.read` |
+| `PUT /api/v1/alerts/response/settings` | 儲存組織的重大事件設定。 | `alerts.response.manage` |
+
+系統會將宣告、指派角色、建立應變室、新增任務、完成任務和發布進度記錄在事件的[時間軸](/zh-Hant/api/alerting/incident-timeline)上。宣告和儲存設定也會記錄在稽核記錄中。
+
+## 宣告
+
+```http
+POST /api/v1/alerts/incidents/{id}/declare
+```
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `commanderId` | string | 否 | 指揮官。未填寫時，由宣告者擔任。 |
+
+已宣告的事件會原樣傳回，已解決的事件則無法宣告。宣告時，系統會依照組織設定執行下列動作：
+
+1. 將設定中的檢查清單項目新增為任務。
+2. 依 `meeting` 建立會議：`feishu_vc` 使用飛書 App 預約一場 6 小時的飛書視訊會議，由指揮官擔任會議擁有者；`tencentMeeting` 預約一場 6 小時的騰訊會議；`zoom` 建立即時會議；`googleMeet` 建立會議空間；`fixed_url` 使用固定的會議連結。
+3. 使用設定中的連接器建立群組（飛書 App、Slack App、釘釘或企業微信），群組名稱為 `[嚴重程度] 事件摘要`。依各自在該連接器中綁定的身分，將事件負責人、各角色成員和關注者加入群組。釘釘和企業微信的群組擁有者為指揮官。系統也會傳送開場訊息、事件連結和會議加入連結。
+4. 透過已啟用 `onMajorIncident` 的[工單連接器](/zh-Hant/api/alerting/tickets)建立工單。
+
+系統會嘗試建立應變室、會議和工單。若建立失敗，只會寫入記錄，不影響宣告結果。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/declare \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"commanderId": "<user-id>"}'
+```
+</RequestExample>
+
+宣告、讀取和指派角色都會傳回 `{ "response": { ... }, "tasks": [ ... ] }`。事件尚未宣告時，`response` 為 `null`。
+
+<ResponseExample>
+```json 200
+{
+  "response": {
+    "incidentId": "<incident-id>",
+    "orgId": "<organization-id>",
+    "declaredAt": 1790000000000000,
+    "declaredBy": "<user-id>",
+    "roles": { "commander": "<user-id>" },
+    "warRoom": {
+      "platform": "lark_app",
+      "connectorId": "<connector-id>",
+      "chatId": "oc_5ad11d72b830411d72b836c20",
+      "url": "https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=<token>"
+    },
+    "meetingUrl": "https://vc.feishu.cn/j/123456789",
+    "updatedAt": 1790000000000000
+  },
+  "tasks": [
+    {
+      "id": "3KJ9a1C7vXe2Rf8MbN4qLw0TzHd",
+      "orgId": "<organization-id>",
+      "incidentId": "<incident-id>",
+      "title": "Open a status page incident",
+      "assigneeId": null,
+      "done": false,
+      "doneBy": null,
+      "doneAt": null,
+      "position": 0,
+      "createdBy": "<user-id>",
+      "createdAt": 1790000000000000
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| 欄位 | 說明 |
+|---|---|
+| `declaredBy` | 宣告者。由組織的自動規則宣告時為 `null`。 |
+| `roles` | `commander`（指揮官）、`communications`（溝通負責人）和 `scribe`（記錄員）對應的使用者 ID。未指派的角色不會列出。 |
+| `warRoom` | 應變室：`platform`（`lark_app`、`slackApp`、`dingtalk_app` 或 `wecom_app`）、連接器、群組 ID 和加入群組的連結。釘釘和企業微信的群組沒有加入連結，`url` 為空字串。未建立群組時為 `null`。 |
+| `meetingUrl` | 會議連結。沒有會議時為 `null`。 |
+
+## 角色與任務
+
+指派角色的要求主體為 `{ "role": "scribe", "userId": "<user-id>" }`。將 `userId` 設為 `null` 即可取消指派該角色。必須先宣告事件。
+
+新增任務的要求主體為 `{ "title": "…", "assigneeId": "<user-id>" }`。標題須為 1 到 200 個字元，每個事件最多可有 50 項任務。更新任務時，只傳送要修改的欄位：`title`、`assigneeId`（傳入 `null` 即可取消指派負責人）和 `done`。完成任務時，系統會記錄 `doneBy` 和 `doneAt`。新增和更新任務都會傳回該任務，刪除則會傳回 `{ "deleted": true }`。
+
+## 發布進度
+
+```http
+POST /api/v1/alerts/incidents/{id}/status-updates
+```
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `impact` | string | 影響。 |
+| `current` | string | 目前狀況。 |
+| `next` | string | 下一步。 |
+
+三個欄位至少填寫一個，每個欄位最多 2000 個字元。必須先宣告事件。系統會將進度記錄在時間軸、發布到應變室，並以通知事件 `incident.status_update` 交由通知引擎處理。收件人包括事件負責人、各角色成員和設定中的關注者，通知由內建策略[重大事件進度：通知關注者](/zh-Hant/notification-channels#內建策略)送出。事件屬性中的 `status_update` 包含 `impact`、`current`、`next` 和發布者 `author`。傳回 `{ "sent": true }`。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/status-updates \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"impact": "EU checkout failing for 30% of users", "current": "Rolling back v2026.10.28", "next": "Confirm the error rate drops"}'
+```
+</RequestExample>
+
+## 組織設定
+
+```http
+PUT /api/v1/alerts/response/settings
+```
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `warRoomConnectorId` | string | 建立應變室所用的通知連接器，必須支援建立群組：`lark_app`、`slackApp`、`dingtalk_app` 或 `wecom_app`。設為 `null` 時不建立群組。 |
+| `meeting` | string | `none`（預設，不召開會議）、`feishu_vc`、`tencentMeeting`、`zoom`、`googleMeet` 或 `fixed_url`。 |
+| `meetingUrl` | string | 使用 `fixed_url` 時的會議連結，須以 `https://` 開頭。 |
+| `meetingConnectorId` | string | 使用 `feishu_vc` 時，用來預約會議的飛書 App 連接器。設為 `null` 時，使用建立群組的連接器，該連接器也必須是飛書 App。 |
+| `tencentMeeting` | object | 使用 `tencentMeeting` 時必填：企業自建應用程式的 `appId`、`sdkId`（應用程式有提供才填寫）、`secretId`，以及會議建立者的 `userid`。 |
+| `zoom` | object | 使用 `zoom` 時必填：伺服器對伺服器 OAuth 應用程式的 `accountId`、`clientId`，以及主持人 `host`（電子郵件地址或使用者 ID）。 |
+| `googleMeet` | object | 使用 `googleMeet` 時必填：主辦人 `organizer`（電子郵件地址）。服務帳號會代主辦人建立會議。 |
+| `secrets` | object | 唯寫：新填入的會議金鑰，鍵為 `tencentMeeting.secretKey`、`zoom.clientSecret` 或 `googleMeet.credentials`（服務帳號金鑰的 JSON 文字）。留空的值維持不變，只保留所選會議類型的金鑰。 |
+| `checklist` | array | 宣告時新增為任務的項目，最多 30 項，每項最多 200 個字元。 |
+| `stakeholderIds` | array | 關注者：系統會通知這些人最新進度，建立群組時也會將其加入。 |
+| `auto` | object | 自動宣告：`{ "enabled": true, "minSeverity": "critical", "conditions": [ ... ] }`。新建事件的嚴重程度不低於 `minSeverity`，且標籤符合 `conditions` 時，系統會自動宣告，`declaredBy` 為 `null`。`conditions` 的寫法與[路由規則的條件](/zh-Hant/api/alerting/create-routing-rule)相同。 |
+
+要求主體須包含完整設定，系統會傳回儲存後的設定。若未曾儲存，則會讀取到預設值。系統會使用根金鑰加密儲存金鑰。讀取設定時，只會傳回 `secretsSet`（已設定金鑰的鍵），不會傳回金鑰值。此外還會傳回唯讀的 `war_room_types`，列出支援建立應變室的連接器類型。
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | 事件已解決、事件尚未宣告、欄位超出限制，或連接器不是此組織的飛書 App 或 Slack App。 |
+| `403` | 缺少權限，或無權存取此事件。 |
+| `404` | 事件或任務不存在。 |

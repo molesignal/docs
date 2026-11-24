@@ -1,0 +1,417 @@
+---
+title: "Regel erstellen"
+description: "Erstellen Sie eine zeitgesteuerte oder kombinierte Alarmregel oder eine Alarmregel für Echtzeitüberwachung, Anomalien, Prognosen, Ausreißer oder Heartbeats."
+"en_link": "/en-US/api/alerting/create-rule"
+"zh-Hans_link": "/zh-Hans/api/alerting/create-rule"
+"zh-Hant_link": "/zh-Hant/api/alerting/create-rule"
+"ja_link": "/ja/api/alerting/create-rule"
+"ko_link": "/ko/api/alerting/create-rule"
+"es_link": "/es/api/alerting/create-rule"
+"fr_link": "/fr/api/alerting/create-rule"
+"pt-BR_link": "/pt-BR/api/alerting/create-rule"
+---
+
+```http
+POST /api/v1/alerts/rules
+```
+
+Erstellt eine Alarmregel. Der Aufruf erfordert `alerts.rules.manage`.
+
+## So funktioniert die Regelauswertung
+
+Die Rolle `alert` wertet jede aktivierte Regel im Intervall `[alert].eval_interval_secs` aus, standardmäßig alle 30 Sekunden. Eine `real_time`-Regel prüft dagegen die Bedingung direkt bei der Datenaufnahme und öffnet bei passenden Datensätzen einen Incident. Die folgenden Schritte gelten für `scheduled`- und `anomaly`-Regeln. Wie die anderen Regeltypen ihre Bedingungen prüfen, steht unter [Prognoseregeln](#prognoseregeln), [Ausreißerregeln](#ausreißerregeln), [Zusammengesetzte Regeln](#zusammengesetzte-regeln) und [Heartbeat-Regeln](#heartbeat-regeln). Für aufeinanderfolgende Treffer, Wiederherstellung und Incidents gelten dieselben Schritte wie hier.
+
+1. Die Auswertungsengine führt `query.statement` für das Zeitfenster von `now - period_secs` bis `now` aus. Eine `sql`-Anweisung läuft in der SQL-Engine. Eine `promql`-Anweisung läuft in der PromQL-Engine als Momentanabfrage zum Zeitpunkt `now`. Eine APM-Regel liest ihre Kennzahl stattdessen aus den APM-Aggregaten des Zeitfensters, eine RUM-Regel aus den RUM-Daten des Zeitfensters. Siehe [APM-Regeln](#apm-regeln) und [RUM-Regeln](#rum-regeln).
+2. Die Auswertungsengine liest die erste Spalte der ersten Zeile als Zahl. Ein Ergebnis ohne Zahl gilt als fehlende Daten. `trigger.no_data` legt fest, wie die Regel damit umgeht. Siehe [Wiederherstellung und fehlende Daten](#wiederherstellung-und-fehlende-daten). Ein `promql`-Ergebnis führt den Messwert `value` zuerst auf. Daher entscheidet die erste Zeitreihe. Aggregieren Sie den Ausdruck zu einer einzigen Zeitreihe, etwa mit `sum(...)`, oder teilen Sie die Regel mit `query.group_by` nach Labels auf. Siehe [Nach Spalten aufgeteilte Regeln](#nach-spalten-gruppierte-regeln).
+3. Die Auswertungsengine vergleicht die Zahl mit der Bedingung in `trigger` oder, wenn das Array `thresholds` nicht leer ist, mit jeder darin enthaltenen Stufe.
+4. Sobald die Bedingung bei `forPeriods` aufeinanderfolgenden Auswertungen zutrifft, öffnet die Regel einen Incident. Pro Regel ist höchstens ein Incident gleichzeitig aktiv. Bei einer Aufteilung nach Spalten gilt das pro Gruppe. Wenn `silenceSecs` größer als 0 ist, öffnet die Regel erst dann einen neuen Incident, wenn seit dem Öffnen des vorherigen Incidents dieser Regel mindestens so viele Sekunden vergangen sind. Das gilt auch, wenn der vorherige Incident bereits behoben ist.
+5. Sobald die Wiederherstellungsbedingung zutrifft, schließt die Auswertungsengine den offenen Incident als behoben. Standardmäßig geschieht das bei der ersten Auswertung, bei der die Auslösebedingung nicht mehr zutrifft. Ein bestätigter Incident bleibt bestätigt und muss manuell als behoben markiert werden.
+6. Nach jeder abgeschlossenen Auswertung speichert die Auswertungsengine den Zeitpunkt in `lastEvalAt` und das Ergebnis in `lastState`. Schlägt eine Abfrage fehl oder überschreitet sie das Zeitlimit, bleiben beide Felder unverändert.
+
+Bei `scheduled`- und `anomaly`-Regeln prüft der Aufruf nicht, ob der Stream oder die Anweisung gültig ist. Führen Sie vor dem Aktivieren einer Regel den Aufruf [Regel testen](/de/api/alerting/test-rule) aus. Beim Speichern einer `real_time`-Regel prüft MoleSignal, ob die Regel die unten genannten Einschränkungen einhält.
+
+**Anfragetext**
+
+| Feld | Typ | Pflichtfeld | Hinweise |
+|---|---|---|---|
+| `name` | string | Ja | Darf nicht leer sein. Der Name dient als Zusammenfassung des Incidents. |
+| `description` | string | Nein | Standardmäßig leer. |
+| `enabled` | boolean | Nein | Standardwert: `true`. Die Auswertungsengine überspringt deaktivierte Regeln. Die Aufrufe zum Testen und Auslösen funktionieren weiterhin. |
+| `kind` | string | Nein | `scheduled` (Standard), `real_time`, `anomaly`, `forecast`, `outlier`, `composite` oder `heartbeat`. Eine `real_time`-Regel prüft die Bedingung direkt bei der Datenaufnahme. Siehe [Echtzeitregeln](/de/alerting/rules#echtzeitregeln). |
+| `query` | object | Ja | Die Anweisung und ihr Zeitfenster. Siehe unten. |
+| `trigger` | object | Ja | Die Bedingung. Siehe unten. |
+| `thresholds` | array | Nein | Schweregradstufen für `scheduled`- und `real_time`-Regeln. Ist das Array nicht leer, ersetzen die Stufen die Bedingung in `trigger`. Eine `anomaly`-Regel ignoriert die Stufen. `forecast`-, `outlier`-, `composite`- und `heartbeat`-Regeln lösen mit nur einem Schweregrad aus. Bei Angabe von Stufen antwortet der Aufruf für diese Regeltypen mit `400`. |
+| `severity` | string | Nein | `info`, `warning`, `error` oder `critical`. Gilt, wenn `thresholds` leer ist. |
+| `anomalyParams` | object | Für `anomaly` | Einstellungen für die Baseline. Andere Regeltypen ignorieren diese Einstellungen. |
+| `escalationPolicyId` | string | Nein | Standardwert: `default`, ein Alias für die Eskalationsrichtlinie namens `default` in der Organisation. Eine explizit angegebene ID muss zu einer Richtlinie der Organisation gehören. Andernfalls antwortet der Aufruf mit `400`. Siehe [Eskalationsrichtlinie erstellen](/de/api/alerting/create-escalation). |
+| `labels` | object | Nein | Schlüssel-Wert-Paare aus Strings, die MoleSignal in Incidents übernimmt. |
+| `annotations` | object | Nein | Schlüssel-Wert-Paare aus Strings, die MoleSignal in Incidents übernimmt, etwa einen Link zu einem Runbook. |
+| `guide` | object | Nein | Erste Schritte zur Untersuchung eines Incidents dieser Regel. Siehe [Leitfaden zur Untersuchung](#untersuchungsleitfaden). |
+
+**`query`**
+
+| Feld | Typ | Pflichtfeld | Hinweise |
+|---|---|---|---|
+| `language` | string | Ja | `sql` oder `promql`. Die Sprache bestimmt, welche Engine die Anweisung auswertet. Bei einer `promql`-Anweisung bestimmen Bereichsselektoren wie `[5m]` das betrachtete Zeitfenster, da `periodSecs` nur das Abfragefenster festlegt. |
+| `statement` | string | Ja | Darf nicht leer sein, außer bei APM- oder RUM-Regeln. Die erste Spalte der ersten Zeile enthält den auszuwertenden Wert. Eine `real_time`-Regel erwartet `SELECT count(*) FROM <stream> [WHERE <condition>]`. |
+| `periodSecs` | integer | Ja | Länge des Zeitfensters in Sekunden. Eine `real_time`-Regel akzeptiert Werte von 1 bis 3600 und zählt die passenden Datensätze in diesem Zeitfenster. |
+| `stream` | object | Ja, außer bei APM- oder RUM-Regeln | `{ "name": "app", "streamType": "logs" }`. Der primäre Stream der Anweisung. |
+| `apm` | object | Für eine APM-Regel | Die APM-Kennzahl, die die Regel anstelle einer Anweisung überwacht. Siehe [APM-Regeln](#apm-regeln). |
+| `rum` | object | Für eine RUM-Regel | Die RUM-Kennzahl, die die Regel anstelle einer Anweisung überwacht. Siehe [RUM-Regeln](#rum-regeln). |
+| `groupBy` | array | Nein | Ergebnisspalten, nach denen eine `scheduled`- oder `outlier`-Regel aufgeteilt wird, zum Beispiel `["host"]`. Bis zu 8 eindeutige Namen mit jeweils 1 bis 128 Zeichen. Siehe [Nach Spalten aufgeteilte Regeln](#nach-spalten-gruppierte-regeln). |
+| `forecast` | object | Für eine `forecast`-Regel | Siehe [Prognoseregeln](#prognoseregeln). |
+| `outlier` | object | Für eine `outlier`-Regel | Siehe [Ausreißerregeln](#ausreißerregeln). |
+| `composite` | object | Für eine `composite`-Regel | Siehe [Zusammengesetzte Regeln](#zusammengesetzte-regeln). |
+| `heartbeat` | object | Für eine `heartbeat`-Regel | Siehe [Heartbeat-Regeln](#heartbeat-regeln). |
+| `delaySecs` | integer | Nein | Anzahl der Sekunden, um die MoleSignal das Zeitfenster bei jeder Auswertung zurückverschiebt: 0 bis 3600. Ohne Angabe gilt automatisch 0 bei einem einzelnen Prozess oder die Instanzeinstellung bei einem Cluster mit getrennten Rollen (standardmäßig 60). Siehe [Auswertungsverzögerung](/de/alerting/rules#auswertungsverzögerung). |
+| `homeCluster` | string | Nein | Für eine Echtzeitregel in einer Föderation: ID des Clusters, der die Zählwerte aller der Organisation zugeordneten Cluster summiert und anhand der Summe entscheidet. Zulässig sind der lokale Cluster und aktivierte Remote-Cluster. Ohne Angabe entscheidet jeder Cluster anhand seines eigenen Zählwerts. Andere Regeltypen verwerfen das Feld. Siehe [Echtzeitregeln in einer Föderation](/de/alerting/rules#echtzeitregeln-in-einer-föderation). |
+| `discovery` | object | Für eine Discovery-Regel | Die Quelle der Regel ist [Discovery](/de/alerting/discovery): `{"kinds": [...], "subjects": [...], "environments": [...], "minSeverity": "warning"}`. Lassen Sie einen Filter weg, um in dieser Kategorie alle Werte einzuschließen. Beim Speichern setzt MoleSignal die feste Struktur der Regel: Aufteilung nach Befund, Schweregrad je Befund und `discovery` als `statement`. Siehe [Discovery](/de/api/alerting/discovery). |
+
+`query` behält nur die Parameter des jeweiligen Regeltyps. Bei einer `scheduled`-Regel verwirft MoleSignal zum Beispiel ein `forecast`-Objekt. `composite`- und `heartbeat`-Regeln führen keine Abfrage aus. Sie verwenden weder `statement` noch `stream`, `apm`, `rum` oder `groupBy`. Bei Angabe von `apm`, `rum` oder `groupBy` antwortet der Aufruf mit `400`.
+
+Die Spalten `service`, `host` und `trace_id` in der ersten Zeile ergänzen den Incident. Aus diesen Spalten übernimmt MoleSignal die Labels `service` und `host` und füllt `affectedServices`, `hostIds` und `traceIds`.
+
+**`trigger`**
+
+| Feld | Typ | Pflichtfeld | Hinweise |
+|---|---|---|---|
+| `operator` | string | Ja | `gt`, `gte`, `lt`, `lte`, `eq` oder `neq`. Eine `real_time`-Regel akzeptiert `gt` oder `gte`. |
+| `threshold` | number | Ja | Der Vergleichswert. |
+| `forPeriods` | integer | Ja | Anzahl aufeinanderfolgender Auswertungen, bei denen die Bedingung zutreffen muss, bevor die Regel einen Incident öffnet. `0` verhält sich wie `1`. Eine `real_time`-Regel akzeptiert `0` oder `1`. |
+| `silenceSecs` | integer | Ja | Sperrzeit in Sekunden. Nach dem Öffnen eines Incidents öffnet die Regel für diese Dauer keinen neuen Incident, auch wenn der Incident vorher behoben ist. `0` deaktiviert die Sperrzeit. Beim [manuellen Auslösen](/de/api/alerting/trigger-rule) gilt die Sperrzeit nicht. |
+| `recovery` | object | Nein | Bedingung, unter der ein offener Incident als behoben gilt. Siehe [Wiederherstellung und fehlende Daten](#wiederherstellung-und-fehlende-daten). |
+| `noData` | object | Nein | Legt fest, wie die Regel eine Auswertung ohne Wert einstuft. Siehe [Wiederherstellung und fehlende Daten](#wiederherstellung-und-fehlende-daten). |
+| `priority` | string | Nein | Priorität beim Öffnen eines Incidents. Zulässig ist eine der Prioritäten der Organisation (standardmäßig `P1` bis `P5`). Ohne Angabe haben Incidents keine Priorität. |
+| `urgency` | string | Nein | Dringlichkeit beim Öffnen eines Incidents. Geben Sie den Schlüssel einer der [Dringlichkeitsstufen](/de/alerting/on-call#dringlichkeits-und-prioritätsstufen) der Organisation an. Ohne Angabe entscheidet die Eskalationsrichtlinie des Incidents. Siehe [Dringlichkeit](/de/alerting/on-call#dringlichkeit). Für eine Discovery-Regel gilt standardmäßig `low`. |
+
+`anomaly`-, `outlier`-, `composite`- und `heartbeat`-Regeln ignorieren `operator` und `threshold`, verwenden aber `forPeriods`. Eine `forecast`-Regel prüft ihre Prognose anhand von `operator` und `threshold`. Eine Regel mit `thresholds` ignoriert `operator`, `threshold` und `forPeriods` in `trigger`. Das Objekt bleibt dennoch erforderlich.
+
+**`thresholds`**
+
+Jede Stufe hat `severity` (`info`, `warning`, `error` oder `critical`), `operator`, `threshold` und `forPeriods`. Jede Stufe zählt ihre aufeinanderfolgenden Treffer separat. Der höchste Schweregrad unter den ausgelösten Stufen bestimmt den Schweregrad des Incidents. Steigt der Schweregrad eines offenen Incidents, beginnt die Eskalation erneut beim ersten Schritt.
+
+Ohne Stufen gilt für den Schweregrad eines Incidents zuerst `severity` der Regel, dann das Label `severity` und schließlich `warning`. Fehlen bei einer `anomaly`-Regel beide Angaben, ergibt eine Abweichung um mindestens das Zehnfache der Baseline `critical` und eine Abweichung um mindestens das Dreifache `error`.
+
+**`anomalyParams`**
+
+| Feld | Typ | Pflichtfeld | Hinweise |
+|---|---|---|---|
+| `algorithm` | string | Ja | `mad` oder `ewma`. |
+| `lookbackDays` | integer | Ja | 1 bis 30. Anzahl der vorherigen Tage, die jeweils zur gleichen Tageszeit für den Vergleich herangezogen werden. |
+| `k` | number | Ja | Multiplikator für die Abweichung. Muss positiv sein. |
+| `alpha` | number | Nein | Glättungsfaktor für `ewma`, größer als 0 und höchstens 1. Standardwert: `0.3`. |
+| `weeklySeasonality` | boolean | Nein | Standardwert: `false`. Vergleicht nur Daten vom gleichen Wochentag und setzt für `lookbackDays` einen Wert von mindestens 7 voraus. |
+
+## Untersuchungsleitfaden
+
+`guide` legt fest, welche Schritte bei der Untersuchung eines Incidents zuerst anstehen. Die Incidents der Regel zeigen den Leitfaden an. Mole Agent liest ihn vor jeder Untersuchung. Alle Felder sind optional. Bei einer Regel ohne Leitfaden enthält die Antwort kein `guide`.
+
+| Feld | Typ | Hinweise |
+|---|---|---|
+| `steps` | Zeichenfolge | Markdown, maximal 8.000 Zeichen. |
+| `queries` | Array | Maximal 10 Abfragen. Jede enthält `name` (1 bis 120 Zeichen), `language` (`sql` oder `promql`), `stream` (`{ "name": "app_logs", "streamType": "logs" }`, Pflichtfeld für `sql`) und `statement` (1 bis 4.000 Zeichen). |
+| `dashboards` | Array | Maximal 5 Dashboard-IDs. Doppelte IDs speichert MoleSignal nur einmal. |
+
+MoleSignal entfernt vor dem Speichern führende und nachgestellte Leerzeichen. Überschreitet der Leitfaden ein Limit oder fehlt bei einer `sql`-Abfrage der Stream, antwortet die API mit `400`. Ein Update der Regel (`PUT /api/v1/alerts/rules/{id}`) ohne `guide` behält den vorhandenen Leitfaden bei. `"guide": {}` entfernt ihn.
+
+```json
+{
+  "guide": {
+    "steps": "1. Check which routes return the 5xx.\n2. Look for an edge proxy change in the last hour.",
+    "queries": [
+      {
+        "name": "5xx by route",
+        "language": "promql",
+        "statement": "sum by (route) (rate(http_requests_total{code=~\"5..\"}[5m]))"
+      },
+      {
+        "name": "Gateway error logs",
+        "language": "sql",
+        "stream": { "name": "app_logs", "streamType": "logs" },
+        "statement": "SELECT * FROM app_logs WHERE level = 'ERROR'"
+      }
+    ],
+    "dashboards": ["d2"]
+  }
+}
+```
+
+## Wiederherstellung und fehlende Daten
+
+`trigger.recovery` hält einen Incident offen, bis der Wert wieder eindeutig im Normalbereich liegt. Andernfalls führt ein Wert, der um den Schwellenwert schwankt, dazu, dass sich Incidents wiederholt öffnen und schließen.
+
+| Feld | Typ | Hinweise |
+|---|---|---|
+| `recovery.threshold` | Zahl | Der Grenzwert, den der Messwert auf dem Rückweg in den Normalbereich passieren muss, damit sich ein offener Incident schließt. Beispiel: `80` für eine Regel, die oberhalb von `90` auslöst. Der Grenzwert muss für jeden Schwellenwert im Normalbereich liegen: Er darf nicht über einem Schwellenwert liegen, bei dessen Überschreitung die Regel auslöst, und nicht unter einem Schwellenwert, bei dessen Unterschreitung sie auslöst. Alle Stufen müssen in dieselbe Richtung auslösen. Gilt nicht für `anomaly`-, `forecast`-, `outlier`-, `composite`- oder `heartbeat`-Regeln. Ohne dieses Feld schließt sich der Incident, sobald der Wert die Schwellenwertbedingung nicht mehr erfüllt. |
+| `recovery.for_periods` | Ganzzahl | Anzahl aufeinanderfolgender Auswertungen im Normalbereich, bevor sich der Incident schließt. `0` und `1` zählen jeweils als eine Auswertung. Maximal 1440. |
+
+`trigger.no_data` legt fest, wie eine Auswertung ohne Wert zählt: Die Abfrage liefert keine Zeile oder keine Zahl, oder im Ergebnis fehlt eine Gruppe einer [nach Spalten gruppierten Regel](#nach-spalten-gruppierte-regeln).
+
+| `no_data.action` | Verhalten bei einer Auswertung ohne Wert |
+|---|---|
+| `resolve` | Zählt als nicht erfüllte Bedingung. Ein offener Incident schließt sich nach Maßgabe der Wiederherstellungsbedingung. Standard für `scheduled`-Regeln. |
+| `keep` | Ändert nichts: Die Auswertung zählt weder als erfüllte Bedingung noch für die Wiederherstellung, und `lastState` lautet `noData`. Standard für `anomaly`-Regeln. |
+| `alert` | Wie `keep`. Nach `no_data.for_periods` aufeinanderfolgenden Auswertungen ohne Wert öffnet MoleSignal zusätzlich einen Incident wegen fehlender Daten. Dieser schließt sich bei der ersten Auswertung mit einem Wert. |
+| `zero` | Setzt für den Vergleich `0` ein. Geeignet für Zählwerte, bei denen eine fehlende Zeitreihe oder Zeile bedeutet, dass nichts passiert ist. |
+
+Ein Incident wegen fehlender Daten hat einen eigenen Fingerprint. Er kann daher gleichzeitig mit einem durch den Schwellenwert ausgelösten Incident offen sein. Er trägt das Label `alert.condition` = `noData` und die Zusammenfassung der Regel oder Gruppe. Benachrichtigungen verwenden den Titel `NO DATA · <summary>`. Als Schweregrad verwendet MoleSignal zuerst `severity` der Regel, andernfalls das Label `severity` und zuletzt `warning`. `silenceSecs` gilt auch für diesen Incident. Nach einer manuellen Schließung öffnet MoleSignal den Incident erst dann wieder, wenn erneut Daten vorliegen. Eine betroffene Gruppe einer gruppierten Regel verfolgt MoleSignal in diesem Fall nicht weiter. Eine `real_time`-Regel unterstützt weder `recovery` noch `noData`. `composite`- und `heartbeat`-Regeln liefern immer ein eindeutiges Ergebnis und unterstützen kein `noData`.
+
+## Nach Spalten gruppierte Regeln
+
+Eine `scheduled`-Regel mit `query.group_by` wertet jede Gruppe im Ergebnis separat aus. Eine Gruppe umfasst alle Zeilen mit denselben Werten in den angegebenen Spalten. Beim Zuordnen der Spaltennamen zum Ergebnis spielt die Groß- und Kleinschreibung keine Rolle. Bei einer APM- oder RUM-Regel sowie bei jedem anderen Regeltyp als `scheduled` oder `outlier` antwortet die API auf `groupBy` mit `400`. Eine `outlier`-Regel erfordert eine Gruppierung: Sie vergleicht die Gruppen miteinander statt mit einem Schwellenwert. Siehe [Ausreißerregeln](#ausreißerregeln).
+
+1. Eine `sql`-Anweisung liefert maximal 101 Zeilen. Eine `promql`-Anweisung liefert alle Zeitreihen. Geben Sie pro Gruppe eine Zeile zurück, beginnend mit der kritischsten Gruppe.
+2. Die erste Zeile einer Gruppe liefert ihren Wert. MoleSignal nimmt dafür die erste numerische Spalte und überspringt dabei die angegebenen Gruppierungsspalten sowie `_timestamp`, `ts`, `time` und `timestamp`.
+3. MoleSignal vergleicht den Wert mit `trigger` oder `thresholds` und zählt `forPeriods` für jede Gruppe separat.
+4. Löst eine Gruppe aus, öffnet MoleSignal einen eigenen Incident. Der Incident erhält die Gruppenwerte als Labels. Die Zusammenfassung enthält den Regelnamen gefolgt von den Werten, zum Beispiel `Errors per host · web-1`. `silenceSecs` gilt für jede Gruppe separat.
+5. Erfüllt eine Gruppe die Wiederherstellungsbedingung, schließt MoleSignal ihren offenen Incident. Fehlt eine zuvor vorhandene Gruppe im aktuellen Ergebnis, hat sie in dieser Auswertung keinen Wert. `trigger.no_data` legt fest, was dann mit der Gruppe passiert.
+6. `lastState` lautet `firing`, solange mindestens eine Gruppe auslöst (`dropped`, wenn eine [Alert-Pipeline](/de/pipelines/alert-events#was-mit-einem-ereignis-geschieht) den Incident einer Gruppe in dieser Auswertung verworfen hat). Der Status lautet `noData`, solange mindestens eine Gruppe keinen Wert hat und ihren Zustand beibehält, `pending`, solange mindestens eine Gruppe die Bedingung erfüllt, und andernfalls `healthy`.
+
+Pro Auswertung liest MoleSignal maximal 100 Gruppen. Enthält das Ergebnis mehr Gruppen, wertet MoleSignal die übrigen nicht aus. In dieser Auswertung bleibt der Incident einer im Ergebnis fehlenden Gruppe offen. Enthält das Ergebnis Zeilen, aber fehlt eine in `groupBy` angegebene Spalte, schlägt die Auswertung ohne Änderungen fehl. [Regel testen](/de/api/alerting/test-rule) gibt alle Gruppen aus.
+
+## Prognoseregeln
+
+Eine `forecast`-Regel fügt den Abfragewert jeder Auswertung zu einer Zeitreihe hinzu und schreibt diese in die Zukunft fort. Erfüllt die
+Prognose innerhalb der Vorlaufzeit die Bedingung aus `trigger.operator` und `trigger.threshold`, zählt die Auswertung als Treffer. Ist die
+Regel neu oder hat sich ihre Abfrage, ihr Auswertungsfenster oder ihr Rückblickzeitraum geändert, fragt sie zunächst jeden vergangenen Zeitpunkt einmal ab, um
+bis zu 48 Punkte zu ergänzen. Beim ersten Fehler endet das Auffüllen. Ab der nächsten Auswertung läuft die Zeitreihe weiter. Die
+Zeitreihe enthält maximal 168 Punkte, zwischen denen mindestens ein Auswertungsfenster liegt. Eine Beurteilung erfolgt erst ab
+6 Punkten.
+
+| Feld | Typ | Hinweise |
+|---|---|---|
+| `forecast.lookback_days` | Ganzzahl | Anzahl der vergangenen Tage der Zeitreihe, die in die Prognose einfließen: 1 bis 30. Standard: `7`. |
+| `forecast.lead_secs` | Ganzzahl | Vorlaufzeit: Die Regel löst aus, wenn der Wert laut Prognose innerhalb dieser Zeit den Schwellenwert passiert. 900 bis 604800 Sekunden (7 Tage). Standard: `86400`. |
+| `forecast.model` | Zeichenfolge | `linear`: robuster Theil–Sen-Trend. `daily`, `weekly`: der Wert zum gleichen Zeitpunkt der vorherigen Periode plus Trend, für Kennzahlen mit Tages- oder Wochenrhythmus. `daily` benötigt einen vollständigen Tag an Zeitreihendaten. `weekly` erfordert für `lookbackDays` einen Wert von mindestens 7 und eine vollständige Woche an Zeitreihendaten. |
+
+Der dadurch geöffnete Incident trägt die Annotationen `forecast_crossing_at` (prognostizierter Zeitpunkt, zu dem der Wert den Schwellenwert
+passiert, in UTC), `forecast_value` (Prognosewert zu diesem Zeitpunkt) und `forecast_model`. Hat der letzte Punkt den Schwellenwert
+bereits passiert, gilt der Zeitpunkt dieses Punkts. Prognosen sind auch für APM- und RUM-Kennzahlen möglich, außer für neue und
+erneut aufgetretene RUM-Probleme.
+
+## Ausreißerregeln
+
+Eine `outlier`-Regel gruppiert das Ergebnis nach `query.group_by` und vergleicht die Gruppenwerte miteinander. Zur Berechnung der Abweichung zieht MoleSignal
+den Median der Gruppen vom jeweiligen Gruppenwert ab und teilt das Ergebnis durch einen Skalierungswert. Dieser entspricht dem größeren der beiden Werte: dem 1,4826-Fachen der medianen
+absoluten Abweichung (MAD) und 5 % des Betrags des Medians. So stuft MoleSignal kleine Schwankungen bei fast identischen Gruppen
+nicht als Ausreißer ein. Für jede Gruppe, deren Abweichung außerhalb der Toleranz liegt, öffnet MoleSignal einen eigenen
+Incident mit der Annotation `outlier_score`. Liegt für weniger als 3 Gruppen ein Wert vor, liefert die Auswertung keine
+Beurteilung.
+
+| Feld | Typ | Hinweise |
+|---|---|---|
+| `outlier.tolerance` | Zahl | Abstand vom Median in Einheiten des Skalierungswerts, ab dem ein Wert als Ausreißer gilt: 0,5 bis 10. Standard: `3`. Je kleiner der Wert, desto empfindlicher reagiert die Regel. |
+| `outlier.direction` | Zeichenfolge | `both` (Standard, nach oben oder unten), `above` (nur nach oben) oder `below` (nur nach unten). |
+
+## Zusammengesetzte Regeln
+
+Eine `composite`-Regel kombiniert andere Regeln: Eine eingebundene Regel ist wahr, solange ein aktiver Vorfall für diese Regel vorliegt. Der Wahrheitswert
+fließt in den Ausdruck ein. Die Auswertungsrunde ergibt einen Treffer, wenn der Ausdruck wahr ist. Die Regel führt keine Abfrage aus.
+
+| Feld | Typ | Hinweise |
+|---|---|---|
+| `composite.expression` | string | Einzelne Großbuchstaben stehen für Regeln. Verknüpfen Sie diese mit `&&` (und), `\|\|` (oder), `!` (nicht) und Klammern, zum Beispiel `A && (B \|\| !C)`. Maximal 200 Zeichen. |
+| `composite.rules` | object | Zuordnung von Buchstaben zu Regel-IDs, zum Beispiel `{ "A": "<rule-id>", "B": "<rule-id>" }`. Maximal 10 Zuordnungen. Ordnen Sie jedem Buchstaben im Ausdruck eine Regel zu und verwenden Sie jeden zugeordneten Buchstaben im Ausdruck. Geben Sie weder dieselbe Regel mehrfach noch die zusammengesetzte Regel selbst an. |
+| `composite.merge_children` | boolean | Standardwert: `false`. Bei `true` [führt MoleSignal die aktiven Vorfälle der eingebundenen Regeln mit dem Vorfall zusammen](/de/api/alerting/merge-incidents), sobald die zusammengesetzte Regel diesen öffnet. In jeder weiteren Runde führt MoleSignal auch neue Vorfälle zusammen. Die eingebundenen Vorfälle lösen keine eigenen Benachrichtigungen aus. |
+
+Eine zusammengesetzte Regel darf keine andere zusammengesetzte Regel einbinden. So können keine
+Zyklen entstehen. Eine gelöschte eingebundene Regel zählt als falsch. Der Vorfall enthält die Annotation
+`composite_active` mit den Buchstaben der Regeln, die als wahr ausgewertet wurden. Zusammengesetzte Regeln lassen sich nicht
+[testen](/de/api/alerting/test-rule).
+
+## Heartbeat-Regeln
+
+Eine `heartbeat`-Regel wartet auf ein Check-in von einem Job, etwa einem Cron-Job oder einem Backup-Skript. Die Auswertungsrunde ergibt einen Treffer,
+wenn bis zum Ende des Intervalls zuzüglich der Toleranzzeit kein Check-in eingeht oder das letzte Check-in einen Fehler meldet. Die Regel
+führt keine Abfrage aus. Jedes Check-in löst sofort eine Auswertung aus.
+
+| Feld | Typ | Hinweise |
+|---|---|---|
+| `heartbeat.period_secs` | integer | Intervall zwischen den Check-ins des Jobs: 60 bis 604800 (7 Tage). |
+| `heartbeat.grace_secs` | integer | Zusätzliche Wartezeit nach Ablauf des Intervalls, bevor ein Check-in als verpasst gilt: 0 bis 86400. Standardwert: `0`. |
+
+Wenn Sie eine Heartbeat-Regel erstmals speichern (beim Erstellen oder beim Wechsel von einem anderen Regeltyp), enthält die
+Antwort zusätzlich `heartbeat_address`:
+`{ "path": "/api/v1/intake/heartbeats/<token>", "url": "<external address>/api/v1/intake/heartbeats/<token>" }`,
+wobei `url` den Wert `null` hat, wenn keine externe Adresse konfiguriert ist. MoleSignal gibt die Adresse nur dieses eine Mal zurück. Setzen Sie eine verlorene Adresse
+[zurück](/de/api/alerting/heartbeats). Der Vorfall enthält die Annotationen `heartbeat_due_at`,
+`heartbeat_last_checkin_at`, `heartbeat_status` und die Check-in-Nachricht `heartbeat_message`. Eine
+Heartbeat-Regel lässt sich nicht [testen](/de/api/alerting/test-rule). Eine Anleitung finden Sie unter
+[Heartbeat-Check-ins](/de/api/alerting/heartbeats).
+
+## APM-Regeln
+
+Eine Regel mit `query.apm` überwacht eine Metrik eines APM-Dienstes oder eines seiner Endpunkte. Die Regel nutzt dafür
+dieselben Aggregate wie die APM-Seiten. Eine APM-Regel muss vom Typ `scheduled` sein. Der Aufruf speichert `query.stream` als
+`null` und füllt ein leeres `query.statement` mit einer Beschreibung wie
+`apm:p95 checkout POST /orders`. Der Aufruf speichert `query.language` unverändert. Das Feld hat keine Auswirkung.
+
+| Feld | Typ | Erforderlich | Hinweise |
+|---|---|---|---|
+| `service` | string | Ja | Name des Dienstes. Maximal 255 Bytes. |
+| `namespace` | string | Nein | Namespace des Dienstes. Ohne Angabe erfasst die Regel alle Namespaces mit diesem Dienstnamen. |
+| `environment` | string | Nein | Ohne Angabe erfasst die Regel alle Umgebungen des Dienstes. |
+| `transaction` | object | Nein | Ein einzelner Endpunkt: `{ "name": "POST /orders", "kind": "http" }`. `kind` ist `http`, `rpc`, `messaging`, `span` oder `other`. Ohne Angabe erfasst die Regel den gesamten Dienst. |
+| `metric` | string | Ja | Metrik. Siehe unten. |
+| `sloId` | string | Für `slo_burn_rate` | SLO, dessen Burn Rate die Regel ausliest. Andere Metriken akzeptieren kein `sloId`. |
+| `shortWindowSecs` | integer | Nein | Nur für `slo_burn_rate`. Muss kleiner als `periodSecs` sein. Die Regel verwendet die niedrigere Burn Rate aus dem gesamten Zeitraum und dessen letzten `shortWindowSecs`. Beide müssen daher die Schwellenwertbedingung erfüllen. |
+
+| `metric` | Wert |
+|---|---|
+| `errorRate` | Anteil fehlgeschlagener Anfragen an allen Anfragen in Prozent, von 0 bis 100. |
+| `p50`, `p90`, `p95`, `p99`, `average` | Latenz in Millisekunden. |
+| `throughput` | Anfragen pro Sekunde im Zeitfenster. |
+| `requestCount`, `errorCount` | Anzahl der Anfragen bzw. der fehlgeschlagenen Anfragen im Zeitfenster. |
+| `new_error_groups` | Fehlergruppen des Dienstes oder von `transaction`, die erstmals im Zeitfenster aufgetreten sind. |
+| `apdex` | Apdex mit einem Schwellenwert von 500 ms, von 0 bis 1. |
+| `slo_burn_rate` | Faktor, um den das SLO sein Fehlerbudget schneller verbraucht, als das Ziel erlaubt. Bei `1` reicht das Budget genau für das SLO-Zeitfenster. |
+
+Für Zeitfenster bis zu 24 Stunden verwendet die Regel Minutenaggregate, für längere Zeitfenster Stundenaggregate. Ohne Anfragen
+im Zeitfenster liefern `requestCount`, `errorCount`, `new_error_groups` und `throughput` den Wert `0`. Die übrigen Metriken liefern keinen
+Wert und erfüllen daher keine Schwellenwertbedingung. Das Ergebnis enthält die Spalten `value`, `service` und `trace_id`. Der
+Vorfall erhält dadurch das Label `service`, den Dienst in `affectedServices` und eine Beispiel-Trace-ID.
+
+## RUM-Regeln
+
+Eine Regel mit `query.rum` überwacht eine Kennzahl einer RUM-Anwendung und ermittelt sie genauso wie die RUM-Seiten. Eine RUM-Regel hat den Typ `scheduled` oder
+`anomaly`. Eine Regel gibt entweder eine APM- oder eine RUM-Kennzahl an, nicht beide. Der Aufruf speichert `query.stream` als `null` und trägt, wenn
+`query.statement` leer ist, eine Beschreibung wie `rum:lcp_p75 checkout-web /checkout` ein. Der Aufruf speichert `query.language` wie
+übermittelt. Das Feld hat keine Auswirkung. Wenn die Anwendung nicht existiert, gibt der Aufruf `400` zurück.
+
+| Feld | Typ | Erforderlich | Hinweise |
+|---|---|---|---|
+| `applicationId` | String | Ja | Die [RUM-Anwendung](/de/rum/applications). |
+| `environment` | String | Nein | Ohne Angabe berücksichtigt die Regel alle Umgebungen der Anwendung. |
+| `page` | String | Nein | Eine Seite oder ein Bildschirm einer App. Ohne Angabe berücksichtigt die Regel alle Seiten. Für Sitzungs- und Problemkennzahlen nicht zulässig. |
+| `version` | String | Nein | Eine Version der Anwendung. Ohne Angabe berücksichtigt die Regel alle Versionen. Für Problemkennzahlen nicht zulässig. |
+| `metric` | String | Ja | Die Kennzahl. Siehe unten. |
+| `minSamples` | Ganzzahl | Nein | Mindestanzahl der Datenzeilen im Zeitfenster, die zur Berechnung der Kennzahl nötig sind. Ohne Angabe gilt der Standardwert der Kennzahl. Für Zählungen nicht zulässig. |
+| `customName`, `statistic` | String | Für `custom_vital` und `custom_timing` | Name des Vitals oder Timings und die Auswertung: `p50`, `p75` (Standard), `p90`, `p95`, `p99`, `avg` oder `count`. |
+| `search` | Objekt | Für `query` | Die Explorer-Abfrage: `type` (`sessions`, `views`, `actions`, `errors`, `resources`, `longTasks` oder `logs`), das unveränderte `statement`, die daraus ermittelten `filters` (`field`, `op`, `value`) und `freeText` sowie `measure` mit der Funktion `fn` (`count`, `count_distinct`, `sum`, `avg`, `min`, `max` oder `p50` bis `p99`) und dem zugehörigen `field`. Der Aufruf gibt `400` zurück, wenn der Typ das Feld nicht unterstützt. `search` ist mit `page` oder `version` nicht zulässig. Bei einer Zählung oder Summe ist `minSamples` nicht zulässig. |
+
+Für `metric` sind folgende Werte zulässig: `sessionCount`, `viewCount`, `errorCount`, `errorRate`, `crash_free_sessions`, `frustration_rate`,
+`failed_request_rate`, `lcp_p75`, `inp_p75`, `cls_p75`, `ttfb_p75`, `new_issues`, `regressed_issues`, `issue_impact`,
+`custom_vital`, `custom_timing` und `query`. Eine Beschreibung jeder Kennzahl, ihre Einheit und die benötigten Datenzeilen finden Sie unter
+[RUM-Alarme](/de/rum/alerts#kennzahlen). Eine `anomaly`-Regel unterstützt alle Kennzahlen außer `new_issues` und `regressed_issues`.
+Für `periodSecs` sind Werte von 60 Sekunden bis 6 Stunden zulässig.
+
+Enthält ein Zeitfenster keine Datenzeilen, ergibt eine Zählung `0`. Andere Kennzahlen liefern keinen Wert, sodass keine Schwellenwertbedingung erfüllt ist. Das Ergebnis enthält die Spalten
+`value` und `application` in einer einzigen Zeile. Wenn die Regel einen Vorfall öffnet, sucht sie außerdem nach bis zu drei Beispielsitzungen und speichert sie beim
+Vorfall. Siehe [RUM-Alarme](/de/rum/alerts#vorfälle).
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "High error rate",
+  "description": "More than 100 errors in five minutes",
+  "enabled": true,
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
+    "periodSecs": 300,
+    "stream": { "name": "app", "streamType": "logs" }
+  },
+  "trigger": { "operator": "gt", "threshold": 100, "forPeriods": 2, "silenceSecs": 0 },
+  "severity": "critical",
+  "escalationPolicyId": "<policy-id>",
+  "labels": { "team": "checkout" }
+}
+EOF
+```
+```bash APM rule
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "Checkout p95",
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "",
+    "periodSecs": 300,
+    "apm": {
+      "namespace": "shop",
+      "service": "checkout",
+      "environment": "production",
+      "transaction": { "name": "POST /orders", "kind": "http" },
+      "metric": "p95"
+    }
+  },
+  "trigger": { "operator": "gt", "threshold": 800, "forPeriods": 2, "silenceSecs": 0 },
+  "severity": "error",
+  "labels": { "service.name": "checkout", "deployment.environment": "production" }
+}
+EOF
+```
+```bash RUM rule
+curl -X POST http://localhost:5080/api/v1/alerts/rules \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  --data-binary @- <<'EOF'
+{
+  "name": "Checkout is slow",
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "",
+    "periodSecs": 3600,
+    "rum": {
+      "applicationId": "checkout-web",
+      "environment": "production",
+      "page": "/checkout",
+      "metric": "lcp_p75"
+    }
+  },
+  "trigger": { "operator": "gt", "threshold": 2500, "forPeriods": 1, "silenceSecs": 0 },
+  "severity": "warning",
+  "labels": { "rum.application": "checkout-web", "deployment.environment": "production", "rum.page": "/checkout" }
+}
+EOF
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KEDBLvTYO6DnWi8H9S9MNLpPT7",
+  "orgId": "<organization-id>",
+  "name": "High error rate",
+  "description": "More than 100 errors in five minutes",
+  "enabled": true,
+  "kind": "scheduled",
+  "query": {
+    "language": "sql",
+    "statement": "SELECT count(*) AS c FROM app WHERE level = 'error'",
+    "periodSecs": 300,
+    "stream": { "name": "app", "streamType": "logs" }
+  },
+  "trigger": { "operator": "gt", "threshold": 100.0, "forPeriods": 2, "silenceSecs": 0 },
+  "anomalyParams": null,
+  "thresholds": [],
+  "severity": "critical",
+  "escalationPolicyId": "<policy-id>",
+  "labels": { "team": "checkout" },
+  "annotations": {},
+  "lastEvalAt": null,
+  "lastState": { "kind": "healthy" },
+  "createdAt": 1790000000000000,
+  "updatedAt": 1790000000000000
+}
+```
+</ResponseExample>
+
+**Fehler**
+
+| Status | Ursache |
+|---|---|
+| `400` | `name` oder `query.statement` ist leer; `query.stream` fehlt; die Regel greift über `query.stream` oder an einer beliebigen Stelle in `query.statement` auf den [`_audit`-Stream](/de/settings/data-security#audit-stream) zu; eine APM-Regel hat nicht den Typ `scheduled` oder enthält ein ungültiges `query.apm` (`APM alert service is invalid`, `an SLO burn-rate alert names its SLO`); eine RUM-Regel hat den Typ `real_time`, gibt eine nicht vorhandene Anwendung an oder enthält ein ungültiges `query.rum` (ein für die Kennzahl unzulässiges `page`- oder `version`-Feld, `minSamples` bei einer Zählung oder ein Zeitfenster außerhalb des Bereichs von 60 bis 21.600 Sekunden); `escalationPolicyId` verweist auf keine Richtlinie der Organisation; die `anomalyParams` einer `anomaly`-Regel fehlen oder sind ungültig; oder eine `real_time`-Regel verletzt die oben genannten Grenzwerte. Die Antwort enthält JSON mit dem Code `invalid_argument` und einer Meldung wie `anomaly detector not yet supported: prophet`. |
+| `403` | Dem Token fehlt die Berechtigung `alerts.rules.manage`. |
+| `422` | Ein Pflichtfeld fehlt oder ein Wert hat den falschen Typ, etwa ein unbekannter Wert für `operator`. Die Antwort besteht aus Klartext. |
+
+Die Schritte in der Konsole finden Sie unter [Alarmierung und Vorfallreaktion](/de/alerting).

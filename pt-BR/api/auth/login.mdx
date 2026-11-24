@@ -1,0 +1,144 @@
+---
+title: "API de login"
+sidebarTitle: "Entrar"
+description: "Inicie uma sessão no navegador com e-mail e senha."
+"en_link": "/en-US/api/auth/login"
+"zh-Hans_link": "/zh-Hans/api/auth/login"
+"zh-Hant_link": "/zh-Hant/api/auth/login"
+"ja_link": "/ja/api/auth/login"
+"ko_link": "/ko/api/auth/login"
+"de_link": "/de/api/auth/login"
+"es_link": "/es/api/auth/login"
+"fr_link": "/fr/api/auth/login"
+---
+
+```http
+POST /api/v1/auth/signin
+```
+
+Inicia uma sessão na interface web. Esta rota **não exige autenticação**. A resposta define os cookies de sessão e retorna em `login` a identidade do usuário autenticado. O corpo não contém token. Para contas com autenticação multifator, consulte [A segunda etapa](#a-segunda-etapa).
+
+**Corpo**
+
+| Campo | Tipo | Obrigatório | Observações |
+|---|---|---|---|
+| `email` | string | Sim | |
+| `password` | string | Sim | |
+| `remember` | boolean | Não | Mantém a sessão após o fechamento do navegador. O padrão é `false`. |
+
+<RequestExample>
+```bash cURL
+curl -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+  -H 'content-type: application/json' \
+  -d '{"email":"admin@example.com","password":"admin"}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "login": {
+    "userId": "<user-id>",
+    "email": "admin@example.com",
+    "displayName": "root",
+    "orgId": "<organization-id>",
+    "orgName": "default",
+    "displayRole": "Owner",
+    "roles": [
+      {
+        "id": "<role-id>",
+        "key": "owner",
+        "name": "Owner",
+        "builtin": true
+      }
+    ],
+    "scope": "organization"
+  }
+}
+```
+</ResponseExample>
+
+O login seleciona a primeira organização à qual o usuário pertence e que permite o acesso. Programas usam um token de API no cabeçalho `Authorization` em vez de fazer login. O cabeçalho não aceita tokens de sessão. Consulte [Emita um token de API](/pt-BR/api/auth/issue-token).
+
+## Excesso de tentativas malsucedidas
+
+Após muitas tentativas com senha incorreta, a rota retorna `429` com um cabeçalho `Retry-After` em segundos, o código `signin_limited` e o mesmo texto para contas existentes e inexistentes. A rota não verifica a senha. Uma senha incorreta ou uma conta desconhecida resulta em `401`. Uma senha correta em uma conta desativada ou pendente resulta em `403`, com o motivo. Consulte [Limites de login](/pt-BR/settings/platform#limites-de-login).
+
+```json
+{
+  "error": "resource_exhausted",
+  "code": "signin_limited",
+  "message": "too many failed password attempts; try again in 14 minutes"
+}
+```
+
+## A segunda etapa
+
+Em contas com [autenticação multifator](/pt-BR/identity/mfa), a senha por si só não define cookies. A resposta inclui `mfa` no lugar de `login` e indica os métodos disponíveis para concluir o login:
+
+```json
+{
+  "mfa": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp", "recovery_code"],
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| Endpoint | Finalidade |
+|---|---|
+| `POST /api/v1/auth/signin/verify` | Conclui o login. Recebe `challenge` e aceita `method` (`totp` ou `recovery_code`) com `code` ou `method` `passkey` com `ceremony` e `credential`. Retorna `{"login": …}` com os cookies de sessão e inclui `recoveryCodesLeft` após o uso de um código de recuperação. |
+| `POST /api/v1/auth/signin/verify/passkey` | Recebe `challenge` e retorna `ceremony` e `options` para verificar uma chave de acesso. Passe `options` para `navigator.credentials.get()` e envie `ceremony` com o resultado. Use `ceremony` uma única vez. |
+
+## Configuração do segundo fator durante o login
+
+Quando a organização [exige autenticação multifator](/pt-BR/identity/sso#requisitos-de-login) e a conta ainda não tem um segundo fator, a resposta inclui `enroll` no lugar de `login`:
+
+```json
+{
+  "enroll": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp"],
+    "organizationName": "default",
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| Endpoint | Finalidade |
+|---|---|
+| `POST /api/v1/auth/signin/enroll/totp` | Recebe `challenge` e retorna `setup`, `secret`, `otpauthUrl`, `qrSvg` e `expiresAt`. |
+| `POST /api/v1/auth/signin/enroll/totp/confirm` | Recebe `challenge`, `setup` e `code`. Retorna `{"login": …, "recoveryCodes": […]}` com os cookies de sessão. |
+| `POST /api/v1/auth/signin/enroll/passkey/options` | Recebe `challenge` e retorna `ceremony` e `options` para `navigator.credentials.create()`. |
+| `POST /api/v1/auth/signin/enroll/passkey` | Recebe `challenge`, `ceremony`, `credential` e, opcionalmente, `name`. Retorna `{"login": …, "recoveryCodes": […]}` com os cookies de sessão. |
+
+Se a organização [permite apenas login único](/pt-BR/identity/sso#requisitos-de-login), a rota retorna `403` ao receber a senha. Quando a conta pertence a várias organizações, o login seleciona a primeira que permite o acesso.
+
+## Login com chave de acesso
+
+Uma [chave de acesso](/pt-BR/identity/mfa#com-uma-chave-de-acesso-sem-senha) permite fazer login sem senha nem segunda etapa.
+
+| Endpoint | Finalidade |
+|---|---|
+| `POST /api/v1/auth/signin/passkey/options` | Retorna `ceremony` e `options`. Retorna `400` quando o `[http].external_url` da instância não pode servir como [parte confiante](/pt-BR/identity/mfa#requisitos-da-instância) da chave de acesso. |
+| `POST /api/v1/auth/signin/passkey` | Recebe `ceremony`, `credential` e, opcionalmente, `remember`. Retorna `{"login": …}` com os cookies de sessão. |
+
+## Cookies de sessão
+
+| Cookie | Caminho | Conteúdo | Validade |
+|---|---|---|---|
+| `accessToken` | `/api` | Token de acesso que acompanha cada solicitação à API. | 15 minutos. Renove com `POST /api/v1/auth/refresh`. |
+| `refreshToken` | `/api/v1/auth` | Token de atualização que serve apenas para renovar o token de acesso. | Até o fim da sessão, `[auth].session_ttl_secs` após o login. O padrão é 24 horas. |
+
+Ambos os cookies têm os atributos `HttpOnly` e `SameSite=Strict`, além de `Secure` quando o navegador acessa o MoleSignal por HTTPS. Sem `remember`, o navegador descarta os cookies ao fechar. Ambos os tokens são JWTs assinados. O servidor não armazena os tokens e verifica a assinatura, a finalidade e a validade de cada um. Desativar ou excluir o usuário encerra a sessão na próxima solicitação.
+
+## Endpoints de sessão
+
+| Endpoint | Finalidade |
+|---|---|
+| `POST /api/v1/auth/refresh` | Emite um novo token de acesso a partir do token de atualização e retorna `204` com um novo cookie `accessToken`. O horário de expiração da sessão não muda. Se a sessão expirou, o usuário está desativado ou falta um cookie, o endpoint retorna `401` e limpa ambos os cookies. |
+| `GET /api/v1/auth/session` | Retorna a identidade da sessão atual no mesmo formato de `login` na resposta de login. |
+| `POST /api/v1/auth/signout` | Limpa ambos os cookies e retorna `204`. |
+
+Uma solicitação que altera dados e usa o cookie de sessão deve partir de uma página do MoleSignal. Se uma solicitação do navegador incluir `Sec-Fetch-Site` com um valor diferente de `same-origin`, o servidor retorna `403`.

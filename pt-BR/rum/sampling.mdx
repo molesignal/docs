@@ -1,0 +1,175 @@
+---
+title: "Amostragem de dados de RUM"
+sidebarTitle: "Amostragem de dados"
+description: "Controle o volume de sessões de RUM e de suas gravações com taxas de amostragem no SDK, filtros de retenção no servidor e limites no tamanho das filas do cliente."
+"en_link": "/en-US/rum/sampling"
+"zh-Hans_link": "/zh-Hans/rum/sampling"
+"zh-Hant_link": "/zh-Hant/rum/sampling"
+"ja_link": "/ja/rum/sampling"
+"ko_link": "/ko/rum/sampling"
+"de_link": "/de/rum/sampling"
+"es_link": "/es/rum/sampling"
+"fr_link": "/fr/rum/sampling"
+---
+
+O SDK de RUM para navegadores decide se inclui a sessão na amostra ao criá-la. A decisão permanece a mesma
+durante toda a sessão, em todas as abas da aplicação.
+
+## Configure as taxas de amostragem
+
+```ts
+const rum = init({
+  applicationId: 'checkout-web',
+  clientToken: 'mspat-your-client-token',
+  site: 'https://molesignal.example.com',
+  sessionSampleRate: 25,
+  sessionReplaySampleRate: 20,
+});
+```
+
+Ambos os valores são porcentagens de `0` a `100`:
+
+- `sessionSampleRate` controla se o SDK envia a sessão e os eventos de RUM associados. O padrão é `100`.
+- `sessionReplaySampleRate` se aplica apenas às sessões selecionadas na amostragem. O padrão é `0`.
+
+A taxa efetiva de gravação é o produto das duas taxas. No exemplo, cerca de 25% das
+sessões enviam dados de RUM e cerca de 5% de todas as sessões têm a reprodução gravada (`25% × 20%`).
+
+<Note>
+  A chamada a `startSessionReplayRecording()` pode ativar a gravação da sessão atual se ela estiver na amostra, mas o método
+  não pode incluir uma sessão excluída por `sessionSampleRate`.
+</Note>
+
+## Retenha uma porcentagem das sessões no servidor
+
+Além da amostragem do SDK, uma aplicação pode reter uma porcentagem das sessões recebidas, independentemente do cliente que as enviou. Abra a
+aplicação em **RUM → Aplicações** e localize **Sessões mantidas**. O valor de **Porcentagem de sessões mantidas (%)** vai de `0` a `100`. O padrão é
+`100`, que mantém todas as sessões.
+
+O servidor retém ou descarta a sessão inteira. A decisão usa um hash do ID da sessão, de modo que todos os eventos e segmentos de
+reprodução da sessão tenham o mesmo destino em qualquer nó. Uma sessão mantida preserva todos os seus dados. Das sessões
+descartadas, não ficam eventos, linhas em `rum_sessions` nem gravações de reprodução. A exceção são os erros (consulte
+[Reter todos os erros](#reter-todos-os-erros)).
+
+A porcentagem se aplica às sessões enviadas pelo SDK. Com `sessionSampleRate: 50` no SDK e **Porcentagem de sessões mantidas** em `20`, cerca de
+10% de todas as sessões ficam armazenadas. O valor `0` não armazena nenhuma sessão, o que permite pausar uma aplicação sem
+alterar os SDKs. A resposta da [ingestão](/pt-BR/rum/events#a-resposta) indica em `sampled` quantos eventos ficaram de fora, e o
+SDK pode identificar que o descarte foi intencional. Ao receber um segmento de reprodução de uma sessão descartada, o servidor retorna `200` com `sampled: true`.
+
+Uma alteração se aplica aos eventos que chegam depois dela. As sessões já armazenadas permanecem, e o servidor passa a aplicar
+a nova porcentagem para decidir se retém ou descarta uma sessão iniciada antes da alteração.
+
+O servidor retém integralmente uma [sessão gerada por um teste](/pt-BR/rum/test-traffic), a menos que um filtro da aplicação mencione `session.type`: uma verificação não deve perder sua sessão por causa de uma taxa destinada a usuários reais.
+
+### Filtros
+
+Um filtro define uma porcentagem própria para as sessões que correspondem a ele. Por exemplo, retenha todas as sessões de produção e 10% das demais. Adicione
+filtros em **Sessões mantidas**. Cada filtro tem um nome, uma porcentagem de `0` a `100` e até 5 condições. A sessão precisa atender
+a todas elas. Um filtro sem condições corresponde a todas as sessões.
+
+Uma condição compara uma característica da sessão com uma lista de valores: o valor da sessão **é** um dos valores da lista ou **não é** nenhum
+deles (se a sessão não tiver valor para a característica, não corresponderá a nenhum deles). Os valores não diferenciam maiúsculas de minúsculas. `*` representa qualquer texto,
+então `2.*` corresponde a todas as versões da série 2. Cada condição aceita até 20 valores, e cada aplicação aceita até 10 filtros.
+
+| Característica | Campo |
+|---|---|
+| Ambiente | `env` |
+| Serviço | `service` |
+| Versão | `version` |
+| Plataforma do SDK | `source` |
+| Tipo de sessão | `session.type` |
+| País | `geo.country_iso_code` |
+| Navegador | `browser.name` |
+| Sistema operacional | `os.name` |
+| Tipo de dispositivo | `device.type` |
+
+O servidor avalia os filtros na ordem da lista. **O primeiro filtro que corresponde à sessão define a porcentagem de retenção**, então posicione os filtros mais
+específicos acima dos mais abrangentes. Para sessões que não correspondem a nenhum filtro, vale a porcentagem abaixo dos filtros, **Porcentagem
+das demais sessões mantidas (%)**. Sem filtros, essa é a única porcentagem da aplicação.
+
+<Note>
+  A decisão de retenção deve ser a mesma para todos os eventos da sessão. Por isso, use apenas características que não mudam durante a sessão.
+  As ações durante a sessão e uma identidade que o SDK só descobre mais tarde (como um ID de usuário definido após o login) não podem
+  determinar a retenção da sessão. A opção abaixo controla a retenção de erros separadamente.
+</Note>
+
+Para avaliar um segmento de reprodução, o servidor usa as informações sobre a sessão que constam no segmento: o navegador, o local de origem e os valores de `env`, `service` e
+`version` que os SDKs para navegadores e Flutter enviam no corpo da requisição (o SDK omite `env` ou `version` se não houver
+valor configurado). Se faltar uma característica, o servidor retém o segmento caso algum filtro que possa corresponder à sessão determine sua retenção.
+
+### Reter todos os erros
+
+O servidor armazena os erros das sessões descartadas, a menos que a opção **Reter todos os erros** esteja desativada. Isso evita que um erro raro
+se perca com a sessão: ele aparece como um problema e entra na contagem com os demais. Esse erro gera apenas uma linha em `rum_errors`. Como
+a sessão não tem linha, visualizações nem gravação de reprodução, a página do problema mostra *Sessão não mantida* no lugar do link para a sessão.
+
+### Os totais são estimativas
+
+Cada linha registra em `retention.rate` a porcentagem de retenção das linhas daquele tipo (`25` para uma sessão mantida por um filtro de 25%) e o motivo da retenção
+em `retention.filter`: o ID do filtro, `default` para a porcentagem das demais sessões ou `errors` para um erro de uma sessão
+descartada. Com **Reter todos os erros** ativado, o servidor mantém todos os erros, então cada erro registra `100`, independentemente da sessão.
+
+As páginas de totais ponderam cada linha pela sua taxa de retenção: uma sessão mantida com uma taxa de 25% conta como quatro. A página exibe
+**Estimado** e a porcentagem de sessões mantidas. O total estima o valor que seria obtido se todas as sessões tivessem sido mantidas.
+
+- As contagens, somas e médias levam em conta as taxas de retenção. Os percentis usam essas mesmas taxas como base para a ponderação.
+- A contagem de usuários distintos e os valores mínimo e máximo não recebem ajuste: a página mostra os valores observados.
+- Funis e caminhos ponderam as sessões pelas taxas de retenção. As coortes de retenção contam usuários sem ajuste.
+- O explorador lista apenas as linhas mantidas e usa essas linhas sem ajuste nas contagens e nos gráficos. Passe `estimate=false`
+  para a [API de agregação](/pt-BR/api/rum#medir-linhas) para obter os mesmos números.
+- Uma regra de alerta que exige um **mínimo de amostras** conta as linhas armazenadas, não o que elas representam.
+
+A amostragem acrescenta ruído: um total baseado em poucas sessões é pouco informativo, mesmo após o ajuste.
+
+## Escolha os valores iniciais
+
+| Perfil de tráfego | Taxa de amostragem de sessões | Taxa de gravação nas sessões amostradas |
+|---|---:|---:|
+| Desenvolvimento ou QA controlado | `100` | `100` |
+| Produção com baixo volume | `100` | `10`–`25` |
+| Produção com alto volume | `10`–`50` | `1`–`10` |
+
+Use esses valores como ponto de partida, não como padrões universais. Antes da implantação, estime o volume de eventos, o armazenamento de objetos, a retenção
+e o número de sessões necessário por navegador e versão.
+
+## Limites da sessão
+
+O SDK armazena a decisão no cookie de sessão `_msrum_s_<applicationId>`, que as abas da aplicação compartilham.
+Uma nova sessão começa quando um dos limites é atingido:
+
+- `sessionInactivityTimeout`: 15 minutos por padrão;
+- `maxSessionDuration`: 4 horas por padrão.
+
+Defina ambos os valores em milissegundos. O intervalo permitido vai de um minuto a 24 horas.
+
+```ts
+sessionInactivityTimeout: 15 * 60_000,
+maxSessionDuration: 2 * 60 * 60_000,
+```
+
+Alterar uma opção de amostragem não muda a decisão que o SDK já armazenou para a sessão atual. Ao testar uma nova configuração, chame
+`stopSession()` ou limpe o cookie `_msrum_s_<applicationId>`.
+
+## Limite o volume no cliente
+
+Use os controles de transporte para manter previsíveis o consumo de memória e o tamanho das requisições:
+
+```ts
+flushInterval: 5_000,
+batchSize: 50,
+replayFlushInterval: 10_000,
+replayBatchSize: 100,
+maxQueueSize: 1_000,
+```
+
+Monitore a taxa de ingestão, o armazenamento de gravações, o impacto no desempenho do navegador e a cobertura das investigações após cada
+alteração. Implante as alterações de amostragem gradualmente por aplicação e versão.
+
+<CardGroup cols={2}>
+  <Card title="SDK de RUM para navegadores" icon="code" href="/pt-BR/rum/browser-sdk">
+    Confira todas as opções de inicialização.
+  </Card>
+  <Card title="Reprodução de sessões" icon="video" href="/pt-BR/rum/session-replay">
+    Configure a coleta de gravações e as opções que afetam o armazenamento.
+  </Card>
+</CardGroup>

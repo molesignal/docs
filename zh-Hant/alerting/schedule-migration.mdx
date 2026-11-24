@@ -1,0 +1,224 @@
+---
+title: "從 Opsgenie 或 PagerDuty 移轉班表"
+description: "透過 Opsgenie 或 PagerDuty 的 REST API 移轉值班班表，在寫入前與來源系統產生的班表比對，並確認哪些內容可以移轉、哪些不行。"
+"en_link": "/en-US/alerting/schedule-migration"
+"zh-Hans_link": "/zh-Hans/alerting/schedule-migration"
+"ja_link": "/ja/alerting/schedule-migration"
+"ko_link": "/ko/alerting/schedule-migration"
+"de_link": "/de/alerting/schedule-migration"
+"es_link": "/es/alerting/schedule-migration"
+"fr_link": "/fr/alerting/schedule-migration"
+"pt-BR_link": "/pt-BR/alerting/schedule-migration"
+---
+
+**匯入排班…** 可讀取 Opsgenie 和 PagerDuty REST API 傳回的排班，遷移團隊時無須手動重建輪值。指令碼使用來源的 API Key 擷取排班並寫入檔案，再依照與[套件](/zh-Hant/alerting/on-call#匯入與匯出)相同的流程匯入：先試跑，再一次寫入。MoleSignal 不會儲存這組 Key，也不會向來源發出請求。匯入需要 `schedules.create` 權限。
+
+匯入內容遵循一項規則：從現在起，任何時間點的值班人員都不變。若有 MoleSignal 的排班無法表示且會改變結果的內容，就會阻止匯入。不影響後續值班結果的內容會跳過，並在結果中說明。
+
+## 步驟
+
+<Steps>
+  <Step title="新增成員">
+    將所有輪值人員加入工作區，並使用與來源相同的電子郵件地址，請參閱[成員](/zh-Hant/identity/members)。系統依電子郵件地址比對成員，不區分大小寫。
+  </Step>
+  <Step title="擷取排班">
+    在裝有 `curl` 和 `jq` 的電腦上執行 [Opsgenie](#opsgenie) 或 [PagerDuty](#pagerduty) 的指令碼，產生一個檔案。
+  </Step>
+  <Step title="試跑">
+    開啟 **警示 → 值班排程**，選擇 **匯入與匯出 → 匯入排班…**，再依序選擇 **選擇檔案** 和 **試跑**。試跑會列出每個排班的預計結果，請參閱[解讀結果](#解讀結果)。
+  </Step>
+  <Step title="解決阻止匯入的問題">
+    修改來源後重新擷取，或直接編輯檔案。只要有一個排班發生錯誤，就不會寫入任何資料。
+  </Step>
+  <Step title="匯入">
+    選擇 **匯入**，再開啟匯入的排班，確認目前的值班人員。將[升級策略](/zh-Hant/alerting/on-call#升級策略)指向該排班，通知就會依照這個排班發送。
+  </Step>
+</Steps>
+
+## Opsgenie
+
+設定具備排班讀取權限的 API Key，再執行指令碼。EU 帳號使用 `api.eu.opsgenie.com`。
+
+```bash
+export OPSGENIE_API_KEY=<api key>
+```
+
+```bash
+API=https://api.opsgenie.com   # EU accounts: https://api.eu.opsgenie.com
+DAYS=200
+
+get() { curl -fsS -H "Authorization: GenieKey $OPSGENIE_API_KEY" "$API$1"; }
+
+get /v2/schedules | jq -r '.data[].id' | while read -r id; do
+  get "/v2/schedules/$id"
+  get "/v2/schedules/$id/timeline?expand=base&interval=$DAYS&intervalUnit=days"
+done | jq -s '{
+  data: map(.data | select(has("rotations"))),
+  timelines: map(.data | select(has("baseTimeline"))
+    | {_parent, startDate, endDate, baseTimeline}
+    | .baseTimeline.rotations[].periods |= map({startDate, endDate, type, recipient}))
+}' > opsgenie-schedules.json
+```
+
+檔案的 `data` 包含每個排班的 `GET /v2/schedules/{id}` 回應，`timelines` 則包含對應的 `GET /v2/schedules/{id}/timeline` 回應。`DAYS` 決定時間軸要往後擷取多久。
+
+| Opsgenie | MoleSignal |
+|---|---|
+| 名稱、說明、時區、啟用狀態 | 維持不變。 |
+| 所屬團隊 | 使用同名團隊。若找不到，則不為排班設定團隊，並在結果中說明。 |
+| 輪替的 `type` 和 `length` | 長度為 1 時，分別對應 **每日** 和 **每週**。其餘使用自訂週期，例如 `hourly` 的長度為 6 時，週期為 6 小時。 |
+| `startDate`、`endDate` | 輪值的開始和結束時間。跳過已結束的輪替。 |
+| `timeRestriction` | 依排班時區設定的每週時段，可跨多天。 |
+| 多個互不重疊的輪替 | 多個輪值，例如上班時段和下班時段各設一個。 |
+| 使用者參與者 | 對應至成員，順序不變。依 `username` 比對，其值為電子郵件地址。 |
+
+輪替仍生效時，下列情況會阻止匯入：
+
+| Opsgenie | 原因 |
+|---|---|
+| 以團隊或升級策略作為參與者 | MoleSignal 的輪值只能安排個別人員。 |
+| **No-One** 參與者 | MoleSignal 的輪值不能留空班次。 |
+| 互相重疊的輪替 | Opsgenie 會讓所有重疊輪替的值班人員同時值班；MoleSignal 的每個排班在同一時間只能有一人值班。請在檔案中將這些輪替拆成名稱不同的排班，再在升級策略的同一層級指定這些排班。 |
+
+不匯入臨時代班、轉送規則、升級策略和路由。
+
+## PagerDuty
+
+設定具備排班和使用者讀取權限的 API Key，再執行指令碼。EU 帳號使用 `api.eu.pagerduty.com`。
+
+```bash
+export PAGERDUTY_API_KEY=<api key>
+```
+
+```bash
+API=https://api.pagerduty.com   # EU accounts: https://api.eu.pagerduty.com
+DAYS=200
+since=$(jq -rn 'now | todate')
+until=$(jq -rn "now + $DAYS * 86400 | todate")
+
+get() {
+  curl -fsSg -H "Authorization: Token token=$PAGERDUTY_API_KEY" \
+    -H 'Accept: application/vnd.pagerduty+json;version=2' "$API$1"
+}
+pages() {
+  offset=0
+  while page=$(get "$1?limit=100&offset=$offset"); do
+    printf '%s\n' "$page"
+    [ "$(printf '%s' "$page" | jq .more)" = true ] || break
+    offset=$((offset + 100))
+  done
+}
+shift_based=$(pages /v3/schedules)
+
+{
+  pages /users
+  printf '%s\n' "$shift_based"
+  printf '%s\n' "$shift_based" | jq -r '.schedules[].id' | while read -r id; do
+    get "/v3/schedules/$id?since=$since&until=$until&include[]=final_schedule"
+  done
+  pages /schedules | jq -r '.schedules[].id' | while read -r id; do
+    get "/schedules/$id?since=$since&until=$until&include[]=final_schedule&include[]=overrides_subschedule"
+  done
+} | jq -s --arg since "$since" --arg until "$until" '{
+  since: $since,
+  until: $until,
+  users: (map(.users // []) | add // [] | map({id, email})),
+  shift_based_schedules: (map(.schedules // []) | add // [] | map({id, type, summary})),
+  schedules: map(.schedule // empty
+    | del(.users, .escalation_policies)
+    | if .type == "schedule_v3" then
+        .final_schedule.computed_shift_assignments[]? |= {start_time, end_time, member, source: {type: .source.type}}
+      else
+        del(.schedule_layers[].rendered_schedule_entries)
+        | .final_schedule.rendered_schedule_entries |= map({start, end, user: (.user | select(.) | {id})})
+        | .overrides_subschedule.rendered_schedule_entries |= map({start, end})
+      end)
+}' > pagerduty-schedules.json
+```
+
+檔案的 `schedules` 包含每個排班的 `GET /schedules/{id}` 和 `GET /v3/schedules/{id}` 回應，`users` 包含 `GET /users` 回傳的電子郵件地址（排班中的人員資料不含電子郵件地址），`shift_based_schedules` 則包含 `GET /v3/schedules` 回傳的清單。`since` 和 `until` 指定 PagerDuty 產生班表的時間範圍，`DAYS` 決定往後擷取多久。
+
+請逐一擷取排班，不要傳入 `time_zone`。`GET /schedules` 會依呼叫端的時區而非排班的時區產生時段限制。MoleSignal 會辨識以其他時區產生的排班，並拒絕匯入。
+
+### 分層排班
+
+| PagerDuty | MoleSignal |
+|---|---|
+| 名稱、說明、時區 | 維持不變。已暫停的排班在更新後仍維持暫停。 |
+| 團隊 | 採用第一個在 MoleSignal 中有同名團隊的團隊，其餘會在結果中說明。 |
+| 層 | 轉為多個優先順序相同的輪值。最新的層排在最前面，優先適用；不在其限定時段內時，由後續的層接替。 |
+| `rotation_turn_length_seconds` | 正好為 24 小時和 7 天時，分別對應 **每日** 和 **每週**。其餘使用自訂週期。 |
+| `rotation_virtual_start` | 輪值開始時間，決定交接時間和輪到哪位成員。 |
+| `start` | 該層的生效時間。若已生效，無須處理；若尚未生效，將輪值開始時間移至生效時間，並將當時應值班的人員排在最前面。 |
+| `end` | 輪值結束時間。跳過已結束的層，例如修改前的舊版本。 |
+| `restrictions` | 依排班時區設定的每週時段，支援 `daily_restriction` 和 `weekly_restriction`。 |
+| `users` | 對應至成員，順序不變。依 `users` 中的電子郵件地址比對。 |
+
+### shift-based 排班
+
+PagerDuty V3 API 傳回的排班由事件組成。事件之間沒有優先順序。如果事件在時間上重疊，這些事件的人員會同時值班。
+
+| PagerDuty | MoleSignal |
+|---|---|
+| 名稱、說明、團隊 | 與分層排班相同。 |
+| 事件的時區 | 將事件時區設為排班時區，讓交接維持在事件的當地時間。若排班本身的 `time_zone` 與事件時區不同，結果會說明。 |
+| 每個事件 | 轉為一個與事件同名的輪值。互不重疊的事件（例如上班時段和下班時段各有一個事件）不受排列順序影響。 |
+| `start_time`、`end_time`、`recurrence` | 第一個班次及其重複方式，請見下表。 |
+| `shifts_per_member` | 每位成員單次輪值的長度。從 `start_time` 起計算重複次數，`BYDAY` 中的每一天算一次。 |
+| `effective_since` | 事件的生效時間。若已生效，無須處理，也不以此時間決定輪到哪位成員。若尚未生效，將輪值開始時間移至生效時間，並將當時應值班的人員排在最前面。 |
+| `effective_until` | 輪值結束時間。跳過已結束的事件。 |
+| `members` | 對應至成員，順序不變。依 `users` 中的電子郵件地址比對。 |
+
+| `recurrence` | 第一個班次 | MoleSignal |
+|---|---|---|
+| `RRULE:FREQ=WEEKLY` | 7 天 | 持續生效。`shifts_per_member` 為 1 時對應 **每週**，其餘使用自訂週期。 |
+| `RRULE:FREQ=DAILY` | 24 小時 | 持續生效。`shifts_per_member` 為 1 時對應 **每日**，為 7 時對應 **每週**，其餘使用自訂週期。 |
+| 含 `INTERVAL` 的 `FREQ=WEEKLY`、`FREQ=DAILY` 或 `FREQ=HOURLY` | 與間隔等長 | 持續生效，使用自訂週期。例如 `RRULE:FREQ=HOURLY;INTERVAL=12` 的週期為 12 小時。 |
+| `RRULE:FREQ=DAILY` | 一天中的一段時間 | 每週每天都有對應時段。 |
+| `RRULE:FREQ=WEEKLY`，或 `BYDAY` 中只有一天 | 一週中的一段時間 | 一段每週時段，可跨多天。 |
+| `RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` | 一天中的一段時間 | 每週在指定的這幾天設定對應時段。`shifts_per_member` 為 5 時每人輪值一週，為 10 時每人輪值兩週。 |
+
+事件仍生效時，下列情況會阻止匯入：
+
+| PagerDuty | 原因 |
+|---|---|
+| 有多位成員的 `every_member_assignment_strategy` | 所有成員會同時值班，但 MoleSignal 的每個排班在同一時間只能有一人值班。請在檔案中為每位成員建立一個名稱不同的排班，再將這些排班放入升級策略的同一個步驟。 |
+| 與其他成員排在一起的 `empty_member` | MoleSignal 的輪值不能留空班次。 |
+| 重疊的事件 | 這些事件的人員會同時值班。請採用與 Opsgenie 相同的做法，拆成不同的排班。 |
+| `EXDATE` 或 `RDATE` | MoleSignal 的輪值無法移除或加上單一班次，PagerDuty 文件也未說明這些班次是否計入 `shifts_per_member`。 |
+| 其他規則，例如 `FREQ=MONTHLY`、`COUNT`、`UNTIL`，或第一個班次比 `INTERVAL` 指定的間隔短 | 交接時間或有人值班的時段不會固定落在每週的同一時間。 |
+| 有多位成員，且 `shifts_per_member` 不是 `BYDAY` 所列天數的倍數 | 交接不依固定週期進行：週五的下一班在週一。 |
+| 尚未結束的自訂班次 | MoleSignal 的輪值無法表示一次性班次。請等班次結束後再匯入，或先從檔案的 `final_schedule` 中刪除該班次，匯入後再用臨時代班補上。 |
+| 使用不同時區的事件 | MoleSignal 的每個排班只能使用一個時區。 |
+
+如果檔案只在 `shift_based_schedules` 中列出 shift-based 排班的名稱（例如指令碼未擷取到排班內容），MoleSignal 會跳過該排班，並在結果中列出。重新執行指令碼即可擷取排班內容。檔案中的其餘排班照常匯入。
+
+不匯入臨時代班、升級策略和服務。
+
+## 解讀結果
+
+| 用詞 | 含義 |
+|---|---|
+| **新增**、**更新**、**未變更** | 與匯入套件相同，依名稱比對。**更新** 會列出變更的欄位。 |
+| **跳過** | 不寫入檔案中只有名稱的 PagerDuty shift-based 排班，或勾選 **只新增，不變更現有的同名規則** 時已存在的排班。 |
+| **錯誤** | 阻止匯入整個檔案。每個原因各占一行，找不到對應成員的電子郵件地址會逐一列出。 |
+
+排班下方的其他幾行會說明跳過的內容，以及與來源比對的結果。
+
+### 與來源比對
+
+檔案包含來源產生的值班表：PagerDuty 的 `final_schedule` 和 Opsgenie 的時間軸。試跑會算出這段期間的值班人員，並從現在起與來源比對。若有差異，試跑會回報錯誤，列出時間和雙方的值班人員，不會寫入任何資料。
+
+- 不匯入臨時代班，也不比對臨時代班的時段。
+- 如果 shift-based 排班的 `final_schedule` 顯示同一時間有多人值班，即使事件之間不重疊，也會阻止匯入。
+- Opsgenie 中已停用的排班匯入後仍為暫停狀態，不進行比對。
+- 如果排班時區採用日光節約時間，但比對範圍未涵蓋切換時間，結果會說明。MoleSignal 的交接維持在相同的當地時間。調大 `DAYS` 可將下一次切換納入比對。
+- 如果檔案沒有來源產生的班表，結果會註明未進行比對，匯入仍會繼續。若要刻意匯入與來源不同的排班，請從檔案中移除 `final_schedule` 或 `timelines`。
+
+### 限制
+
+每個檔案上限為 4 MiB，最多可包含 500 個排班。每個排班最多可包含 60 個仍生效的輪值。檔案過大時，請調小 `DAYS`。
+
+## 再次匯入
+
+MoleSignal 依名稱比對排班。再次匯入時，只更新來源中已變更的輪值，其餘維持不變。MoleSignal 會保留在其中設定的臨時代班和換班，以及檔案未包含的設定，例如團隊和 **換班須經核准**。

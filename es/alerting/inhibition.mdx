@@ -1,0 +1,112 @@
+---
+title: "Inhibición"
+description: "Suprime las notificaciones de los incidentes secundarios mientras siga activo uno más grave o en una dependencia de origen, para que el equipo solo reciba el aviso prioritario."
+"en_link": "/en-US/alerting/inhibition"
+"zh-Hans_link": "/zh-Hans/alerting/inhibition"
+"zh-Hant_link": "/zh-Hant/alerting/inhibition"
+"ja_link": "/ja/alerting/inhibition"
+"ko_link": "/ko/alerting/inhibition"
+"de_link": "/de/alerting/inhibition"
+"fr_link": "/fr/alerting/inhibition"
+"pt-BR_link": "/pt-BR/alerting/inhibition"
+---
+
+La base de datos está caída y los diez servicios que dependen de ella reportan errores. El personal de guardia necesita recibir el aviso sobre la base de datos; los demás avisos solo hacen sonar el teléfono. Una regla de inhibición establece lo siguiente: **mientras un incidente de origen esté activo, se retienen las notificaciones de los incidentes de destino que coincidan en las etiquetas indicadas.**
+
+Un incidente inhibido se abre, queda registrado y aparece en las páginas. Sus notificaciones quedan pendientes y el incidente no escala. Cuando se resuelve el incidente de origen, los incidentes de destino que siguen abiertos notifican como de costumbre.
+
+Abre **Alertas → Inhibición**. Para ver las reglas, necesitas `alerts.inhibitions.read`; para crearlas, modificarlas y eliminarlas, necesitas `alerts.inhibitions.manage`.
+
+## Inhibición y silencios
+
+| | Silencio | Inhibición |
+|---|---|---|
+| Cuándo se aplica | Durante un intervalo de tiempo | Mientras esté activo un incidente que cumpla las condiciones |
+| Para qué sirve | Mantenimiento programado, ruido conocido | La cadena de alertas que desencadena una falla |
+| Quién decide qué se retiene | Una persona, de antemano, según el horario | El sistema, según los incidentes activos en ese momento |
+
+Ambos solo retienen las notificaciones y detienen el escalamiento. Ninguno afecta al incidente en sí, a las [páginas de estado](/es/status-pages) ni a los [tickets](/es/alerting/tickets).
+
+## Crear una regla
+
+Haz clic en **Nueva regla de inhibición**:
+
+| Configuración | Descripción |
+|---|---|
+| **Nombre**, **Habilitado** | Una regla deshabilitada no inhibe ningún incidente. |
+| **Gravedad mínima** y condiciones de etiquetas del origen | Determinan qué incidentes pueden inhibir a otros. Si no especificas nada, puede hacerlo cualquier incidente, pero debes completar **Estas etiquetas deben coincidir**. |
+| **Gravedad máxima** y condiciones de etiquetas del destino | Determinan qué incidentes pueden quedar inhibidos. Si no especificas nada, puede quedar inhibido cualquier incidente. |
+| **Estas etiquetas deben coincidir** | Separa las etiquetas con comas. Ambos incidentes deben tener cada etiqueta con el mismo valor; si falta una etiqueta, no hay coincidencia. Si dejas el campo vacío, la regla ignora las etiquetas y debes especificar el origen. De lo contrario, cualquier incidente inhibiría a todos los demás. |
+| **El incidente de origen debe ser más grave que el de destino** | Esta opción está habilitada de forma predeterminada: el incidente de origen debe tener una gravedad estrictamente mayor. Así, la regla indica que «en un mismo servicio, el incidente más grave inhibe al menos grave». Deshabilítala para las dependencias (el incidente de la base de datos inhibe a los de los servicios que dependen de ella). |
+| **Espera del incidente de destino (segundos)** | 60 de forma predeterminada, con un mínimo de 15 y un máximo de 600. Consulta [Dos períodos de espera](#dos-períodos-de-espera). |
+| **Inhibición tras la resolución (segundos)** | 120 de forma predeterminada, con un máximo de 3600. |
+
+Escribe las condiciones de etiquetas como en las [políticas de silencio](/es/alerting/silences): deben cumplirse todas, y `=~` y `!~` aplican expresiones regulares al valor completo. Además de las etiquetas del incidente, puedes usar estas tres:
+
+- `service` y `host`: si el incidente no tiene la etiqueta correspondiente, se usa el servicio o el host afectado;
+- `alert.rule_id`: el ID de la regla o de la fuente de alertas que abrió el incidente, para casos como «la regla A inhibe los incidentes de la regla B».
+
+Haz clic en **Ejecutar** para aplicar la regla a los incidentes activos en ese momento, aunque todavía no la hayas guardado, y ver cuáles quedarían inhibidos y qué incidente inhibiría a cada uno.
+
+## Reglas comunes
+
+**En un mismo servicio, el incidente más grave inhibe al menos grave.** Esta es la configuración inicial de una regla nueva:
+
+- Estas etiquetas deben coincidir: `service`
+- El incidente de origen debe ser más grave que el de destino: habilitado
+
+**Si la base de datos está caída, no hace falta notificar los incidentes de los servicios que dependen de ella.** Sin importar la gravedad:
+
+- Condición de etiqueta del origen: `service` `=` `database`
+- Condición de etiqueta del destino: `tier` `=` `api`
+- Estas etiquetas deben coincidir: `region` (solo en la misma región)
+- El incidente de origen debe ser más grave que el de destino: deshabilitado
+
+## Cómo se decide la inhibición
+
+El sistema de escalamiento decide en cada ciclo (cada 10 segundos de forma predeterminada) y registra el resultado en el incidente. Para garantizar que **por cada incidente inhibido siempre haya un incidente de origen que sí notifique a alguien**:
+
+- **Un incidente silenciado no puede ser el origen.** No avisa a nadie, así que, si inhibiera a los demás, nadie recibiría el aviso.
+- **Un incidente confirmado puede seguir siendo el origen.** Alguien ya lo está atendiendo.
+- **Un incidente fusionado con otro no cuenta ni como origen ni como destino.**
+- **Un incidente abierto manualmente nunca queda inhibido**, aunque puede inhibir a otros.
+- **La inhibición se aplica en cadena.** Si A inhibe a B y B inhibe a C, ni B ni C notifican; A sí.
+- **Si dos incidentes se inhiben entre sí, uno notifica.** Si dos reglas indican que A inhibe a B y B inhibe a A, el más grave (o el que se abrió primero si tienen la misma gravedad) notifica como de costumbre.
+
+## Dos períodos de espera
+
+**El incidente de destino espera.** Los síntomas suelen generar avisos antes que la causa: la tasa de errores supera primero su umbral y la regla de la base de datos se evalúa en el siguiente ciclo. Cuando se abre un incidente que podría quedar inhibido, sus notificaciones esperan el tiempo indicado en **Espera del incidente de destino (segundos)**. Si aparece un incidente de origen durante ese tiempo, inhibe al de destino. Si no aparece ninguno, el incidente de destino notifica como de costumbre. Aunque configures 0, el incidente espera 15 segundos: el siguiente ciclo de escalamiento decide, y la primera notificación no debe salir antes.
+
+Solo esperan los incidentes que podrían quedar inhibidos: si el origen debe ser más grave que el destino, los incidentes de mayor gravedad no esperan. Tampoco esperan los que no tienen las etiquetas que deben coincidir.
+
+**Inhibición tras la resolución.** Cuando se resuelve la causa, los síntomas suelen desaparecer poco después, sin necesidad de avisar al personal de guardia. Una vez que se resuelve un incidente de origen, los incidentes de destino siguen inhibidos durante el tiempo configurado, o más si aparece otro origen. Al final de ese período, solo se envían las notificaciones retenidas de los incidentes que siguen abiertos.
+
+## Qué sucede con las notificaciones
+
+| Notificación | Durante la inhibición | Al terminar la inhibición |
+|---|---|---|
+| Activación, escalamiento | No se envían; el escalamiento permanece en el mismo nivel. | Si el incidente sigue abierto y sin confirmar, se envía la notificación de activación y continúa el escalamiento. El plazo de confirmación del nivel empieza a contar en ese momento. Si el incidente se confirmó o se resolvió durante la inhibición, no se envía ninguna de estas notificaciones. |
+| Pasos posteriores de la secuencia de notificación de una persona, vencimiento del plazo de confirmación de una política | No se envían. | Se envían si el incidente sigue sin confirmar. |
+| Confirmación, resolución | Se envían solo si se envió la notificación de activación. | Se envían como de costumbre. |
+
+## En las páginas
+
+- **Lista de incidentes**: el resumen de cada incidente inhibido indica su estado y, mientras haya algún incidente inhibido, aparece la vista **Inhibidos**.
+- **Página del incidente**: muestra qué incidente y qué regla lo inhiben, con un enlace al incidente de origen. Si está en espera, indica hasta cuándo. Usa **Notificar como de costumbre** para levantar la inhibición del incidente: las notificaciones pendientes se envían de inmediato y el incidente no vuelve a quedar inhibido. Esta acción requiere `alerts.incidents.update` y queda registrada en la cronología y en el registro de auditoría.
+- **Cronología**: registra el inicio y el fin de la inhibición (porque se resolvió el origen, cambió o se eliminó la regla, o se levantó la inhibición manualmente).
+- **Lista de reglas**: si todos los incidentes de una regla están inhibidos, la regla muestra **Activa (inhibida)**.
+- **Página de inhibición**: cada regla indica cuántos incidentes inhibe en ese momento. Al eliminar una regla que inhibe incidentes, aparece un aviso de que estos notificarán de inmediato.
+
+Escalar de inmediato, reasignar o agregar personas al equipo de respuesta indica que se quiere avisar a alguien, así que estas acciones también levantan la inhibición del incidente. Al reasignar o agregar personas al equipo de respuesta, solo reciben avisos las personas seleccionadas, no las del paso actual de la política.
+
+## Varios clústeres
+
+Las reglas de inhibición se sincronizan mediante la [federación de clústeres](/es/settings/data-plane#federación-de-clústeres). Cada clúster decide según sus propios incidentes: un incidente de un clúster no inhibe a ninguno de otro clúster.
+
+## API de inhibición
+
+| Acción | Endpoint |
+|---|---|
+| Administrar reglas de inhibición | [`/api/v1/alerts/inhibit-rules`](/es/api/alerting/inhibit-rules) |
+| Previsualizar una regla | [`POST /api/v1/alerts/inhibit-rules/preview`](/es/api/alerting/inhibit-rules#vista-previa) |
+| Levantar la inhibición de un incidente | [`POST /api/v1/alerts/incidents/{id}/inhibition/lift`](/es/api/alerting/inhibit-rules#levanta-la-inhibición-de-un-incidente) |

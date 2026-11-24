@@ -1,0 +1,250 @@
+---
+title: "Gateway API"
+description: "Configurez les points d’entrée interne et public avec deux ressources Gateway : la ressource HTTPRoute interne achemine les requêtes quel que soit leur chemin, tandis que la ressource HTTPRoute publique ne sélectionne que les requêtes de rappel externes et celles destinées aux pages publiques, selon leur chemin et leur méthode."
+"en_link": "/en-US/public-access/gateway-api"
+"zh-Hans_link": "/zh-Hans/public-access/gateway-api"
+"zh-Hant_link": "/zh-Hant/public-access/gateway-api"
+"ja_link": "/ja/public-access/gateway-api"
+"ko_link": "/ko/public-access/gateway-api"
+"de_link": "/de/public-access/gateway-api"
+"es_link": "/es/public-access/gateway-api"
+"pt-BR_link": "/pt-BR/public-access/gateway-api"
+---
+
+La configuration ci-dessous suit les recommandations de la section [Accès public](/fr/public-access) : une ressource Gateway se trouve derrière un équilibreur de charge interne et une autre derrière un équilibreur de charge public. Le même nom, `molesignal.example.com`, pointe vers la première dans le DNS interne et vers la seconde dans le DNS public. Les exemples utilisent Gateway API `v1` et fonctionnent avec toutes les implémentations. Les listes d’autorisation par adresse source, les limites de débit, les limites de taille du corps des requêtes et les journaux d’accès ne font pas partie de Gateway API. Chaque implémentation les fournit via ses propres politiques. Consultez la section [Politiques de l’implémentation](#politiques-de-l’implémentation). Le Service de MoleSignal est `molesignal`, sur le port `5080`, dans l’espace de noms `molesignal`. Dans un déploiement à rôles séparés, utilisez plutôt le Service du routeur.
+
+## Deux ressources Gateway
+
+Définissez `gatewayClassName` sur la GatewayClass de l’implémentation utilisée. Placez la ressource Gateway interne derrière un équilibreur de charge interne. Si l’implémentation prend en charge `infrastructure`, utilisez ce champ pour transmettre les annotations du fournisseur cloud au Service de l’équilibreur de charge. Sinon, suivez la documentation de l’implémentation.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: molesignal-internal
+  namespace: molesignal
+spec:
+  gatewayClassName: <GatewayClass>
+  infrastructure:
+    annotations:
+      # Per cloud provider, for example Alibaba Cloud ACK:
+      service.beta.kubernetes.io/alibaba-cloud-loadbalancer-address-type: intranet
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: molesignal.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: molesignal-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: molesignal-public
+  namespace: molesignal
+spec:
+  gatewayClassName: <GatewayClass>
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: molesignal.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: molesignal-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+```
+
+## HTTPRoute interne
+
+La ressource HTTPRoute interne achemine tous les chemins. Les requêtes en temps réel renvoient des réponses en flux continu et disposent donc d’un délai d’expiration plus long qui leur est propre :
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: molesignal-internal
+  namespace: molesignal
+spec:
+  parentRefs:
+    - name: molesignal-internal
+  hostnames: [molesignal.example.com]
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: /api/v1/query/stream }
+      timeouts:
+        request: 600s
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    - matches:
+        - path: { type: PathPrefix, value: / }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+```
+
+## HTTPRoute publique
+
+La ressource HTTPRoute publique ne sélectionne que les chemins à exposer et leurs méthodes. La passerelle renvoie un code 404 pour toute requête qui ne correspond à aucune règle. Conservez uniquement les règles de correspondance utilisées :
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: molesignal-public
+  namespace: molesignal
+spec:
+  parentRefs:
+    - name: molesignal-public
+  hostnames: [molesignal.example.com]
+  rules:
+    # External callbacks: external alerts, heartbeat check-ins, the Jira ticket webhook, on-call calendar subscriptions, Mole Agent in Teams, replies to texts and calls, WeCom and Mattermost buttons, one-time action links, automation API triggers, push sources
+    - matches:
+        - { path: { type: Exact, value: /api/v1/intake/alerts }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/intake/heartbeats }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/intake/heartbeats }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/tickets/jira }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/calendar }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/im/teams }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/notify }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/notify }, method: POST }
+        - { path: { type: PathPrefix, value: /api/v1/public/automations }, method: POST }
+        - { path: { type: Exact, value: /api/v1/_kinesis_firehose }, method: POST }
+        - { path: { type: Exact, value: /api/v1/_cloudflare }, method: POST }
+        - { path: { type: Exact, value: /api/v1/_heroku }, method: POST }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    # RUM: POST and the browser's CORS preflight
+    - matches:
+        - { path: { type: Exact, value: /api/v1/rum/events }, method: POST }
+        - { path: { type: Exact, value: /api/v1/rum/events }, method: OPTIONS }
+        - { path: { type: Exact, value: /api/v1/rum/replay }, method: POST }
+        - { path: { type: Exact, value: /api/v1/rum/replay }, method: OPTIONS }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    # Synthetics Probe Agent artifact uploads
+    - matches:
+        - { path: { type: PathPrefix, value: /api/v1/synthetics/artifacts }, method: PUT }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+    # Status pages, resource sharing, the confirm pages of one-time action links, and their web files
+    - matches:
+        - { path: { type: PathPrefix, value: /status }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/status-pages } }
+        - { path: { type: PathPrefix, value: /s }, method: GET }
+        - { path: { type: Exact, value: /shared }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/share } }
+        - { path: { type: PathPrefix, value: /notify/actions }, method: GET }
+        - { path: { type: PathPrefix, value: /assets }, method: GET }
+        - { path: { type: Exact, value: /favicon.ico }, method: GET }
+        - { path: { type: Exact, value: /favicon-dark.ico }, method: GET }
+        - { path: { type: Exact, value: /favicon.svg }, method: GET }
+        - { path: { type: Exact, value: /favicon-dark.svg }, method: GET }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+```
+
+`PathPrefix` établit la correspondance par segment de chemin : `/s` correspond à `/s/<share token>`, mais pas à `/shared`. La correspondance par méthode est une fonctionnalité étendue de Gateway API que la plupart des implémentations prennent en charge. Si l’implémentation utilisée ne la prend pas en charge, supprimez `method` et laissez MoleSignal renvoyer `405` ou `404` pour les méthodes non prises en charge.
+
+## Politiques de l’implémentation
+
+Les listes d’autorisation par adresse source, les limites de débit, les limites de taille du corps des requêtes et la détection de l’adresse IP réelle du client ne font pas partie de Gateway API. Chaque implémentation fournit ses propres ressources, par exemple :
+
+- **Envoy Gateway** : `SecurityPolicy` autorise les requêtes selon leur adresse source, `BackendTrafficPolicy` limite le débit et `ClientTrafficPolicy` détecte l’adresse IP réelle du client.
+- **Istio** : `AuthorizationPolicy` autorise les requêtes selon leur adresse source.
+- **NGINX Gateway Fabric** : `ClientSettingsPolicy` fixe la taille maximale du corps des requêtes.
+
+Avec une autre implémentation, configurez les mêmes limites en suivant sa documentation. Par exemple, pour limiter l’accès au point de terminaison de rappel Teams dans Envoy Gateway aux seules plages d’adresses de l’étiquette de service Azure `AzureBotService`, déplacez la règle de correspondance Teams vers une ressource HTTPRoute dédiée, `molesignal-public-teams`, et associez-lui une `SecurityPolicy` :
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: molesignal-teams-allowlist
+  namespace: molesignal
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: molesignal-public-teams
+  authorization:
+    defaultAction: Deny
+    rules:
+      - action: Allow
+        principal:
+          clientCIDRs:
+            - 203.0.113.0/24
+            - 198.51.100.0/24
+```
+
+## Domaines personnalisés des pages de statut
+
+Si une page de statut utilise `status.example.org`, ajoutez un écouteur pour ce nom à la ressource Gateway publique, puis ajoutez une ressource HTTPRoute qui expose uniquement les chemins racine, les points de terminaison et les fichiers web de la page de statut :
+
+```yaml
+# Add to the listeners of molesignal-public
+- name: https-status
+  protocol: HTTPS
+  port: 443
+  hostname: status.example.org
+  tls:
+    mode: Terminate
+    certificateRefs:
+      - name: status-example-org-tls
+  allowedRoutes:
+    namespaces:
+      from: Same
+```
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: molesignal-status-domain
+  namespace: molesignal
+spec:
+  parentRefs:
+    - { name: molesignal-public, sectionName: https-status }
+  hostnames: [status.example.org]
+  rules:
+    - matches:
+        - { path: { type: Exact, value: / }, method: GET }
+        - { path: { type: Exact, value: /history }, method: GET }
+        - { path: { type: Exact, value: /uptime }, method: GET }
+        - { path: { type: PathPrefix, value: /incidents }, method: GET }
+        - { path: { type: PathPrefix, value: /api/v1/public/status-pages } }
+        - { path: { type: PathPrefix, value: /assets }, method: GET }
+        - { path: { type: Exact, value: /favicon.ico }, method: GET }
+        - { path: { type: Exact, value: /favicon-dark.ico }, method: GET }
+        - { path: { type: Exact, value: /favicon.svg }, method: GET }
+        - { path: { type: Exact, value: /favicon-dark.svg }, method: GET }
+      backendRefs:
+        - { name: molesignal, port: 5080 }
+```
+
+## Vérification
+
+Vérifiez que les deux ressources Gateway disposent d’adresses et que les ressources HTTPRoute indiquent les conditions `Accepted` et `ResolvedRefs` :
+
+```bash
+kubectl -n molesignal get gateway,httproute
+```
+
+Depuis Internet, le point de terminaison de connexion renvoie `404` et celui de réception des alertes renvoie `401` en l’absence de jeton :
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://molesignal.example.com/api/v1/auth/signin
+```
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://molesignal.example.com/api/v1/intake/alerts
+```
+
+Enfin, dans l’organisation `_sys`, ajoutez le réseau des proxys de la passerelle publique à la liste des proxys de confiance sous **Paramètres → Détection de l’adresse IP du client**. Consultez la section [Détection de l’adresse IP du client](/fr/settings/platform#détection-de-l’adresse-ip-du-client).

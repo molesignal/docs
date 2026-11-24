@@ -1,0 +1,203 @@
+---
+title: "Funciones"
+description: "Crea y prueba transformaciones reutilizables en VRL y JavaScript, y consulta tablas de enriquecimiento y ubicaciones de direcciones IP desde VRL."
+"en_link": "/en-US/functions"
+"zh-Hans_link": "/zh-Hans/functions"
+"zh-Hant_link": "/zh-Hant/functions"
+"ja_link": "/ja/functions"
+"ko_link": "/ko/functions"
+"de_link": "/de/functions"
+"fr_link": "/fr/functions"
+"pt-BR_link": "/pt-BR/functions"
+---
+
+Las funciones encapsulan transformaciones de eventos reutilizables. Abre **Funciones** para crear, probar y mantener
+definiciones de funciones sin depender de un pipeline.
+
+## Busca una función
+
+La lista incluye las funciones de la organización y las funciones predefinidas. En la parte superior,
+tres vistas filtran la lista y cada una muestra su recuento:
+
+| Vista | Contenido |
+|---|---|
+| **Todos** | Todas las funciones de la organización y las predefinidas. |
+| **Tus funciones** | Las funciones que creó la organización. |
+| **Predefinidas** | Las funciones de solo lectura que incluye MoleSignal. |
+
+La búsqueda compara el texto con el nombre de las funciones y la descripción de las predefinidas. Haz clic en una función de la
+organización para abrirla en el área de trabajo.
+
+## Lenguajes
+
+| Lenguaje | Disponibilidad | Uso recomendado |
+|---|---|---|
+| VRL | Integrado | Análisis sintáctico, normalización, filtrado, ocultación de datos y enriquecimiento. |
+| JavaScript | Integrado | Lógica más fácil de expresar con JavaScript. |
+| LLM | Configurable mediante la API; requiere `llm_eval_enabled` y un proveedor de modelos | Clasificación o enriquecimiento de volúmenes bajos de eventos con la salida del modelo. |
+
+VRL y JavaScript se ejecutan dentro del binario de MoleSignal. No requieren configuración ni instalaciones adicionales.
+
+MoleSignal valida y compila cada función al guardarla. Si el código fuente no es válido, la función
+no se activa.
+
+El área de trabajo de Funciones admite VRL y JavaScript. Las funciones LLM usan un flujo de trabajo avanzado mediante la API:
+el código fuente de la función sirve como instrucción del sistema, el evento sirve como entrada del modelo y
+`params_schema.output_field` selecciona el campo de salida (`_llm_eval` de forma predeterminada). Cada ejecución llama al
+modelo, por lo que el ajuste `[functions].llm_eval_enabled` permanece en `false` de forma predeterminada. Consulta
+[Configuración](/es/configuration#funciones-e-integraciones). Para que un modelo resuma los eventos de
+alerta, usa el paso **Resumen con IA** de un [pipeline de alertas](/es/pipelines/alert-events#resumen-con-ia),
+que no depende de este ajuste.
+
+## Funciones predefinidas
+
+Todas las organizaciones tienen acceso a estas funciones VRL de solo lectura:
+
+| Función | Qué hace |
+|---|---|
+| `add-intake-time` | Agrega una marca de tiempo de recepción para ayudar a diagnosticar la latencia de extremo a extremo. |
+| `normalize-logs` | Analiza el mensaje JSON, agrega campos de entorno y clúster, y normaliza `level` a minúsculas. |
+| `parse-key-value` | Extrae campos de un mensaje en formato logfmt o `key=value` y los incorpora al evento. |
+| `redact-email` | Sustituye las direcciones de correo electrónico de `message` por un marcador de posición. |
+| `route-by-service` | Normaliza el nombre del servicio y determina un flujo de destino por servicio (`logs_<service>`) para orientar el enrutamiento. |
+
+La fila de cada función predefinida muestra la etiqueta **Integrada** y su descripción en el idioma
+de la interfaz de la cuenta activa. Haz clic en la fila para leer el código fuente.
+
+Las funciones predefinidas son de solo lectura. Para modificar una, selecciona **Usar como base** en la fila o en el
+panel de la función predefinida. El área de trabajo abre una función nueva con el lenguaje y el código fuente de la predefinida y le asigna el nombre
+`<preset>-copy`. Al guardarla, se crea una función de la organización sin modificar la predefinida.
+
+## Escribe y prueba una función
+
+El área de trabajo tiene tres partes:
+
+- el nombre y el lenguaje de la función;
+- **Origen**, el editor, con el estado de validación del código fuente junto al título;
+- **Ejecución de prueba**, con la **Entrada de ejemplo** en JSON y la **Salida de ejemplo**.
+
+Selecciona **Ejecutar ejemplo** para ejecutar el código fuente del editor con el evento de ejemplo. No hace falta
+guardar el código antes. El evento transformado aparece en **Salida de ejemplo**. Si la ejecución falla,
+el motivo del error aparece en lugar del evento.
+
+**Guardar función** y **Cancelar** aparecen en la fila del título de la página, junto con **Eliminar función** si la
+función ya está guardada. Si el nombre o el código fuente están vacíos, **Guardar función** no está
+disponible y el texto de ayuda indica qué falta.
+En el editor, usa `⌘ Enter` o `Ctrl+Enter` para ejecutar el ejemplo, y `⌘S` o `Ctrl+S` para guardar.
+
+El ejecutor llama a `POST /api/v1/functions/run` con un lenguaje, el código fuente y un evento de ejemplo, y
+devuelve el evento transformado:
+
+```bash
+curl -X POST http://localhost:5080/api/v1/functions/run \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"language":"vrl","source":".service = downcase!(string!(.service))","input":{"service":"Checkout"}}'
+```
+
+```json
+{ "output": { "service": "checkout" } }
+```
+
+Ejemplo de VRL:
+
+```vrl
+.service = downcase!(string!(.service))
+.severity = upcase(string(.level) ?? "INFO")
+if exists(.customer_id) {
+  .customer = lookup("customers", .customer_id)
+}
+```
+
+## Consulta tablas y direcciones IP
+
+Dos funciones VRL leen datos que almacena MoleSignal. Funcionan en una ejecución de ejemplo y en cada paso VRL
+de un pipeline, incluidos los pipelines de alertas.
+
+| Función | Devuelve |
+|---|---|
+| `lookup("<table>", key)` | La fila de la [tabla de extensión](/es/extend-tables) `<table>` con la clave `key`, como objeto, o `null`. |
+| `geoip_lookup(ip)` | La ubicación de una dirección IPv4 o IPv6, como objeto, o `null`. |
+
+```vrl
+# the team that owns the host, from the extend table host_owner
+.team = lookup("host_owner", .host).team
+
+# where the client is
+place = geoip_lookup(.client_ip)
+if is_object(place) {
+  .country = place.country
+  .city = place.city
+}
+```
+
+- Ninguna de las dos funciones genera errores. Ambas devuelven `null` si no existe la tabla o la fila, si la clave no es texto, un número ni
+  un booleano, o si la dirección no se puede interpretar o no figura en la base de datos.
+  Una ruta como `.team` sobre `null` también devuelve `null`.
+- Escribe el nombre de la tabla en `lookup` como una cadena literal. El código no compila si el nombre proviene de un campo o de una variable.
+  La función busca las claves numéricas o booleanas como texto: `42` encuentra la fila con la
+  clave `42`.
+- `lookup` lee las tablas de extensión del espacio de trabajo. Consulta
+  [Tablas de extensión](/es/extend-tables#buscar-una-clave-en-un-pipeline) para saber cuánto tardan en reflejarse
+  los cambios en las filas.
+- `geoip_lookup` lee la base de datos City Lite de [DB-IP](https://db-ip.com) que indica
+  [`[mmdb].db_path`](/es/configuration#funciones-e-integraciones) y devuelve `null` si no está
+  disponible. La base de datos no incluye direcciones privadas. El objeto incluye los siguientes campos cuando
+  la base de datos dispone de ellos:
+
+| Campo | Contenido |
+|---|---|
+| `country` | El código ISO 3166 del país, como `DE`. |
+| `country_name` | El nombre del país en inglés. |
+| `continent_code` | El código del continente, como `EU`. |
+| `continent` | El nombre del continente en inglés. |
+| `region` | El nombre en inglés de la división administrativa de primer nivel, como un estado o una provincia. |
+| `city` | El nombre de la ciudad en inglés. |
+| `latitude`, `longitude` | Las coordenadas en grados. |
+
+## Funciones de JavaScript
+
+El código fuente se ejecuta una vez por evento. El objeto global `molesignal` contiene el evento y funciones auxiliares:
+
+| Miembro | Finalidad |
+|---|---|
+| `molesignal.fields` | El evento como objeto. Lee o modifica el objeto, o asigna uno nuevo. |
+| `molesignal.set(name, value)` | Establece un campo. |
+| `molesignal.del(name)` | Elimina un campo. |
+| `molesignal.now()` | El tiempo actual en microsegundos desde la época Unix. |
+| `molesignal.parse_json(text)` y `molesignal.encode_json(value)` | Convierten entre texto JSON y valores. |
+| `molesignal.sha256(text)` | El hash SHA-256 de los bytes UTF-8 del texto, expresado en 64 caracteres hexadecimales en minúsculas. |
+
+```js
+molesignal.set("severity", String(molesignal.fields.level || "info").toUpperCase());
+molesignal.set("seen_at", molesignal.now());
+molesignal.del("level");
+```
+
+Cada función de JavaScript se ejecuta en un motor aislado con estos límites:
+
+- Si una ejecución tarda más de 50 ms, el motor la detiene con `js timeout 50ms`.
+- Cada función dispone de un máximo de 32 MiB de memoria de heap.
+- El acceso a la red, los temporizadores y `TextEncoder` no están disponibles.
+
+## Usa una función
+
+Los pasos de un pipeline ejecutan VRL. En un paso de **VRL personalizado**, **Partir de una función guardada** copia el código fuente
+de una función VRL o de una función predefinida en el paso, donde puedes editarlo. El paso conserva su copia:
+los cambios posteriores en la función o su eliminación no afectan al pipeline.
+
+## Permisos
+
+- `functions.read` permite listar y abrir funciones.
+- `functions.create` y `functions.edit` permiten gestionar las definiciones.
+- `functions.run` permite ejecutar los ejemplos.
+- `functions.delete` permite eliminar una definición.
+
+<CardGroup cols={2}>
+  <Card title="Pipelines" icon="diagram-project" href="/es/pipelines">
+    Crea flujos de trabajo de origen → transformación → destino.
+  </Card>
+  <Card title="Tablas de extensión" icon="table" href="/es/extend-tables">
+    Mantén los datos de consulta para el enriquecimiento.
+  </Card>
+</CardGroup>

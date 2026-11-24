@@ -1,0 +1,204 @@
+---
+title: "빠른 시작"
+description: "Docker Compose로 로컬 MoleSignal 샌드박스를 실행하고 로그 이벤트를 전송한 뒤 웹 UI에서 확인합니다."
+"en_link": "/en-US/quickstart"
+"zh-Hans_link": "/zh-Hans/quickstart"
+"zh-Hant_link": "/zh-Hant/quickstart"
+"ja_link": "/ja/quickstart"
+"de_link": "/de/quickstart"
+"es_link": "/es/quickstart"
+"fr_link": "/fr/quickstart"
+"pt-BR_link": "/pt-BR/quickstart"
+---
+
+이 가이드에서는 로컬 MoleSignal 샌드박스를 시작하고 로그 이벤트를 하나 전송한 다음, 웹 UI와 쿼리 API에서 해당 이벤트를 찾습니다. 샌드박스는 평가 용도로만 사용합니다.
+
+## 사전 요구 사항
+
+- **Docker** 및 **Docker Compose** v2.
+- 약 2 GB의 여유 메모리.
+- 사용 가능한 로컬 포트: `5080`(웹 UI 및 API), `5082`, `5432`(PostgreSQL), `9000` 및 `9001`(RustFS).
+
+## 샌드박스 시작
+
+<Steps>
+  <Step title="리포지토리 복제 및 스택 시작">
+    ```bash
+    git clone https://github.com/molesignal/molesignal
+    cd molesignal
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
+    ```
+
+    처음 시작할 때는 이미지를 다운로드하거나 빌드하므로 몇 분 정도 걸릴 수 있습니다. 스택은 메타데이터를 저장하는 PostgreSQL 17, S3 호환 오브젝트 스토리지인 RustFS, 모든 역할을 수행하고 웹 UI를 제공하는 단일 MoleSignal 프로세스로 구성됩니다.
+
+    서버가 준비되었는지 확인합니다.
+
+    ```bash
+    curl http://localhost:5080/api/v1/healthz
+    ```
+
+    서버가 정상이면 `{"status":"ok"}`를 반환합니다.
+  </Step>
+
+  <Step title="웹 UI에 로그인">
+    [http://localhost:5080](http://localhost:5080)을 열고 다음 자격 증명으로 로그인합니다.
+
+    - **이메일:** `admin@example.com`
+    - **비밀번호:** `admin`
+
+    <Warning>
+      샌드박스 구성은 처음 시작할 때만 이 루트 계정을 생성합니다. 로컬 평가 외의 용도로 사용하기 전에 이 계정을 교체합니다. [프로덕션 체크리스트](/ko/deployment/production-checklist)를 참고합니다.
+    </Warning>
+
+    [http://localhost:9001](http://localhost:9001)에서 `rustfsadmin` / `rustfsadmin`으로 RustFS 콘솔에 로그인할 수 있습니다. 이 샌드박스 자격 증명은 안전하지 않습니다.
+  </Step>
+
+  <Step title="액세스 토큰 발급">
+    API로 로그인하면 웹 UI에서 사용하는 세션 쿠키가 설정되고, `curl`은 이 쿠키를 `ms-cookies.txt`에 저장합니다. API는 API 토큰을 Bearer 토큰으로 받습니다. 세션을 한 번 사용해 7일 동안 유효한 개인 API 토큰을 발급하고 조직 ID를 기록합니다. 토큰은 발급 계정과 동일한 권한을 가집니다.
+
+    ```bash
+    RESP=$(curl -s -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+      -H 'content-type: application/json' \
+      -d '{"email":"admin@example.com","password":"admin"}')
+
+    export MS_ORG=$(echo "$RESP" | jq -r .login.orgId)
+
+    export MS_TOKEN=$(curl -s -b ms-cookies.txt -X POST http://localhost:5080/api/v1/me/api-tokens \
+      -H 'content-type: application/json' \
+      -d '{"name":"quickstart","expiresInDays":7}' | jq -r .token)
+    ```
+
+    `jq`가 없으면 로그인 응답에서 `orgId`를, 마지막 응답에서 `token`을 복사한 뒤 각각 환경 변수로 직접 내보냅니다.
+
+    <Note>
+      세션 쿠키는 기본적으로 24시간 후에 만료됩니다. API 토큰은 만료되거나 **계정 설정 → API 토큰**에서 취소할 때까지 사용할 수 있습니다. [API 토큰](/ko/identity/tokens)을 참고합니다.
+    </Note>
+  </Step>
+
+  <Step title="로그 이벤트 전송">
+    기본 HTTP JSON 수집 방식은 레코드 배열을 받습니다. `_timestamp`에는 Unix epoch 이후 경과한 시간을 마이크로초 단위로 담습니다. 처음 데이터를 쓰면 `app` 스트림이 생성됩니다.
+
+    ```bash
+    curl -X POST http://localhost:5080/api/v1/intake/logs/app \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+    ```
+
+    응답에서 수락한 레코드를 확인할 수 있습니다.
+
+    ```json
+    {"accepted":1,"rejected":0,"errors":[]}
+    ```
+  </Step>
+
+  <Step title="웹 UI에서 이벤트 찾기">
+    1. **로그**를 엽니다.
+    2. 스트림 선택기에서 `app` 스트림을 선택합니다.
+    3. 시간 범위를 **최근 1시간**으로 유지하고 **실행**을 선택합니다.
+
+    결과 테이블에 이벤트가 표시됩니다. 원본 필드를 확인하려면 해당 행을 선택합니다.
+  </Step>
+
+  <Step title="API로 이벤트 쿼리">
+    쿼리 API로 동일한 이벤트를 조회합니다. `timeRange`에는 항상 시작과 끝을 마이크로초 단위로 지정합니다. 범위가 너무 넓으면 쿼리 플래너가 쿼리를 비동기 검색 작업으로 전환합니다.
+
+    ```bash
+    NOW=$(date +%s)000000
+
+    curl -X POST http://localhost:5080/api/v1/query \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+           \"statement\":\"SELECT level, msg, trace_id FROM app WHERE trace_id = 'abc123'\",
+           \"timeRange\":{\"start\":$((NOW - 3600000000)),\"end\":$((NOW + 60000000))},
+           \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+    ```
+
+    응답에는 `columns`, `rows`, `scannedRows`, `tookMs`가 포함됩니다.
+
+    ```json
+    {"columns":["level","msg","trace_id"],"rows":[["error","db pool exhausted","abc123"]],"scannedRows":1,"tookMs":120}
+    ```
+  </Step>
+</Steps>
+
+## 샘플 데이터 불러오기
+
+데이터가 없는 워크스페이스에는 빈 페이지가 표시됩니다. 여러 신호를 연계해 조사하려면 `trace_id` 값을 공유하는 소규모 데모 데이터 세트(로그, 메트릭, 트레이스)를 불러옵니다.
+
+```bash
+curl -X POST http://localhost:5080/api/v1/onboarding/sample-data \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+
+이 요청은 `sample_app_logs`, `sample_app_metrics`, `sample_app_traces` 스트림을 생성합니다. 자체 스트림이 아직 없는 워크스페이스에서는 웹 UI에서도 샘플 데이터를 불러올 수 있습니다. **홈** 페이지 상단에서 설정 단계 버튼을 선택한 다음 **샘플 데이터 불러오기** 옆의 **불러오기**를 선택합니다. 위 단계에서 만든 `app`은 자체 스트림이므로, 해당 단계를 완료한 후에는 요청을 사용합니다. 목록의 모든 단계를 완료하면 버튼이 사라집니다.
+
+응답에는 각 스트림에 기록한 행 수와 샘플 대시보드 및 저장된 뷰의 ID가 포함됩니다.
+
+```json
+{
+  "loaded": true,
+  "totalRows": 196,
+  "streams": [
+    { "stream": "sample_app_traces", "rows": 24 },
+    { "stream": "sample_app_logs", "rows": 24 },
+    { "stream": "sample_app_metrics", "rows": 148 }
+  ],
+  "dashboardId": "<dashboard id>",
+  "savedViewIds": ["<saved view id>", "<saved view id>", "<saved view id>", "<saved view id>"]
+}
+```
+
+`GET /api/v1/onboarding/sample-data`는 스트림 3개, 대시보드, 저장된 뷰 4개가 모두 있을 때만 `{"loaded":true}`를 반환합니다. 현재 조회 중인 시간 범위에 샘플 데이터가 여전히 포함되는지는 알려 주지 않습니다. 불러올 때 생성되는 항목, 다시 불러올 때의 동작, 필요한 권한은 [홈에서 빠르게 시작하기](/ko/home#빠른-시작)를 참고합니다.
+
+## OpenTelemetry 데이터 전송
+
+모든 OpenTelemetry SDK 또는 Collector에서 HTTP를 통한 OTLP를 사용할 수 있습니다. 내보내기 도구의 기본 경로를 `/api`로 설정합니다. 내보내기 도구가 `/v1/logs`, `/v1/metrics`, `/v1/traces`를 경로에 추가합니다.
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer $MS_TOKEN"
+export OTEL_SERVICE_NAME=checkout
+```
+
+`stream-name` 헤더로 다른 스트림을 지정하지 않으면 각 신호 유형의 `default` 스트림으로 텔레메트리가 들어갑니다. Collector, Vector, Fluent Bit, Prometheus, SDK 설정은 [데이터 소스](/ko/intake)와 [통합 가이드](/ko/intake/integrations)를 참고합니다.
+
+## 샌드박스 중지
+
+```bash
+# Stop the containers and keep the data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down
+
+# Stop the containers and delete all sandbox data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down -v
+```
+
+## 문제 해결
+
+| 증상 | 원인 및 해결 방법 |
+|---|---|
+| `healthz`가 `"status":"degraded"`와 함께 `503`을 반환합니다 | 오브젝트 스토리지 상태 검사 등 하위 시스템에 문제가 있습니다. `reason` 필드를 읽고 `rustfs` 컨테이너를 확인합니다. |
+| 로그인 시 `401`을 반환합니다 | 루트 계정은 처음 시작할 때만 생성됩니다. 이전 실행에서 사용한 데이터베이스 볼륨은 이전 비밀번호를 유지합니다. `down -v`를 실행해 샌드박스를 초기화합니다. |
+| 쿼리가 `jobId`와 함께 `202`를 반환합니다 | 시간 범위가 너무 넓어(기본 설정에서 약 13.9시간 이상) 쿼리 플래너가 비동기 검색 작업을 시작했습니다. 범위를 좁히거나 `Prefer: respond-sync`를 보내거나 `GET /api/v1/query/jobs/{id}`를 주기적으로 호출합니다. [쿼리](/ko/query#시간-범위-및-비동기-작업)를 참고합니다. |
+| 쿼리가 `422 missing field orgId` 또는 `400 query.stream hint is required`를 반환합니다 | `orgId`와 `stream` 객체를 모두 보냅니다. |
+| 포트가 이미 사용 중입니다 | 다른 프로세스를 중지하거나 `deploy/docker/docker-compose.yaml`에서 공개 포트를 변경합니다. |
+| 호스트에서 `4317` 포트의 OTLP gRPC에 연결할 수 없습니다 | 샌드박스 Compose 파일은 `4317`을 공개하지 않습니다. `molesignal` 서비스에 `4317:4317` 포트 매핑을 추가합니다. |
+
+## 다음 단계
+
+<CardGroup cols={2}>
+  <Card title="실제 데이터 연결" icon="inbox" href="/ko/intake">
+    데이터 소스 페이지, 수집 토큰, 호환 프로토콜을 사용합니다.
+  </Card>
+  <Card title="통합 가이드" icon="plug" href="/ko/intake/integrations">
+    OpenTelemetry Collector, Vector, Fluent Bit, Filebeat, Prometheus를 구성합니다.
+  </Card>
+  <Card title="핵심 개념" icon="book" href="/ko/concepts">
+    신호, 스트림, 워크스페이스, 권한을 알아봅니다.
+  </Card>
+  <Card title="프로덕션 환경에 배포" icon="server" href="/ko/deployment">
+    샌드박스에서 프로덕션 배포로 전환합니다.
+  </Card>
+</CardGroup>

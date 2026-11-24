@@ -1,0 +1,216 @@
+---
+title: "Catálogo e execução de ferramentas"
+sidebarTitle: "Ferramentas"
+description: "Entenda como funcionam o catálogo compartilhado de ferramentas do MoleSignal, a descoberta progressiva, o isolamento entre tenants, a política de risco e as aprovações. Veja também quais áreas do produto são cobertas."
+"en_link": "/en-US/tools"
+"zh-Hans_link": "/zh-Hans/tools"
+"zh-Hant_link": "/zh-Hant/tools"
+"ja_link": "/ja/tools"
+"ko_link": "/ko/tools"
+"de_link": "/de/tools"
+"es_link": "/es/tools"
+"fr_link": "/fr/tools"
+---
+
+O MoleSignal modela os recursos do produto operáveis por IA em um **Catálogo de ferramentas** independente de protocolo. O Mole
+Agent e o MCP de entrada usam os mesmos contratos `ToolSpec` e o mesmo ambiente de execução no servidor, em vez de
+duplicar a lógica de negócios em cada adaptador.
+
+O catálogo atual contém **254 ferramentas registradas**. Cada ferramenta define um nome estável, uma descrição
+canônica, esquemas de entrada e saída, permissões de IAM obrigatórias, nível de risco, modo de acesso,
+anotações e superfícies permitidas.
+
+<CardGroup cols={2}>
+  <Card title="Operações no nível do produto" icon="wrench">
+    As ferramentas representam ações de escopo limitado no produto, como consultar logs, testar um alerta ou atualizar
+    um painel de um dashboard, e não fazer requisições HTTP arbitrárias.
+  </Card>
+  <Card title="Contexto com isolamento entre tenants" icon="shield">
+    O adaptador autenticado injeta a identidade e a organização de origem da chamada. Os campos `userId` e
+    `orgId` nunca determinam o tenant em que a ferramenta é executada.
+  </Card>
+  <Card title="Contexto progressivo" icon="magnifying-glass">
+    As ferramentas comuns permanecem visíveis. A busca só localiza as demais ferramentas sob demanda, o que limita
+    o contexto do modelo e o uso de tokens.
+  </Card>
+  <Card title="Fluxo único de execução" icon="arrows-rotate">
+    Durante a execução, o ambiente de execução volta a aplicar permissões, políticas, tempo limite, limites de saída, idempotência, aprovação, verificação e
+    auditoria.
+  </Card>
+</CardGroup>
+## Granularidade das ferramentas
+
+Uma boa ferramenta do MoleSignal tem um único objetivo operacional claro e um resultado de escopo limitado.
+
+- Use uma ferramenta para cada operação atômica de leitura, verificação prévia ou alteração.
+- Mantenha separadas as operações de listar, obter, criar, atualizar, excluir, testar, acionar, cancelar e tentar novamente.
+- Exponha conceitos do produto, não rotas brutas nem mecanismos para montar requisições arbitrárias.
+- Retorne uma saída estruturada e limitada, adequada para um modelo e para um registro de auditoria.
+- Mantenha credenciais em texto simples, transferências de dados binários, ingestão bruta, execução de comandos de shell e controle do navegador
+  fora do catálogo.
+
+Essa granularidade permite que o IAM e a Política de ferramentas controlem cada operação específica, em vez de conceder
+acesso amplo a toda uma família de recursos HTTP.
+
+## Superfícies
+
+Cada superfície de execução define explicitamente quais ferramentas expõe.
+
+| Superfície | Descoberta e execução |
+|---|---|
+| Mole Agent | Ferramentas comuns e `tool_search → tools_call` para ferramentas integradas sob demanda e ferramentas MCP de saída autorizadas. |
+| MCP de entrada | Ferramentas comuns de leitura e controles de aprovação, além de `tool_search → call_read_tool` ou `call_managed_tool`. |
+| Automação | Somente ferramentas habilitadas explicitamente para a superfície de automação. `query_logs`, `get_stream_schema`, `search_field_values` e `analyze_log_patterns` estão habilitadas para [inspeções agendadas de logs](/pt-BR/logs/inspections). |
+
+O servidor verifica se a superfície expõe a ferramenta ao montar a lista de ferramentas e imediatamente antes da
+execução. Ignorar `tools/list` não contorna a restrição da superfície.
+
+## Descoberta no MCP de entrada
+
+O MCP de entrada mantém a lista de `tools/list` curta. A resposta autorizada pode incluir:
+
+- sete ferramentas de leitura fixadas: `query_logs`, `query_metrics`, `list_streams`,
+  `get_stream_schema`, `list_traces`, `get_trace` e `get_incident`;
+- controles de aprovação: `list_agent_approvals`, `get_agent_approval` e
+  `execute_agent_approval`;
+- controles de execução: `list_agent_executions` e `get_agent_execution`;
+- `tool_search`, `call_read_tool` e `call_managed_tool`.
+
+O IAM e a Política de ferramentas podem remover qualquer ferramenta do produto dessa lista.
+
+### Busque no catálogo autorizado
+
+Chame `tool_search` com um termo ou domínio do produto:
+
+```json
+{
+  "query": "status page incident",
+  "limit": 10,
+  "includeSchema": true
+}
+```
+
+O resultado inclui apenas ferramentas que o MCP de entrada disponibiliza, que a Política de ferramentas do espaço de trabalho
+habilita e que a credencial autoriza. Mediante solicitação, cada resultado inclui o esquema e os metadados efetivos de
+execução.
+
+### Execute uma leitura ou verificação prévia
+
+Passe o nome encontrado e os argumentos para `call_read_tool`:
+
+```json
+{
+  "name": "list_status_page_incidents",
+  "arguments": {
+    "pageId": "status-page-id",
+    "view": "current"
+  }
+}
+```
+
+Defina `asTask` como `true` para criar uma tarefa de leitura persistente quando o cliente MCP indicar suporte à extensão
+Tasks. Consulte periodicamente o status da tarefa retornada, atualize-a ou cancele-a com os métodos de tarefas do MCP.
+
+### Execute uma alteração gerenciada
+
+Passe uma chave de idempotência exclusiva para `call_managed_tool`:
+
+```json
+{
+  "name": "update_annotation",
+  "arguments": {
+    "annotationId": "annotation-id",
+    "title": "Deployment rollback started"
+  },
+  "idempotencyKey": "8d7788d2-9b4e-44bd-bf35-61a5690f0064"
+}
+```
+
+O MoleSignal reserva a chave para a identidade autenticada antes de criar um registro de aprovação ou
+executar a alteração. Repetir a mesma requisição retorna o resultado armazenado ou o status
+da execução em andamento. O MoleSignal rejeita a reutilização da chave com argumentos diferentes.
+
+## Risco e política de execução
+
+O nível de risco da ferramenta define um padrão seguro. A Política de ferramentas do espaço de trabalho pode aplicar um modo de execução
+mais restritivo.
+
+| Risco | Modo padrão | Significado |
+|---|---|---|
+| L0 | Automático | Operações somente de leitura com escopo limitado. |
+| L1 | Confirmação | Alterações de baixo risco exigem confirmação no host MCP, a menos que a política determine a execução automática. |
+| L2 | Aprovação única | Exige uma aprovação no MoleSignal. |
+| L3 | Aprovação dupla | Exige duas aprovações no MoleSignal. |
+| L4 | Desativado | Operações remotas de alto risco ou destrutivas ficam indisponíveis por padrão. |
+
+Mesmo no modo automático, o MoleSignal cria um registro de aprovação auditável para alterações gerenciadas. O modo de confirmação pode usar
+o fluxo de entrada do MCP em várias etapas. Os modos de aprovação única e dupla aguardam as análises no MoleSignal.
+Após as análises obrigatórias, a identidade que fez a solicitação original pode chamar `execute_agent_approval` com outra
+`idempotencyKey` para concluir a operação.
+
+Antes da execução, o ambiente de execução revalida:
+
+1. a identidade autenticada e o estado da organização;
+2. as permissões de IAM obrigatórias e o modo de permissão;
+3. a exposição na superfície e a Política de ferramentas vigente;
+4. o esquema de entrada, o estado do recurso de destino e o risco;
+5. o tempo limite, o limite de tamanho da resposta e a idempotência;
+6. a verificação após a operação e o registro de auditoria.
+
+## Cobertura do catálogo
+
+O catálogo abrange as operações do produto que são seguras e úteis para investigações
+e tarefas administrativas com IA.
+
+| Domínio | Exemplos de recursos |
+|---|---|
+| Logs, métricas e fluxos | Consulte a telemetria, inspecione esquemas e configurações, busque eventos próximos e explore rótulos ou séries de métricas; agrupe logs por padrão e compare com um período de referência; resuma quando uma métrica começou a variar, quanto variou e quais séries e rótulos mais contribuíram para a variação; verifique se os dados estão prontos para uso (se registram o serviço, o ambiente e o ID do trace, se cada serviço usa o mesmo nome em todos os sinais e se os nomes das métricas incluem as unidades); consulte as inspeções agendadas de logs e os relatórios ou execute uma inspeção agora. |
+| Traces, APM, RUM e perfis | Inspecione traces, a topologia dos serviços, sessões, erros, dependências, gráficos de chama e correlações entre sinais; consulte as análises de APM e veja quais serviços um serviço alcança no mapa de serviços; pesquise no catálogo de serviços por nome, alias, descrição ou tag; resuma os Core Web Vitals página por página; resuma uma aplicação RUM, liste e consulte os problemas, identifique o que causa frustração aos usuários, consulte o gráfico em cascata de uma visualização e agregue dados de qualquer fluxo RUM. |
+| Alertas e incidentes | Consulte os incidentes e o status do plantão; encontre incidentes semelhantes dos últimos 90 dias e liste as implantações, as alterações de configuração e as flags de recursos próximos a um horário ou incidente; crie, atualize, exclua, teste ou acione regras de alerta; confirme o recebimento de incidentes ou resolva-os. |
+| Dashboards, relatórios e anotações | Gerencie dashboards, pastas, painéis, anotações, modelos de relatório, agendamentos e entregas. |
+| Tarefas de busca e visualizações salvas | Envie, inspecione, cancele, tente executar novamente ou exclua buscas persistentes e gerencie visualizações salvas. |
+| Pipelines, funções, enriquecimento e conectores | Inspecione execuções agendadas, gerencie funções, teste transformações e consulte metadados de enriquecimento ou de conectores. |
+| Monitoramento sintético e páginas de status | Inspecione monitores e resultados, execute ou pause monitores, gerencie o ciclo de vida e a automação das páginas de status e prepare um rascunho do post-mortem de um incidente. |
+| Notificações | Inspecione conectores, políticas, modelos e entregas; tente reenviar ou confirme o recebimento de uma entrega. |
+| IAM e administração | Consulte usuários, equipes, funções, recursos, eventos de auditoria, contas de serviço e metadados de tokens de API; gerencie o estado das credenciais sem acessar os segredos. |
+| Controle do Mole Agent | Inspecione investigações, aprovações, execuções e automações. Em seguida, execute uma operação aprovada se houver autorização. |
+
+Chame `get_platform_capabilities` para obter um resumo dos recursos disponíveis na interface usada. Chame `tool_search` para consultar
+os nomes e esquemas autorizados no momento, em vez de usar uma lista estática.
+
+## Limites de acesso a identidades e segredos
+
+- A credencial autenticada fornece o `userId` e o `orgId` de quem faz a chamada.
+- `get_user_profile` e `get_user_preferences` aceitam o parâmetro opcional `target_user_id` apenas para
+  selecionar um recurso. Para consultar os dados de outro membro, é necessário ter a permissão `org.members.read` e verificar
+  se o membro pertence à organização.
+- As ferramentas de consulta e listagem retornam apenas os metadados das credenciais.
+- `create_api_token` e `create_service_account` não estão disponíveis no MCP de entrada porque ambas as ferramentas
+  retornam o segredo em texto simples uma única vez. Crie essas credenciais na interface web.
+- Ainda é possível listar, atualizar, ativar, desativar,
+  revogar ou excluir contas de serviço e tokens de API existentes com ferramentas autorizadas que não expõem segredos.
+- `query_logs`, `search_around`, `search_field_values`, `get_stream_schema` e os recursos de esquema de fluxo
+  bloqueiam o acesso ao [fluxo `_audit`](/pt-BR/settings/data-security#fluxo-de-auditoria), qualquer que seja a credencial.
+
+O catálogo exclui intencionalmente login, cadastro, redefinição de senha, rotas públicas sem
+autenticação, ingestão de dados brutos via OTLP ou Prometheus, webhooks externos, upload e download de arquivos binários, drenagem de nós,
+criação de perfis em tempo de execução e execução arbitrária de requisições HTTP, comandos de shell ou ações no navegador.
+
+## Recursos, prompts e tarefas do MCP
+
+O MCP de entrada também disponibiliza recursos filtrados pelo IAM para consultar os recursos da plataforma, o catálogo de ferramentas,
+aprovações, execuções, tarefas de busca e esquemas de fluxo. Os prompts integrados do Mole Agent, os da organização e os do usuário atual
+estão disponíveis em `prompts/list` e `prompts/get`.
+
+Operações de leitura demoradas podem ser executadas como tarefas do MCP. Notificações de progresso, assinaturas de recursos e
+notificações de alterações no catálogo ficam disponíveis quando a versão negociada do protocolo MCP
+oferece suporte a esses recursos.
+
+<CardGroup cols={2}>
+  <Card title="Conecte um cliente MCP" icon="plug" href="/pt-BR/inbound-mcp">
+    Ative o endpoint e conecte-se com OAuth 2.1 ou um token de API.
+  </Card>
+  <Card title="Mole Agent" icon="robot" href="/pt-BR/agent">
+    Use o mesmo catálogo com controles de acesso no agente de operações integrado.
+  </Card>
+</CardGroup>

@@ -1,0 +1,94 @@
+---
+title: "備份與還原"
+description: "說明需要備份哪些內容、如何維持 PostgreSQL 與物件儲存的一致性，以及如何還原 MoleSignal 部署。"
+"en_link": "/en-US/backup-restore"
+"zh-Hans_link": "/zh-Hans/backup-restore"
+"ja_link": "/ja/backup-restore"
+"ko_link": "/ko/backup-restore"
+"de_link": "/de/backup-restore"
+"es_link": "/es/backup-restore"
+"fr_link": "/fr/backup-restore"
+"pt-BR_link": "/pt-BR/backup-restore"
+---
+
+MoleSignal 的狀態保存在 PostgreSQL、物件儲存以及設定與金鑰中，節點的磁碟上只有快取。請逐一備份，並在依賴備份之前演練一次還原。
+
+## 需要備份的內容
+
+| 狀態 | 內容 | 備份 |
+|---|---|---|
+| PostgreSQL | 使用者、組織、權杖、資料流、儀表板、警示規則，以及將資料流對應到物件的檔案目錄 | 必須 |
+| 物件儲存 | Parquet 資料檔案、檢索索引、Profile 資料區塊，以及包含尚未寫入儲存空間之記錄的預寫日誌（WAL）物件（`wal/v1/`） | 必須 |
+| `MS_CIPHER_KEY` | PostgreSQL 中密文的根金鑰 | 必須，與資料庫備份分開保存。 |
+| 設定 | `config.toml`、環境變數，以及有使用時的 `MS_AUTH_JWT_SECRET_OVERRIDE` | 必須 |
+| ACME 目錄（`[http.tls].key_storage_dir`） | ACME 帳號金鑰與網域名稱金鑰 | 選用，憑證可以重新簽發。 |
+| 快取目錄（`[cache.object].root`） | 遠端物件位元組範圍的本機副本 | 不需要備份。 |
+
+## 保持資料庫與物件一致
+
+PostgreSQL 中的檔案目錄會參照儲存貯體中的物件。寫入儲存空間時，先上傳物件，再將物件登錄到目錄。合併與保留策略會先移除目錄中的參照，垃圾回收器會在 `[storage.gc].grace_period_secs`（預設 3600 秒）之後才刪除物件。
+
+依照以下順序備份，才能保持一致：
+
+1. 先備份 PostgreSQL。
+2. 緊接著複製儲存貯體，並在寬限期內完成。
+
+在寬限期內完成的複本會包含資料庫備份所參照的所有物件。如果複製需要更長時間，請在備份前調高 `grace_period_secs`，或啟用儲存貯體版本控制，並將物件還原到資料庫備份的時間點。
+
+## 備份 PostgreSQL
+
+使用 PostgreSQL 服務內建的備份功能，例如支援時間點還原的定期快照。在小規模部署中，自行架設的資料庫可以使用邏輯傾印：
+
+```bash
+pg_dump --format=custom --file=molesignal.dump "postgres://molesignal@db.internal:5432/molesignal"
+```
+
+## 備份物件儲存
+
+使用雲端服務供應商提供的儲存貯體複寫或版本控制。也可以定期複製到第二個儲存貯體：
+
+```bash
+aws s3 sync s3://molesignal s3://molesignal-backup
+```
+
+RustFS 等相容於 S3 的服務需要加上 `--endpoint-url`。備份使用的憑證不應具備刪除備份儲存貯體內容的權限。
+
+## 還原
+
+<Steps>
+  <Step title="停止所有節點">
+    停止所有 MoleSignal 程序，確保替換資料期間沒有寫入作業。
+  </Step>
+  <Step title="還原 PostgreSQL">
+    將備份還原到空白資料庫：
+
+    ```bash
+    pg_restore --no-owner --dbname "postgres://molesignal@db.internal:5432/molesignal" molesignal.dump
+    ```
+  </Step>
+  <Step title="還原物件">
+    將備份複製到節點使用的儲存貯體。將儲存貯體還原到資料庫備份的時間點或之後的狀態。
+
+    對帳器會將還原後的目錄未參照的物件排入孤立物件佇列，垃圾回收器會在 `[storage.reconciler].orphan_grace_secs`（預設 24 小時）之後將其刪除。如果較新的物件可能還有用，請先複製到其他位置。
+  </Step>
+  <Step title="還原金鑰與設定">
+    提供設定，以及備份時部署所使用的同一個 `MS_CIPHER_KEY`。使用不同金鑰的節點無法解密已儲存的密文，啟動時會失敗，並回報類似 `open Probe CA key` 的錯誤。
+  </Step>
+  <Step title="由 intake 接管 WAL">
+    WAL 物件會隨儲存貯體一併還原。節點開始執行後，intake 節點會在寫入端的租約到期後，發佈還原後的資料庫中登錄的各個寫入端的 WAL。資料庫備份後才登錄的寫入端，其 WAL 物件不會發佈。
+  </Step>
+  <Step title="啟動並驗證">
+    啟動節點，等待 `GET /api/v1/healthz` 傳回 `200`。登入後開啟一個資料流，對還原的時間範圍執行查詢。
+
+    檢查 `/metrics` 中 `reason="missing"` 的 `storage_reconciler_issues_total`。如果出現這類項目，表示目錄參照了儲存貯體中不存在的物件。
+  </Step>
+</Steps>
+
+## 故障情境
+
+| 遺失的內容 | 影響 | 還原方式 |
+|---|---|---|
+| 節點的本機磁碟 | 不會遺失已確認的資料，快取會重建。 | 更換節點。其他 intake 節點會在 `[wal].lease_secs` 之後發佈該節點的 WAL，請參閱[持久性與接管](/zh-Hant/architecture#持久性與接管)。 |
+| PostgreSQL | 所有中繼資料都會遺失，無法存取物件。 | 還原最新備份。備份後寫入的資料無法還原，因為目錄中沒有這些物件的項目。 |
+| 儲存貯體 | 查詢遺失資料的時間範圍時會失敗。 | 還原儲存貯體。目錄中沒有對應物件的項目會在 `/metrics` 中顯示為 `missing`。 |
+| `MS_CIPHER_KEY` | 無法解密已儲存的密文，節點無法啟動。 | 從金鑰管理系統還原金鑰。缺少金鑰就無法還原加密的欄位。 |

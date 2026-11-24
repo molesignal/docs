@@ -1,0 +1,95 @@
+---
+title: "Check-ins de heartbeat"
+description: "Envie o check-in de uma tarefa agendada para o endereço de uma regra de heartbeat, consulte o último check-in e redefina o endereço."
+"en_link": "/en-US/api/alerting/heartbeats"
+"zh-Hans_link": "/zh-Hans/api/alerting/heartbeats"
+"zh-Hant_link": "/zh-Hant/api/alerting/heartbeats"
+"ja_link": "/ja/api/alerting/heartbeats"
+"ko_link": "/ko/api/alerting/heartbeats"
+"de_link": "/de/api/alerting/heartbeats"
+"es_link": "/es/api/alerting/heartbeats"
+"fr_link": "/fr/api/alerting/heartbeats"
+---
+
+Uma [regra de heartbeat](/pt-BR/api/alerting/create-rule#regras-de-heartbeat) aguarda o check-in de uma tarefa após cada
+execução. A regra dispara se não receber um check-in dentro do período mais o tempo de tolerância ou se um check-in indicar
+uma falha.
+
+| Método e caminho | O que faz | Permissão |
+|---|---|---|
+| `GET`, `POST /api/v1/intake/heartbeats/{token}` | Registra um check-in sem exigir login. | O token no endereço |
+| `GET /api/v1/alerts/rules/{id}/heartbeat` | Retorna o último check-in e o prazo para o próximo. | `alerts.rules.read` na regra |
+| `POST /api/v1/alerts/rules/{id}/heartbeat-token` | Redefine o endereço de check-in. | `alerts.rules.manage` na regra |
+
+## Registrar um check-in
+
+```http
+GET /api/v1/intake/heartbeats/{token}
+POST /api/v1/intake/heartbeats/{token}
+```
+
+Ao salvar uma regra de heartbeat pela primeira vez, obtenha o endereço. Consulte
+[Criar uma regra](/pt-BR/api/alerting/create-rule#regras-de-heartbeat). Envie uma solicitação a esse endereço quando a tarefa for bem-sucedida. Adicione
+`?status=fail` se a tarefa falhar. Assim, a regra dispara imediatamente, sem aguardar o fim do período. O início do
+corpo de uma solicitação `POST` (até 1000 caracteres) fica registrado como mensagem do check-in e aparece na anotação de incidente
+`heartbeat_message`. Se o corpo ultrapassar 64 KiB, a API retorna `413`. Cada check-in aciona uma avaliação imediata da regra:
+uma falha dispara a regra, e um sucesso permite que um incidente aberto se recupere se atender à condição de recuperação.
+
+<RequestExample>
+```bash cURL
+# The backup succeeded
+curl -fsS https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN
+
+# The backup failed: send its last lines of output
+tail -n 20 backup.log | curl -fsS -X POST --data-binary @- \
+  "https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN?status=fail"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "ok": true, "status": "fail" }
+```
+</ResponseExample>
+
+A regra considera apenas `status=fail` como falha. Qualquer outro valor, ou a ausência de valor, conta como sucesso. A API retorna `404` se o token for inválido, se a
+regra tiver sido excluída ou se o endereço tiver sido redefinido.
+
+## Consultar o estado do check-in
+
+```http
+GET /api/v1/alerts/rules/{id}/heartbeat
+```
+
+<ResponseExample>
+```json 200
+{
+  "lastCheckinAt": 1790000000000000,
+  "lastStatus": "ok",
+  "lastMessage": "",
+  "dueAt": 1790003900000000,
+  "alarming": false,
+  "issuedAt": 1789900000000000
+}
+```
+</ResponseExample>
+
+| Campo | Observações |
+|---|---|
+| `lastCheckinAt` | Data e hora do último check-in em microssegundos Unix. Antes do primeiro check-in, o valor é `null`. |
+| `lastStatus`, `lastMessage` | O status informado pelo último check-in (`ok` ou `fail`) e a mensagem correspondente. |
+| `dueAt` | Prazo para o próximo check-in: data e hora do último check-in (ou da emissão do endereço, se ainda não houve check-in) mais o período e o tempo de tolerância. |
+| `alarming` | Indica se a regra deve disparar agora: o último check-in indicou uma falha ou o prazo `dueAt` já passou. |
+| `issuedAt` | Data e hora da emissão ou redefinição do endereço atual. |
+
+A API retorna `404` se a regra não for de heartbeat ou se ainda não tiver um endereço.
+
+## Redefinir o endereço de check-in
+
+```http
+POST /api/v1/alerts/rules/{id}/heartbeat-token
+```
+
+Emite um novo endereço e mantém o registro de check-ins. O endereço anterior deixa de funcionar imediatamente. Retorna
+`{ "path": "...", "url": "..." }` e exibe o novo endereço apenas nessa resposta. O campo `url` é `null` se não houver um
+endereço externo configurado. O log de auditoria registra a redefinição. A API retorna `400` se a regra não for de heartbeat.

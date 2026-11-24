@@ -1,0 +1,181 @@
+---
+title: "Selbstüberwachung"
+description: "Überwachen Sie MoleSignal anhand seiner eigenen Logs, Metriken, Traces, Profile, Zustandsdaten und knotenlokalen Diagnosedaten."
+"en_link": "/en-US/self-observability"
+"zh-Hans_link": "/zh-Hans/self-observability"
+"zh-Hant_link": "/zh-Hant/self-observability"
+"ja_link": "/ja/self-observability"
+"ko_link": "/ko/self-observability"
+"es_link": "/es/self-observability"
+"fr_link": "/fr/self-observability"
+"pt-BR_link": "/pt-BR/self-observability"
+---
+
+Prozesslogs verbleiben in der konfigurierten Konsolen- oder Dateiausgabe. MoleSignal schreibt Plattformmetriken,
+Traces und Profile in die geschützte Organisation `_sys`. Jedes gespeicherte Signal verwendet exakt den
+Streamnamen `_molesignal` mit dem jeweils passenden Streamtyp.
+
+| Signal | Stream mit Typ | Inhalt |
+|---|---|---|
+| Metriken | `metrics/_molesignal` | Counter, Gauges, Histogramme und Summaries. |
+| Traces | `traces/_molesignal` | Kanonische abgeschlossene Spans nach dem Tail-Sampling. |
+| Profile | `profiles/_molesignal` | Profilmetadaten mit Verweisen auf pprof-Blobs im Objektspeicher. |
+
+Diese Streams lassen sich nur im Systembereich mit `sys.telemetry.read` abfragen.
+
+## Erfassung der Eigentelemetrie aktivieren
+
+```toml
+[telemetry.self_collect]
+enabled = true
+metrics_enabled = true
+metrics_interval_secs = 15
+queue_capacity = 8192
+batch_max_events = 256
+batch_max_delay_ms = 1000
+flush_timeout_secs = 5
+profile_kinds = ["cpu"]
+profile_interval_secs = 600
+profile_duration_secs = 10
+```
+
+Eine Mandantenorganisation ist als Ziel nicht zulässig. Über öffentliche Datenannahme, Streamänderungen und
+Pipelines lässt sich `_molesignal` weder erstellen noch überschreiben oder löschen.
+
+Die Streams haben bei der Erstellung eine Aufbewahrungsdauer von 7 Tagen. Ändern Sie diese und das Downsampling des Metrikstreams
+auf der Registerkarte **Nutzerbindung** des jeweiligen Streams in der Organisation `_sys`. Die Werte bleiben bei einem Neustart erhalten.
+
+In Bereitstellungen mit getrennten Rollen leiten Knoten ohne Intake-Rolle die Eigentelemetrie an einen funktionsfähigen Intake-Knoten weiter. Legen Sie
+für alle Rollen denselben Wert für `MS_SELF_TELEMETRY_CLUSTER_TOKEN` fest.
+
+## Verteiltes Tracing im Backend
+
+MoleSignal instrumentiert die Verarbeitungsstufen für HTTP, gRPC, Flight SQL, Datenbanken, Objektspeicher, Datenannahme, Abfragen,
+Hintergrund-Worker und den Agenten.
+
+Die Spans folgen den OpenTelemetry Semantic Conventions 1.43.0. Standardattribute behalten ihre standardisierten
+Namen. Zusätzliche Attribute von MoleSignal beginnen mit `molesignal.`. Jeder Span erfasst die
+Version in `semantic_conventions_version`.
+
+MoleSignal validiert oder ersetzt den eingehenden W3C-Kontext. Externes Baggage erteilt keine Zugriffsrechte auf eine Organisation.
+Spans enthalten keine sensiblen Request-Bodys, SQL-Werte, Zugangsdaten, Prompts, Modellausgaben oder
+Tool-Argumente.
+
+Ein SQL-Span kann `molesignal.db.query.fingerprint` enthalten, einen schlüsselbasierten Fingerabdruck der SQL-Anweisung, in der
+`?` die Werte ersetzt. Ein Objektspeicher-Span kann `molesignal.object.key_fingerprint` enthalten, einen schlüsselbasierten
+Fingerabdruck des Objektschlüssels. So lassen sich Spans derselben Anweisung oder desselben Objekts gruppieren, ohne die
+Anweisung oder den Objektschlüssel zu speichern. MoleSignal schreibt die Fingerabdrücke nur, solange
+[`MS_TRACE_FINGERPRINT_KEY`](/de/configuration#umgebungsvariablen) mindestens 16 Byte enthält.
+
+Der Tail-Sampler entscheidet in dieser Reihenfolge, welche Traces erhalten bleiben:
+
+1. Deaktivierung bei der Bereitstellung oder zur Laufzeit;
+2. erzwungene Erfassung im vertrauenswürdigen Debug-Modus;
+3. Fehler;
+4. langsame Traces;
+5. Richtlinienregeln in festgelegter Reihenfolge;
+6. deterministische Anwendung der regulären Sampling-Rate.
+
+Der Sampler und die Warteschlangen für die interne Datenannahme und den Export haben feste Grenzen. Bei Störungen lassen sie den Anwendungsverkehr passieren. Prüfen Sie
+die Komponentenmetriken mit fester Kardinalität unter `/metrics` und den detaillierten Systemzustand unter
+`GET /api/v1/system/telemetry`.
+
+## Knotenlokales pprof
+
+Der Diagnose-Listener ist standardmäßig deaktiviert:
+
+```toml
+[profiling]
+enabled = true
+bind = "127.0.0.1"
+port = 5086
+allow_remote = false
+```
+
+Legen Sie dieselben Einstellungen bei Bedarf über `MS_PROFILING_ENABLED`, `MS_PROFILING_BIND`, `MS_PROFILING_PORT` und
+`MS_PROFILING_ALLOW_REMOTE` fest. `bind` erwartet eine IP-Adresse, keinen Hostnamen wie `localhost`. Der Port muss sich
+von den Ports aller anderen aktivierten Listener unterscheiden, auch von denen für Rollen, die auf dem Knoten
+nicht laufen. Andernfalls bricht der Prozess beim Start ab. Siehe [pprof](/de/configuration#pprof).
+
+Erfassen Sie Profile:
+
+```bash
+curl --fail --output cpu.pb.gz \
+  'http://127.0.0.1:5086/debug/pprof/profile?seconds=30'
+
+curl --fail --output heap.pb.gz \
+  'http://127.0.0.1:5086/debug/pprof/heap'
+```
+
+Binden Sie den Listener nur an die Loopback-Adresse und verwenden Sie einen SSH-Tunnel. Für den Fernzugriff sind
+`allow_remote = true`, Netzwerk-Zugriffskontrollen, eine TLS-Terminierung vor dem Listener und ein
+Bearer-Token mit Administratorrechten erforderlich.
+
+## Systemzustand und Rollout
+
+- `/api/v1/healthz` ist öffentlich und meldet, ob der Prozess läuft und die Abhängigkeiten funktionsfähig sind. Verwenden Sie den Endpunkt für Zustandsprüfungen von Containern und Load Balancern.
+- `/api/v1/readyz` meldet nach dem Start des Knotens, ob der Knoten Datenverkehr annehmen kann. Der Endpunkt erfordert ein Bearer-Token.
+- `/metrics` stellt Prometheus-Metriken ohne Mandantenlabels bereit.
+- `X-Request-Id` und `X-Trace-Id` verknüpfen Anfragen mit gespeicherten Traces.
+
+Beginnen Sie einen neuen Rollout für verteiltes Tracing mit `telemetry.trace.force_disabled = true`. Prüfen Sie
+die Systemressourcen und den Datenschutz, aktivieren Sie das Tracing zunächst in einer Canary-Instanz und erweitern Sie dann die dauerhaft gespeicherte Laufzeitrichtlinie.
+
+## Komponentenmetriken
+
+Jeder Knoten stellt die folgenden Metriken unter `/metrics` bereit. Die Labelwerte stammen aus festen Listen und
+enthalten weder Organisationsnamen noch Angaben zu Traces, Routen oder Objektschlüsseln. In der Organisation `_sys`
+visualisieren die integrierten Dashboards **MoleSignal Self Telemetry & Runtime** und **MoleSignal Tracing & APM**
+diese Metriken.
+
+### Eigentelemetrie und Metadatenbank
+
+| Metrik | Labels | Bedeutung |
+|---|---|---|
+| `self_telemetry_accepted_total` | `signal` | Für die `_molesignal`-Streams angenommene Datensätze. |
+| `self_telemetry_dropped_total` | `signal`, `reason` | Auf dem Weg zu den `_molesignal`-Streams verworfene Datensätze. Mögliche Werte für `reason` sind `queue_full`, `queue_closed`, `trace_candidate_queue`, `delivery_failed`, `flush_timeout` oder `persistence_failed`. Bei einem geplanten, aber nicht erfassten Profil sind es `capture_busy`, `unavailable`, `invalid_duration` oder `capture_failed`. |
+| `self_telemetry_batches_total` | `signal`, `outcome` | Gesendete Batches mit dem `outcome` `success` oder `error`. |
+| `self_telemetry_retries_total` | `signal`, `reason` | Wiederholungsversuche, wenn ein Knoten ohne die Rolle `intake` einen Batch an einen Intake-Knoten weiterleitet: `no_intake`, `connect` oder `push`. |
+| `self_telemetry_queue_depth`, `self_telemetry_queue_capacity` | `signal` | Anzahl der wartenden Spans in der Trace-Warteschlange und deren Kapazität (`queue_capacity`). Nur `traces` hat eine Warteschlange. |
+| `self_telemetry_last_success_unixtime` | `signal` | Zeitpunkt des letzten erfolgreichen Batch-Versands in Sekunden seit der Unix-Epoche. |
+| `self_telemetry_profile_available` | `kind` | `1`, wenn der Build auf dieser Plattform das Profil `cpu` bzw. `heap` erfassen kann, sonst `0`. |
+| `db_pool_connections` | `pool`, `state` | Verbindungszahlen im Pool der Metadatenbank (`pool="meta"`): `total`, `idle`, `checked_out` sowie die konfigurierten Werte `min` und `max`. |
+| `db_pool_acquire_duration_seconds` | `pool` | Wartezeit auf eine Verbindung aus dem Pool, ohne die anschließende Ausführungszeit der Anweisung. |
+
+`signal` hat den Wert `metrics`, `traces` oder `profiles`. Verworfene Datensätze blockieren den Prozess nicht, hinterlassen aber Lücken in
+den `_molesignal`-Streams.
+
+### APM-Projektion
+
+Die Projektion läuft auf den Knoten, die für die Trace-Kandidaten zuständig sind. Der Rollup läuft auf Knoten mit der Rolle `alert`. Siehe
+[APM](/de/configuration#apm).
+
+| Metrik | Labels | Bedeutung |
+|---|---|---|
+| `molesignal_apm_facts_total` | `result` | Spans, die bei der Projektion ankommen, nach Ergebnis: `accepted`, `duplicate_skip`, `late_kept`, `late_dropped`, `queue_full`, `stopped`, `cardinality_rejected`, `extract_failed` oder `flush_failed`. `flush_failed` zählt fehlgeschlagene Schreibvorgänge, keine Spans. |
+| `molesignal_apm_cardinality_total` | `reason` | Spans, die ein [Kardinalitätslimit](/de/apm/settings#kardinalitätslimits) überschreiten, nach Limit, etwa `service_rejected` oder `transaction_overflow`. Ein Span eines abgelehnten Dienstes geht nicht in die Zählung ein. Bei anderen Limits fällt sein Name unter **Sonstige** oder verliert an Detailtiefe. |
+| `molesignal_apm_queue` | `resource` | Anzahl der wartenden Spans in der Projektionswarteschlange (`depth`) und deren Kapazität (`capacity`, `[apm].queue_capacity`). |
+| `molesignal_apm_flushes_total` | `result` | Schreibvorgänge für Aggregate in PostgreSQL: `success` oder `failure`. |
+| `molesignal_apm_flush_duration_seconds` | | Dauer eines Schreibvorgangs. |
+| `molesignal_apm_rollups_total` | `result` | Durchläufe des Rollups von Minuten- zu Stundenaggregaten: `success` oder `failure`. |
+| `molesignal_apm_rollup_rows_total` | `kind` | Zeilen, die der Rollup liest (`source`), schreibt (`rollup`) oder nach Ablauf der Aufbewahrungsdauer löscht (`deleted`). |
+| `molesignal_apm_lag_seconds` | `stage` | Für `projection`: Alter des letzten Spans, den die Projektion angenommen hat. Für `rollup`: Zeitraum, in dem der Rollup verspätete Daten noch annimmt (`[apm].late_grace_secs`). |
+| `molesignal_apm_health` | `component` | `1`, wenn die jeweilige Komponente (`projector`, `repository` oder `rollup`) ordnungsgemäß funktioniert, `0` bei eingeschränkter Funktion. |
+| `molesignal_apm_api_duration_seconds` | `endpoint` | Antwortzeit für Anfragen an die APM-API, nach Endpunkt, etwa `overview` oder `services`. |
+
+Lösen Sie einen Alarm aus, wenn:
+
+- `molesignal_apm_queue{resource="depth"}` dauerhaft über 80% von `capacity` liegt;
+- `molesignal_apm_facts_total` für den `result`-Wert `queue_full`, `cardinality_rejected` oder
+  `flush_failed` steigt. Dabei entstehen Lücken, die die [Hinweise zur Datenqualität](/de/apm#hinweise-zur-datenqualität-lesen)
+  als unvollständige Daten melden;
+- `molesignal_apm_lag_seconds{stage="projection"}` dauerhaft über 120 Sekunden (zwei Ein-Minuten-Intervalle) liegt;
+- `molesignal_apm_health` den Wert `0` hat;
+- das 95. Perzentil von `molesignal_apm_api_duration_seconds{endpoint="overview"}` dauerhaft über 0,5 Sekunden liegt.
+
+Ein eingeschränkter APM-Betrieb führt bei `/api/v1/healthz` und `/api/v1/readyz` nicht zu einem Fehler. `GET /api/v1/apm/health` zeigt den
+Status der Projektion für eine einzelne Organisation an. Siehe [APM-API](/de/api/apm).
+
+<Card title="Konfiguration" icon="sliders" href="/de/configuration">
+  Prüfen Sie alle Einstellungen für Telemetrie, Tracing, Exporter und Profiling.
+</Card>

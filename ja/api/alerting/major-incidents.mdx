@@ -1,0 +1,161 @@
+---
+title: "重大インシデント"
+description: "インシデントを重大インシデントとして宣言し、インシデント指揮官、連絡責任者、記録担当者を割り当てます。ウォールームと会議を開設し、チェックリストで作業を分担して、更新情報を1つのストリームに投稿します。"
+"en_link": "/en-US/api/alerting/major-incidents"
+"zh-Hans_link": "/zh-Hans/api/alerting/major-incidents"
+"zh-Hant_link": "/zh-Hant/api/alerting/major-incidents"
+"ko_link": "/ko/api/alerting/major-incidents"
+"de_link": "/de/api/alerting/major-incidents"
+"es_link": "/es/api/alerting/major-incidents"
+"fr_link": "/fr/api/alerting/major-incidents"
+"pt-BR_link": "/pt-BR/api/alerting/major-incidents"
+---
+
+影響範囲が広く、複数人で対応するインシデントは、重大インシデントとして宣言できます。宣言すると、3 つのロールを割り当てられるようになります。ウォールーム（Feishu または Slack のチャット）やミーティングを設定でき、タスクリストも利用できます。状況更新はウォールームに投稿され、関係者に通知されます。組織では、条件に一致する新規インシデントを作成時に重大インシデントとして宣言するルールも設定できます。各ページでの使い方については、[重大インシデントとポストモーテム](/ja/alerting/major-incidents)を参照してください。
+
+| メソッドとパス | 処理内容 | 権限 |
+|---|---|---|
+| `GET /api/v1/alerts/incidents/{id}/response` | 重大インシデントの対応情報とタスクを取得します。 | 対象インシデントの `alerts.incidents.read` |
+| `POST /api/v1/alerts/incidents/{id}/declare` | 重大インシデントとして宣言します。 | 対象インシデントの `alerts.incidents.escalate` |
+| `PUT /api/v1/alerts/incidents/{id}/roles` | ロールを割り当てるか、割り当てを解除します。 | 対象インシデントの `alerts.incidents.update` |
+| `POST /api/v1/alerts/incidents/{id}/tasks` | タスクを追加します。 | 対象インシデントの `alerts.incidents.update` |
+| `PUT /api/v1/alerts/incidents/{id}/tasks/{taskId}` | タスクのタイトル、担当者、完了状態を変更します。 | 対象インシデントの `alerts.incidents.update` |
+| `DELETE /api/v1/alerts/incidents/{id}/tasks/{taskId}` | タスクを削除します。 | 対象インシデントの `alerts.incidents.update` |
+| `POST /api/v1/alerts/incidents/{id}/status-updates` | 状況更新を投稿します。 | 対象インシデントの `alerts.incidents.update` |
+| `GET /api/v1/alerts/response/settings` | 組織の重大インシデント設定を取得します。 | `alerts.response.read` |
+| `PUT /api/v1/alerts/response/settings` | 組織の重大インシデント設定を保存します。 | `alerts.response.manage` |
+
+重大インシデントの宣言、ロールの割り当て、ウォールームの開設、タスクの追加と完了、状況更新の投稿は、インシデントの[タイムライン](/ja/api/alerting/incident-timeline)に記録されます。重大インシデントの宣言と設定の保存は、監査ログにも記録されます。
+
+## 重大インシデントとして宣言
+
+```http
+POST /api/v1/alerts/incidents/{id}/declare
+```
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `commanderId` | string | いいえ | インシデント指揮官です。省略すると、宣言したユーザーが指揮官になります。 |
+
+宣言済みのインシデントはそのまま返します。解決済みのインシデントは宣言できません。宣言時は組織の設定に従って次の処理を行います。
+
+1. 設定のチェックリストからタスクを作成します。
+2. `meeting` の値に従ってミーティングを設定します。`feishu_vc` では、Feishu App がインシデント指揮官をオーナーとする 6 時間の Feishu ミーティングを予約します。`tencentMeeting` では 6 時間の Tencent Meeting を予約し、`zoom` ではインスタントミーティングを開始します。 `googleMeet` ではミーティングスペースを作成し、`fixed_url` では固定のミーティングリンクを使用します。
+3. 設定で指定したコネクター（Feishu App、Slack App、DingTalk、WeCom のいずれか）が、 `[severity] incident summary` という名前のグループチャットを作成し、インシデントの担当者、ロールの割り当て先、ステークホルダーをコネクターに紐づくユーザー情報に基づいて追加します。DingTalk と WeCom では指揮官がグループのオーナーになります。コネクターは最初のメッセージにインシデントとミーティングのリンクを記載して投稿します。
+4. `onMajorIncident` を設定したチケットコネクターが[チケット](/ja/api/alerting/tickets)を作成します。
+
+ウォールーム、ミーティング、チケットの作成はベストエフォートで行います。失敗してもログに記録するだけで、重大インシデントの宣言は有効なままです。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/declare \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"commanderId": "<user-id>"}'
+```
+</RequestExample>
+
+宣言、取得、ロールの割り当ては `{ "response": { ... }, "tasks": [ ... ] }` を返します。インシデントをまだ宣言していない場合、`response` は `null` です。
+
+<ResponseExample>
+```json 200
+{
+  "response": {
+    "incidentId": "<incident-id>",
+    "orgId": "<organization-id>",
+    "declaredAt": 1790000000000000,
+    "declaredBy": "<user-id>",
+    "roles": { "commander": "<user-id>" },
+    "warRoom": {
+      "platform": "lark_app",
+      "connectorId": "<connector-id>",
+      "chatId": "oc_5ad11d72b830411d72b836c20",
+      "url": "https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=<token>"
+    },
+    "meetingUrl": "https://vc.feishu.cn/j/123456789",
+    "updatedAt": 1790000000000000
+  },
+  "tasks": [
+    {
+      "id": "3KJ9a1C7vXe2Rf8MbN4qLw0TzHd",
+      "orgId": "<organization-id>",
+      "incidentId": "<incident-id>",
+      "title": "Open a status page incident",
+      "assigneeId": null,
+      "done": false,
+      "doneBy": null,
+      "doneAt": null,
+      "position": 0,
+      "createdBy": "<user-id>",
+      "createdAt": 1790000000000000
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| フィールド | 備考 |
+|---|---|
+| `declaredBy` | 宣言したユーザーです。組織のルールによる宣言の場合は `null` です。 |
+| `roles` | `commander`（インシデント指揮官）、`communications`（コミュニケーション責任者）、`scribe`（記録係）をユーザー ID にマッピングします。未割り当てのロールは含みません。 |
+| `warRoom` | ウォールームの `platform`（`lark_app`、`slackApp`、`dingtalk_app`、`wecom_app` のいずれか）、コネクター、チャット ID、参加リンクです。DingTalk と WeCom のグループには参加リンクがないため、`url` は空です。ウォールームがない場合は `null` です。 |
+| `meetingUrl` | ミーティングのリンクです。ミーティングがない場合は `null` です。 |
+
+## ロールとタスク
+
+ロールを割り当てるには `{ "role": "scribe", "userId": "<user-id>" }` を送信します。割り当てを解除するには、`userId` に `null` を指定します。事前に重大インシデントとして宣言してください。
+
+タスクを追加するには `{ "title": "…", "assigneeId": "<user-id>" }` を送信します。タイトルは 1〜200 文字で、タスクはインシデントごとに最大 50 件です。変更時は `title`、`assigneeId`（`null` で担当者の割り当てを解除）、`done` のうち、変更するフィールドだけを送信します。タスクを完了すると `doneBy` と `doneAt` を記録します。追加と変更ではタスクを返し、削除では `{ "deleted": true }` を返します。
+
+## 状況更新の投稿
+
+```http
+POST /api/v1/alerts/incidents/{id}/status-updates
+```
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `impact` | string | 影響です。 |
+| `current` | string | 現在の状況です。 |
+| `next` | string | 次の対応です。 |
+
+少なくとも 1 つのフィールドに内容を入力してください。各フィールドは最大 2000 文字です。事前に重大インシデントとして宣言してください。状況更新はタイムラインに記録され、ウォールームに投稿され、イベント `incident.status_update` として通知エンジンに渡されます。通知先は、インシデントの担当者、ロールの割り当て先、および設定で指定したステークホルダーです。通知には次の組み込みポリシーを使用します。 [重大インシデントの状況更新：ステークホルダーに通知](/ja/notification-channels#組み込みポリシー)。イベント属性 `status_update` には `impact`、`current`、`next`、`author` が含まれます。 `{ "sent": true }` を返します。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/status-updates \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"impact": "EU checkout failing for 30% of users", "current": "Rolling back v2026.10.28", "next": "Confirm the error rate drops"}'
+```
+</RequestExample>
+
+## 組織設定
+
+```http
+PUT /api/v1/alerts/response/settings
+```
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `warRoomConnectorId` | string | ウォールームを作成する通知コネクターです。グループチャットを作成できる `lark_app`、`slackApp`、`dingtalk_app`、`wecom_app` のいずれかを指定します。`null` の場合は作成しません。 |
+| `meeting` | string | `none`（デフォルト、ミーティングなし）、`feishu_vc`、`tencentMeeting`、`zoom`、`googleMeet`、`fixed_url` のいずれかです。 |
+| `meetingUrl` | string | `fixed_url` で使用する、`https://` で始まるミーティングリンクです。 |
+| `meetingConnectorId` | string | `feishu_vc` でミーティングを予約する Feishu App コネクターです。`null` の場合はウォールームのコネクターを使用します。その場合、ウォールームのコネクターは Feishu App である必要があります。 |
+| `tencentMeeting` | object | `tencentMeeting` では、自社開発アプリの `appId`、`sdkId`（ある場合のみ）、`secretId` と、作成者の `userid` が必要です。 |
+| `zoom` | object | `zoom` では、Server-to-Server OAuth アプリの `accountId` と `clientId`、および `host`（メールアドレスまたはユーザー ID）が必要です。 |
+| `googleMeet` | object | `googleMeet` では、サービスアカウントがミーティングを作成する際の主催者として `organizer`（メールアドレス）を指定する必要があります。 |
+| `secrets` | object | 書き込み専用です。新しいミーティング用シークレットを `tencentMeeting.secretKey`、`zoom.clientSecret`、`googleMeet.credentials`（サービスアカウントの JSON キーのテキスト）のいずれかのキーで指定します。空欄の場合は既存の値を保持します。選択したミーティングサービスのシークレットのみ保持します。 |
+| `checklist` | array | 宣言時にタスクとして追加する項目です。最大 30 件で、各項目は最大 200 文字です。 |
+| `stakeholderIds` | array | ステークホルダーです。状況更新時に通知し、ウォールームにも追加します。 |
+| `auto` | object | 自動宣言の設定です。`{ "enabled": true, "minSeverity": "critical", "conditions": [ ... ] }`。重大度が `minSeverity` 以上で、ラベルが `conditions` を満たす新規インシデントを直ちに宣言します。この場合、`declaredBy` は `null` です。`conditions` は[ルーティングルール](/ja/api/alerting/create-routing-rule)と同じ形式で記述します。 |
+
+リクエストボディには設定オブジェクト全体を指定します。保存した設定を返します。一度も保存していない場合、取得時にはデフォルト値を返します。シークレットはルートキーで暗号化して保存します。取得時はシークレットの値を返さず、設定済みのシークレットのキーを示す `secretsSet` と、読み取り専用の `war_room_types` を返します。`war_room_types` は、ウォールームを作成できるコネクターの種類を示します。
+
+**エラー**
+
+| ステータス | 理由 |
+|---|---|
+| `400` | インシデントが解決済みか未宣言です。または、フィールドの値が制限を超えているか、コネクターがこの組織の Feishu App または Slack App ではありません。 |
+| `403` | 必要な権限がないか、対象のインシデントにアクセスできません。 |
+| `404` | インシデントまたはタスクが存在しません。 |

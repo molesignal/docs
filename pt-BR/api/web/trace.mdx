@@ -1,0 +1,390 @@
+---
+title: "Lista e detalhes de rastreamentos"
+description: "Liste resumos de rastreamentos e spans, conte os rastreamentos ao longo do tempo, consulte os spans de um rastreamento e encontre os spans que fazem referência a ele."
+"en_link": "/en-US/api/web/trace"
+"zh-Hans_link": "/zh-Hans/api/web/trace"
+"zh-Hant_link": "/zh-Hant/api/web/trace"
+"ja_link": "/ja/api/web/trace"
+"ko_link": "/ko/api/web/trace"
+"de_link": "/de/api/web/trace"
+"es_link": "/es/api/web/trace"
+"fr_link": "/fr/api/web/trace"
+---
+
+Todas as chamadas leem um único fluxo de rastreamentos da organização: o fluxo que contém todos os campos `trace_id`, `span_id`, `service.name`, `name`, `start_time_unix_nano`, `end_time_unix_nano` e `status_code`. Um fluxo chamado `default` tem prioridade sobre os demais fluxos elegíveis. O nome do fluxo resolve os empates restantes. Se a organização não tiver um fluxo elegível, as chamadas retornam resultados vazios. Só é possível ler os rastreamentos que a [amostragem na cauda](/pt-BR/configuration#captura-de-traces-e-amostragem-ao-final) manteve.
+
+Todas as chamadas exigem `traces.read` ou, no escopo do sistema, `sys.telemetry.read`.
+
+## Listar resumos de rastreamentos
+
+```http
+GET /api/v1/web/traces
+```
+
+Retorna um resumo por rastreamento, com paginação por cursor. Se o fluxo ainda não tiver resumos de rastreamentos, a chamada retorna uma página vazia.
+
+**Parâmetros de consulta**
+
+| Parâmetro | Tipo | Observações |
+|---|---|---|
+| `from`, `to` | inteiro | A janela em microssegundos. Por padrão, abrange as últimas 24 horas até o momento da consulta. `to` deve ser maior que `from`. |
+| `q` | string | Texto que deve aparecer no `trace_id`, no `span_id`, no serviço, na operação ou no status de um span. A busca não diferencia maiúsculas de minúsculas. Até 256 caracteres. |
+| `filters` | string | Um array JSON de filtros. Veja abaixo. |
+| `where` | string | Uma árvore de condições em JSON: filtros e texto combinados com AND e OR. Veja abaixo. |
+| `expression` | string | Uma consulta por campos na sintaxe da página **Rastreamentos**. Substitui `q`, `filters` e `where`: envie a expressão ou esses parâmetros. Veja abaixo. |
+| `sort` | string | `latest` (padrão), `earliest`, `duration_desc`, `duration_asc`, `span_count_desc` ou `errors_desc`. |
+| `limit` | inteiro | Tamanho da página. O padrão é `20`. O servidor mantém o valor entre 1 e 5000. |
+| `cursor` | string | O `nextCursor` ou `previousCursor` de uma página anterior. |
+| `fields` | string | Campos do span raiz a retornar com cada rastreamento. Use os nomes do fluxo e separe-os por vírgulas. Até 12 campos. A chamada retorna `400` se receber um campo desconhecido, um campo JSON ou um campo `molesignal.trace.*`. |
+
+Um filtro é um objeto com `field`, `op` e `value`. Cada solicitação aceita até 32 filtros. Todos os filtros devem corresponder. O operador `in` aceita `values`, uma lista de valores, no lugar de `value`.
+
+| Campo | Tipo | Operadores |
+|---|---|---|
+| `trace_id` | texto | `=`, `!=`, `contains`, `in` |
+| `duration_ns`, `span_count`, `error_count` | inteiro | `=`, `!=`, `>`, `>=`, `<`, `<=`, `in` |
+| Qualquer outro campo escalar do fluxo de rastreamentos | conforme o tipo do campo | Texto: `=`, `!=`, `contains`, `in`. Números e carimbos de data e hora: `=`, `!=`, `>`, `>=`, `<`, `<=`, `in`. Booleanos: `=`, `!=`, `in`. |
+
+Use no filtro o nome exato do campo no fluxo, como `service.name` ou `name`. Nenhum outro nome identifica o campo. Os operadores `eq`, `ne` e `like` são aliases de `=`, `!=` e `contains`. Não é possível filtrar por um campo JSON.
+
+O servidor compara `trace_id`, `duration_ns`, `span_count` e `error_count` no nível do rastreamento. Todos os outros campos pertencem a um span. Um filtro nesses campos seleciona o rastreamento quando pelo menos um dos spans atende ao filtro. Já `!=` seleciona o rastreamento quando nenhum dos spans tem o valor. Um span sem o campo não tem o valor.
+
+O operador `in` aceita qualquer um dos valores em `values`: de 1 a 64 valores, cada um com até 512 bytes e do mesmo tipo do campo. Valores repetidos contam uma única vez. Em um campo de span, `in` seleciona o rastreamento quando pelo menos um dos spans tem um dos valores.
+
+Use `where` para expressar alternativas que a lista de filtros não permite. O parâmetro aceita um objeto JSON em um destes quatro formatos:
+
+| Formato | Correspondência |
+|---|---|
+| Um filtro, como em `filters` | O filtro. |
+| `{"text": "..."}` | O texto, com o mesmo critério de `q`. |
+| `{"and": [...]}` | Todas as condições da lista. |
+| `{"or": [...]}` | Qualquer condição da lista. |
+
+A consulta aplica `filters`, `q` e `where` em conjunto. Um filtro na árvore segue as mesmas regras: em um campo de span, seleciona o rastreamento quando pelo menos um dos spans atende ao filtro. Já `!=` seleciona o rastreamento quando nenhum dos spans tem o valor. Um rastreamento atende a `{"or": [A, B]}` quando atende a `A` ou a `B`. Os filtros de `filters` e `where` somam para o limite de 32. A árvore aceita até 8 buscas de texto e até 8 níveis de grupos aninhados. Cada grupo deve conter pelo menos uma condição.
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'filters=[{"field":"status_code","op":"=","value":"ERROR"}]' \
+  --data-urlencode 'where={"or":[{"field":"service.name","op":"=","value":"checkout"},{"field":"span_count","op":">","value":"50"}]}'
+```
+
+A solicitação lista os rastreamentos com falha que têm um span de `checkout` ou mais de 50 spans.
+
+Como alternativa, `expression` aceita o texto da página **Rastreamentos**: comparações com `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains` e `field in ('a', 'b')`, palavras de busca, uma frase entre aspas, `AND` e `OR` sem distinção entre maiúsculas e minúsculas, e delimitadores de agrupamento. `AND` tem precedência sobre `OR`. O servidor converte o texto nos parâmetros `q`, `filters` e `where` que a página envia e os valida conforme as regras acima. O texto pode ter até 8 KiB e até 32 níveis de agrupamento. Se o servidor não conseguir interpretar um trecho, como um delimitador sem fechamento ou uma comparação incompleta, retorna `400` e identifica o trecho.
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode "expression=status_code = 'ERROR' AND (service.name = 'checkout' OR span_count > 50)"
+```
+
+A solicitação lista os mesmos rastreamentos que a anterior.
+
+O `cursor` vincula a página à consulta que o gerou. Se uma nova solicitação usar o mesmo cursor e alterar `limit`, `sort`, `q`, `filters` ou `where`, o servidor retorna `400`.
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'sort=duration_desc' \
+  --data-urlencode 'limit=2' \
+  --data-urlencode 'fields=http.route' \
+  --data-urlencode 'filters=[{"field":"service.name","op":"in","values":["checkout","payments"]}]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    {
+      "traceId": "0af7651916cd43dd8448eb211c80319c",
+      "service": "checkout",
+      "operation": "GET /checkout",
+      "startNs": 1790000000000000000,
+      "durationMs": 180.0,
+      "spanCount": 3,
+      "errorCount": 1,
+      "status": "ERROR",
+      "httpStatusCode": 502,
+      "fields": { "http.route": "/checkout" }
+    }
+  ],
+  "nextCursor": null,
+  "previousCursor": null,
+  "hasMore": false
+}
+```
+</ResponseExample>
+
+Cada item descreve um rastreamento a partir do span raiz: o `service` e a `operation` do span raiz, o horário de início em nanossegundos, a duração em milissegundos, o número de spans e o número de spans com erro. `hasMore` é `true` quando a resposta inclui `nextCursor`.
+
+| Campo | Observações |
+|---|---|
+| `status` | O status do span raiz: `OK`, `ERROR` ou `UNSET`. |
+| `httpStatusCode` | O valor de `http.response.status_code` ou de `http.status_code` do span raiz, se for um código de 100 a 599. A resposta omite o campo nos demais casos e para rastreamentos armazenados antes de o resumo incluir esse código. |
+| `fields` | Os campos solicitados em `fields` para os quais o span raiz tem um valor. Se nenhum tiver valor ou se a leitura falhar, a resposta omite esses campos. |
+
+## Contar rastreamentos ao longo do tempo
+
+```http
+GET /api/v1/web/traces/histogram
+```
+
+Conta todos os rastreamentos que correspondem a uma consulta de listagem e os agrupa em intervalos pelo horário de início. A chamada aceita a janela, `q`, `filters` e `where` da listagem e encontra os mesmos rastreamentos. Defina os intervalos na solicitação.
+
+**Parâmetros de consulta**
+
+| Parâmetro | Tipo | Observações |
+|---|---|---|
+| `from`, `to` | inteiro | A janela em microssegundos. Ambos são obrigatórios. `to` deve ser maior que `from`. |
+| `q`, `filters`, `where`, `expression` | string | Os mesmos parâmetros da listagem. |
+| `bucketTime` | inteiro | A duração de cada intervalo em microssegundos. No mínimo `1000`. |
+| `originTime` | inteiro | O início do primeiro intervalo, em microssegundos. Não pode ser posterior a `from`. |
+
+Uma solicitação abrange até 512 intervalos entre `originTime` e `to`.
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces/histogram" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'from=1790000100000000' \
+  --data-urlencode 'to=1790003700000000' \
+  --data-urlencode 'bucketTime=900000000' \
+  --data-urlencode 'originTime=1790000100000000' \
+  --data-urlencode 'filters=[{"field":"service.name","op":"=","value":"checkout"}]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "bucketTime": 900000000,
+  "originTime": 1790000100000000,
+  "buckets": [
+    { "startTime": 1790000100000000, "total": 42, "errors": 3, "p50Ns": 41000000, "p95Ns": 180000000, "p99Ns": 320000000 },
+    { "startTime": 1790001900000000, "total": 17, "errors": 0, "p50Ns": 38000000, "p95Ns": 95000000, "p99Ns": 120000000 }
+  ],
+  "split": true
+}
+```
+</ResponseExample>
+
+`buckets` lista apenas os intervalos com pelo menos um rastreamento, do mais antigo para o mais recente. `total` é o número de rastreamentos que começaram no intervalo. `errors` é o número desses rastreamentos com pelo menos um span com erro. `p50Ns`, `p95Ns` e `p99Ns` são a mediana, o 95º percentil e o 99º percentil das durações desses rastreamentos, em nanossegundos. Esses valores são estimativas. A resposta os omite se o cálculo não incluir nenhuma duração.
+
+A contagem lê os resumos dos rastreamentos e, quando há um filtro em um campo de span, lê também os spans. A listagem retorna um resumo por rastreamento. Se uma nova tentativa de gravação armazenar o mesmo resumo duas vezes, a contagem inclui as duas cópias.
+
+Mesmo quando a contagem não está disponível, a chamada retorna `200`. Nesse caso, `buckets` fica vazio e `unavailable` indica o motivo.
+
+| `unavailable` | Causa |
+|---|---|
+| `time_budget` | A contagem levou mais de 20 segundos. |
+| `busy` | As consultas da função ocupam todas as vagas de [`[search.admission]`](/pt-BR/configuration#controle-de-admissão) e nenhuma vaga ficou disponível dentro do prazo definido por `max_wait_secs`. |
+| `scan_limit` | A janela contém mais linhas do que `[querier].max_scan_rows` permite ler em uma única consulta. |
+
+## Consultar métricas de requisições
+
+```http
+GET /api/v1/web/traces/red
+GET /api/v1/web/traces/red/breakdown
+```
+
+Retorna a taxa, os erros e a duração das requisições que correspondem a uma consulta de listagem: no total, por intervalo de tempo e por faixa de duração. O detalhamento retorna as mesmas métricas para cada valor de um campo. Cada requisição corresponde a um span. Por padrão, só entram na consulta os spans em que um serviço recebeu uma requisição: um span de servidor ou de consumidor, ou o span raiz de um trace. `scope=all` inclui todos os spans.
+
+Um filtro em um campo do span se aplica ao próprio span. Assim, `service.name = 'api'` retorna as requisições que `api` atendeu. `trace_id` e `duration_ns` vêm do span, enquanto `span_count` e `error_count` vêm do trace ao qual o span pertence.
+
+**Parâmetros de consulta**
+
+| Parâmetro | Tipo | Observações |
+|---|---|---|
+| `from`, `to`, `bucketTime`, `originTime` | inteiro | Os mesmos da contagem de traces ao longo do tempo. |
+| `q`, `filters`, `where`, `expression` | string | Os mesmos da listagem. |
+| `scope` | string | `entry` (padrão) ou `all`. |
+| `by` | string | Obrigatório e exclusivo do detalhamento: use o nome que o fluxo atribui ao campo pelo qual agrupar as requisições. |
+
+<RequestExample>
+```bash cURL
+curl -G "http://localhost:5080/api/v1/web/traces/red" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'from=1790000100000000' \
+  --data-urlencode 'to=1790003700000000' \
+  --data-urlencode 'bucketTime=60000000' \
+  --data-urlencode 'originTime=1790000100000000' \
+  --data-urlencode "expression=service.name = 'checkout'"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "bucketTime": 60000000,
+  "originTime": 1790000100000000,
+  "scope": "entry",
+  "total": { "requests": 1840, "errors": 12, "p50Ns": 41000000.0, "p95Ns": 180000000.0, "p99Ns": 320000000.0 },
+  "buckets": [
+    { "startTime": 1790000100000000, "requests": 31, "errors": 0, "p50Ns": 40000000.0, "p95Ns": 150000000.0, "p99Ns": 210000000.0 }
+  ],
+  "latency": [
+    { "fromNs": 0, "toNs": 50000000, "requests": 1203, "errors": 2 },
+    { "fromNs": 50000000, "toNs": null, "requests": 637, "errors": 10 }
+  ]
+}
+```
+</ResponseExample>
+
+`buckets` lista os intervalos de tempo com pelo menos uma requisição, do mais antigo ao mais recente. `latency` agrupa as requisições por faixa de duração, da menor para a maior; a última faixa não tem limite superior. `errors` é `null` quando não é possível identificar falhas. As durações são expressas em nanosegundos e têm valor `null` quando não há requisições ou quando estão mascaradas.
+
+O detalhamento retorna `field`, `bucketTime`, `originTime`, `scope` e `groups`. `groups` lista os 50 valores mais frequentes, em ordem decrescente de frequência, cada um com suas métricas e uma `series` de intervalos com `requests`, `errors` e `p95Ns`. `value` é `null` para as requisições sem valor para o campo. `more` é `true` quando há mais valores do que os listados.
+
+Quando as métricas não estão disponíveis, as chamadas ainda retornam `200` com `unavailable`: `time_budget`, `busy` e `scan_limit`, como na contagem de traces; `timestamp_masked`, quando o horário está mascarado para quem consulta; e `field_protected`, quando o campo do detalhamento está mascarado ou criptografado.
+
+## Listar spans
+
+```http
+GET /api/v1/web/traces/spans
+```
+
+Retorna uma linha por span que corresponde à consulta, com paginação por cursor. A chamada usa a janela de tempo e os parâmetros `q`, `filters` e `where` da listagem de traces e os aplica a cada span: um filtro em um campo do span se aplica ao próprio span, e `!=` inclui spans que não têm o campo. `duration_ns` é a duração do próprio span. `span_count` e `error_count` vêm do trace ao qual o span pertence. Um span corresponde a `{"or": [A, B]}` quando corresponde a `A` ou a `B`.
+
+**Parâmetros de consulta**
+
+| Parâmetro | Tipo | Observações |
+|---|---|---|
+| `from`, `to` | inteiro | A janela de tempo em microssegundos. Por padrão, abrange as últimas 24 horas até o momento atual. `to` deve ser maior que `from`. |
+| `q`, `filters`, `where`, `expression` | string | Os mesmos da listagem de traces. |
+| `sort` | string | `latest` (padrão), `earliest`, `duration_desc` ou `duration_asc`. |
+| `limit` | inteiro | Tamanho da página. Padrão: `100`. Valores abaixo de 1 ou acima de 5000 são ajustados para o limite mais próximo. |
+| `cursor` | string | O `nextCursor` ou `previousCursor` de uma página já retornada. O cursor inclui a consulta da página. Usar um `limit` diferente faz a chamada retornar `400`. |
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    {
+      "traceId": "0af7651916cd43dd8448eb211c80319c",
+      "spanId": "53995c3f42cd8ad8",
+      "parentSpanId": "b7ad6b7169203331",
+      "service": "payments",
+      "operation": "POST /pay",
+      "startNs": 1790000000020000000,
+      "durationNs": 140000000,
+      "status": "ERROR",
+      "kind": 2,
+      "httpStatusCode": 502
+    }
+  ],
+  "nextCursor": null,
+  "previousCursor": null,
+  "hasMore": false
+}
+```
+</ResponseExample>
+
+`status` é `OK`, `ERROR` ou `UNSET`. `kind` usa os mesmos números do OTLP para identificar o tipo de span: `1` interno, `2` servidor, `3` cliente, `4` produtor e `5` consumidor. A resposta omite `parent_span_id`, `kind` e `http_status_code` quando o span não tem o campo correspondente. O sistema monitora a execução dessa consulta e aplica as mesmas regras de admissão das demais consultas.
+
+## Consultar um trace
+
+```http
+GET /api/v1/web/trace/{traceId}
+```
+
+Retorna todos os spans de um trace, em ordem de horário de início. `trace_id` tem de 1 a 128 caracteres do conjunto `A-Z`, `a-z`, `0-9`, `-` e `_`.
+
+**Parâmetros de consulta**
+
+| Parâmetro | Tipo | Observações |
+|---|---|---|
+| `from`, `to` | inteiro | A janela de tempo, em microssegundos, em que os spans do trace começaram. Informe os dois parâmetros ou nenhum. Use uma janela de até 31 dias. Sem esses parâmetros, a chamada procura o trace nas últimas 24 horas. |
+
+A resposta tem limites de 100.000 spans e 32 MiB. `truncated` é `true` quando um desses limites corta a lista de spans.
+
+<ResponseExample>
+```json 200
+{
+  "traceId": "0af7651916cd43dd8448eb211c80319c",
+  "rootSpanId": "b7ad6b7169203331",
+  "spans": [
+    {
+      "spanId": "53995c3f42cd8ad8",
+      "parentSpanId": "b7ad6b7169203331",
+      "service": "payments",
+      "operation": "POST /pay",
+      "startNs": 1790000000020000000,
+      "endNs": 1790000000160000000,
+      "durationNs": 140000000,
+      "kind": 2,
+      "status": "ERROR",
+      "statusMessage": "upstream timeout",
+      "attributes": { "http.method": "POST", "http.status_code": "502" },
+      "events": [],
+      "links": [],
+      "samplingReason": "error",
+      "partial": false,
+      "late": false,
+      "duplicate": false,
+      "conflict": false
+    }
+  ],
+  "truncated": false,
+  "partial": false,
+  "partialReasons": [],
+  "samplingReasons": ["error"],
+  "lateSpanCount": 0,
+  "duplicateSpanCount": 0,
+  "conflictSpanCount": 0
+}
+```
+</ResponseExample>
+
+O exemplo mostra um span com os campos principais. Um span real também inclui `traceFlags`, `traceState`, `resource`, `scope`, os contadores `dropped_*_count`, `schemaVersion` e `semanticConventionsVersion`.
+
+| Campo | Observações |
+|---|---|
+| `rootSpanId` | O primeiro span sem pai. Monte a árvore a partir de `span_id` e `parent_span_id`. |
+| `spans[].status` | `OK`, `ERROR` ou `UNSET`. |
+| `spans[].attributes` | Os atributos do span, combinados com as colunas de atributos desaninhados do fluxo. |
+| `spans[].sampling_reason` | O motivo pelo qual a amostragem ao final do trace manteve o trace, como `error`. |
+| `partial`, `partialReasons` | Indicam se faltam spans e por quê. |
+| `lateSpanCount`, `duplicateSpanCount`, `conflictSpanCount` | Contagens de spans que chegaram com atraso, estavam duplicados ou apresentaram conflitos. |
+
+## Encontrar spans com links para um trace
+
+```http
+GET /api/v1/web/trace/{traceId}/linked
+```
+
+Um span mantém links para os spans dos quais deriva. A consulta de detalhes do trace retorna esses links junto com o span. Esta chamada busca na direção inversa: encontra spans de outros traces com links que apontam para um span deste trace. A chamada aceita os mesmos parâmetros `from` e `to` da consulta de detalhes do trace e pesquisa nessa janela.
+
+<ResponseExample>
+```json 200
+{
+  "spans": [
+    {
+      "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "spanId": "00f067aa0ba902b7",
+      "service": "billing-worker",
+      "operation": "process invoice",
+      "startNs": 1790000005000000000,
+      "durationNs": 30000000,
+      "status": "OK",
+      "linkedSpanId": "53995c3f42cd8ad8",
+      "attributes": { "messaging.operation": "process" }
+    }
+  ],
+  "more": false
+}
+```
+</ResponseExample>
+
+`spans` lista até 200 spans com links para o trace, do mais recente ao mais antigo. `more` é `true` quando há outros spans com links para o trace. `linkedSpanId` identifica o span deste trace para o qual o link aponta, e `attributes` contém os atributos do link.
+
+A busca lê como texto os links de todos os spans na janela, com o mesmo limite de tempo da contagem de traces. Quando a busca não termina, a chamada ainda retorna `200` com `spans` vazio e um motivo em `unavailable`: `time_budget`, `busy` ou `scan_limit`, como na contagem de traces.
+
+**Erros**
+
+| Status | Causa |
+|---|---|
+| `400` | Um parâmetro é inválido: `to` não é maior que `from`; um filtro usa um campo ou operador desconhecido (`unsupported trace filter field: nope`); um filtro `in` não tem valores ou tem mais de 64; `where` não é uma árvore de condições ou excede os limites; `expression` aparece junto com `q`, `filters` ou `where`, ou contém um trecho que a chamada não consegue interpretar; o cursor não corresponde à consulta; um campo em `fields` é desconhecido ou é um documento; ou `trace_id` tem caracteres ou comprimento inválidos. Na contagem: falta a janela de tempo ou um parâmetro de intervalo; `bucketTime` é menor que `1000`; `originTime` é posterior a `from`; ou a requisição abrange mais de 512 intervalos. Nos detalhes do trace e na busca de spans com links para ele: a chamada recebe apenas um de `from` e `to`, ou a janela ultrapassa 31 dias. |
+| `403` | O token não tem a permissão `traces.read`. |
+| `404` | A chamada não encontra o trace na janela, ou a amostragem descartou o trace. |

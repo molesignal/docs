@@ -1,0 +1,123 @@
+---
+title: "執行查詢"
+description: "在組織的資料流上執行 SQL 或 PromQL。"
+"en_link": "/en-US/api/query/execute"
+"zh-Hans_link": "/zh-Hans/api/query/execute"
+"ja_link": "/ja/api/query/execute"
+"ko_link": "/ko/api/query/execute"
+"de_link": "/de/api/query/execute"
+"es_link": "/es/api/query/execute"
+"fr_link": "/fr/api/query/execute"
+"pt-BR_link": "/pt-BR/api/query/execute"
+---
+
+```http
+POST /api/v1/query
+GET  /api/v1/query
+```
+
+執行查詢並傳回資料列；規模較大的查詢則啟動非同步搜尋任務。此呼叫需要 `streams.query`，系統遙測則需要 `sys.telemetry.read`。
+
+**請求本文**
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `orgId` | string | 是 | 必須提供此欄位，但系統會忽略其值，改用已通過驗證的組織。 |
+| `language` | string | 是 | `sql` 或 `promql`。 |
+| `statement` | string | 是 | 查詢陳述式。 |
+| `timeRange` | object | 是 | `{ "start": <微秒>, "end": <微秒> }`。 |
+| `stream` | object | SQL 必填 | `{ "name": "app", "streamType": "logs" }` 指定主資料表。兩個欄位都必填，類型為 `logs`、`metrics`、`traces`、`profiles` 或 `extend`。 |
+| `limit` | integer | 否 | 資料列數上限。PromQL 範圍查詢會在上限內，對每個時間序列等距取樣。 |
+| `step` | integer | 否 | 僅適用於 PromQL。指定範圍查詢的步長，單位為微秒。提供 `step` 時，PromQL 從 `start` 到 `end` 每一步傳回一個值；未提供時，則傳回 `end` 時刻的值。每個時間序列最多 11,000 步；步長太小時傳回 `400`。 |
+
+**GET 的查詢字串**
+
+`GET /api/v1/query` 透過查詢字串接收相同的查詢，因此每次讀取都能以可複製、可再次開啟的網址表示。回應、支援的請求標頭和所需權限都與 `POST` 相同。陳述式太長而無法放入網址時，請改用 `POST` 傳送：服務前端的代理伺服器可能會拒絕超過 8 KB 的請求行。
+
+| 參數 | 必填 | 說明 |
+|---|---|---|
+| `language` | 是 | `sql` 或 `promql`。 |
+| `statement` | 是 | 查詢陳述式，須經 URL 編碼。 |
+| `start`、`end` | 是 | 以微秒表示的時間範圍。 |
+| `stream`、`streamType` | SQL 必填 | 主資料表及其類型，須同時提供。 |
+| `limit` | 否 | 資料列數上限。 |
+| `step` | 否 | PromQL 範圍查詢的步長，單位為微秒。 |
+
+**請求標頭與查詢字串**
+
+| 名稱 | 效果 |
+|---|---|
+| `Prefer: respond-async` | 建立搜尋任務並傳回 `202`。查詢 `_audit` 時仍在請求內執行。 |
+| `Prefer: respond-sync` | 即使時間範圍很長，仍在請求內執行。 |
+| `Accept: application/x-ndjson` | 以串流方式逐行傳回 JSON 物件，最後附上一筆 `{"__meta__": ...}` 記錄。 |
+| `?clusters=local,remote` | 在聯合搜尋中納入遠端叢集。 |
+
+<RequestExample>
+```bash cURL
+NOW=$(date +%s)000000
+
+curl -X POST http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"timeRange\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
+       \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+```
+
+```bash cURL (GET)
+NOW=$(date +%s)000000
+
+curl -G http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'language=promql' \
+  --data-urlencode 'statement=sum(rate(http_requests_total[5m]))' \
+  --data-urlencode "start=$((NOW-3600000000))" \
+  --data-urlencode "end=$NOW" \
+  --data-urlencode 'step=60000000'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "columns": ["level", "n"],
+  "rows": [["error", 12], ["info", 40]],
+  "scannedRows": 10432,
+  "tookMs": 18
+}
+```
+</ResponseExample>
+
+PromQL 結果中，每個值各占一列。範圍查詢會傳回 `_timestamp`（微秒）、`value`，以及每個標籤各自的欄位；每個時間序列的每一步各占一列。未提供 `step` 的查詢會傳回 `value` 和標籤欄位，每個時間序列各占一列。
+
+```json
+{
+  "columns": ["_timestamp", "value", "service.name"],
+  "rows": [[1761638400000000, 0.42, "checkout"], [1761638460000000, 0.40, "checkout"]],
+  "scannedRows": 2,
+  "tookMs": 6
+}
+```
+
+查詢的估計資料列數達到 `[querier].auto_async_threshold_rows` 時，會傳回 `202`：
+
+```json
+{
+  "jobId": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+如需閾值與任務端點的詳細資訊，請參閱[查詢](/zh-Hant/query#時間範圍與非同步工作)。
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | 無法規劃陳述式、SQL 缺少 `stream` 提示（`query.stream hint is required`）、PromQL 的 `step` 不是正數或導致單一時間序列超過 11,000 步，或查詢讀取的資料列數超過 `[querier].max_scan_rows` 的限制。`GET` 缺少必填參數，或提供 `stream` 卻未提供 `streamType` 時，也會傳回 `400`。 |
+| `503` | 在依角色分工的叢集中，沒有可用的 `querier` 節點（`no querier node is available`）。 |
+| `403` | 組織中沒有該資料串流（`stream not found: <name>`）、權杖缺少 `streams.query`，或查詢讀取 `_audit` 但權杖缺少 `audit.read`。 |
+| `422` | 請求本文中的欄位缺漏或類型錯誤，例如 `orgId` 或 `streamType`。回應為純文字。 |
+| `429` | 該工作群組的查詢已占滿此節點的查詢名額，且這筆查詢在等候 [`[search.admission].max_wait_secs`](/zh-Hant/configuration#准入控制) 後仍無可用名額；或該工作群組已達叢集層級的查詢上限。 |

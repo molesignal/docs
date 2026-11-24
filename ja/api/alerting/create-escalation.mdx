@@ -1,0 +1,124 @@
+---
+title: "エスカレーションポリシーの作成"
+description: "インシデントの通知ステップとその順序を定義します。"
+"en_link": "/en-US/api/alerting/create-escalation"
+"zh-Hans_link": "/zh-Hans/api/alerting/create-escalation"
+"zh-Hant_link": "/zh-Hant/api/alerting/create-escalation"
+"ko_link": "/ko/api/alerting/create-escalation"
+"de_link": "/de/api/alerting/create-escalation"
+"es_link": "/es/api/alerting/create-escalation"
+"fr_link": "/fr/api/alerting/create-escalation"
+"pt-BR_link": "/pt-BR/api/alerting/create-escalation"
+---
+
+```http
+POST /api/v1/alerts/escalations
+```
+
+エスカレーションポリシーを作成します。ポリシーでは、ステップを実行順に指定します。各ステップでは、通知先に通知して確認応答を待ちます。この呼び出しには `alerts.escalations.manage` 権限が必要です。
+
+## エスカレーションの仕組み
+
+1. `alert` ロールは、`[alert].dispatch_interval_secs`（デフォルトは 10 秒）ごとにアクティブなインシデントをチェックします。ステータスが `open` のインシデントだけがエスカレーションの対象になります。インシデントに確認応答すると、エスカレーションは停止します。
+2. `minSeverity` を指定したステップは、重大度が指定値以上のインシデントにのみ適用します。該当しないステップはスキップします。
+3. 現在のステップのすべての通知先に通知イベントを送信します。[通知チャネル](/ja/notification-channels)がメッセージの配信方法を決定します。インシデントの `assignees` には、そのステップで直接指定するユーザー（`user` の通知先と、各 `schedule` の通知先でオンコールを担当するユーザー）を設定します。通知先がチームのみのステップでは、既存の担当者を維持します。
+4. 確認応答がないまま `ackTimeoutSecs` が経過すると、次に該当するステップを開始します。
+5. 最後に該当するステップがタイムアウトすると、`repeat` が `true` のポリシーでは、`maxLoops` で指定した回数に達するまで最初のステップから繰り返します。
+6. `ackRetriggerSecs` を設定すると、確認応答から指定時間が経過しても未解決の `acknowledged` インシデントは `open` に戻ります。`escalation.reason` を `ack_timeout` に設定して担当者に再通知します。担当者がいなければ、現在のステップの通知先に再通知します。現在のステップでは確認応答の待ち時間を最初から計測し、通常どおりエスカレーションを続けます。スヌーズ中のインシデントには、この時間計測を適用しません。
+
+ルールは `escalationPolicyId` でポリシーを選択します。指定がないルールは `default` を使います。これは、組織内で名前が `default` のポリシーを指すエイリアスで、名前の大文字と小文字は区別しません。エスカレーションの開始時に、インシデントはポリシーの実際の ID を保存します。そのため、後でポリシー名を変更しても、未解決のインシデントが別のポリシーに切り替わることはありません。組織に `default` という名前のポリシーがない場合、ポリシーを指定していないルールのインシデントはエスカレーションしません。ただし、トリガーされたイベントは通知ポリシーに届きます。`default` という名前のポリシーを作成するか、ルールにポリシー ID を指定してください。
+
+**ボディ**
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `name` | string | はい | 空にはできません。 |
+| `steps` | array | いいえ | デフォルトは空の配列です。ステップのないポリシーは通知を送信しません。 |
+| `repeat` | boolean | いいえ | デフォルトは `false` です。有効にすると、最後のステップの後に最初から繰り返します。 |
+| `maxLoops` | integer | いいえ | デフォルトは `1` です。`repeat` が `true` の場合に、一連のステップを実行する合計回数です。1 未満の値は 1 として扱います。 |
+| `ackRetriggerSecs` | integer | いいえ | 確認応答済みのインシデントが未解決のままの場合に、再通知するまでの時間です。300～86400 秒の範囲で指定します。デフォルトは `null` で、再通知しません。 |
+| `urgencyRule` | object | いいえ | 緊急度が指定されていないインシデントに緊急度を設定する方法です。デフォルトは `{"mode": "by_severity"}` で、重大度ごとに組織が指定した緊急度を適用します（設定を変更しない場合、`critical` と `error` は `high`、`warning` と `info` は `low`）。`{"mode": "always", "urgency": "high"}` または `{"mode": "support_hours", "hours": {"timezone": "Asia/Shanghai", "ranges": [{"weekdayMask": 62, "start": "09:00", "end": "18:00"}], "calendar": {"calendarId": "<id>", "holidays": "exclude"}}, "inside": "high", "outside": "low", "raiseAtStart": true}` も指定できます。サポート時間内は `inside`、時間外は `outside` を適用します。デフォルトはそれぞれ `high` と `low` です。`raiseAtStart` を有効にすると、サポート時間の開始時に、確認応答がなく緊急度が `inside` より低いインシデントを `inside` に引き上げ、最初のステップから再通知します。緊急度には、組織の[レベル](/ja/alerting/on-call#緊急度と優先度のレベル)のキーを指定します。`weekdayMask` のビット 0 は日曜日です。`calendar` はオプションで、`holidays` には `exclude` または `only` を指定します（[休日カレンダー](/ja/alerting/on-call#休日カレンダー)を参照）。[緊急度](/ja/alerting/on-call#緊急度)を参照してください。 |
+| `escalateLowUrgency` | boolean | いいえ | デフォルトは `false` です。後続のステップに進まない緊急度のインシデントは、最初のステップでのみ通知し、その先には進まず、繰り返しもしません。`true` にすると、そのようなインシデントもこのポリシーに従って通常どおりエスカレーションします。 |
+
+ステップには次のフィールドがあります。
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `targets` | array | はい | ステップの通知先です。すべての通知先に同時に通知します。 |
+| `ackTimeoutSecs` | integer | いいえ | 次のステップに進むまで確認応答を待つ秒数です。省略すると、`[alert].default_ack_timeout_secs`（デフォルトは 300）の値を適用し、ステップとともに保存します。 |
+| `minSeverity` | string | いいえ | `info`、`warning`、`error`、`critical` のいずれかです。指定した重大度以上のインシデントにステップを適用します。すべてのインシデントに適用するには省略してください。 |
+
+通知先は `kind` で指定します。
+
+| `kind` | 追加フィールド | 通知先 |
+|---|---|---|
+| `user` | `userId` | 1 人のユーザー。 |
+| `team` | `teamId` | チームのメンバー。 |
+| `schedule` | `scheduleId` | オンコールスケジュールでオンコールを担当するユーザー。 |
+
+この呼び出しでは、参照先のユーザー、チーム、スケジュールが存在するかどうかを確認しません。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/escalations \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "Primary operations",
+    "steps": [
+      { "targets": [{ "kind": "user", "userId": "<user-id>" }],
+        "ackTimeoutSecs": 300 },
+      { "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+        "ackTimeoutSecs": 900,
+        "minSeverity": "critical" }
+    ],
+    "repeat": true,
+    "maxLoops": 2,
+    "ackRetriggerSecs": 3600
+  }'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KED3sy8RBNYIdLayGZN0bp2IIY",
+  "orgId": "<organization-id>",
+  "name": "Primary operations",
+  "steps": [
+    {
+      "targets": [{ "kind": "user", "userId": "<user-id>" }],
+      "ackTimeoutSecs": 300,
+      "minSeverity": null
+    },
+    {
+      "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+      "ackTimeoutSecs": 900,
+      "minSeverity": "critical"
+    }
+  ],
+  "repeat": true,
+  "maxLoops": 2,
+  "ackRetriggerSecs": 3600
+}
+```
+</ResponseExample>
+
+**エラー**
+
+| ステータス | 原因 |
+|---|---|
+| `400` | `name` が空か、`ackRetriggerSecs` が 300～86400 の範囲外です。 |
+| `403` | トークンに `alerts.escalations.manage` 権限がありません。 |
+| `422` | フィールドが不足しているか、値が無効です。たとえば、通知先の `kind` が `user`、`team`、`schedule` のいずれでもない場合や、`minSeverity` の値が認識できない場合です。レスポンスはプレーンテキストです。 |
+
+## ポリシーのその他のルート
+
+| 操作 | エンドポイント | 権限 |
+|---|---|---|
+| 一覧取得 | `GET /api/v1/alerts/escalations` | `alerts.escalations.read` |
+| 取得 | `GET /api/v1/alerts/escalations/{id}` | `alerts.escalations.read` |
+| 置換 | `PUT /api/v1/alerts/escalations/{id}` | `alerts.escalations.manage` |
+| 削除 | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.escalations.delete` |
+
+`PUT` は作成時と同じリクエストボディを受け取り、ポリシーを置き換えます。`DELETE` はプレーンテキストの `deleted` を返します。指定した ID が存在しない場合は `404` を返します。ポリシーの削除時には、そのポリシーを参照するルールを確認しません。該当するルールではエスカレーションが停止します。

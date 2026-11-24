@@ -1,0 +1,85 @@
+---
+title: "トラブルシューティング"
+description: "起動の失敗、リクエストの拒否、データの欠落、クエリの遅延や非同期実行など、よくある事象の原因と対処方法を説明します。"
+"en_link": "/en-US/troubleshooting"
+"zh-Hans_link": "/zh-Hans/troubleshooting"
+"zh-Hant_link": "/zh-Hant/troubleshooting"
+"ko_link": "/ko/troubleshooting"
+"de_link": "/de/troubleshooting"
+"es_link": "/es/troubleshooting"
+"fr_link": "/fr/troubleshooting"
+"pt-BR_link": "/pt-BR/troubleshooting"
+---
+
+まずプロセスログを確認してください。起動に失敗すると、ログに原因が出力されます。リクエストが拒否されると、HTTP エラーレスポンスの本文にメッセージが表示されます。ログレベルは `[telemetry].log_level` または `RUST_LOG` で指定します。
+
+## 起動
+
+| 症状 | 原因 | 対処方法 |
+|---|---|---|
+| `... password authentication failed for user` | DSN のユーザー名またはパスワードが間違っています。 | `[meta_database].dsn` を修正してください。 |
+| `... pool timed out while waiting for an open connection` | ノードから PostgreSQL に接続できません。 | ホスト、ポート、ファイアウォール、`sslmode` の要件を確認してください。 |
+| `startup_ping put: ... SignatureDoesNotMatch` | オブジェクトストアが認証情報を拒否しています。 | `access_key` と `secret_key` を確認してください。`MS_OBJECT_STORE_ACCESS_KEY` と `MS_OBJECT_STORE_SECRET_KEY` で設定してください。 |
+| `startup_ping put: ... NoSuchBucket` | バケットが存在しません。 | バケットを作成するか、`[object_store].bucket` を修正してください。 |
+| `Encountered transport error` が繰り返し出力された後に終了する | エンドポイントに接続できないか、クライアントに認証情報が渡されていません。 | `endpoint`、DNS、ネットワークを確認してください。認証情報は `access_key` と `secret_key` で指定する必要があります。 |
+| `unknown field: found ...` | 厳密な検証を行うセクションに、名前の誤りがあるキーか、未対応のキーがあります。 | キーを削除するか修正してください。[設定](/ja/configuration#設定の読み込み順序)を参照してください。 |
+| `MS_SELF_TELEMETRY_CLUSTER_TOKEN must be set when split-role self intake is enabled` | ロールを分離した構成で、`intake` ロールを持たないノードが、トレースのキャプチャまたは自己収集を有効にしたまま、共有トークンなしで起動しようとしています。 | すべてのノードに同じトークンを設定してください。トレースのキャプチャはデフォルトで有効なため、`[telemetry.self_collect]` を無効にするだけでは不十分です。 |
+| `open Probe CA key` | `MS_CIPHER_KEY` がデータベースの暗号化に使用したキーと一致しません。 | 元のキーを復元してください。[本番環境のチェックリスト](/ja/deployment/production-checklist)を参照してください。 |
+| `migration ... was previously applied but is missing in the resolved migrations` または `... has been modified` | バイナリとデータベースのバージョンに互換性がありません。 | 対応するバージョンを実行するか、バックアップを復元してください。[アップグレード](/ja/upgrade)を参照してください。 |
+| `address already in use` | 別のプロセスが設定済みのポートを使用しています。 | ポートを変更してください。 |
+| `profiling.port and ... are both ...` | pprof リスナーが別のリスナーと同じポートを使用しています。 | `[profiling].port` に、ほかのリスナーが使用していないポートを指定してください。 |
+| 環境変数で指定した設定が反映されない | 環境変数名にピリオドや連続する 2 つのアンダースコアが含まれているか、名前に入力ミスがあります。 | `MS_META_DATABASE_DSN` のように、設定パスの各要素を 1 つのアンダースコアでつないでください。 |
+
+## サインイン
+
+| 症状 | 原因 | 対処方法 |
+|---|---|---|
+| `admin@example.com` と `admin` でサインインできない | データベースに既存のユーザーがいるためルートアカウントを再作成しなかったか、`root_email` と `root_password` が空でした。 | 既存のアカウントでサインインしてください。ルートアカウントを作成するには、両方の値を設定し、空のデータベースを使用して起動してください。 |
+| パスワードリセットメールが届かない | SMTP または `http.external_url` が未設定です。リクエストは受け付けますが、メールは送信しません。 | `[notify.smtp].host` と `[http].external_url` を設定してください。 |
+| サインイン後に `Authorization: Bearer` を送信するスクリプトが `401` を受け取る | サインイン時は Web UI 用のセッション Cookie を設定し、トークンは返しません。このヘッダーで使用できるのは API トークンのみです。 | スクリプト用の API トークンを発行してください。[API トークン](/ja/identity/tokens)を参照してください。 |
+| Web UI で毎日サインインを求められる | サインインセッションは `[auth].session_ttl_secs`（24 hours）が経過すると終了します。 | `[auth].session_ttl_secs` の値を大きくしてください。 |
+
+## データの送信
+
+| 症状 | 原因 | 対処方法 |
+|---|---|---|
+| `401` | トークンがないか無効、またはヘッダーにサインインセッショントークンが含まれています。 | デフォルトの取り込みトークンまたはサービスアカウントトークンを `Authorization: Bearer <token>` で送信してください。 |
+| `403` | トークンに `logs.write` など、対象のシグナルへの書き込み権限がありません。たとえば、取り込みパスに RUM クライアントトークンを送信すると発生します。 | 対象のシグナルへの書き込み権限を持つトークンを使用してください。 |
+| `413` | リクエスト本文がエンドポイントの上限を超えています。上限はネイティブ JSON の取り込みでは 16 MiB、それ以外では 2 MiB です。 | バッチを小さくして送信してください。プロキシの上限をエンドポイントの上限以上に引き上げてください。 |
+| OTLP over HTTP エンドポイントが `400` を返す | 送信側が本文を圧縮しています。 | OpenTelemetry Collector のエクスポーターに `compression: none` を設定してください。 |
+| OTLP over HTTP エンドポイントが `404` を返す | エクスポーターのエンドポイントにベースパス `/api` がないため、リクエストが `/v1/logs` に送信されます。 | OTLP エンドポイントに `http://host:5080/api` を指定してください。 |
+| `Retry-After` を伴う `429` | `router` ロールで組織ごとのレート制限が適用されています。 | 送信頻度を下げるか、`[router.rate_limit]` の上限を引き上げてください。 |
+| ネイティブ JSON の取り込みで `rejected` レコードが報告される | フィールドの値がストリームのスキーマと一致していません。たとえば、`type mismatch on field level: expected Utf8, got Number` などです。レスポンスにはインデックスごとに拒否理由が表示されます。 | 対象のフィールドについて、ストリームに保存済みの型で値を送信してください。 |
+| `event #1 must be a JSON object` を伴う `400` | 配列に JSON オブジェクトではない要素が含まれています。エンドポイントはリクエスト全体を拒否します。 | オブジェクトの配列を送信してください。 |
+| Promtail または Grafana Alloy からプッシュできない | Loki エンドポイントは JSON のみをデコードしますが、これらの送信元は snappy で圧縮した protobuf を使用します。 | OpenTelemetry Collector、Vector、または Fluent Bit 経由で送信してください。 |
+| レコードを受け付けたのに見つからない | クエリで別のストリーム名やタイプを指定しているか、レコードが指定の時間範囲に含まれていません。 | ストリーム名とシグナルタイプを確認してください。タイムスタンプについては次のセクションを参照してください。 |
+
+## データが見つからない、または想定と異なる
+
+- **タイムスタンプ。** `_timestamp` は Unix エポックからの経過時間をマイクロ秒で表します。値を秒、ミリ秒、またはナノ秒で指定すると、イベントの日時が別の年や遠い将来になり、直近の時間範囲を指定したクエリでは取得できません。サーバーの受信時刻を使用するには、`_timestamp` を省略してください。
+- **時間範囲。** 長い時間範囲を対象とするクエリは非同期ジョブとして実行します。対話型クエリでは、開始時刻と終了時刻を指定した `timeRange` を使用してください。[クエリ](/ja/query#時間範囲と非同期ジョブ)を参照してください。
+- **データ保持。** ストリームの保持期間を過ぎたデータは削除します。ストリームに保持期間を設定していない場合は、**設定 → データ保持**のプラットフォーム既定値を適用します。
+- **ストリームタイプ。** 名前とタイプの組み合わせでストリームを識別します。ログ、メトリクス、トレースのそれぞれに `default` という名前のストリームを作成できます。
+
+## クエリ
+
+| 症状 | 原因 | 対処方法 |
+|---|---|---|
+| レスポンスが `202` で、`jobId` と `monitor` パスが含まれる | 推定行数が `[querier].auto_async_threshold_rows` に達したため、クエリを非同期検索ジョブとして実行します。デフォルト設定では、約 13.9 hours 以上の時間範囲が該当します。 | ジョブが完了するまで `monitor` パスにリクエストを送り、完了後に `/results` から結果を取得してください。または、時間範囲を狭めるか、`Prefer: respond-sync` を送信してください。[クエリ](/ja/query#時間範囲と非同期ジョブ)を参照してください。 |
+| Flight SQL クライアントが接続できない | `[flight_sql]` はデフォルトで無効です。 | `enabled = true` を設定し、ポート `5083` を公開して、API トークンで認証してください。 |
+
+## 運用
+
+| 症状 | 原因 | 対処方法 |
+|---|---|---|
+| `GET /api/v1/healthz` が `503` を返します | オブジェクトストアに接続できません。レスポンスボディに `reason` が含まれます。 | オブジェクトストアへの接続を修正してください。 |
+| WAL ディレクトリのサイズが増え続けます | フラッシュに失敗しています。通常は、オブジェクトストアに接続できないことが原因です。 | オブジェクトストアの問題を解消してください。その後、取り込みプロセスが保留中のデータをフラッシュします。 |
+| 取り込みリクエストに対して `intake buffer memory limit exceeded` と `429` が返ります | プロセスのバッファーが使用するメモリが `[intake].max_buffer_memory_size` を超えています。通常は、フラッシュが繰り返し失敗していることが原因です。 | `intake flush failed` のログで原因を特定し、オブジェクトストアまたはデータベースの問題を解消してください。公開できないことが確定した行は、上限の計算から除外されます（次の2行を参照）。ネイティブ JSON 取り込みでは、このレスポンスに `Retry-After` が含まれます。指定された時間が経過してから再試行してください。 |
+| ログに `dataset no longer exists; buffered rows discarded` が表示されます | ストリームの行がバッファーに残っている間に、そのストリームが削除されたか、削除後に再作成されました。これらの行には書き込み先がないため、取り込みプロセスは行を破棄し、使用していたメモリを解放します。カウンター `intake_flush_errors_total` は、破棄を `stream_gone` または `dataset_gone` ステップとして記録します。 | 対処は不要です。必要な場合は、データを再送信してください。 |
+| 書き込みリクエストに対して `fenced by a newer writer epoch` と `503` が返ります | 別のプロセスが同じ `[node].id` を使用して、同じデータセットにデータを公開しています。フェンシングされたプロセスはデータを公開できず、メモリに保持している行を破棄し、そのデータセットへの書き込みを拒否します。WAL はディスクに残ります。カウンター `intake_flush_errors_total` は、フェンシングを `writer_fenced` ステップとして記録します。 | 各プロセスに一意の `[node].id` を割り当て、フェンシングされたプロセスを再起動してください。[ロールベースのデプロイ](/ja/deployment/role-based)を参照してください。 |
+| スケジュールされた PDF または PNG レポートの生成に失敗します | Chrome がインストールされていないか、`[scheduled_reports.renderer].base_url` で指定したアドレスから Web UI にアクセスできません。 | Chromium を含むリリースイメージを使用し、ノードからアクセスできる Web UI のアドレスを `base_url` に設定してください。 |
+| オンボーディング用のスニペットに誤ったホストが表示されます | プロキシの背後で `http.external_url` が空のままになっています。 | `[http].external_url` に公開アドレスを設定し、再起動してください。 |
+| クエリに対して `no querier node is available` と `503` が返ります | `querier` ロールを持つノードから、直近のハートビートを受信していません。 | `querier` ノードを起動し、ルーターからそのノードの `advertise_addr` にアクセスできることを確認してください。[ロールベースのデプロイ](/ja/deployment/role-based#クラスターのメンバーシップ)を参照してください。 |
+| ルーター経由の書き込みリクエストに対して `no intake node is available` と `503` が返ります | `intake` ロールを持つノードから、直近のハートビートを受信していません。 | `intake` ノードを起動し、そのノードの `advertise_addr` を確認してください。[ロールベースのデプロイ](/ja/deployment/role-based#クラスターのメンバーシップ)を参照してください。 |
+| リクエストに対して `no metadata database connection` と `503` が返ります | ノードは PostgreSQL への接続を10秒間待ちましたが、接続を取得できませんでした。PostgreSQL に過剰な負荷がかかっているか、PostgreSQL に接続できないか、`[meta_database].max_connections` で設定した数の接続がすべて使用中です。 | リクエストを再試行してください。問題が続く場合は、まず PostgreSQL の負荷と接続可否を確認してください。PostgreSQL がアイドル状態の場合は、PostgreSQL の `max_connections` を超えない範囲で、負荷に合わせて `[meta_database].max_connections` を引き上げてください。 |
+| ホストから OTLP gRPC ポートにアクセスできません | Compose ファイルでポート `4317` を公開していません。 | `4317:4317` のマッピングを追加してください。 |

@@ -1,0 +1,123 @@
+---
+title: "クエリの実行"
+description: "組織のストリームに対して SQL または PromQL のクエリを実行します。"
+"en_link": "/en-US/api/query/execute"
+"zh-Hans_link": "/zh-Hans/api/query/execute"
+"zh-Hant_link": "/zh-Hant/api/query/execute"
+"ko_link": "/ko/api/query/execute"
+"de_link": "/de/api/query/execute"
+"es_link": "/es/api/query/execute"
+"fr_link": "/fr/api/query/execute"
+"pt-BR_link": "/pt-BR/api/query/execute"
+---
+
+```http
+POST /api/v1/query
+GET  /api/v1/query
+```
+
+クエリを実行して結果の行を返します。大規模なクエリの場合は、非同期検索ジョブを開始します。この呼び出しには `streams.query` 権限が必要です。システムテレメトリの場合は `sys.telemetry.read` 権限が必要です。
+
+**ボディ**
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `orgId` | string | はい | フィールドは必須ですが、値は無視します。認証済みの組織を使用します。 |
+| `language` | string | はい | `sql` または `promql` です。 |
+| `statement` | string | はい | クエリのテキストです。 |
+| `timeRange` | object | はい | `{ "start": <microseconds>, "end": <microseconds> }` です。 |
+| `stream` | object | SQL の場合 | `{ "name": "app", "streamType": "logs" }` で主テーブルを指定します。両方のフィールドが必須です。型は `logs`、`metrics`、`traces`、`profiles`、`extend` のいずれかです。 |
+| `limit` | integer | いいえ | 行数の上限です。PromQL の範囲クエリでは、上限に収まるように各系列を等間隔でサンプリングします。 |
+| `step` | integer | いいえ | PromQL 専用です。範囲クエリのステップをマイクロ秒で指定します。`step` を指定すると、`start` から `end` までの各ステップの値を系列ごとに返します。指定しない場合は `end` 時点の値を返します。1 系列あたりの上限は 11,000 ステップです。ステップ間隔が短すぎて上限を超える場合は `400` を返します。 |
+
+**GET のクエリ文字列**
+
+`GET /api/v1/query` では、同じクエリをクエリ文字列で指定できます。これにより、読み取りに使った URL をコピーして再度開けます。`POST` と同じ形式で応答し、同じヘッダーを適用します。必要な権限も同じです。URL に収まらない長さのクエリは `POST` で送信してください。サーバーの前段にあるプロキシが、8 KB を超えるリクエスト行を拒否することがあります。
+
+| パラメーター | 必須 | 備考 |
+|---|---|---|
+| `language` | はい | `sql` または `promql` です。 |
+| `statement` | はい | URL エンコードしたクエリのテキストです。 |
+| `start`, `end` | はい | 時間範囲をマイクロ秒で指定します。 |
+| `stream`, `streamType` | SQL の場合 | 主テーブルとその型をセットで指定します。 |
+| `limit` | いいえ | 行数の上限です。 |
+| `step` | いいえ | PromQL の範囲クエリのステップをマイクロ秒で指定します。 |
+
+**ヘッダーとクエリ文字列**
+
+| 名前 | 動作 |
+|---|---|
+| `Prefer: respond-async` | 検索ジョブを作成し、`202` を返します。ただし、`_audit` へのクエリはリクエスト内で実行します。 |
+| `Prefer: respond-sync` | 時間範囲が長い場合でも、リクエスト内で実行します。 |
+| `Accept: application/x-ndjson` | 行ごとに 1 つの JSON オブジェクトをストリーミングし、最後に `{"__meta__": ...}` レコードを返します。 |
+| `?clusters=local,remote` | フェデレーション検索にリモートクラスターを含めます。 |
+
+<RequestExample>
+```bash cURL
+NOW=$(date +%s)000000
+
+curl -X POST http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"timeRange\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
+       \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+```
+
+```bash cURL (GET)
+NOW=$(date +%s)000000
+
+curl -G http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'language=promql' \
+  --data-urlencode 'statement=sum(rate(http_requests_total[5m]))' \
+  --data-urlencode "start=$((NOW-3600000000))" \
+  --data-urlencode "end=$NOW" \
+  --data-urlencode 'step=60000000'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "columns": ["level", "n"],
+  "rows": [["error", 12], ["info", 40]],
+  "scannedRows": 10432,
+  "tookMs": 18
+}
+```
+</ResponseExample>
+
+PromQL の応答は、値ごとに 1 行を返します。範囲クエリは `_timestamp`（マイクロ秒）、`value`、各ラベルの列を返します。各系列の各ステップが 1 行に対応します。`step` を指定しないクエリは `value` と各ラベルの列を返します。各系列が 1 行に対応します。
+
+```json
+{
+  "columns": ["_timestamp", "value", "service.name"],
+  "rows": [[1761638400000000, 0.42, "checkout"], [1761638460000000, 0.40, "checkout"]],
+  "scannedRows": 2,
+  "tookMs": 6
+}
+```
+
+クエリの推定行数が `[querier].auto_async_threshold_rows` に達すると、`202` を返します。
+
+```json
+{
+  "jobId": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+しきい値とジョブのエンドポイントについては、[クエリ](/ja/query#時間範囲と非同期ジョブ)を参照してください。
+
+**エラー**
+
+| ステータス | 原因 |
+|---|---|
+| `400` | クエリの実行計画を作成できない、SQL に `stream` ヒントがない（`query.stream hint is required`）、PromQL の `step` が正の値でないか 1 系列あたり 11,000 ステップを超える、またはクエリが読み取る行数が `[querier].max_scan_rows` の上限を超えています。`GET` では、必須パラメーターがない場合や、`stream` を指定して `streamType` を指定していない場合も `400` を返します。 |
+| `503` | ロールを分離したクラスターで、稼働中の `querier` ノードがありません（`no querier node is available`）。 |
+| `403` | 組織内にストリームがない（`stream not found: <name>`）、トークンに `streams.query` 権限がない、またはクエリが `_audit` を読み取るときにトークンに `audit.read` 権限がありません。 |
+| `422` | `orgId` や `streamType` など、ボディのフィールドがないか、型が正しくありません。レスポンスはプレーンテキストです。 |
+| `429` | ワークグループのクエリがノードの実行枠を使い切り、このクエリが [`[search.admission].max_wait_secs`](/ja/configuration#クエリの受付制御) の間待機しても実行枠が空かなかったか、ワークグループがクラスター全体の上限に達しました。 |

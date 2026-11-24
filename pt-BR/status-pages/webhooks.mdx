@@ -1,0 +1,450 @@
+---
+title: "Assinaturas de webhook em páginas de status"
+description: "Cadastre um endpoint HTTPS para receber notificações de uma página de status pública. Veja como funciona a confirmação, o formato das requisições, os campos do payload, as novas tentativas e o cancelamento da assinatura."
+"en_link": "/en-US/status-pages/webhooks"
+"zh-Hans_link": "/zh-Hans/status-pages/webhooks"
+"zh-Hant_link": "/zh-Hant/status-pages/webhooks"
+"ja_link": "/ja/status-pages/webhooks"
+"ko_link": "/ko/status-pages/webhooks"
+"de_link": "/de/status-pages/webhooks"
+"es_link": "/es/status-pages/webhooks"
+"fr_link": "/fr/status-pages/webhooks"
+---
+
+Uma assinatura por webhook envia cada alteração publicada em uma página de status pública para um endpoint HTTPS como
+uma solicitação `POST` em JSON. Use a assinatura para espelhar o status de um serviço em uma sala de chat, um sistema de
+chamados ou um painel de status interno.
+
+Leia primeiro [Páginas de status](/pt-BR/status-pages) para conhecer os componentes, os incidentes, a manutenção e a
+tela de gerenciamento de assinantes.
+
+## Como funciona uma assinatura
+
+<Steps>
+  <Step title="Cadastre o endpoint">
+    Envie a URL do endpoint pela página pública ou pela API. A assinatura começa com o status
+    pendente.
+  </Step>
+  <Step title="Receba a solicitação de confirmação">
+    O MoleSignal envia uma solicitação `status_page_subscription_confirmation` ao endpoint. O
+    endpoint deve responder com um código de status 2xx. Caso contrário, o cadastro falha.
+  </Step>
+  <Step title="Confirme com o token">
+    Abra a `confirmUrl` da solicitação ou envie o `token` ao endpoint de confirmação. A
+    assinatura fica ativa.
+  </Step>
+  <Step title="Receba atualizações">
+    O MoleSignal envia uma solicitação para cada alteração publicada após a confirmação. Alterações publicadas
+    antes da confirmação não geram solicitações.
+  </Step>
+</Steps>
+
+## Requisitos do endpoint
+
+| Requisito | Regra |
+|---|---|
+| Visibilidade da página | Apenas páginas públicas. Páginas privadas aceitam apenas assinaturas com e-mail verificado. |
+| Esquema | Apenas `https`. |
+| Credenciais | A URL não pode conter nome de usuário nem senha. |
+| Host | O MoleSignal rejeita `localhost`, `*.localhost` e `*.local`. O host deve resolver para um endereço IP público. O MoleSignal rejeita faixas privadas, de loopback, de link-local, de NAT em escala de operadora e de documentação. |
+| Comprimento | De 3 a 2048 caracteres, sem caracteres de controle. |
+| Resposta | Qualquer código de status 2xx em até 10 segundos. O MoleSignal não segue redirecionamentos, então uma resposta 3xx conta como falha. |
+
+O MoleSignal resolve o host novamente a cada envio e aplica sempre as mesmas regras de
+endereço.
+
+## Inscrever-se
+
+Na página pública, selecione **Inscrever-se**, defina **Canal de envio** como **Webhook**, informe a
+URL do endpoint e selecione **Enviar confirmação**.
+
+Pela API, envie a solicitação à origem que serve a página de status:
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<slug>/subscriptions" \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "webhook", "target": "https://hooks.example.com/status"}'
+```
+
+Para receber atualizações apenas de alguns componentes, adicione `componentIds` com o `id` de cada componente, conforme a
+lista da página pública em `GET /api/v1/public/status-pages/<slug>`. Omita esse campo ou envie uma lista
+vazia para assinar a página inteira. Não selecione o grupo como componente: indique os componentes que fazem parte dele.
+
+A chamada não exige autenticação. Um cadastro bem-sucedido retorna `202 Accepted`:
+
+```json
+{
+  "accepted": true,
+  "confirmationRequired": true
+}
+```
+
+| Caso | Resultado |
+|---|---|
+| Novo endpoint | O MoleSignal envia a solicitação de confirmação. |
+| Endpoint já ativo | A chamada retorna `202` e o MoleSignal envia uma solicitação `status_page_subscription_manage`. Os componentes selecionados e o token não mudam. |
+| Endpoint que recebeu uma solicitação de confirmação há menos de 10 minutos | A chamada retorna `202` e o MoleSignal não envia outra solicitação de confirmação. |
+| Endpoint com assinatura pendente ou cancelada após esses 10 minutos | O MoleSignal envia uma nova solicitação de confirmação com um novo token. Os tokens anteriores deixam de funcionar. |
+| Solicitação de confirmação sem resposta 2xx | A chamada falha com `503` e o código de erro `unavailable`. Cadastre o endpoint novamente após corrigir o problema. |
+| URL que não atende a um requisito do endpoint | A chamada falha com `400` e o código de erro `invalid_argument`. |
+| Página com 10.000 assinantes pendentes ou ativos | A chamada falha com `429` e o código de erro `resource_exhausted`. |
+
+<Note>
+  O MoleSignal usa `http.external_url` para gerar os links da assinatura ou usa o domínio personalizado da página quando
+  há um ativo. O cadastro falha com `503` enquanto `http.external_url` estiver vazio.
+</Note>
+
+## Formato da solicitação
+
+Todas as solicitações ao endpoint seguem o mesmo formato.
+
+| Propriedade | Valor |
+|---|---|
+| Método | `POST` |
+| `Content-Type` | `application/json` |
+| `User-Agent` | `MoleSignal-Status-Page/1.0` |
+| Corpo | Um objeto JSON. O campo `type` identifica o tipo de payload. |
+| Tempo limite | 10 segundos |
+| Sucesso | Qualquer código de status 2xx. O MoleSignal ignora o corpo da resposta. |
+
+As solicitações não incluem um cabeçalho de assinatura. Para identificar solicitações legítimas, inclua um valor difícil de adivinhar no
+caminho ou na string de consulta da URL cadastrada e rejeite solicitações sem esse valor. A
+tela de gerenciamento mostra apenas o esquema e o host do destino do webhook, como em
+`https://hooks.example.com/***`.
+
+Encaminhe as solicitações com base em `type`. Ignore campos e valores de `type` desconhecidos para que o endpoint continue funcionando
+quando o payload passar a incluir um novo campo.
+
+## Solicitação de confirmação
+
+O MoleSignal envia este payload uma vez por cadastro:
+
+```json
+{
+  "type": "status_page_subscription_confirmation",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "confirmUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=confirm&subscriptionToken=<token>",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>",
+  "components": ["Public API"],
+  "token": "<token>"
+}
+```
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `type` | string | Sempre `status_page_subscription_confirmation`. |
+| `pageName` | string | Nome da página de status. |
+| `pageSlug` | string | Slug da página de status. Use esse valor nos caminhos da API abaixo. |
+| `confirmUrl` | string | Endereço da página. Abra no navegador para confirmar a assinatura. |
+| `manageUrl` | string | Endereço da página **Gerenciar assinatura**, onde é possível alterar os componentes. |
+| `unsubscribeUrl` | string | Endereço da página. Abra no navegador para cancelar a assinatura. |
+| `components` | array de strings | Nomes dos componentes cobertos pela assinatura. Array vazio para a página inteira. |
+| `token` | string | Token da assinatura. Use o token para confirmar a assinatura e, mais tarde, para cancelá-la. |
+
+Confirme a assinatura abrindo a `confirmUrl` ou enviando o token:
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/confirm" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+Quando a confirmação é bem-sucedida, a chamada retorna `200 OK`:
+
+```json
+{
+  "accepted": true,
+  "confirmationRequired": false
+}
+```
+
+Se o token for desconhecido, tiver sido substituído em um cadastro posterior ou já tiver sido usado para cancelar a assinatura, a chamada retorna
+`400` com o código de erro `invalid_argument`.
+
+<Warning>
+  Guarde o token. Os payloads de atualização não incluem o token, e ele é a única credencial que permite
+  ao responsável pelo endpoint cancelar a assinatura.
+</Warning>
+
+## Solicitação de gerenciamento
+
+Ao cadastrar novamente um endpoint já ativo, o MoleSignal envia a esse endpoint o link para
+gerenciar a assinatura em vez de uma nova confirmação, no máximo uma vez a cada 10 minutos:
+
+```json
+{
+  "type": "status_page_subscription_manage",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>",
+  "components": [],
+  "token": "<token>"
+}
+```
+
+Os campos são os mesmos da solicitação de confirmação, exceto `confirmUrl`.
+
+## Payloads de atualização
+
+Todos os registros de data e hora são números inteiros em microssegundos desde a época Unix, em UTC. Os nomes dos componentes, os títulos dos incidentes
+e as mensagens seguem exatamente o texto da equipe responsável pela página, sem tradução.
+
+Uma assinatura com componentes selecionados recebe apenas as atualizações que mencionam pelo menos um deles. Uma atualização
+publicada com **Notificar assinantes** desativado não gera nenhum envio. Todo payload de atualização também inclui os links
+da assinatura:
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `manageUrl` | string | Endereço da página que abre **Gerenciar assinatura**. |
+| `unsubscribeUrl` | string | Endereço da página que cancela a assinatura. |
+
+### Atualizações de incidentes e manutenções
+
+O MoleSignal envia `incident_update` a cada publicação de uma atualização de incidente ou manutenção.
+A manutenção planejada usa o mesmo payload, com `incidentKind` definido como `maintenance`. Rascunhos não geram
+nenhum envio.
+
+| Evento | Quando o MoleSignal envia a solicitação | `status` |
+|---|---|---|
+| Incidente | Na publicação do incidente. | O status selecionado na publicação, geralmente `investigating`. |
+| Incidente | A cada atualização posterior. | `investigating`, `identified`, `in_progress` ou `monitoring`. |
+| Incidente | Na resolução do incidente. | `resolved` |
+| Manutenção | Na publicação da manutenção. | Geralmente `scheduled`. |
+| Manutenção | Quando a equipe edita o título, o horário planejado, os componentes ou a mensagem da manutenção agendada. | `scheduled` |
+| Manutenção | Quando a manutenção começa, seja automaticamente no horário planejado ou quando a equipe a marca como iniciada. | `in_progress` |
+| Manutenção | Quando a equipe conclui ou cancela a manutenção. | `completed` ou `cancelled` |
+
+Uma atualização de incidente:
+
+```json
+{
+  "type": "incident_update",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "incidentKind": "incident",
+  "title": "Elevated error rates on the public API",
+  "impact": "major",
+  "status": "identified",
+  "message": "A configuration change to the edge proxies is rejecting a share of requests. The change is being rolled back.",
+  "occurredAt": 1779529680000000,
+  "nextUpdateAt": 1779531480000000,
+  "startedAt": 1779529260000000,
+  "endedAt": null,
+  "componentNames": ["Public API", "Web dashboard"]
+}
+```
+
+Um anúncio de manutenção:
+
+```json
+{
+  "type": "incident_update",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "incidentKind": "maintenance",
+  "title": "Database upgrade in the EU region",
+  "impact": "maintenance",
+  "status": "scheduled",
+  "message": "The primary database of the EU region is upgraded on May 25 from 10:00 to 10:30 UTC. Writes can take a few seconds longer during the switch-over.",
+  "occurredAt": 1779443280000000,
+  "nextUpdateAt": null,
+  "startedAt": 1779703200000000,
+  "endedAt": null,
+  "componentNames": ["EU region"]
+}
+```
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `type` | string | Sempre `incident_update`. |
+| `pageName` | string | Nome da página de status. |
+| `pageSlug` | string | Slug da página de status. |
+| `incidentId` | string | Identificador do incidente ou da manutenção. Permanece o mesmo em todas as atualizações. |
+| `incidentKind` | string | `incident` para um evento não planejado, `maintenance` para uma manutenção planejada. |
+| `title` | string | Título do incidente ou da manutenção no momento da publicação da atualização. |
+| `impact` | string | `minor`, `major` ou `critical` para um incidente. `maintenance` para uma manutenção planejada. |
+| `status` | string | Status definido pela atualização. Consulte a tabela abaixo. |
+| `message` | string | Texto da atualização. |
+| `occurredAt` | inteiro | Horário da publicação da atualização. |
+| `nextUpdateAt` | inteiro ou nulo | Prazo informado para a próxima atualização. `null` se a atualização não informar um prazo. |
+| `startedAt` | inteiro | Horário planejado para o início da manutenção ou horário de início do incidente. |
+| `endedAt` | inteiro ou nulo | Horário da resolução do incidente ou da conclusão ou do cancelamento da manutenção. Até lá, o valor é `null`. |
+| `componentNames` | array de strings | Nomes dos componentes afetados que a página exibe, na ordem em que aparecem. Não inclui componentes ocultos nem arquivados. Fica vazio se não houver componentes a listar. |
+
+| `incidentKind` | Valores de `status` | Status final |
+|---|---|---|
+| `incident` | `investigating`, `identified`, `in_progress`, `monitoring`, `resolved` | `resolved` |
+| `maintenance` | `scheduled`, `in_progress`, `completed`, `cancelled` | `completed` ou `cancelled` |
+
+Em todas as atualizações de manutenção, `startedAt` indica o horário planejado para o início. Esse valor muda quando a equipe
+reagenda a manutenção. Após o início da manutenção, o campo mantém o horário planejado. O horário real de
+início é o valor de `occurredAt` na atualização `in_progress`. A manutenção não tem horário de término planejado, então
+`endedAt` permanece `null` até a conclusão ou o cancelamento da manutenção.
+
+<Note>
+  Com o início automático ativado por padrão, o MoleSignal publica a atualização `in_progress` no
+  horário planejado para o início e a envia como `incident_update`. Com o início automático desativado, o MoleSignal não envia nada
+  nesse horário: só envia a próxima solicitação quando a equipe publica a próxima atualização.
+</Note>
+
+### Lembretes de manutenção
+
+O MoleSignal envia `maintenance_reminder` antes do início da manutenção agendada. A configuração de cada manutenção define
+a antecedência do lembrete, que por padrão é de 60 minutos. Um lembrete não é uma atualização e não aparece
+na linha do tempo da manutenção.
+
+```json
+{
+  "type": "maintenance_reminder",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "title": "Database upgrade in the EU region",
+  "occurredAt": 1779699600000000,
+  "startedAt": 1779703200000000,
+  "componentNames": ["EU region"]
+}
+```
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `type` | string | Sempre `maintenance_reminder`. |
+| `pageName` | string | Nome da página de status. |
+| `pageSlug` | string | Slug da página de status. |
+| `incidentId` | string | Identificador da manutenção. É o mesmo dos payloads `incident_update` dessa manutenção. |
+| `title` | string | Título da manutenção no momento do envio do lembrete. |
+| `occurredAt` | inteiro | Horário do envio do lembrete. |
+| `startedAt` | inteiro | Horário planejado para o início da manutenção. |
+| `componentNames` | array de strings | Nomes dos componentes afetados que a página exibe, na ordem em que aparecem. Não inclui componentes ocultos nem arquivados. |
+
+O MoleSignal envia um lembrete por horário de início planejado. Se a equipe reagendar a manutenção, o MoleSignal envia outro lembrete
+antes do novo horário de início. O MoleSignal não envia lembrete se a equipe anunciar ou reagendar a manutenção
+depois do horário de envio do lembrete, se a antecedência for `0` ou se a manutenção não estiver mais com o status `scheduled`.
+
+### Alterações de status dos componentes
+
+O MoleSignal envia `component_status_changed` quando muda o status de um componente que a página
+exibe. O status inicial de um componente não gera nenhum envio. Componentes ocultos ou arquivados também não geram
+envios.
+
+```json
+{
+  "type": "component_status_changed",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "componentId": "2xZqD1hWk9TfM5vBn7QsR3yLgUe",
+  "componentName": "Public API",
+  "status": "degraded_performance",
+  "occurredAt": 1779529440000000
+}
+```
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `type` | string | Sempre `component_status_changed`. |
+| `pageName` | string | Nome da página de status. |
+| `pageSlug` | string | Slug da página de status. |
+| `componentId` | string | Identificador do componente. Permanece o mesmo quando o nome do componente muda. |
+| `componentName` | string | Nome do componente no momento da alteração de status. |
+| `status` | string | Novo status: `operational`, `degraded_performance`, `partial_outage`, `major_outage` ou `maintenance`. |
+| `occurredAt` | inteiro | Horário em que o novo status entrou em vigor. |
+
+O MoleSignal não envia `component_status_changed` para os componentes afetados por um incidente. O payload
+`incident_update` lista esses componentes em `componentNames`.
+
+<Note>
+  Se um componente estiver oculto no momento da publicação de uma alteração, o MoleSignal não informa seu nome aos assinantes. As alterações de status
+  desse componente não geram envios, e o payload `incident_update` não o inclui em `componentNames`. Se um incidente ou
+  uma manutenção afetar apenas componentes ocultos, o MoleSignal ainda envia a atualização, com `componentNames` vazio.
+  Ocultar ou exibir um componente não gera nenhum envio por si só.
+</Note>
+
+### Post-mortems
+
+O MoleSignal envia `postmortem_published` quando a equipe publica o post-mortem de um incidente resolvido ou
+uma revisão desse post-mortem com **Notificar assinantes** ativado.
+
+```json
+{
+  "type": "postmortem_published",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "title": "Elevated error rates on the public API",
+  "impact": "major",
+  "revision": false,
+  "occurredAt": 1779616080000000,
+  "startedAt": 1779529260000000,
+  "endedAt": 1779533520000000,
+  "componentNames": ["Public API"],
+  "postmortem": "## What happened\n\nA configuration change to the edge proxies rejected a share of requests.",
+  "incidentUrl": "https://status.example.com/status/acme-cloud/incidents/2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>"
+}
+```
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `type` | string | Sempre `postmortem_published`. |
+| `incidentId` | string | Identificador do incidente, igual ao dos payloads `incident_update` desse incidente. |
+| `title` | string | Título do incidente. |
+| `impact` | string | `minor`, `major` ou `critical`. |
+| `revision` | booleano | `true` quando um texto revisado substitui um texto já publicado. |
+| `occurredAt` | inteiro | Horário da publicação do post-mortem. |
+| `postmortem` | string | Texto do post-mortem em Markdown, sem alterações. |
+| `incidentUrl` | string | Endereço do incidente na página pública. |
+
+Os campos `pageName`, `pageSlug`, `startedAt`, `endedAt` e `componentNames` seguem as mesmas definições de `incident_update`.
+
+## Entrega e novas tentativas
+
+| Comportamento | Detalhe |
+|---|---|
+| Latência | A entrega normalmente começa em até 30 segundos após a alteração. |
+| Tentativas | Até 5 por atualização. |
+| Intervalos entre tentativas | Após cada falha, aguarde, nesta ordem, 1 minuto, 5 minutos, 30 minutos e 2 horas. |
+| Falha | Qualquer resposta que não seja um status 2xx em até 10 segundos, inclusive um redirecionamento. |
+| Fim das tentativas | Após a quinta falha, o MoleSignal marca a entrega como malsucedida e não tenta enviá-la novamente. |
+| Garantia | Pelo menos uma vez. Uma entrega pode chegar mais de uma vez e fora de ordem. |
+
+Cada nova tentativa de entrega usa o mesmo corpo. Os payloads não incluem um identificador de entrega, então elimine duplicatas usando
+`type`, `incidentId` ou `componentId`, e `occurredAt`. Ordene as atualizações de um incidente por
+`occurredAt`.
+
+O MoleSignal deixa de enfileirar atualizações para o endpoint quando a assinatura termina, quando alguém arquiva a página ou
+quando alguém torna a página privada.
+
+Consulte cada entrega em **Páginas de status → Assinantes → Entregas**, com suas
+tentativas, seu estado e o último erro. O MoleSignal remove os registros de entregas bem-sucedidas e malsucedidas após o prazo de
+retenção de entregas da página: 30, 60, 90, 180 ou 365 dias.
+
+## Cancelar assinatura
+
+Abra a URL `unsubscribeUrl` da solicitação de confirmação ou envie o token:
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/unsubscribe" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+A chamada retorna `200 OK` com `"accepted": true`. O MoleSignal cancela as entregas que ainda aguardam
+envio ao endpoint.
+
+Com a permissão `status_pages.subscribers.manage`, também é possível cancelar uma assinatura em **Páginas de status → Assinantes**,
+ou selecionar **Reenviar confirmação** para uma assinatura pendente. O reenvio gera um novo token.
+
+<CardGroup cols={2}>
+  <Card title="Páginas de status" icon="signal" href="/pt-BR/status-pages">
+    Crie páginas, publique incidentes e manutenções e gerencie assinantes.
+  </Card>
+  <Card title="Conectores de notificação por webhook" icon="webhook" href="/pt-BR/notification-channels/webhooks">
+    Envie notificações de alerta para Slack, Lark ou um webhook genérico.
+  </Card>
+</CardGroup>

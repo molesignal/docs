@@ -1,0 +1,144 @@
+---
+title: "ログイン API"
+sidebarTitle: "ログイン"
+description: "メールアドレスとパスワードでブラウザーセッションを開始します。"
+"en_link": "/en-US/api/auth/login"
+"zh-Hans_link": "/zh-Hans/api/auth/login"
+"zh-Hant_link": "/zh-Hant/api/auth/login"
+"ko_link": "/ko/api/auth/login"
+"de_link": "/de/api/auth/login"
+"es_link": "/es/api/auth/login"
+"fr_link": "/fr/api/auth/login"
+"pt-BR_link": "/pt-BR/api/auth/login"
+---
+
+```http
+POST /api/v1/auth/signin
+```
+
+Web UIのセッションを開始します。このルートは**認証不要**です。レスポンスはセッションクッキーを設定し、サインインしたユーザーの情報を `login` に格納して返します。レスポンスボディにはトークンを含めません。多要素認証を設定したアカウントについては、[2番目のステップ](#2番目のステップ)を参照してください。
+
+**ボディ**
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `email` | string | はい | |
+| `password` | string | はい | |
+| `remember` | boolean | いいえ | ブラウザーを閉じた後もセッションを維持します。デフォルトは `false` です。 |
+
+<RequestExample>
+```bash cURL
+curl -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+  -H 'content-type: application/json' \
+  -d '{"email":"admin@example.com","password":"admin"}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "login": {
+    "userId": "<user-id>",
+    "email": "admin@example.com",
+    "displayName": "root",
+    "orgId": "<organization-id>",
+    "orgName": "default",
+    "displayRole": "Owner",
+    "roles": [
+      {
+        "id": "<role-id>",
+        "key": "owner",
+        "name": "Owner",
+        "builtin": true
+      }
+    ],
+    "scope": "organization"
+  }
+}
+```
+</ResponseExample>
+
+サインイン時は、ユーザーが所属する組織のうち、サインインを許可する最初の組織を選択します。プログラムからアクセスする場合は、代わりに `Authorization` ヘッダーでAPIトークンを送信します。このヘッダーではセッショントークンを受け付けません。[APIトークンの発行](/ja/api/auth/issue-token)を参照してください。
+
+## サインインの失敗回数が上限を超えた場合
+
+パスワード認証の失敗回数が上限を超えると、秒単位の待ち時間を示す `Retry-After` ヘッダーとコード `signin_limited` を含む `429` を返します。アカウントが存在するかどうかにかかわらず、同じメッセージを返します。このとき、パスワードは検証しません。パスワードが誤っているかアカウントが存在しない場合は `401` を返します。パスワードが正しくても、アカウントが無効または保留中の場合は、理由とともに `403` を返します。[サインインの制限](/ja/settings/platform#サインイン制限)を参照してください。
+
+```json
+{
+  "error": "resource_exhausted",
+  "code": "signin_limited",
+  "message": "too many failed password attempts; try again in 14 minutes"
+}
+```
+
+## 2番目のステップ
+
+[多要素認証](/ja/identity/mfa)を設定したアカウントでは、パスワードだけではクッキーを設定しません。レスポンスは `login` の代わりに `mfa` を返し、サインインの完了に使える方法を示します。
+
+```json
+{
+  "mfa": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp", "recovery_code"],
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| エンドポイント | 用途 |
+|---|---|
+| `POST /api/v1/auth/signin/verify` | サインインを完了します。`challenge` に加えて、`method` に `totp` または `recovery_code` を指定して `code` を渡すか、`method` に `passkey` を指定して `ceremony` と `credential` を渡します。セッションクッキーとともに `{"login": …}` を返します。リカバリーコードを使った場合は `recoveryCodesLeft` も返します。 |
+| `POST /api/v1/auth/signin/verify/passkey` | `challenge` を受け取り、パスキーの検証に必要な `ceremony` と `options` を返します。`options` は `navigator.credentials.get()` に渡します。検証結果とともに `ceremony` を送り返します。`ceremony` は一度だけ使用できます。 |
+
+## サインイン時の第2要素の設定
+
+組織が[多要素認証を必須にしている](/ja/identity/sso#サインイン要件)場合、アカウントに第2要素がまだ設定されていなければ、レスポンスは `login` の代わりに `enroll` を返します。
+
+```json
+{
+  "enroll": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp"],
+    "organizationName": "default",
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| エンドポイント | 用途 |
+|---|---|
+| `POST /api/v1/auth/signin/enroll/totp` | `challenge` を受け取り、`setup`、`secret`、`otpauthUrl`、`qrSvg`、`expiresAt` を返します。 |
+| `POST /api/v1/auth/signin/enroll/totp/confirm` | `challenge`、`setup`、`code` を受け取ります。セッションクッキーとともに `{"login": …, "recoveryCodes": […]}` を返します。 |
+| `POST /api/v1/auth/signin/enroll/passkey/options` | `challenge` を受け取り、`navigator.credentials.create()` で使用する `ceremony` と `options` を返します。 |
+| `POST /api/v1/auth/signin/enroll/passkey` | `challenge`、`ceremony`、`credential` と、任意で `name` を受け取ります。セッションクッキーとともに `{"login": …, "recoveryCodes": […]}` を返します。 |
+
+組織が[シングルサインオンのみを許可している](/ja/identity/sso#サインイン要件)場合、パスワードでのサインインには `403` を返します。アカウントが複数の組織に所属している場合は、サインインを許可する最初の組織を選択します。
+
+## パスキーでのサインイン
+
+[パスキー](/ja/identity/mfa#パスワードを使わずにパスキーでサインインする)を使うと、パスワードも2番目のステップも不要です。
+
+| エンドポイント | 用途 |
+|---|---|
+| `POST /api/v1/auth/signin/passkey/options` | `ceremony` と `options` を返します。インスタンスの `[http].external_url` をパスキーの[リライングパーティ](/ja/identity/mfa#インスタンスの要件)として使用できない場合は `400` を返します。 |
+| `POST /api/v1/auth/signin/passkey` | `ceremony`、`credential` と、任意で `remember` を受け取ります。セッションクッキーとともに `{"login": …}` を返します。 |
+
+## セッションクッキー
+
+| クッキー | パス | 内容 | 有効期間 |
+|---|---|---|---|
+| `accessToken` | `/api` | アクセストークンです。すべてのAPIリクエストに含めて送信します。 | 15分です。`POST /api/v1/auth/refresh` で更新します。 |
+| `refreshToken` | `/api/v1/auth` | リフレッシュトークンです。アクセストークンの更新にのみ使用します。 | セッションが終了するまでです。サインインから `[auth].session_ttl_secs` が経過すると終了します。デフォルトは24時間です。 |
+
+両方のクッキーに `HttpOnly` と `SameSite=Strict` を設定します。ブラウザーがHTTPSでMoleSignalにアクセスする場合は、`Secure` も設定します。`remember` を有効にしない場合、ブラウザーは終了時にクッキーを破棄します。両方のトークンは署名付きJWTです。サーバーはトークンを保存せず、それぞれの署名、用途、有効期限を検証します。ユーザーを無効化または削除すると、次のリクエストでセッションを終了します。
+
+## セッションのエンドポイント
+
+| エンドポイント | 用途 |
+|---|---|
+| `POST /api/v1/auth/refresh` | リフレッシュトークンから新しいアクセストークンを発行し、新しい `accessToken` クッキーとともに `204` を返します。セッションの有効期限は変わりません。セッションの期限切れ、ユーザーの無効化、クッキーの欠落のいずれかに該当する場合は、`401` を返し、両方のクッキーを削除します。 |
+| `GET /api/v1/auth/session` | 現在のセッションのユーザー情報を、サインインレスポンスの `login` と同じ形式で返します。 |
+| `POST /api/v1/auth/signout` | 両方のクッキーを削除し、`204` を返します。 |
+
+セッションクッキーを使ってデータを変更するリクエストは、MoleSignalのページから送信する必要があります。ブラウザーからのリクエストで `Sec-Fetch-Site` の値が `same-origin` 以外の場合は、`403` を返します。

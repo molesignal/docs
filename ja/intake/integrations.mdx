@@ -1,0 +1,216 @@
+---
+title: "インテグレーションガイド"
+description: "OpenTelemetry Collector、OpenTelemetry SDK、Vector、Fluent Bit、Prometheus からテレメトリを送信します。"
+"en_link": "/en-US/intake/integrations"
+"zh-Hans_link": "/zh-Hans/intake/integrations"
+"zh-Hant_link": "/zh-Hant/intake/integrations"
+"ko_link": "/ko/intake/integrations"
+"de_link": "/de/intake/integrations"
+"es_link": "/es/intake/integrations"
+"fr_link": "/fr/intake/integrations"
+"pt-BR_link": "/pt-BR/intake/integrations"
+---
+
+このガイドでは、よく使われる送信元の設定を説明します。**データソース**ページでは、実際のエンドポイントとトークンを入力済みの同じ設定を生成できます。このページは、ここで紹介する以外のプラットフォームにも対応します。[データソース](/ja/intake)を参照してください。
+
+`molesignal.example.com` をデプロイ先のアドレスに、`MS_TOKEN` を[取り込みトークン](/ja/intake#取り込みトークン)に置き換えます。Docker Compose のサンドボックスでは `http://localhost:5080` を使用します。
+
+## OpenTelemetry Collector
+
+Collector の `otlphttp` エクスポーターは、`endpoint` をベース URL として扱い、`/v1/logs`、`/v1/metrics`、`/v1/traces` を付加します。リクエストが `/api/v1/logs`、`/api/v1/metrics`、`/api/v1/traces` に届くように、`endpoint` に `/api` パスを指定します。
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+processors:
+  batch:
+    send_batch_size: 500
+    send_batch_max_size: 500
+
+exporters:
+  otlphttp/molesignal:
+    endpoint: https://molesignal.example.com/api
+    compression: none
+    headers:
+      authorization: "Bearer ${env:MS_TOKEN}"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/molesignal]
+```
+
+<Warning>
+  `compression: none` のままにしてください。`otlphttp` エクスポーターはデフォルトで gzip 圧縮を行いますが、HTTP 経由の OTLP では圧縮されたリクエストボディを `400` で拒否します。リクエストボディが 2 MiB を超えると `413` で拒否されるため、レコードのサイズに応じて `send_batch_max_size` を十分に小さく設定します。エクスポーターのログに `413` が出たら、この値を下げてください。
+</Warning>
+
+gRPC で送信するには、`otlp` エクスポーターを使用します。ポート `4317` は TLS なしの gRPC を受け付けるため、プロキシで TLS を終端する場合を除き、`tls.insecure: true` を設定します。
+
+```yaml
+exporters:
+  otlp/molesignal:
+    endpoint: molesignal.example.com:4317
+    tls:
+      insecure: true
+    headers:
+      authorization: "Bearer ${env:MS_TOKEN}"
+```
+
+`default` 以外のストリームに書き込むには、`headers` に `stream-name: <stream>` を追加します。このヘッダーは、そのエクスポーターを使用するすべてのシグナルに適用されます。シグナルごとに異なるストリームが必要な場合は、ストリームごとにエクスポーターを 1 つ定義します。
+
+## OpenTelemetry SDK
+
+すべての OpenTelemetry SDK は標準の環境変数を読み取ります。`OTEL_EXPORTER_OTLP_ENDPOINT` に `/api` パスを指定し、OTLP を HTTP 経由で送信します。
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://molesignal.example.com/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer ${MS_TOKEN}"
+export OTEL_SERVICE_NAME=checkout
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment=production
+```
+
+SDK のエクスポーターはデフォルトでは圧縮しません。`OTEL_EXPORTER_OTLP_COMPRESSION` は未設定のままにするか、`none` に設定します。
+
+<Tabs>
+  <Tab title="Python">
+    ```bash
+    pip install opentelemetry-distro opentelemetry-exporter-otlp
+    opentelemetry-bootstrap -a install
+
+    opentelemetry-instrument python app.py
+    ```
+  </Tab>
+  <Tab title="Node.js">
+    ```bash
+    npm i @opentelemetry/api @opentelemetry/auto-instrumentations-node
+
+    NODE_OPTIONS="--require @opentelemetry/auto-instrumentations-node/register" node server.js
+    ```
+  </Tab>
+  <Tab title="Java">
+    ```bash
+    java -javaagent:opentelemetry-javaagent.jar \
+      -Dotel.service.name=checkout \
+      -Dotel.exporter.otlp.protocol=http/protobuf \
+      -Dotel.exporter.otlp.endpoint=https://molesignal.example.com/api \
+      -Dotel.exporter.otlp.headers="authorization=Bearer ${MS_TOKEN}" \
+      -jar app.jar
+    ```
+  </Tab>
+  <Tab title="Go">
+    Go のトレースエクスポーターには、シグナルの完全な URL を指定します。
+
+    ```go
+    exp, _ := otlptracehttp.New(ctx,
+      otlptracehttp.WithEndpointURL("https://molesignal.example.com/api/v1/traces"),
+      otlptracehttp.WithHeaders(map[string]string{"authorization": "Bearer " + token}),
+    )
+    tp := trace.NewTracerProvider(trace.WithBatcher(exp))
+    otel.SetTracerProvider(tp)
+    ```
+  </Tab>
+</Tabs>
+
+## Vector
+
+`http` シンクを使用して、ネイティブの HTTP JSON 取り込みエンドポイントにログを送信します。`_timestamp` フィールドがないイベントには、サーバーが受け付けた時刻を設定します。
+
+```yaml
+sources:
+  host_journald:
+    type: journald
+    current_boot_only: true
+
+sinks:
+  molesignal_logs:
+    type: http
+    inputs: [host_journald]
+    uri: https://molesignal.example.com/api/v1/intake/logs/default
+    encoding: { codec: json }
+    auth: { strategy: bearer, token: "${MS_TOKEN}" }
+```
+
+## Fluent Bit
+
+`http` 出力を使用し、形式に JSON を指定します。
+
+```ini
+[INPUT]
+    Name        tail
+    Path        /var/log/nginx/access.log
+    Parser      nginx
+    Tag         nginx.access
+
+[OUTPUT]
+    Name        http
+    Match       nginx.*
+    Host        molesignal.example.com
+    Port        443
+    URI         /api/v1/intake/logs/default
+    Format      json
+    Header      Authorization Bearer ${MS_TOKEN}
+    tls         On
+```
+
+Docker Compose のサンドボックスでは、`Port` を `5080` に、`tls` を `Off` に設定します。
+
+### Kubernetes
+
+`/var/log/containers` に追記されるログを読み取る DaemonSet として Fluent Bit を実行します。**データソース → Kubernetes** を開くと、エンドポイントとトークンを入力済みの完全なマニフェストを取得できます。Fluent Bit の設定の出力セクションでは、上記と同じ `http` 出力に `Match kube.*` を指定します。
+
+## Prometheus
+
+MoleSignal をリモート書き込み先として追加します。書き込み先を評価している間も、Prometheus でスクレイピングとローカル保存を続けます。
+
+```yaml
+remote_write:
+  - url: https://molesignal.example.com/api/v1/prometheus/api/v1/write
+    authorization:
+      credentials: "${MS_TOKEN}"
+```
+
+サンプルは `stream-name` ヘッダーで指定したメトリクスストリームに送信されます。ヘッダーがない場合は `default` に送信されます。Prometheus サーバーごとにストリームを分けるには、`remote_write` エントリに `headers: { stream-name: <source> }` を追加します。メトリクス名を指定し、PromQL でデータをクエリします。対応する関数については、[PromQL 対応表](/ja/query/promql-subset)を参照してください。
+
+## スクリプトとカスタム送信元
+
+`curl` または任意の HTTP クライアントで、JSON レコードの配列を送信します。
+
+```bash
+curl -X POST https://molesignal.example.com/api/v1/intake/logs/app \
+  -H "authorization: Bearer ${MS_TOKEN}" \
+  -H 'content-type: application/json' \
+  -d '[{"level":"info","service":"billing","msg":"invoice created"}]'
+```
+
+リクエストが上限の 16 MiB 未満になるように、レコードをバッチに分けて送信します。`Content-Encoding: gzip` を指定した場合は、展開後のボディサイズで判定します。元のイベント時刻を保持する必要がある場合は、`_timestamp` をマイクロ秒単位で送信します。
+
+## データを確認する
+
+1. **ストリーム**を開き、ストリーム名、タイプ、最終受信時刻を確認します。
+2. **ログ**、**メトリクス**、**トレース**のいずれかを開き、ストリームを選択します。
+
+データが届かない場合は、送信元のログに `401`（トークンがない、または期限切れ）、`403`（トークンに `logs.write` 権限がない）、`400`（OTLP リクエストボディが圧縮されている）、`413`（リクエストボディがエンドポイントの上限を超えている）がないか確認します。[トラブルシューティング](/ja/troubleshooting)を参照してください。
+
+## 別のスタックから移行する
+
+| 移行元 | 引き継げるもの |
+|---|---|
+| Prometheus | Prometheus を引き続き使用し、`remote_write` の書き込み先を追加します。MoleSignal は PromQL の一部にのみ対応するため、アラートルールを移行する前に[対応表](/ja/query/promql-subset)を確認してください。 |
+| Grafana | Grafana を引き続き使用し、[MoleSignal データソース](/ja/query/grafana)経由でデータを読み取るか、[ダッシュボードエディター](/ja/dashboards/edit)でダッシュボードを作り直します。PromQL 式はメトリクスパネルにそのまま貼り付けられます。Grafana のダッシュボード JSON はインポートできません。 |
+| Loki | Vector または Fluent Bit の送信先に、ネイティブの HTTP JSON 取り込みエンドポイントを指定します。Promtail と Grafana Alloy は Loki エンドポイントに送信できません。 |
+| Elasticsearch | `_bulk` プロトコルに対応する送信元は、送信先を `/api/v1/_bulk` に変更できます。クエリには Elasticsearch のクエリ DSL ではなく SQL を使用します。 |

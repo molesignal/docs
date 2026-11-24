@@ -1,0 +1,204 @@
+---
+title: "Schnellstart"
+description: "Starten Sie mit Docker Compose eine lokale MoleSignal-Testumgebung, senden Sie ein Log-Ereignis und suchen Sie es in der Weboberfläche."
+"en_link": "/en-US/quickstart"
+"zh-Hans_link": "/zh-Hans/quickstart"
+"zh-Hant_link": "/zh-Hant/quickstart"
+"ja_link": "/ja/quickstart"
+"ko_link": "/ko/quickstart"
+"es_link": "/es/quickstart"
+"fr_link": "/fr/quickstart"
+"pt-BR_link": "/pt-BR/quickstart"
+---
+
+Diese Anleitung startet eine lokale MoleSignal-Sandbox, sendet ein Log-Ereignis und zeigt, wie Sie es in der Weboberfläche und über die Abfrage-API finden. Die Sandbox dient nur zur Evaluierung.
+
+## Voraussetzungen
+
+- **Docker** mit **Docker Compose** v2.
+- Etwa 2 GB freier Arbeitsspeicher.
+- Freie lokale Ports: `5080` (Weboberfläche und API), `5082`, `5432` (PostgreSQL), `9000` und `9001` (RustFS).
+
+## Sandbox starten
+
+<Steps>
+  <Step title="Repository klonen und Stack starten">
+    ```bash
+    git clone https://github.com/molesignal/molesignal
+    cd molesignal
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
+    ```
+
+    Beim ersten Start lädt oder baut Docker die Images. Das kann mehrere Minuten dauern. Der Stack umfasst PostgreSQL 17 für Metadaten, RustFS als S3-kompatiblen Objektspeicher und einen MoleSignal-Prozess, der alle Rollen übernimmt und die Weboberfläche bereitstellt.
+
+    Prüfen Sie, ob der Server bereit ist:
+
+    ```bash
+    curl http://localhost:5080/api/v1/healthz
+    ```
+
+    Ein betriebsbereiter Server gibt `{"status":"ok"}` zurück.
+  </Step>
+
+  <Step title="An der Weboberfläche anmelden">
+    Öffnen Sie [http://localhost:5080](http://localhost:5080) und melden Sie sich mit diesen Zugangsdaten an:
+
+    - **E-Mail:** `admin@example.com`
+    - **Passwort:** `admin`
+
+    <Warning>
+      Die Sandbox-Konfiguration legt dieses Root-Konto nur beim ersten Start an. Ersetzen Sie das Konto, bevor Sie die Sandbox für mehr als eine lokale Evaluierung nutzen. Siehe [Checkliste für den Produktivbetrieb](/de/deployment/production-checklist).
+    </Warning>
+
+    Die RustFS-Konsole ist unter [http://localhost:9001](http://localhost:9001) mit `rustfsadmin` / `rustfsadmin` erreichbar. Diese Sandbox-Zugangsdaten sind nicht sicher.
+  </Step>
+
+  <Step title="Zugriffstoken abrufen">
+    Bei der Anmeldung über die API setzt der Server die Sitzungscookies für die Weboberfläche. `curl` speichert sie in `ms-cookies.txt`. Die API verwendet ein API-Token als Bearer-Token. Nutzen Sie die Sitzung einmalig, um ein persönliches API-Token mit einer Gültigkeit von 7 Tagen zu erstellen. Notieren Sie die Organisations-ID. Das Token hat dieselben Berechtigungen wie das zugehörige Konto.
+
+    ```bash
+    RESP=$(curl -s -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+      -H 'content-type: application/json' \
+      -d '{"email":"admin@example.com","password":"admin"}')
+
+    export MS_ORG=$(echo "$RESP" | jq -r .login.orgId)
+
+    export MS_TOKEN=$(curl -s -b ms-cookies.txt -X POST http://localhost:5080/api/v1/me/api-tokens \
+      -H 'content-type: application/json' \
+      -d '{"name":"quickstart","expiresInDays":7}' | jq -r .token)
+    ```
+
+    Kopieren Sie ohne `jq` den Wert von `orgId` aus der Anmeldeantwort und den Wert von `token` aus der letzten Antwort. Exportieren Sie beide Werte manuell.
+
+    <Note>
+      Die Sitzungscookies laufen standardmäßig nach 24 Stunden ab. Das API-Token bleibt gültig, bis es abläuft oder Sie es unter **Kontoeinstellungen → API-Token** widerrufen. Siehe [API-Token](/de/identity/tokens).
+    </Note>
+  </Step>
+
+  <Step title="Log-Ereignis senden">
+    Die native HTTP-Schnittstelle für die JSON-Datenaufnahme erwartet ein Array von Datensätzen. `_timestamp` enthält die Anzahl der Mikrosekunden seit der Unix-Epoche. MoleSignal legt den Stream `app` beim ersten Schreibvorgang an.
+
+    ```bash
+    curl -X POST http://localhost:5080/api/v1/intake/logs/app \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+    ```
+
+    Die Antwort gibt an, welche Datensätze die Schnittstelle angenommen hat:
+
+    ```json
+    {"accepted":1,"rejected":0,"errors":[]}
+    ```
+  </Step>
+
+  <Step title="Ereignis in der Weboberfläche finden">
+    1. Öffnen Sie **Logs**.
+    2. Wählen Sie in der Stream-Auswahl den Stream `app` aus.
+    3. Lassen Sie den Zeitraum auf **Letzte Stunde** und klicken Sie auf **Ausführen**.
+
+    Die Ergebnistabelle zeigt das Ereignis an. Wählen Sie die Zeile aus, um die ursprünglichen Felder zu prüfen.
+  </Step>
+
+  <Step title="Ereignis über die API abfragen">
+    Führen Sie dieselbe Abfrage über die Abfrage-API aus. Geben Sie mit `timeRange` immer einen begrenzten Zeitraum in Mikrosekunden an. Bei einem sehr großen Zeitraum wandelt der Abfrageplaner die Abfrage in einen asynchronen Suchauftrag um.
+
+    ```bash
+    NOW=$(date +%s)000000
+
+    curl -X POST http://localhost:5080/api/v1/query \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+           \"statement\":\"SELECT level, msg, trace_id FROM app WHERE trace_id = 'abc123'\",
+           \"timeRange\":{\"start\":$((NOW - 3600000000)),\"end\":$((NOW + 60000000))},
+           \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+    ```
+
+    Die Antwort enthält `columns`, `rows`, `scannedRows` und `tookMs`:
+
+    ```json
+    {"columns":["level","msg","trace_id"],"rows":[["error","db pool exhausted","abc123"]],"scannedRows":1,"tookMs":120}
+    ```
+  </Step>
+</Steps>
+
+## Beispieldaten laden
+
+Ein Arbeitsbereich ohne Daten zeigt leere Seiten an. Laden Sie einen kleinen, korrelierten Beispieldatensatz, um die signalübergreifende Analyse auszuprobieren. Die Logs, Metriken und Traces haben gemeinsame `trace_id`-Werte:
+
+```bash
+curl -X POST http://localhost:5080/api/v1/onboarding/sample-data \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+
+Die Anfrage legt die Streams `sample_app_logs`, `sample_app_metrics` und `sample_app_traces` an. Falls der Arbeitsbereich noch keinen eigenen Stream enthält, können Sie die Beispieldaten auch in der Weboberfläche laden: Klicken Sie oben auf der **Startseite** auf die Schaltfläche für die Einrichtungsschritte und dann neben **Beispieldaten laden** auf **Laden**. Der oben angelegte Stream `app` zählt als eigener Stream. Verwenden Sie daher nach diesen Schritten die Anfrage. Sobald alle Schritte in der Liste abgeschlossen sind, verschwindet die Schaltfläche.
+
+Die Antwort gibt an, wie viele Zeilen MoleSignal in jeden Stream geschrieben hat. Sie enthält auch die IDs des Beispiel-Dashboards und der gespeicherten Ansichten:
+
+```json
+{
+  "loaded": true,
+  "totalRows": 196,
+  "streams": [
+    { "stream": "sample_app_traces", "rows": 24 },
+    { "stream": "sample_app_logs", "rows": 24 },
+    { "stream": "sample_app_metrics", "rows": 148 }
+  ],
+  "dashboardId": "<dashboard id>",
+  "savedViewIds": ["<saved view id>", "<saved view id>", "<saved view id>", "<saved view id>"]
+}
+```
+
+`GET /api/v1/onboarding/sample-data` gibt `{"loaded":true}` nur zurück, wenn alle drei Streams, das Dashboard und alle vier gespeicherten Ansichten vorhanden sind. Die Antwort gibt nicht an, ob im aktuell angezeigten Zeitraum noch Beispieldaten liegen. Was beim ersten und erneuten Laden passiert und welche Berechtigungen dafür nötig sind, erfahren Sie unter [Schnellstart auf der Startseite](/de/home#schnellstart).
+
+## OpenTelemetry-Daten senden
+
+OTLP über HTTP funktioniert mit jedem OpenTelemetry SDK oder Collector. Konfigurieren Sie den Exporter mit dem Basispfad `/api`. Der Exporter hängt `/v1/logs`, `/v1/metrics` und `/v1/traces` an:
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer $MS_TOKEN"
+export OTEL_SERVICE_NAME=checkout
+```
+
+Die Telemetriedaten landen für jeden Signaltyp im Stream `default`, sofern der Header `stream-name` keinen anderen Stream vorgibt. Unter [Datenquelle](/de/intake) und [Integrationsanleitungen](/de/intake/integrations) finden Sie Informationen zur Einrichtung von Collector, Vector, Fluent Bit, Prometheus und SDKs.
+
+## Sandbox stoppen
+
+```bash
+# Stop the containers and keep the data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down
+
+# Stop the containers and delete all sandbox data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down -v
+```
+
+## Fehlerbehebung
+
+| Symptom | Ursache und Lösung |
+|---|---|
+| `healthz` gibt `503` mit `"status":"degraded"` zurück | Ein Teilsystem meldet einen Fehler, etwa bei der Prüfung des Objektspeichers. Lesen Sie das Feld `reason` und prüfen Sie den Container `rustfs`. |
+| Die Anmeldung gibt `401` zurück | MoleSignal legt das Root-Konto nur beim ersten Start an. Ein Datenbank-Volume aus einem früheren Lauf behält das alte Passwort. Führen Sie `down -v` aus, um die Sandbox zurückzusetzen. |
+| Die Abfrage gibt `202` mit einer `jobId` zurück | Der Zeitraum ist zu groß (mit den Standardeinstellungen etwa 13,9 Stunden oder mehr). Deshalb hat der Abfrageplaner einen asynchronen Suchauftrag gestartet. Schränken Sie den Zeitraum ein, senden Sie `Prefer: respond-sync` oder fragen Sie `GET /api/v1/query/jobs/{id}` wiederholt ab. Siehe [Abfrage](/de/query#zeitbereiche-und-asynchrone-jobs). |
+| Die Abfrage gibt `422 missing field orgId` oder `400 query.stream hint is required` zurück | Senden Sie sowohl `orgId` als auch das Objekt `stream`. |
+| Ein Port ist bereits belegt | Stoppen Sie den anderen Prozess oder ändern Sie die veröffentlichten Ports in `deploy/docker/docker-compose.yaml`. |
+| OTLP gRPC auf `4317` ist vom Host aus nicht erreichbar | Die Compose-Datei der Sandbox veröffentlicht `4317` nicht. Fügen Sie dem Dienst `molesignal` die Portzuordnung `4317:4317` hinzu. |
+
+## Nächste Schritte
+
+<CardGroup cols={2}>
+  <Card title="Echte Daten anbinden" icon="inbox" href="/de/intake">
+    Nutzen Sie die Seite „Datenquelle“, Aufnahmetoken und kompatible Protokolle.
+  </Card>
+  <Card title="Integrationsanleitungen" icon="plug" href="/de/intake/integrations">
+    Konfigurieren Sie den OpenTelemetry Collector, Vector, Fluent Bit, Filebeat und Prometheus.
+  </Card>
+  <Card title="Grundkonzepte" icon="book" href="/de/concepts">
+    Machen Sie sich mit Signalen, Streams, Arbeitsbereichen und Berechtigungen vertraut.
+  </Card>
+  <Card title="Für den Produktivbetrieb bereitstellen" icon="server" href="/de/deployment">
+    Wechseln Sie von der Sandbox zu einer Produktionsumgebung.
+  </Card>
+</CardGroup>

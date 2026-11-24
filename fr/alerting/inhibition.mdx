@@ -1,0 +1,112 @@
+---
+title: "Inhibition"
+description: "Tant qu’un incident plus grave ou en amont est actif, inhibez les notifications des incidents secondaires pour ne signaler que l’incident prioritaire."
+"en_link": "/en-US/alerting/inhibition"
+"zh-Hans_link": "/zh-Hans/alerting/inhibition"
+"zh-Hant_link": "/zh-Hant/alerting/inhibition"
+"ja_link": "/ja/alerting/inhibition"
+"ko_link": "/ko/alerting/inhibition"
+"de_link": "/de/alerting/inhibition"
+"es_link": "/es/alerting/inhibition"
+"pt-BR_link": "/pt-BR/alerting/inhibition"
+---
+
+La base de données est en panne et les dix services qui en dépendent signalent des erreurs. L’équipe d’astreinte doit être avertie de la panne de la base de données. Les autres alertes ne font que multiplier les appels. Une règle d’inhibition traduit ce principe : **tant qu’un incident source est actif, les notifications des incidents cibles dont les étiquettes spécifiées correspondent sont mises en attente.**
+
+Un incident inhibé s’ouvre quand même, reste enregistré et apparaît sur les pages. Ses notifications restent en attente et aucune escalade n’a lieu. Dès que l’incident source est résolu, les incidents cibles encore ouverts déclenchent leurs notifications normalement.
+
+Ouvrez **Alertes → Inhibition**. La consultation nécessite `alerts.inhibitions.read` ; la création, la modification et la suppression nécessitent `alerts.inhibitions.manage`.
+
+## Inhibition et silences
+
+| | Silence | Inhibition |
+|---|---|---|
+| Quand s’applique-t-il ? | Pendant une plage horaire | Tant qu’un incident correspondant est actif |
+| Cas d’usage | Maintenance planifiée, alertes parasites connues | Cascade d’alertes déclenchée par une même panne |
+| Qui décide quelles notifications mettre en attente ? | Une personne, à l’avance, selon les horaires | Le système, selon les incidents actifs à cet instant |
+
+Les deux bloquent uniquement les notifications et l’escalade. Aucun des deux n’affecte l’incident lui-même, les [pages de statut](/fr/status-pages) ni les [tickets](/fr/alerting/tickets).
+
+## Créer une règle
+
+Cliquez sur **Nouvelle règle d’inhibition** :
+
+| Paramètre | Description |
+|---|---|
+| **Nom**, **Activé** | Une règle désactivée n’inhibe aucun incident. |
+| Source : **Gravité minimale**, conditions sur les étiquettes | Définit les incidents qui peuvent en inhiber d’autres. Sans critère, tout incident peut servir de source, mais le champ **Ces étiquettes doivent correspondre** est alors obligatoire. |
+| Cible : **Gravité maximale**, conditions sur les étiquettes | Définit les incidents à inhiber. Sans critère, tous les incidents sont des cibles possibles. |
+| **Ces étiquettes doivent correspondre** | Séparez les étiquettes par des virgules. Chaque étiquette doit être présente des deux côtés et avoir la même valeur. Une étiquette absente ne correspond pas. Laissez le champ vide pour ignorer les étiquettes. Dans ce cas, précisez des critères pour la source : sinon, n’importe quel incident pourrait inhiber tous les autres. |
+| **La source doit être plus grave que la cible** | Activé par défaut : la gravité de la source doit être strictement supérieure à celle de la cible. Sur un même service, une seule règle permet ainsi aux incidents les plus graves d’inhiber les moins graves. Désactivez cette option pour les dépendances : un incident de la base de données peut alors inhiber les incidents des services qui l’utilisent. |
+| **Délai d’attente de la cible (secondes)** | 60 par défaut, 15 au minimum et 600 au maximum. Consultez [Deux délais d’attente](#deux-délais-d’attente). |
+| **Durée de l’inhibition après résolution (secondes)** | 120 par défaut, 3600 au maximum. |
+
+Écrivez les conditions sur les étiquettes comme dans les [politiques de silence](/fr/alerting/silences) : toutes les conditions doivent être remplies, et `=~` et `!~` appliquent des expressions régulières à la valeur entière. En plus des étiquettes de l’incident, trois autres sont reconnues :
+
+- `service` et `host` : en l’absence de l’étiquette correspondante, le service ou l’hôte affecté par l’incident ;
+- `alert.rule_id` : l’identifiant de la règle ou de la source d’alerte qui a ouvert l’incident, pour appliquer une logique du type « la règle A inhibe la règle B ».
+
+Cliquez sur **Exécuter** pour tester la règle, enregistrée ou non, sur les incidents actuellement actifs et afficher quels incidents en inhiberaient d’autres.
+
+## Règles courantes
+
+**Sur un même service, les incidents les plus graves inhibent les moins graves.** Une nouvelle règle utilise cette configuration par défaut :
+
+- Ces étiquettes doivent correspondre : `service`
+- La source doit être plus grave que la cible : activé
+
+**La base de données est en panne : inutile de signaler les incidents des services qui l’utilisent.** Quelle que soit la gravité :
+
+- Condition sur les étiquettes de la source : `service` `=` `database`
+- Condition sur les étiquettes de la cible : `tier` `=` `api`
+- Ces étiquettes doivent correspondre : `region` (uniquement dans la même région)
+- La source doit être plus grave que la cible : désactivé
+
+## Comment le système décide
+
+À chaque cycle (toutes les 10 secondes par défaut), le système d’escalade décide et consigne le résultat dans l’incident. Pour garantir qu’**au moins un incident en amont de chaque incident inhibé donne effectivement lieu à une notification** :
+
+- **Un incident sous silence ne peut pas servir de source.** Il ne déclenche aucune notification. S’il inhibait d’autres incidents, aucune notification ne serait envoyée.
+- **Un incident acquitté reste une source.** L’incident est déjà pris en charge.
+- **Un incident fusionné avec un autre ne compte ni comme source ni comme cible.**
+- **Un incident ouvert manuellement n’est jamais inhibé**, mais il peut en inhiber d’autres.
+- **L’inhibition s’applique en chaîne.** Si A inhibe B et que B inhibe C, seul A déclenche des notifications.
+- **Un incident reste actif pour les notifications en cas d’inhibition mutuelle.** Si deux règles font que A inhibe B et que B inhibe A, l’incident le plus grave (ou le plus ancien à gravité égale) déclenche ses notifications normalement.
+
+## Deux délais d’attente
+
+**Attente de la cible.** Les symptômes déclenchent souvent des alertes avant la cause : le taux d’erreur franchit d’abord son seuil, puis le système évalue la règle de la base de données au cycle suivant. Lorsqu’un incident susceptible d’être inhibé s’ouvre, ses notifications attendent pendant le **Délai d’attente de la cible**. Si un incident source s’ouvre pendant ce délai, il inhibe la cible. Sinon, la cible déclenche ses notifications normalement. Même avec un délai de 0, l’attente dure 15 secondes : le système décide au cycle d’escalade suivant, et la première notification ne doit pas partir avant cette décision.
+
+Seuls les incidents susceptibles d’être inhibés attendent. Les incidents les plus graves n’attendent pas si la source doit être plus grave. Les incidents dépourvus des étiquettes qui doivent correspondre n’attendent pas non plus.
+
+**Maintien de l’inhibition après résolution.** Une fois la cause résolue, les symptômes disparaissent généralement peu après, sans qu’il soit nécessaire de prévenir l’astreinte. Après la résolution d’un incident source, les cibles restent inhibées pendant la durée configurée, ou plus longtemps si un autre incident source s’ouvre. À la fin de l’inhibition, seules les notifications des incidents encore ouverts sont envoyées.
+
+## Envoi des notifications
+
+| Notification | Pendant l’inhibition | Après la fin de l’inhibition |
+|---|---|---|
+| Déclenchement, escalade | Aucun envoi. L’escalade reste au même niveau. | Pour les incidents encore ouverts et non acquittés, le système envoie la notification de déclenchement et reprend l’escalade. Le délai d’acquittement du niveau commence à ce moment-là. Le système n’envoie aucune notification pour les incidents acquittés ou résolus entre-temps. |
+| Étapes suivantes de la séquence de notification d’une personne, expiration du délai d’acquittement d’une politique | Aucun envoi. | Le système envoie la notification si l’incident n’est toujours pas acquitté. |
+| Acquittement, résolution | Le système envoie la notification uniquement si la notification de déclenchement a été envoyée. | Envoi normal. |
+
+## Affichage dans les pages
+
+- **Liste des incidents** : la ligne de résumé d’un incident inhibé affiche **Inhibés**. La vue **Inhibés** apparaît tant qu’au moins un incident est inhibé.
+- **Page de l’incident** : la page indique l’incident et la règle à l’origine de l’inhibition, avec un lien vers l’incident source. Pour un incident en attente, elle indique la fin du délai. Cliquez sur **Notifier normalement** à côté de ces informations pour lever l’inhibition : le système envoie immédiatement les notifications en attente et n’inhibe plus cet incident. Cette action nécessite `alerts.incidents.update`. Le système la consigne dans la chronologie et le journal d’audit.
+- **Chronologie** : une entrée marque le début de l’inhibition et une autre sa fin (résolution de l’incident source, modification ou suppression de la règle, levée manuelle de l’inhibition).
+- **Liste des règles** : une règle dont tous les incidents sont inhibés affiche **Déclenchée (inhibée)**.
+- **Page Inhibition** : chaque règle indique le nombre d’incidents qu’elle inhibe actuellement. Si la règle inhibe des incidents, un message avertit que sa suppression déclenchera immédiatement leurs notifications.
+
+L’escalade immédiate, la réattribution et l’ajout d’intervenants lèvent aussi l’inhibition, car ces actions visent à prévenir quelqu’un. La réattribution et l’ajout d’intervenants ne notifient que les personnes sélectionnées, sans avertir en plus les destinataires de l’étape en cours de la politique.
+
+## Plusieurs clusters
+
+Les règles d’inhibition se synchronisent via la [fédération de clusters](/fr/settings/data-plane#fédération-de-clusters). Chaque cluster prend ses décisions à partir de ses propres incidents : un incident ne peut rien inhiber dans un autre cluster.
+
+## API d’inhibition
+
+| Action | Point de terminaison |
+|---|---|
+| Gérer les règles d’inhibition | [`/api/v1/alerts/inhibit-rules`](/fr/api/alerting/inhibit-rules) |
+| Prévisualiser les effets d’une règle | [`POST /api/v1/alerts/inhibit-rules/preview`](/fr/api/alerting/inhibit-rules#aperçu) |
+| Lever l’inhibition d’un incident | [`POST /api/v1/alerts/incidents/{id}/inhibition/lift`](/fr/api/alerting/inhibit-rules#lever-l’inhibition-d’un-incident) |

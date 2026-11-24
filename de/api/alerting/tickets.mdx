@@ -1,0 +1,186 @@
+---
+title: "Ticket-API"
+sidebarTitle: "Tickets"
+description: "Verbinden Sie Jira, ServiceNow oder Meegle (Feishu Project) und erstellen Sie Tickets für Incidents. Halten Sie die Tickets mit Kommentaren und Workflow-Übergängen auf dem Stand des Incidents und synchronisieren Sie ihren Status."
+"en_link": "/en-US/api/alerting/tickets"
+"zh-Hans_link": "/zh-Hans/api/alerting/tickets"
+"zh-Hant_link": "/zh-Hant/api/alerting/tickets"
+"ja_link": "/ja/api/alerting/tickets"
+"ko_link": "/ko/api/alerting/tickets"
+"es_link": "/es/api/alerting/tickets"
+"fr_link": "/fr/api/alerting/tickets"
+"pt-BR_link": "/pt-BR/api/alerting/tickets"
+---
+
+Ein Ticket-Konnektor bindet Jira (Cloud oder Data Center / Server), ServiceNow oder Feishu Project (außerhalb
+Chinas: Meegle) an. Ein für einen Incident erstelltes Ticket bleibt mit ihm verknüpft: Bestätigungen, Meldungen zur Behebung und Notizen lassen sich als
+Kommentare übernehmen. Bei der Behebung des Incidents kann der Konnektor das Ticket auf „Erledigt“ setzen. Der Konnektor synchronisiert den Ticketstatus
+alle 5 Minuten. Jira kann den Status auch sofort per Webhook übermitteln. Wie die Seiten diese Funktion nutzen, steht unter
+[Tickets](/de/alerting/tickets).
+
+| Methode und Pfad | Funktion | Berechtigung |
+|---|---|---|
+| `GET /api/v1/alerts/tickets/connectors` | Gibt die Ticket-Konnektoren der Organisation als `{ "connectors": [ ... ] }` zurück. | `alerts.tickets.read` |
+| `POST /api/v1/alerts/tickets/connectors` | Erstellt einen Konnektor. | `alerts.tickets.manage` |
+| `PUT /api/v1/alerts/tickets/connectors/{id}` | Ersetzt einen Konnektor. `system` bleibt unverändert. | `alerts.tickets.manage` |
+| `DELETE /api/v1/alerts/tickets/connectors/{id}` | Löscht einen Konnektor. | `alerts.tickets.manage` |
+| `POST /api/v1/alerts/tickets/connectors/{id}/test` | Testet die Verbindung: Jira gibt `{ "ok": true, "detail": "<signed-in user>" }` zurück, Feishu Project liest einmal den Typ des Arbeitselements. | `alerts.tickets.manage` |
+| `GET /api/v1/alerts/tickets/sites` | Gibt die Adressen der Feishu Project-Plattformen zurück: `{ "meegle": [{ "key": "feishu", "url": "https://project.feishu.cn" }, { "key": "lark", "url": "https://meegle.com" }] }`. | `alerts.tickets.read` |
+| `GET /api/v1/alerts/incidents/{id}/tickets` | Gibt die Tickets des Incidents als `{ "tickets": [ ... ] }` zurück. | `alerts.incidents.read` für den Incident |
+| `POST /api/v1/alerts/incidents/{id}/tickets` | Erstellt über einen Konnektor ein Ticket für den Incident. | `alerts.incidents.tickets` für den Incident |
+| `POST /api/v1/public/tickets/jira/{connectorId}` | Empfängt den Jira-Webhook ohne Anmeldung. | `X-Hub-Signature` |
+
+## Konnektoren
+
+**Anfrageinhalt**
+
+| Feld | Typ | Erforderlich | Hinweise |
+|---|---|---|---|
+| `name` | string | Ja | Name des Konnektors. |
+| `system` | string | Ja | `jira` oder `meegle`. |
+| `settings` | object | Ja | Website, Projekt, Typ und Zuordnungen (siehe unten). |
+| `secrets` | object | Beim Erstellen | MoleSignal speichert die Zugangsdaten verschlüsselt und gibt sie nie zurück. Jira benötigt `apiToken` (ein Cloud-API-Token oder ein persönliches Zugriffstoken für Data Center) und optional `webhook_secret`. Feishu Project benötigt `plugin_secret`. Bleibt ein Secret bei einer Änderung leer, behält es seinen Wert. |
+| `comments` | object | Nein | `{ "acknowledged": true, "resolved": true, "notes": true }`: Fügt bei der Bestätigung oder Behebung des Incidents einen Kommentar hinzu und übernimmt seine Notizen als Kommentare. Standard für alle Optionen: `false`. |
+| `transitionOnResolve` | boolean | Nein | Setzt das Ticket auf „Erledigt“, sobald der Incident behoben ist. Standard: `false`. |
+| `resolveIncidentWhenDone` | boolean | Nein | Markiert den Incident als behoben, sobald das Ticket erledigt ist. Das gilt für offene und bestätigte Incidents. MoleSignal vermerkt dabei kein Konto. Standard: `false`. |
+| `auto` | object | Nein | Automatische Tickets: `{ "enabled": true, "minSeverity": "error", "conditions": [ ... ] }`. Ein neuer Incident erhält ein Ticket, wenn sein Schweregrad mindestens `minSeverity` erreicht und seine Labels `conditions` erfüllen. Für `conditions` gilt dieselbe Syntax wie für [Routing-Regeln](/de/api/alerting/create-routing-rule). |
+| `onMajorIncident` | boolean | Nein | Erstellt ein Ticket, sobald ein [schwerwiegender Incident](/de/api/alerting/major-incidents) ausgerufen wird. Standard: `false`. |
+| `enabled` | boolean | Nein | Standard: `true`. Ein deaktivierter Konnektor erstellt und synchronisiert keine Tickets und nimmt keine Webhooks an. |
+
+**`settings`: Jira**
+
+| Feld | Hinweise |
+|---|---|
+| `siteUrl` | Die Website-Adresse, beginnend mit `https://`, zum Beispiel `https://example.atlassian.net`. |
+| `deployment` | `cloud` (Standard): E-Mail-Adresse des Kontos und API-Token. Verwendet REST API v3 mit Anfrageinhalten im Atlassian Document Format. `data_center`: persönliches Zugriffstoken. Verwendet REST API v2. |
+| `email` | Die E-Mail-Adresse des Cloud-Kontos. |
+| `projectKey`, `issueType` | Der Projektschlüssel und der Vorgangstyp, zum Beispiel `OPS` und `Incident`. |
+| `priorities` | Ordnet Schweregraden die Namen von Jira-Prioritäten zu, zum Beispiel `{ "critical": "Highest" }`. Ohne Zuordnung setzt der Konnektor keine Priorität. |
+| `labels` | Zusätzliche Labels neben `molesignal`, das jedes Ticket erhält. |
+| `fields` | Standardwerte für weitere Felder beim Erstellen eines Tickets. Als Schlüssel dient die Jira-Feld-ID. |
+| `resolveTransition` | Der Statusübergang bei Behebung des Incidents, angegeben als Name oder ID. Ist das Feld leer, nutzt der Konnektor den ersten Übergang in einen Erledigt-Status. |
+
+**`settings`: Feishu Project**
+
+| Feld | Hinweise |
+|---|---|
+| `site` | Die Plattform: `feishu` (Standard, Feishu Project unter `https://project.feishu.cn`) oder `lark` (Meegle unter `https://meegle.com`). Die Plattform bestimmt die Adresse. Die Adresse lässt sich nicht ändern. |
+| `pluginId` | Die Plugin-ID. Der Konnektor tauscht sie zusammen mit `plugin_secret` gegen ein Plugin-Token ein. |
+| `userKey` | Das Konto, in dessen Namen der Konnektor Tickets und Kommentare erstellt. |
+| `projectKey`, `workItemTypeKey` | Der Bereich und der Typ des Arbeitselements. |
+| `priorityField`, `priorities` | Der Schlüssel des Prioritätsfelds und die Zuordnung von Schweregraden zu den Werten der Prioritätsoptionen. Ohne Angabe setzt der Konnektor keine Priorität. |
+| `fields` | Standardwerte für weitere Felder beim Erstellen eines Tickets. Als Schlüssel dient field_key. |
+| `resolveTransitionId` | Für ein Arbeitselement mit statusbasiertem Workflow: die ID des Übergangs, den der Konnektor bei Behebung des Incidents ausführt. |
+| `resolveNodeId` | Für ein Arbeitselement mit knotenbasiertem Workflow: die ID des Knotens, den der Konnektor bei Behebung des Incidents abschließt. |
+| `doneStates` | Die Schlüssel der Status, die als erledigt gelten. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/tickets/connectors \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "Jira OPS",
+    "system": "jira",
+    "settings": {
+      "siteUrl": "https://example.atlassian.net",
+      "deployment": "cloud",
+      "email": "oncall-bot@example.com",
+      "projectKey": "OPS",
+      "issueType": "Incident",
+      "priorities": { "critical": "Highest", "error": "High" }
+    },
+    "secrets": { "apiToken": "<jira-api-token>", "webhookSecret": "<webhook-secret>" },
+    "comments": { "acknowledged": true, "resolved": true, "notes": true },
+    "transitionOnResolve": true,
+    "auto": { "enabled": true, "minSeverity": "critical", "conditions": [] }
+  }'
+```
+</RequestExample>
+
+Die Antwort enthält den gespeicherten Konnektor ohne `secrets`. `secretsSet` listet die Zugangsdaten auf,
+für die Werte hinterlegt sind. Ein Jira-Konnektor enthält außerdem `webhook_path` mit dem Wert
+`/api/v1/public/tickets/jira/<connector ID>`. MoleSignal protokolliert das Erstellen, Ändern und Löschen im Audit-Log.
+
+**`settings` für ServiceNow**
+
+| Feld | Beschreibung |
+|---|---|
+| `instanceUrl` | Die Adresse der Instanz, beginnend mit https. |
+| `auth` | `basic` (Standard, Secret `password`), `oauth` (Client-Anmeldedaten, Secret `clientSecret`) oder `apiKey` (Secret `apiKey`). |
+| `username`, `clientId` | Das Konto für die Basisauthentifizierung bzw. die OAuth-Client-ID. |
+| `table` | Die Tabelle, in der der Konnektor Tickets erstellt. Standard ist `incident`. Die Tabelle muss `task` erweitern. |
+| `assignmentGroup`, `callerId`, `category` | Felder, die der Konnektor beim Erstellen befüllt. Die ersten beiden Werte sind `sys_id`-Angaben. |
+| `priorities` | Zuordnung von Schweregrad oder Priorität zu `impact/urgency`. Eine einzelne Zahl gilt für beide Werte. |
+| `fields` | Standardwerte für weitere Felder beim Erstellen (Feldname → Wert). |
+| `resolveState`, `closeCode` | Die Werte für `state` und `closeCode` bei Behebung des Incidents. Standard: `6` und `Solution provided`. Ist `closeCode` leer, schreibt der Konnektor keinen Abschlusscode. |
+| `doneStates` | Werte von `state`, die als erledigt gelten. Standard: `6`, `7` und `8`. |
+
+Der Verbindungstest gibt `{ "ok": true, "detail": "<table>" }` zurück.
+
+## Ticket für einen Incident erstellen
+
+```http
+POST /api/v1/alerts/incidents/{id}/tickets
+```
+
+| Feld | Typ | Erforderlich | Hinweise |
+|---|---|---|---|
+| `connectorId` | string | Ja | Der Konnektor, über den MoleSignal das Ticket erstellt. Existiert für den Incident dort bereits ein Ticket, gibt MoleSignal dieses Ticket zurück. |
+
+Der Ticket-Titel lautet `[severity] incident summary`. Die Beschreibung enthält Schweregrad und Status des Incidents,
+Services, Labels, die auslösende Abfrage, eine Zusammenfassung der KI-Ursachenanalyse und die Adresse der Incident-Seite. MoleSignal verwendet
+die Standardsprache des Workspace und erfasst das Ticket in der Incident-Timeline und im Audit-Log.
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KJ4m8T1qHd0Ue6WzB2nLc9RfPa",
+  "orgId": "<organization-id>",
+  "incidentId": "<incident-id>",
+  "connectorId": "<connector-id>",
+  "system": "jira",
+  "externalId": "10482",
+  "externalKey": "OPS-42",
+  "url": "https://example.atlassian.net/browse/OPS-42",
+  "status": "To Do",
+  "done": false,
+  "incidentStatus": "open",
+  "createdBy": "<user-id>",
+  "createdAt": 1790000000000000,
+  "syncedAt": 1790000000000000,
+  "lastError": "",
+  "actionItemId": null
+}
+```
+</ResponseExample>
+
+| Feld | Hinweise |
+|---|---|
+| `externalId`, `externalKey` | Die ID und der Schlüssel des Jira-Vorgangs. In Feishu Project enthalten beide Felder die ID des Arbeitselements. |
+| `status`, `done` | Der bei der letzten Synchronisierung ermittelte Statusname und die Angabe, ob das Ticket erledigt ist. Für Jira zählt die Statuskategorie `done`, für Feishu Project die Einstellung `doneStates` des Konnektors. |
+| `syncedAt`, `lastError` | Zeitpunkt der letzten Synchronisierung und der Fehler beim letzten Synchronisieren oder Kommentieren. Nach einem erfolgreichen Vorgang löscht der Konnektor den Fehler. |
+| `actionItemId` | Kennzeichnet ein Ticket für eine [Postmortem-Maßnahme](/de/api/alerting/postmortems). Der Incident löst für solche Tickets weder Kommentare noch Statusübergänge aus. |
+
+## Statussynchronisierung und der Jira-Webhook
+
+MoleSignal synchronisiert offene Tickets alle 5 Minuten. Sobald ein Ticket den Status „Erledigt“ erreicht und für seinen Connector
+`resolveIncidentWhenDone` festgelegt ist, löst MoleSignal den Incident. Ausgenommen sind Tickets für Maßnahmen aus
+Postmortems.
+
+Sobald ein Jira-Connector über ein `webhook_secret` verfügt, fügen Sie in Jira unter **Systemeinstellungen → WebHooks** einen Webhook hinzu:
+Geben Sie als URL die externe Adresse von MoleSignal gefolgt von `webhook_path` an. Verwenden Sie dasselbe
+`webhook_secret` als Geheimnis und wählen Sie Vorgangsaktualisierungen als Ereignisse aus.
+
+```http
+POST /api/v1/public/tickets/jira/{connectorId}
+```
+
+MoleSignal berechnet mit `webhook_secret` den HMAC-SHA256-Wert des Request-Bodys und vergleicht ihn mit
+`X-Hub-Signature: sha256=<hex>`. Der Request-Body darf höchstens 1 MiB groß sein.
+
+| Status | Grund |
+|---|---|
+| `204` | Angenommen; auch `204`, wenn der Vorgang im Request-Body kein von MoleSignal erstelltes Ticket ist. |
+| `401` | Die Signatur stimmt nicht überein oder der Connector hat kein `webhook_secret` und nimmt keine Webhook-Anfragen an. |
+| `404` | Der Connector existiert nicht, ist deaktiviert oder ist kein Jira-Connector. |

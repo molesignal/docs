@@ -1,0 +1,85 @@
+---
+title: "Solución de problemas"
+description: "Consulta las causas y soluciones de los problemas habituales de inicio, las solicitudes rechazadas, la falta de datos y las consultas lentas o asíncronas."
+"en_link": "/en-US/troubleshooting"
+"zh-Hans_link": "/zh-Hans/troubleshooting"
+"zh-Hant_link": "/zh-Hant/troubleshooting"
+"ja_link": "/ja/troubleshooting"
+"ko_link": "/ko/troubleshooting"
+"de_link": "/de/troubleshooting"
+"fr_link": "/fr/troubleshooting"
+"pt-BR_link": "/pt-BR/troubleshooting"
+---
+
+Revisa primero el registro del proceso. El registro indica la causa de los errores de inicio, y el cuerpo de la respuesta de error HTTP incluye un mensaje cuando se rechaza una solicitud. `[telemetry].log_level` o `RUST_LOG` determina el nivel de registro.
+
+## Inicio
+
+| Síntoma | Causa | Solución |
+|---|---|---|
+| `... password authentication failed for user` | El usuario o la contraseña del DSN no son correctos. | Corrige `[meta_database].dsn`. |
+| `... pool timed out while waiting for an open connection` | El nodo no puede conectarse a PostgreSQL. | Revisa el host, el puerto, el firewall y los requisitos de `sslmode`. |
+| `startup_ping put: ... SignatureDoesNotMatch` | El almacén de objetos rechaza las credenciales. | Revisa `access_key` y `secret_key`. Configúralas con `MS_OBJECT_STORE_ACCESS_KEY` y `MS_OBJECT_STORE_SECRET_KEY`. |
+| `startup_ping put: ... NoSuchBucket` | El bucket no existe. | Crea el bucket o corrige `[object_store].bucket`. |
+| El proceso muestra varias líneas con `Encountered transport error` y luego termina | No se puede acceder al endpoint o el cliente no recibe las credenciales. | Revisa `endpoint`, el DNS y la red. Las credenciales deben provenir de `access_key` y `secret_key`. |
+| `unknown field: found ...` | Una sección estricta contiene una clave mal escrita o no admitida. | Elimina o corrige la clave. Consulta [Configuración](/es/configuration#cómo-se-carga-la-configuración). |
+| `MS_SELF_TELEMETRY_CLUSTER_TOKEN must be set when split-role self intake is enabled` | En un despliegue con roles separados, un nodo sin el rol `intake` arranca sin el token compartido mientras la captura de trazas o la recopilación de telemetría propia está activa. | Configura el mismo token en todos los nodos. No basta con desactivar `[telemetry.self_collect]`, porque la captura de trazas está activa de forma predeterminada. |
+| `open Probe CA key` | `MS_CIPHER_KEY` no coincide con la clave que cifró la base de datos. | Restaura la clave original. Consulta la [Lista de verificación para producción](/es/deployment/production-checklist). |
+| `migration ... was previously applied but is missing in the resolved migrations` o `... has been modified` | El binario y la base de datos corresponden a versiones incompatibles. | Ejecuta la versión correspondiente o restaura una copia de seguridad. Consulta [Actualización](/es/upgrade). |
+| `address already in use` | Otro proceso usa uno de los puertos configurados. | Cambia el puerto. |
+| `profiling.port and ... are both ...` | El servicio de escucha de pprof comparte un puerto con otro servicio de escucha. | Configura `[profiling].port` con un puerto que no use ningún otro servicio de escucha. |
+| Un ajuste definido mediante una variable de entorno no surte efecto | El nombre de la variable contiene un punto, dos guiones bajos seguidos o un error tipográfico. | Une los componentes de la ruta con un solo guion bajo, como en `MS_META_DATABASE_DSN`. |
+
+## Inicio de sesión
+
+| Síntoma | Causa | Solución |
+|---|---|---|
+| El sistema rechaza el inicio de sesión con `admin@example.com` y `admin` | La base de datos ya contenía usuarios y el sistema no volvió a crear la cuenta raíz, o bien `root_email` y `root_password` estaban vacíos. | Inicia sesión con una cuenta existente. Para crear la cuenta raíz, configura ambos valores e inicia MoleSignal con una base de datos vacía. |
+| El correo de restablecimiento de contraseña nunca llega | Falta configurar SMTP o `http.external_url`. El sistema acepta la solicitud, pero no envía ningún correo. | Configura `[notify.smtp].host` y `[http].external_url`. |
+| Un script que inicia sesión y envía `Authorization: Bearer` recibe un `401` | El inicio de sesión establece cookies de sesión para la interfaz web y no devuelve ningún token. El encabezado solo admite tokens de API. | Genera un token de API para el script. Consulta [Tokens de API](/es/identity/tokens). |
+| La interfaz web pide volver a iniciar sesión todos los días | La sesión vence después del intervalo definido en `[auth].session_ttl_secs` (24 horas). | Aumenta `[auth].session_ttl_secs`. |
+
+## Envío de datos
+
+| Síntoma | Causa | Solución |
+|---|---|---|
+| `401` | Falta el token, el token no es válido o el encabezado contiene un token de sesión. | Envía `Authorization: Bearer <token>` con un token de ingesta predeterminado o un token de cuenta de servicio. |
+| `403` | El token no tiene el permiso de escritura de la señal, como `logs.write`. Esto ocurre, por ejemplo, al enviar un token de cliente RUM a una ruta de ingesta. | Usa un token con el permiso de escritura de la señal. |
+| `413` | El cuerpo de la solicitud supera el límite del endpoint: 16 MiB para la ingesta de JSON nativo y 2 MiB para el resto. | Envía lotes más pequeños. Aumenta el límite del proxy hasta que iguale o supere el del endpoint. |
+| `400` en un endpoint OTLP sobre HTTP | El emisor comprimió el cuerpo de la solicitud. | Configura `compression: none` en el exportador de OpenTelemetry Collector. |
+| `404` en un endpoint OTLP sobre HTTP | El endpoint del exportador no incluye la ruta base `/api`, por lo que el exportador envía las solicitudes a `/v1/logs`. | Usa `http://host:5080/api` como endpoint de OTLP. |
+| `429` con `Retry-After` | Se alcanzó el límite de frecuencia de solicitudes que el rol `router` aplica a la organización. | Reduce la frecuencia de envío o aumenta `[router.rate_limit]`. |
+| La ingesta de JSON nativo informa de registros `rejected` | Un valor de campo no coincide con el esquema del flujo, por ejemplo, `type mismatch on field level: expected Utf8, got Number`. La respuesta indica el motivo para cada índice. | Envía valores del tipo que el flujo ya almacena para el campo. |
+| `400` con `event #1 must be a JSON object` | El arreglo contiene un elemento que no es un objeto JSON. El sistema rechaza toda la solicitud. | Envía un arreglo de objetos. |
+| Promtail o Grafana Alloy no pueden enviar datos | El endpoint de Loki solo decodifica JSON y estos emisores usan protobuf comprimido con Snappy. | Envía los datos mediante OpenTelemetry Collector, Vector o Fluent Bit. |
+| El sistema acepta los registros, pero la consulta no los encuentra | La consulta usa otro nombre o tipo de flujo, o un intervalo de tiempo que excluye los registros. | Revisa el nombre del flujo y el tipo de señal. Consulta la siguiente sección para revisar las marcas de tiempo. |
+
+## Datos faltantes o inesperados
+
+- **Marcas de tiempo.** `_timestamp` cuenta los microsegundos desde la época Unix. Un valor en segundos, milisegundos o nanosegundos sitúa los eventos en el año equivocado o en un futuro lejano, por lo que las consultas de intervalos recientes no los devuelven. Omite `_timestamp` para usar la hora de recepción del servidor.
+- **Intervalo de tiempo.** Una consulta que abarca un intervalo largo se ejecuta como tarea asíncrona. Usa un `timeRange` acotado para las consultas interactivas. Consulta [Consultas](/es/query#rangos-de-tiempo-y-tareas-asincrónicas).
+- **Retención.** MoleSignal elimina los datos que superan el período de retención del flujo. Si el flujo no tiene un período propio, aplica el valor predeterminado de la plataforma en **Configuración → Retención de datos**.
+- **Tipo de flujo.** El nombre y el tipo identifican cada flujo. Puede haber un flujo `default` para logs, otro para métricas y otro para trazas al mismo tiempo.
+
+## Consultas
+
+| Síntoma | Causa | Solución |
+|---|---|---|
+| La respuesta es `202` con un `jobId` y una ruta `monitor` | El tamaño estimado alcanza `[querier].auto_async_threshold_rows`, por lo que la consulta se ejecuta como tarea de búsqueda asíncrona. Con la configuración predeterminada, esto corresponde a un intervalo de unas 13,9 horas o más. | Consulta la ruta `monitor` hasta que termine la tarea y luego recupera sus resultados en `/results`. También puedes acotar el intervalo de tiempo o enviar `Prefer: respond-sync`. Consulta [Consultas](/es/query#rangos-de-tiempo-y-tareas-asincrónicas). |
+| El cliente de Flight SQL no puede conectarse | La configuración predeterminada desactiva `[flight_sql]`. | Configura `enabled = true`, expón el puerto `5083` y usa un token de API para la autenticación. |
+
+## Operaciones
+
+| Síntoma | Causa | Solución |
+|---|---|---|
+| `GET /api/v1/healthz` devuelve `503` | El almacén de objetos no es accesible. El cuerpo de la respuesta incluye un campo `reason`. | Restablece la conexión con el almacén de objetos. |
+| El directorio del WAL crece | Los volcados fallan, normalmente porque el almacén de objetos no es accesible. | Corrige el problema del almacén de objetos. Luego, el servicio de ingesta volcará los datos pendientes. |
+| El servicio de ingesta devuelve `429` con `intake buffer memory limit exceeded` | Los búferes del proceso superan el límite de memoria `[intake].max_buffer_memory_size`, normalmente porque los volcados fallan de forma reiterada. | Busca la causa en las líneas del registro que contienen `intake flush failed` y corrige el problema del almacén de objetos o de la base de datos. Las filas que no se pueden publicar dejan de contar para el límite (consulta las dos filas siguientes). La ingesta nativa de JSON incluye `Retry-After` en esta respuesta. Vuelve a intentarlo después del tiempo indicado. |
+| El registro muestra `dataset no longer exists; buffered rows discarded` | Se eliminó un flujo, o se eliminó y se volvió a crear, mientras aún había filas del flujo en el búfer. Como esas filas ya no tienen destino, el servicio de ingesta las descarta y libera la memoria que ocupaban. El contador `intake_flush_errors_total` registra cada descarte en el paso `stream_gone` o `dataset_gone`. | No hace falta corregir nada. Si necesitas los datos, vuelve a enviarlos. |
+| Las escrituras devuelven `503` con `fenced by a newer writer epoch` | Otro proceso publica en el mismo conjunto de datos con el mismo `[node].id`. El proceso bloqueado no puede publicar sus datos, descarta las filas que tiene en memoria y rechaza las escrituras en ese conjunto de datos. Su WAL permanece en disco. El contador `intake_flush_errors_total` registra el bloqueo en el paso `writer_fenced`. | Asigna un `[node].id` único a cada proceso y reinicia el proceso bloqueado. Consulta [Implementación basada en roles](/es/deployment/role-based). |
+| Fallan los informes programados en PDF o PNG | Falta Chrome o la dirección de `[scheduled_reports.renderer].base_url` no permite acceder a la interfaz web. | Usa la imagen de la versión publicada, que incluye Chromium, y configura `base_url` con una dirección de la interfaz web a la que el nodo pueda acceder. |
+| Los fragmentos de código de la configuración inicial muestran un host incorrecto | `http.external_url` está vacío en una instalación detrás de un proxy. | Configura `[http].external_url` con la dirección pública y reinicia. |
+| Las consultas devuelven `503` con `no querier node is available` | Ningún nodo con el rol `querier` ha enviado una señal de actividad reciente. | Inicia un nodo `querier` y verifica que el enrutador pueda acceder a su `advertise_addr`. Consulta [Implementación basada en roles](/es/deployment/role-based#membresía-del-clúster). |
+| Las escrituras a través del enrutador devuelven `503` con `no intake node is available` | Ningún nodo con el rol `intake` ha enviado una señal de actividad reciente. | Inicia un nodo `intake` y verifica su `advertise_addr`. Consulta [Implementación basada en roles](/es/deployment/role-based#membresía-del-clúster). |
+| Las solicitudes devuelven `503` con `no metadata database connection` | El nodo esperó 10 segundos sin obtener una conexión a PostgreSQL. PostgreSQL está sobrecargado o no es accesible, o las `[meta_database].max_connections` conexiones están en uso. | Reintenta la solicitud. Si el problema persiste, verifica primero la carga de PostgreSQL y confirma que sea accesible. Si PostgreSQL está inactivo, aumenta `[meta_database].max_connections` según la carga, sin superar el límite `max_connections` de PostgreSQL. |
+| No se puede acceder al puerto OTLP gRPC desde el host | El archivo de Compose no publica el puerto `4317`. | Agrega una asignación de puertos `4317:4317`. |

@@ -1,0 +1,235 @@
+---
+title: "Ingress de Kubernetes"
+description: "Configura los puntos de entrada interno y público con dos controladores ingress-nginx: el Ingress interno reenvía todas las rutas y el público solo enumera los callbacks externos y las páginas públicas."
+"en_link": "/en-US/public-access/ingress"
+"zh-Hans_link": "/zh-Hans/public-access/ingress"
+"zh-Hant_link": "/zh-Hant/public-access/ingress"
+"ja_link": "/ja/public-access/ingress"
+"ko_link": "/ko/public-access/ingress"
+"de_link": "/de/public-access/ingress"
+"fr_link": "/fr/public-access/ingress"
+"pt-BR_link": "/pt-BR/public-access/ingress"
+---
+
+La siguiente configuración sigue el enfoque recomendado en [Acceso público](/es/public-access): dos controladores ingress-nginx se ejecutan en el clúster, uno detrás de un balanceador de carga interno y otro detrás de un balanceador de carga público. El mismo nombre, `molesignal.example.com`, apunta a uno u otro según se resuelva en el DNS interno o en el público. El Service de MoleSignal es `molesignal`, usa el puerto `5080` y está en el espacio de nombres `molesignal`. Si el despliegue separa los roles, usa el Service del enrutador.
+
+## Dos controladores
+
+Los dos controladores necesitan recursos IngressClass distintos y valores de `controllerValue` distintos. De lo contrario, cada uno procesa los recursos Ingress del otro. El Service del controlador interno incluye la anotación del proveedor de nube para el balanceador de carga interno:
+
+```yaml
+# ingress-internal-values.yaml
+controller:
+  ingressClassResource:
+    name: nginx-internal
+    controllerValue: k8s.io/ingress-nginx-internal
+  ingressClass: nginx-internal
+  electionID: ingress-nginx-internal-leader
+  service:
+    annotations:
+      # Per cloud provider, for example Alibaba Cloud ACK:
+      service.beta.kubernetes.io/alibaba-cloud-loadbalancer-address-type: intranet
+```
+
+El controlador público conserva la dirección IP de origen del cliente y registra las rutas, pero nunca las cadenas de consulta. Las rutas de señales de actividad, calendarios, enlaces de acción y devoluciones de llamada de Huawei Cloud contienen un token, así que el controlador solo registra su prefijo:
+
+```yaml
+# ingress-public-values.yaml
+controller:
+  ingressClassResource:
+    name: nginx-public
+    controllerValue: k8s.io/ingress-nginx-public
+  ingressClass: nginx-public
+  electionID: ingress-nginx-public-leader
+  service:
+    externalTrafficPolicy: Local
+  config:
+    http-snippet: |
+      map $uri $molesignal_log_uri {
+          ~^(/api/v1/(?:intake/heartbeats|public/calendar|public/notify/actions)/)  $1<token>;
+          ~^(/notify/actions/)                                                      $1<token>;
+          ~^(/api/v1/public/notify/[^/]+/(?:replies|keypress)/)                     $1<token>;
+          default                                                                   $uri;
+      }
+    log-format-upstream: '$remote_addr [$time_local] "$request_method $molesignal_log_uri $server_protocol" $status $body_bytes_sent "$http_user_agent" $request_time'
+```
+
+Instala cada controlador:
+
+```bash
+helm upgrade --install ingress-internal ingress-nginx --repo https://kubernetes.github.io/ingress-nginx --namespace ingress-internal --create-namespace -f ingress-internal-values.yaml
+```
+
+```bash
+helm upgrade --install ingress-public ingress-nginx --repo https://kubernetes.github.io/ingress-nginx --namespace ingress-public --create-namespace -f ingress-public-values.yaml
+```
+
+## Ingress interno
+
+El Ingress interno reenvía todas las rutas. Las consultas en tiempo real transmiten las respuestas de forma continua, así que desactiva el almacenamiento en búfer y configura tiempos de espera largos:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-internal
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: nginx-internal
+  tls:
+    - hosts: [molesignal.example.com]
+      secretName: molesignal-tls
+  rules:
+    - host: molesignal.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: molesignal
+                port:
+                  number: 5080
+```
+
+## Ingress público
+
+El Ingress público enumera solo las rutas que se deben abrir. El backend predeterminado del controlador responde con un 404 para las rutas que no aparecen en la lista. Conserva solo las rutas en uso:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-public
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+spec:
+  ingressClassName: nginx-public
+  tls:
+    - hosts: [molesignal.example.com]
+      secretName: molesignal-tls
+  rules:
+    - host: molesignal.example.com
+      http:
+        paths:
+          # External alerts
+          - { path: /api/v1/intake/alerts, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Heartbeat check-ins, the Jira ticket webhook, on-call calendar subscriptions
+          - { path: /api/v1/intake/heartbeats, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/tickets/jira, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/calendar, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Mole Agent in Teams, automation API triggers, replies to texts and calls, WeCom and Mattermost buttons, the API of one-time action links
+          - { path: /api/v1/public/im/teams, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/automations, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/notify, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Push sources
+          - { path: /api/v1/_kinesis_firehose, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/_cloudflare, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/_heroku, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # RUM
+          - { path: /api/v1/rum/events, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/rum/replay, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Synthetics Probe Agent artifact uploads
+          - { path: /api/v1/synthetics/artifacts, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Status pages
+          - { path: /status, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/status-pages, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Resource sharing
+          - { path: /s, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /shared, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/share, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # The confirm pages of one-time action links
+          - { path: /notify/actions, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          # Web files of status pages, shared resources and action link pages
+          - { path: /assets, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+```
+
+`Prefix` busca coincidencias por segmento de ruta: `/s` coincide con `/s/<share token>`, pero no con `/shared`, y `/api/v1/public/share` coincide con `/api/v1/public/share/query`.
+
+Un Ingress no puede filtrar por método, así que MoleSignal se encarga: cada ruta anterior solo admite los métodos que usa y devuelve `405` o `404` para los demás. Las anotaciones se aplican a todo el objeto Ingress. Para definir un límite de tamaño del cuerpo de la solicitud o direcciones de origen específicos para algunas rutas, muévelas a otro Ingress. Por ejemplo, permite que solo los rangos de la etiqueta de servicio `AzureBotService` de Azure accedan a la ruta de devolución de llamada de Teams:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-public-teams
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/whitelist-source-range: "203.0.113.0/24,198.51.100.0/24"
+spec:
+  ingressClassName: nginx-public
+  tls:
+    - hosts: [molesignal.example.com]
+      secretName: molesignal-tls
+  rules:
+    - host: molesignal.example.com
+      http:
+        paths:
+          - { path: /api/v1/public/im/teams, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+```
+
+Si mueves una ruta, elimínala de `molesignal-public`. Cada ruta debe aparecer en un solo Ingress.
+
+## Dominios personalizados de las páginas de estado
+
+Cuando una página de estado use `status.example.org`, agrega una regla en el controlador público que abra solo las rutas raíz, los endpoints y los archivos web de esa página:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molesignal-status-domain
+  namespace: molesignal
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+spec:
+  ingressClassName: nginx-public
+  tls:
+    - hosts: [status.example.org]
+      secretName: status-example-org-tls
+  rules:
+    - host: status.example.org
+      http:
+        paths:
+          - { path: /, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /history, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /uptime, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /incidents, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /api/v1/public/status-pages, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /assets, pathType: Prefix, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.ico, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+          - { path: /favicon-dark.svg, pathType: Exact, backend: { service: { name: molesignal, port: { number: 5080 } } } }
+```
+
+## Verificación
+
+Confirma que cada controlador haya procesado sus propios recursos Ingress y que estos tengan las direcciones de los balanceadores de carga correspondientes:
+
+```bash
+kubectl -n molesignal get ingress
+```
+
+Desde internet, el endpoint de inicio de sesión devuelve `404` y el de recepción de alertas devuelve `401` si la solicitud no incluye un token:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://molesignal.example.com/api/v1/auth/signin
+```
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://molesignal.example.com/api/v1/intake/alerts
+```
+
+Por último, en la organización `_sys`, agrega la red de los pods del controlador público a la lista de proxies de confianza en **Configuración → Identificación de la IP del cliente**. Consulta [Identificación de la IP del cliente](/es/settings/platform#identificación-de-la-ip-del-cliente).

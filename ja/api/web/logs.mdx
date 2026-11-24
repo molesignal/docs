@@ -1,0 +1,156 @@
+---
+title: "ログ検索"
+description: "ログストリームのレコードをページ単位で取得し、件数を時間帯ごとに集計し、フィールドの値の概要を取得します。"
+"en_link": "/en-US/api/web/logs"
+"zh-Hans_link": "/zh-Hans/api/web/logs"
+"zh-Hant_link": "/zh-Hant/api/web/logs"
+"ko_link": "/ko/api/web/logs"
+"de_link": "/de/api/web/logs"
+"es_link": "/es/api/web/logs"
+"fr_link": "/fr/api/web/logs"
+"pt-BR_link": "/pt-BR/api/web/logs"
+---
+
+これらの呼び出しは、**ログ**ページと同じ方法で、組織内の1つのログストリームを読み取ります。ストリームが存在しない場合は、空の結果を返します。すべての呼び出しに `logs.read` が必要です。システムスコープでは `sys.telemetry.read` が必要です。
+
+各呼び出しでは、JSON ボディを指定する `POST` と、同じフィールドをクエリ文字列で指定する `GET` のどちらかを使用できます。`filters` と `freeText` は JSON 配列の文字列として、`where` は JSON オブジェクトの文字列として指定します。URL に収まらない長さのクエリは `POST` で送信してください。
+
+## 呼び出しのマッチ条件
+
+呼び出しは、指定された時間範囲内のストリームのレコードのうち、次の条件をすべて満たすものにマッチします。
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `filters` | リスト | すべて満たす必要があるフィルターです。`where` のフィルターと合わせて最大 32 個です。 |
+| `freeText` | リスト | `message` フィールドで検索する単語またはフレーズです。それぞれ最大 512 bytes です。小文字の英字と数字で構成される 40 bytes 以下の単語は、大文字と小文字を区別せずにマッチします。それ以外のテキストは、入力どおりにマッチします。`where` のテキスト条件と合わせて最大 8 個です。 |
+| `where` | オブジェクト | 条件を組み合わせるための条件ツリーです。フィルター、`{"text": "..."}`、`{"and": [...]}`、`{"or": [...]}` のいずれかを指定します。 |
+| `expression` | 文字列 | **ログ**ページと同じ書式で記述するフィールドクエリです。`filters`、`freeText`、`where` の代わりに使います。両方の形式を同時に送信しないでください。 |
+
+フィルターは `field`、`op`、`value`、`quoted` を持つオブジェクトです。フィールド名はストリームで使われている名前で指定します。
+
+| 演算子 | フィールド | マッチ条件 |
+|---|---|---|
+| `=`, `!=` | 任意のスカラーフィールド | `=` は指定した値に、`!=` はそれ以外の値にマッチします。空の値を指定すると、フィールドに値があるかどうかを判定します。`=` は値がないレコードにマッチします。 |
+| `>`, `>=`, `<`, `<=` | 数値とタイムスタンプ | 比較条件を満たす値にマッチします。 |
+| `contains` | テキスト | フィールド内のどこかに指定した値が含まれていればマッチします。 |
+| `match` | 任意のフィールド | 大文字と小文字を区別せず、指定した値を部分文字列として含む値にマッチします。空の値は何にもマッチしません。 |
+| `match_text` | 全文検索インデックスがあるテキスト | 単語、フレーズ、ワイルドカードによる全文検索でマッチします。全文検索インデックスがないフィールドを指定すると、`400` が返ります。 |
+
+`eq`、`ne`、`like` は、それぞれ `=`、`!=`、`contains` のエイリアスです。値を引用符で囲むと、`quoted` は `true` になります。引用符で囲むのは単語だけで、数値は囲みません。ここでは JSON フィールドをフィルタリングできません。SQL でクエリしてください。
+
+`expression` には、**ログ**ページと同じクエリテキストを指定します。比較式、`MATCH(field, 'text')` と `MATCH_TEXT(field, 'words')`、検索する単語、引用符で囲んだフレーズ、`AND`、`OR`、括弧を使えます。`AND` と `OR` は大文字と小文字を区別せず、`AND` が優先されます。サーバーはテキストを、ページが送信する形式の `filters`、`freeText`、`where` に変換し、上記のルールに従って検証します。テキストは最大 8 KiB で、括弧のネストは最大 32 レベルです。閉じていない括弧や比較対象のない比較式など、解析できない箇所があると、サーバーは `400` を返し、該当箇所を示します。
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/logs" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'stream=app' \
+  --data-urlencode "expression=level = 'error' AND (service.name = 'checkout' OR timeout)"
+```
+
+## レコードの一覧を取得する
+
+```http
+POST /api/v1/web/logs
+GET  /api/v1/web/logs
+```
+
+条件に一致するレコードを新しい順に返します。ページ分割にはカーソルを使用します。
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `stream` | string | 必須です。対象のログストリームです。 |
+| `from`, `to` | integer | マイクロ秒単位で指定する時間範囲です。デフォルトは現在までの直近24時間です。`to` には `from` より大きい値を指定してください。 |
+| `filters`, `freeText`, `where`, `expression` | | レコードの絞り込み条件です。 |
+| `limit` | integer | 1ページあたりの件数です。デフォルトは `20` で、指定値は1～5000の範囲に収めます。 |
+| `cursor` | string | 先に取得したページの `nextCursor` または `previousCursor` です。最初のページの時間範囲と絞り込み条件を引き継ぎます。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/web/logs \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"stream":"app","expression":"level = '\''error'\''","limit":2}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    { "_timestamp": 1790000000000000, "level": "error", "message": "db pool exhausted", "trace_id": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "nextCursor": "eyJ2IjoxLC...",
+  "previousCursor": null,
+  "hasMore": true
+}
+```
+</ResponseExample>
+
+各項目には、レコードのフィールドが含まれます。`_timestamp` の単位はマイクロ秒です。`cursor` を指定したリクエストで、ストリーム、時間範囲、`limit`、絞り込み条件のいずれかが最初のページと異なる場合は、`400` を返します。
+
+## 時間バケットごとにレコードをカウントする
+
+```http
+POST /api/v1/web/logs/histogram
+GET  /api/v1/web/logs/histogram
+```
+
+条件に一致するレコードを時間バケットごとにカウントします。
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `stream` | 文字列 | 必須です。 |
+| `from`, `to` | 整数 | 必須です。マイクロ秒単位で時間範囲を指定します。 |
+| `filters`, `freeText`, `where`, `expression` | | カウント対象のレコードを絞り込む条件です。 |
+| `bucketTime` | 整数 | 1 バケットの長さをマイクロ秒単位で指定します。最小値は `1000` です。 |
+| `originTime` | 整数 | 最初のバケットの開始時刻です。`from` 以前の時刻を指定します。 |
+
+1 回のリクエストで、`originTime` から `to` までの最大 512 バケットを対象にします。
+
+```json
+{
+  "bucketTime": 60000000,
+  "originTime": 1790000100000000,
+  "buckets": [{ "startTime": 1790000100000000, "total": 120, "errors": 4 }],
+  "split": true
+}
+```
+
+`buckets` には、レコードが 1 件以上あるバケットが古い順に並びます。`errors` は、`level` または `body_level` の値が `ERROR` のレコードの件数です。ストリームにどちらのフィールドもない場合、またはリクエスト元に対してレベルがマスクされている場合、`split` は `false` になり、`errors` は `0` になります。件数を取得できない場合は、[トレースのカウント](/ja/api/web/trace#時間ごとにトレースを集計する)と同様に、ステータスコード `200` と、空の `buckets` および `unavailable` を返します。`unavailable` の値は `time_budget`、`busy`、`scan_limit` のいずれかです。
+
+## フィールドの値の概要を取得する
+
+```http
+POST /api/v1/web/logs/field-stats
+GET  /api/v1/web/logs/field-stats
+```
+
+条件に一致するレコードを対象に、指定したフィールドの値の概要を取得します。
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `stream` | 文字列 | 必須です。 |
+| `from`, `to` | 整数 | 対象期間をマイクロ秒単位で指定します。 |
+| `filters`, `freeText`, `where`, `expression` | | 対象レコードの抽出条件を指定します。 |
+| `field` | 文字列 | 必須です。ストリームで定義されたフィールド名を指定します。 |
+
+```json
+{
+  "kind": "text",
+  "total": 1840,
+  "present": 1840,
+  "distinct": 3,
+  "distinctExact": true,
+  "top": [{ "value": "info", "count": 1500 }, { "value": "warn", "count": 300 }, { "value": "error", "count": 40 }],
+  "topSkipped": false
+}
+```
+
+`kind` は `number`、`time`、`text`、`bool` のいずれかです。`total` は条件に一致するレコードの件数、`present` はそのうちフィールドに値があるレコードの件数です。`top` は出現頻度の高い値を頻度の降順で並べます。値がほぼすべて異なり、一覧に値が含まれない場合は、`topSkipped` が `true` になります。`range` は最小値と最大値をテキストで返します。数値フィールドの場合は `spread` と `bars` も返します。`trend` は対象期間内で出現頻度の高い値の出現回数を集計します。他の値よりも出現頻度の高い値がなければ、`trend` は返しません。
+
+## エラー
+
+| ステータス | 原因 |
+|---|---|
+| `400` | パラメーターが無効です。`stream` が指定されていない、`to` が `from` より大きくない、フィルターが不明なフィールドやフィールドの型に対応していない演算子を使用している、リストやツリーが上限を超えている、`expression` を `filters`、`freeText`、`where` のいずれかと併用しているか、`expression` に解析できない部分がある、カーソルがクエリと一致しない、またはヒストグラムのパラメーターが不足しているか、対象のバケット数が512を超えています。 |
+| `403` | トークンに `logs.read` 権限がありません。 |

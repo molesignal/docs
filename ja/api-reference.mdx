@@ -1,0 +1,152 @@
+---
+title: "API の概要"
+description: "ベース URL、認証、権限、リクエストの規約、ページネーション、ストリーミング、エラー処理について説明します。"
+"en_link": "/en-US/api-reference"
+"zh-Hans_link": "/zh-Hans/api-reference"
+"zh-Hant_link": "/zh-Hant/api-reference"
+"ko_link": "/ko/api-reference"
+"de_link": "/de/api-reference"
+"es_link": "/es/api-reference"
+"fr_link": "/fr/api-reference"
+"pt-BR_link": "/pt-BR/api-reference"
+---
+
+MoleSignal は、バージョン管理された HTTP API を公開します。製品のエンドポイントは `/api/v1` を使用します。ヘルスプローブ、Prometheus メトリクス、公開共有リンク、一部の互換プロトコルは、別のパスも使用します。
+
+## ベース URL
+
+ローカルインスタンスの場合は、次の URL を使用します。
+
+```text
+http://localhost:5080/api/v1
+```
+
+本番環境では、ホストをデプロイ先の公開アドレス（`[http].external_url` の値）に置き換えてください。
+
+## 認証
+
+保護されたエンドポイントでは、`Authorization` ヘッダーで Bearer トークンを受け付けます。
+
+```http
+Authorization: Bearer <token>
+```
+
+| トークン | 取得方法 | 有効期間 |
+|---|---|---|
+| API トークン | **アカウント設定 → API トークン**、または [API トークンの発行](/ja/api/auth/issue-token)から取得します。トークンの形式は `mspat-<36>` です。 | 失効させるか、設定した有効期限に達するまで有効です。 |
+| デフォルトの取り込みトークン | `GET /api/v1/me/api-tokens/default`。権限は `logs.write`、`metrics.write`、`traces.write`、`profiles.write`、`apm.deploy` に限られます。 | 有効期限はありません。 |
+| RUM クライアントトークン | `GET /api/v1/auth/tokens/rum?applicationId=<id>`。権限は `rum.write` に限られます。 | 有効期限はありません。 |
+
+スクリプトとコレクターには API トークンを使用してください。取り込みトークンについては、[データソース](/ja/intake#取り込みトークン)を参照してください。
+
+Web UI は `POST /api/v1/auth/signin` でサインインします。このエンドポイントはトークンを返さず、セッション Cookie を設定します。`Authorization` ヘッダーではセッショントークンを受け付けません。[ログイン](/ja/api/auth/login)を参照してください。
+
+認証処理では、主体、アクティブな組織またはプラットフォームのスコープ、有効な権限を含む IAM コンテキストを構築します。リクエストの組織は、常にこのコンテキストで決まります。リクエストボディで別の組織を指定することはできません。
+
+## 公開ルートと独自に認証するルート
+
+一部のルートでは、組織の Bearer トークンを使用できません。代わりに、用途を限定した認証情報やポリシーを検証します。
+
+- サインイン、サインアップポリシー、パスワードのリセット
+- `GET /api/v1/healthz` とトップレベルの `/metrics`
+- 公開リソース共有用トークンの交換と共有セッションのリクエスト
+- 署名付きファイルのダウンロードと公開アバター
+- プッシュトークンを検証するプッシュコネクターのエンドポイント
+
+公開ルートにもアクセス制限があります。ハンドラーは、サインアップポリシー、共有トークン、ダウンロードトークン、署名、コネクターの認証情報のいずれかを確認します。
+
+## 認可
+
+エンドポイントによっては、次の条件のうち 1 つ以上を満たす必要があります。
+
+- `streams.query` などの組織権限
+- `sys.telemetry.read` などのプラットフォーム権限
+- リソースの所有権、リソースとの関係、または組織をまたいで付与された権限
+
+`GET /api/v1/iam/capabilities` は、現在の主体に対して有効な権限を返します。ロール名やメニュー項目が表示されていることだけで、アクセスの可否を判断しないでください。
+
+## リクエスト
+
+- ほとんどのリクエストでは、ボディに JSON を使用し、`Content-Type: application/json` を指定します。
+- 互換性を提供する取り込みエンドポイントでは、Protobuf、NDJSON、gzip 圧縮されたボディなど、各プロトコルに対応するペイロードを使用します。
+- 取り込みリクエストのボディが 2 MiB（ネイティブ JSON の取り込みでは 16 MiB）を超えると、エンドポイントは `413` を返します。
+- 時刻は Unix エポックからの経過時間をマイクロ秒単位の整数で表します。ある時点を表すフィールドには、その時点で起きたことにちなんだ名前（`createdAt`、`expiresAt`）を付けます。単語 1 つでは意味が明確でない場合は、`Time` を付けます（`startTime`）。時間の長さを表すフィールド名の末尾には `Time` を付けます（`p95Time`）。ただし、`duration` のように名前自体が時間の長さを表す場合は付けません。ネイティブテレメトリレコードは `_timestamp` を使用し、この値もマイクロ秒単位です。
+- パス内の ID とストリーム名は URL エンコードしてください。
+
+## レスポンスとエラー
+
+エンドポイントがストリーミングやファイルのダウンロードを行う場合を除き、成功時のレスポンスは JSON です。エラーレスポンスには、ステータスコードと、機械可読な `error` コードおよび `message` を含む JSON ボディが含まれます。
+
+```json
+{
+  "error": "unauthorized",
+  "message": "unauthorized: missing Authorization Bearer token"
+}
+```
+
+`validation_failed` エラーには `issues` 配列が追加され、無効なフィールドごとに 1 件のエントリが入ります。
+
+| ステータス | `error` | 意味 |
+|---|---|---|
+| `400` | `invalid_argument`, `validation_failed` | リクエストまたはそのパラメーターに無効なものがあります。 |
+| `401` | `unauthorized` | トークンが指定されていないか、形式が正しくないか、無効または期限切れです。 |
+| `403` | `forbidden` | 必要な権限、関係、またはスコープがありません。 |
+| `404` | `not_found` | リソースが存在しないか、許可されたスコープ内では参照できません。 |
+| `409` | `conflict` | リソースの状態が競合しているか、一意性制約に違反しています。 |
+| `413` | `payload_too_large` | ボディが上限を超えています。 |
+| `429` | `resource_exhausted` | レート制限が適用されています。`Retry-After` ヘッダーがある場合は、その指定に従ってください。 |
+| `499` | `cancelled` | リクエストがキャンセルされました。 |
+| `503` | `unavailable` | 依存先を利用できません。 |
+| `500` | `internal` | 内部エラーが発生しました。ボディには `internal error` というメッセージが入り、詳細はサーバーログにのみ記録します。 |
+
+ボディを解析できないリクエストは、エンドポイントに到達する前に失敗します。この場合、レスポンスは JSON ではなくプレーンテキストです。
+
+| ステータス | 意味 |
+|---|---|
+| `400` | ボディが有効な JSON ではありません。 |
+| `415` | リクエストに `Content-Type: application/json` がありません。 |
+| `422` | フィールドが指定されていないか、型が正しくありません。レスポンスのテキストに該当するフィールド名が入ります。 |
+
+すべてのレスポンスに `X-Request-Id` ヘッダーと `X-Trace-Id` ヘッダーが含まれます。サーバー側のエラーを報告するときは、両方の値を添えてください。
+
+## ページネーション
+
+多数の行を返す可能性があるエンドポイントは、`limit` と `cursor` を受け付けます。この場合、レスポンスには `items` と `nextCursor` が含まれます。次のページを取得するには `nextCursor` の値を `cursor` に渡し、`nextCursor` が空になったら取得を終了してください。それ以外の一覧エンドポイントは、一覧全体を返します。各エンドポイントのページを参照してください。
+
+## クエリと長時間実行される処理
+
+クエリ系のエンドポイントは、通常の JSON を返すか、NDJSON をストリーミングします。実行時間の長いクエリは、非同期の検索ジョブとして実行します。処理規模が大きすぎるクエリに対しては、ステータスコード `202` とともに `jobId` と `monitor` パスを返します。ストリーミングを利用する場合は、結果を部分的に受信できるようにし、結果が不要になった時点でリクエストをキャンセルしてください。[クエリ](/ja/query)を参照してください。
+
+生成したレポート、プロファイルの BLOB、エクスポートデータなどの大きな成果物は、JSON ボディに含めず、スコープを限定したダウンロードトークンを使ってファイルとして配信します。
+
+## API リファレンス
+
+<CardGroup cols={3}>
+  <Card title="API カタログ" icon="list" href="/ja/api/catalog">
+    ルートの分類、用途、アクセスに必要な権限を確認します。
+  </Card>
+  <Card title="認証" icon="key" href="/ja/api/auth/login">
+    サインインし、API トークンを管理します。
+  </Card>
+  <Card title="取り込み" icon="inbox" href="/ja/api/intake/native-json">
+    ネイティブ JSON や互換プロトコルでテレメトリを送信します。
+  </Card>
+  <Card title="クエリ" icon="magnifying-glass" href="/ja/api/query/execute">
+    SQL クエリ、PromQL 互換クエリ、ストリーミングクエリ、保存済みクエリを実行します。
+  </Card>
+  <Card title="APM" icon="gauge-high" href="/ja/api/apm">
+    サービス、トランザクション、依存関係、エラーのメトリクスを取得します。
+  </Card>
+  <Card title="ストリーム" icon="database" href="/ja/api/streams/list">
+    ストリームを作成、確認、設定します。
+  </Card>
+  <Card title="アラート" icon="bell" href="/ja/api/alerting/list-rules">
+    ルール、インシデント、チャネル、エスカレーションを管理します。
+  </Card>
+  <Card title="相関分析と Web" icon="diagram-project" href="/ja/api/web/correlation">
+    検索、トポロジー、トレースを利用し、関連するシグナルに移動します。
+  </Card>
+  <Card title="プラットフォームと管理" icon="shield-halved" href="/ja/api/admin/audit">
+    監査ログ、暗号鍵、稼働状態を確認します。
+  </Card>
+</CardGroup>

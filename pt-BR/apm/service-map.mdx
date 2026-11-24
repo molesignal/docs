@@ -1,0 +1,149 @@
+---
+title: "Mapa de serviços"
+sidebarTitle: "Mapa de serviços"
+description: "Topologia em tempo real das chamadas entre serviços, gerada automaticamente a partir dos spans dos rastreamentos."
+"en_link": "/en-US/apm/service-map"
+"zh-Hans_link": "/zh-Hans/apm/service-map"
+"zh-Hant_link": "/zh-Hant/apm/service-map"
+"ja_link": "/ja/apm/service-map"
+"ko_link": "/ko/apm/service-map"
+"de_link": "/de/apm/service-map"
+"es_link": "/es/apm/service-map"
+"fr_link": "/fr/apm/service-map"
+---
+
+O **mapa de serviços** mostra as chamadas entre serviços e a integridade dessas chamadas com base na taxa de requisições, na taxa de erros
+e na latência (as métricas **RED**). O MoleSignal cria o mapa automaticamente a partir dos traces existentes. Assim,
+o rastreamento padrão não exige instrumentação adicional.
+
+<Info>
+  O Mapa de serviços e o [APM](/pt-BR/apm) usam os mesmos traces de entrada, mas geram projeções diferentes. O Mapa de serviços
+  associa spans pais e filhos de serviços diferentes para montar a topologia. O APM gera agregações com limites para serviços,
+  transações, dependências, erros e versões.
+</Info>
+
+## Como o MoleSignal cria o mapa
+
+À medida que os spans dos traces chegam, o MoleSignal associa cada span ao seu span pai. Spans de **serviços
+diferentes** formam uma aresta de chamada — *serviço pai → serviço filho* —, que recebe
+a duração e o status de erro do span filho (chamado). Spans pais e filhos do mesmo serviço são internos e
+não aparecem como arestas. Cada aresta fica no ambiente do chamador (`deployment.environment.name` ou
+`deployment.environment`) ou, na falta dele, no ambiente do serviço chamado. O MoleSignal não associa os spans que um
+[pipeline em tempo real](/pt-BR/pipelines#traces) descarta.
+
+O MoleSignal agrupa as arestas em **intervalos de um minuto** para cada par de serviços e grava os dados no armazenamento em
+segundo plano. Assim, o mapa reflete o tráfego recente em cerca de meio minuto.
+
+### Modo em memória ou em armazenamento
+
+Por padrão (modo `intake`), a associação ocorre **em memória** no nó que recebe os spans, com baixa
+latência. Em uma implantação com vários nós, o MoleSignal não consegue associar em memória spans de uma mesma chamada que chegam a nós diferentes.
+Por isso, o mapa pode contar menos chamadas nessas arestas. O mapa nunca exibe uma aresta sem dados que a comprovem.
+
+Para obter um mapa completo de todos os nós, altere **Configurações → Geral → Fonte de dados do Mapa de serviços** para
+o modo **storage**. Um único nó passa a reconstruir periodicamente o grafo a partir dos **traces armazenados**, o que permite incluir
+todos os spans, independentemente do nó de ingestão, com um atraso de 1 a 2 minutos. O MoleSignal salva a configuração
+no banco de dados e a aplica em tempo de execução, sem precisar reiniciar.
+
+## Dados obrigatórios dos traces
+
+O mapa precisa de traces com:
+
+- um atributo de recurso **`service.name`** em cada span (os exportadores OTLP definem esse atributo); e
+- **relações entre spans pais e filhos** que cruzam os limites entre serviços — ou seja, um span de cliente em um
+  serviço com um span filho de servidor executado em outro.
+
+A instrumentação padrão do OpenTelemetry gera os dois. Aponte o tracer para qualquer
+[endpoint de ingestão de traces](/pt-BR/intake), e o MoleSignal preencherá o mapa automaticamente.
+
+## Topologia
+
+O endpoint de topologia agrega os dados de uma janela de tempo em nós (serviços) e arestas (chamadas):
+
+```http
+GET /api/v1/web/topology?from=2026-06-14T00:00:00Z&to=2026-06-14T01:00:00Z
+Authorization: Bearer <jwt>
+```
+
+```json
+{
+  "nodes": [
+    { "id": "checkout", "name": "checkout", "rps": 42.0, "errorRate": 0.01, "p95Ms": 120.0, "spanCount": 151200 }
+  ],
+  "edges": [
+    { "source": "checkout", "target": "payments", "rps": 41.0, "errRate": 0.02, "p95Ms": 95.0 }
+  ]
+}
+```
+
+| Campo | Significado |
+|---|---|
+| `rps` | Requisições por segundo na janela. |
+| `errorRate` / `errRate` | Fração de requisições com status `ERROR` (0–1). |
+| `p95Ms` | Maior valor, na janela, do percentil 95 da latência calculado a cada minuto, em milissegundos. |
+| `spanCount` | Total de spans observados para o nó na janela. |
+
+## Grafo de serviços bruto
+
+Para obter os registros das arestas minuto a minuto — úteis para visualizar uma única dependência ao
+longo do tempo —, consulte o grafo de serviços diretamente:
+
+```http
+GET /api/v1/traces/service_graph?from=1717200000000000&to=1717286400000000&service=checkout
+Authorization: Bearer <jwt>
+```
+
+`from` e `to` representam microssegundos desde o início da época Unix. O filtro opcional `service` retorna as arestas
+em que o serviço selecionado aparece em qualquer um dos lados da chamada. Cada linha contém `environment`,
+`request_count`, `error_count` e `p50_us` / `p95_us` / `p99_us` para um par de serviços em um minuto.
+
+## Na interface
+
+- **APM → Mapa de serviços** mostra os serviços de um ambiente e as chamadas entre eles, além dos destinos
+  das chamadas e dos tópicos em que publicam e dos quais consomem mensagens. Consulte [o Mapa de serviços do APM](#o-mapa-de-serviços-do-apm).
+- **Dependências**, na página de APM de um serviço, mostra o serviço junto aos chamadores e aos destinos das chamadas,
+  como no mapa do APM, e lista as chamadas recebidas. Clique em uma chamada para abri-la no mesmo painel lateral.
+- A aba **Grafo de serviços** da página Traces exibe o mapa dos traces que correspondem à consulta.
+
+Todos os mapas de serviços seguem o mesmo padrão: um anel na cor do estado de integridade contorna o tipo do nó, o
+nome, as requisições por segundo, a taxa de erros e o P95. Cada chamada aparece como uma seta com espessura proporcional ao tráfego: vermelha
+a partir de 5% de falhas e laranja a partir de 1%.
+
+A partir de qualquer serviço ou aresta, acesse diretamente os traces e logs correspondentes por meio da
+[correlação entre sinais](/pt-BR/correlation).
+
+## O Mapa de serviços do APM
+
+**APM → Mapa de serviços** combina o grafo de serviços com as projeções do APM para o ambiente e o
+namespace selecionados na barra de escopo:
+
+| Nó | Fonte dos dados |
+|---|---|
+| Serviço | O grafo de serviços, com as métricas RED e o estado de integridade do resumo do APM. |
+| Banco de dados, cache, HTTP ou RPC externo | As chamadas de saída das dependências do APM, agrupadas por destino. |
+| Serviço que não envia dados | Uma chamada que identifica o serviço em `peer.service` quando ele não envia spans próprios. |
+| Tópico | Chamadas de publicação em um destino de mensageria e endpoints de mensageria que consomem mensagens desse destino. |
+
+A espessura da seta indica o volume de tráfego, e a cor indica a taxa de falhas. Em comparação com o período anterior de mesma
+duração, uma chamada que só ocorreu no período atual recebe o rótulo **Novo**. Uma chamada que deixou de ocorrer recebe o rótulo **Ausente** e aparece tracejada, junto com
+seu nó. Selecione um nó para realçar os chamadores, os destinos das chamadas e o **caminho mais lento** a partir
+desse nó. Em cada nó, o caminho segue a chamada com o maior P95. O cartão sobre o mapa lista as chamadas do nó. Clique em uma chamada
+para abrir um painel lateral com as requisições, os erros e a latência ao longo do tempo, além dos detalhes da chamada:
+
+- para um serviço, os endpoints chamados por todos os chamadores e os grupos de erros do serviço;
+- para um banco de dados, um cache ou um endpoint externo, as operações da chamada;
+- por um tópico, o tempo de espera das mensagens entre o fim da publicação e o início do
+  consumo. O MoleSignal consulta os registros de consumo mais recentes no armazenamento de traces (até 200) e associa cada registro ao
+  span indicado pelos links ou, na falta dessa indicação, ao span pai.
+
+Em um mapa com mais de 60 nós, cada namespace começa recolhido em um único nó. Selecione o nó para expandir
+o namespace. Use **Recolher namespaces** para recolher ou expandir todos de uma vez. O mapa exibe até 400 nós, priorizando os de maior tráfego.
+
+<CardGroup cols={2}>
+  <Card title="API de topologia e do grafo de serviços" icon="diagram-project" href="/pt-BR/api/web/topology">
+    Consulte os endpoints de topologia e do grafo de serviços bruto via HTTP.
+  </Card>
+  <Card title="Monitoramento de desempenho de aplicações" icon="gauge-high" href="/pt-BR/apm">
+    Mantenha o catálogo de serviços e analise endpoints, dependências, erros e implantações dos serviços.
+  </Card>
+</CardGroup>

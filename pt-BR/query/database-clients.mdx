@@ -1,0 +1,152 @@
+---
+title: "Conecte-se com um cliente de banco de dados"
+description: "Consulte o MoleSignal usando DBeaver, JDBC ou ADBC via Arrow Flight SQL."
+"en_link": "/en-US/query/database-clients"
+"zh-Hans_link": "/zh-Hans/query/database-clients"
+"zh-Hant_link": "/zh-Hant/query/database-clients"
+"ja_link": "/ja/query/database-clients"
+"ko_link": "/ko/query/database-clients"
+"de_link": "/de/query/database-clients"
+"es_link": "/es/query/database-clients"
+"fr_link": "/fr/query/database-clients"
+---
+
+O MoleSignal disponibiliza um endpoint **Arrow Flight SQL** para que ferramentas padrão de banco de dados se conectem
+diretamente e executem consultas SQL somente leitura nos dados de telemetria da organização, sem precisar de código de integração HTTP. Os resultados
+são transmitidos em lotes de registros Arrow, um formato significativamente mais rápido que JSON para conjuntos grandes de resultados.
+
+<Note>
+Flight SQL é um protocolo baseado em gRPC. Ferramentas que só usam o protocolo de comunicação do PostgreSQL ou do MySQL
+(`psql`, CLI `mysql`, Navicat) não conseguem se conectar. Use o DBeaver, o driver JDBC do Arrow Flight SQL
+ou qualquer cliente ADBC.
+</Note>
+
+## Ative o endpoint
+
+O listener fica **desativado por padrão**. Ative o listener em `config.toml` e reinicie o MoleSignal:
+
+```toml
+[flight_sql]
+enabled = true
+bind = "0.0.0.0"
+port = 5083
+# Default time window when the SQL carries no pruning hint (see below)
+default_lookback_hours = 24
+```
+
+A porta do Flight SQL é diferente da porta interna do gRPC (5082). Exponha apenas a porta 5083
+às redes dos clientes e mantenha a porta 5082 dentro do cluster. Para TLS, encerre a conexão em um ingress compatível com gRPC.
+
+## Autenticação
+
+O Flight SQL usa o sistema de autenticação do MoleSignal. O handshake padrão de autenticação básica
+aceita dois tipos de credenciais:
+
+| | Nome de usuário | Senha | Indicado para |
+|---|---|---|---|
+| **Login da conta** | e-mail da conta | senha da conta | uso interativo (DBeaver, consultas pontuais) |
+| **Token de API** | qualquer valor (use `token`) | token `mspat-...` | automação, scripts e serviços de BI |
+
+O login da conta segue o fluxo de autenticação da interface web e emite um token de sessão de curta duração (JWT).
+A autenticação por token de API usa diretamente o token fornecido. O Flight SQL também aceita clientes que enviam um cabeçalho bearer
+em vez de usar autenticação básica. Ambos os métodos restringem o acesso a uma única organização e disponibilizam
+apenas os streams e os dados dessa organização.
+
+**Escolha da organização** (contas vinculadas a várias organizações): assim como no login pela web, o sistema seleciona
+a primeira organização por padrão. Para selecionar outra organização, acrescente `@<org>` ao nome de usuário, como em
+`alice@example.com@acme`, em que `acme` é o nome, o slug ou o ID da organização.
+
+<Warning>
+Clientes de banco de dados armazenam senhas em perfis de conexão, URLs JDBC e scripts, o que gera uma superfície
+de exposição muito maior que a de um token com escopo limitado. **Use senhas de conta apenas em
+sessões interativas. Sempre use um token de API `mspat-` para automação**. É possível revogar um token de API e definir
+um prazo de validade. O token se limita a uma organização. Crie um token em **Configurações da conta → Tokens de API** ou via
+[`POST /api/v1/me/api-tokens`](/pt-BR/api/auth/issue-token).
+</Warning>
+
+Outros pontos importantes:
+
+- **Contas com SSO**: contas que usam apenas OIDC/SAML não têm senha local e não permitem o login da conta.
+  Use um token de API.
+- **Contas com autenticação multifator**: o cliente de banco de dados não tem um campo para o código, então o servidor
+  rejeita o handshake. Use um token de API. Consulte
+  [Autenticação multifator](/pt-BR/identity/mfa).
+- **Workspaces com requisitos de login**: quando um workspace
+  [exige autenticação multifator ou permite apenas login único](/pt-BR/identity/sso#requisitos-de-login),
+  o servidor rejeita o login da conta e os clientes já conectados deixam de funcionar na próxima solicitação. Use um token
+  de API.
+- **Muitas senhas incorretas**: o login da conta segue os mesmos
+  [limites de login](/pt-BR/settings/platform#limites-de-login) do login pela web. Ao atingir um limite, o handshake
+  retorna `RESOURCE_EXHAUSTED`. O DBeaver tenta se reconectar com as credenciais salvas. Se a senha estiver desatualizada,
+  o servidor bloqueia o endereço de origem. Atualize a senha salva e aguarde o fim do bloqueio.
+- **Expiração da sessão**: o JWT emitido no login da conta expira após o intervalo definido no servidor em
+  `[auth].session_ttl_secs`. Depois disso, as solicitações falham com `UNAUTHENTICATED`. O DBeaver se reconecta automaticamente com
+  as credenciais salvas, sem interromper o uso interativo. Em scripts ADBC de longa duração,
+  use um token de API sem prazo de validade.
+
+## DBeaver
+
+O DBeaver Community não inclui um driver Flight SQL. Cadastre o driver JDBC do Arrow Flight SQL
+uma única vez (cerca de um minuto):
+
+1. **Banco de dados → Gerenciador de drivers → Novo**
+2. Na aba **Bibliotecas**, clique em **Adicionar artefato** e cole
+   `org.apache.arrow:flight-sql-jdbc-driver:RELEASE`. Em seguida, clique em **Baixar/Atualizar**
+   (ou clique em **Adicionar arquivo** e selecione o JAR do driver baixado localmente)
+3. Volte à aba **Configurações**: em Nome do driver, informe `Arrow Flight SQL`; em Nome da classe,
+   `org.apache.arrow.driver.jdbc.ArrowFlightJdbcDriver`; em Modelo de URL,
+   `jdbc:arrow-flight-sql://{host}:{port}/?useEncryption=false`
+4. **Nova conexão** → selecione o driver recém-criado → Host: servidor MoleSignal, Porta: `5083`
+5. Nome de usuário: e-mail da conta (opcionalmente `email@org`), Senha: senha da conta — ou
+   Nome de usuário: `token` / Senha: `mspat-...`
+
+O navegador exibe um catálogo (`molesignal`), quatro esquemas (`logs`, `metrics`, `traces`,
+`extend`) e os streams da organização ativa como tabelas.
+
+## JDBC
+
+```text
+jdbc:arrow-flight-sql://molesignal.example.com:5083/?useEncryption=false&user=token&password=mspat-...
+```
+
+Artefato do driver: `org.apache.arrow:flight-sql-jdbc-driver`.
+
+## Python (ADBC)
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+conn = flightsql.connect(
+    "grpc://molesignal.example.com:5083",
+    db_kwargs={"username": "token", "password": "mspat-..."},
+)
+cur = conn.cursor()
+cur.execute("SELECT level, count(*) AS n FROM logs.nginx GROUP BY level")
+print(cur.fetch_arrow_table())   # or fetchall() / .fetch_df()
+```
+
+## Como escrever consultas
+
+- **Qualifique as tabelas com o tipo de stream**: `logs.nginx`, `metrics.cpu_usage`,
+  `traces.checkout`, `extend.lookup_table`. Sem qualificação, o servidor usa `logs` por padrão. Nomes totalmente
+  qualificados, com o catálogo (`molesignal.logs.nginx`, formato que o DBeaver gera
+  ao navegar pelas tabelas), também funcionam.
+- **Somente leitura**: o servidor rejeita `INSERT` / `UPDATE` / `DELETE` / DDL.
+- **Stream de auditoria**: `logs._audit` exige `audit.read`. Consulte [Stream de auditoria](/pt-BR/settings/data-security#fluxo-de-auditoria).
+- **Janela de tempo**: o Flight SQL não tem um parâmetro de intervalo de tempo, então o servidor usa as últimas
+  `default_lookback_hours` (24h por padrão) para descartar partições fora desse intervalo. Um filtro de `_timestamp` na
+  cláusula `WHERE` continua valendo dentro dessa janela. Para consultar dados mais antigos, aumente
+  `default_lookback_hours` ou use a [API HTTP de consultas](/pt-BR/api/query/execute), que aceita
+  um intervalo de tempo explícito.
+- O servidor retorna `_timestamp` como uma coluna de data e hora com precisão de microssegundos.
+
+## Limitações
+
+- Instruções preparadas funcionam, mas **a vinculação de parâmetros não funciona**. Use valores literais diretamente na consulta.
+- O mecanismo é somente leitura e não oferece transações.
+- O Flight SQL não oferece suporte a PromQL. Use a API HTTP para consultas em PromQL.
+- O esquema do resultado em `FlightInfo` fica vazio. Os clientes leem o esquema no stream de dados
+  (o DBeaver e o ADBC fazem isso automaticamente).
+
+As consultas Flight SQL em execução aparecem em `GET /api/v1/query/running`. Para cancelá-las, use
+`POST /api/v1/query/{id}/cancel`, como em qualquer consulta HTTP.

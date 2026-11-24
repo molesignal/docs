@@ -1,0 +1,81 @@
+---
+title: "シグナル間の相関分析 API"
+sidebarTitle: "シグナル間の相関分析"
+description: "別のシグナルに移動する際に適用するフィルター、時間範囲、クエリの初期値を算出します。"
+"en_link": "/en-US/api/web/correlation"
+"zh-Hans_link": "/zh-Hans/api/web/correlation"
+"zh-Hant_link": "/zh-Hant/api/web/correlation"
+"ko_link": "/ko/api/web/correlation"
+"de_link": "/de/api/web/correlation"
+"es_link": "/es/api/web/correlation"
+"fr_link": "/fr/api/web/correlation"
+"pt-BR_link": "/pt-BR/api/web/correlation"
+---
+
+```http
+GET /api/v1/web/correlation/{fromKind}/{toKind}?ctx=<base64url-json>
+```
+
+トレースから関連するログに移動する場合など、シグナル間を移動するときに Web UI が適用するフィルター、時間範囲、クエリの初期値を算出します。この呼び出しには `traces.read` が必要です。システムスコープでは `sys.telemetry.read` が必要です。
+
+**パラメーター**
+
+| パラメーター | 場所 | 必須 | 説明 |
+|---|---|---|---|
+| `fromKind` | パス | はい | 移動元のシグナルです。`trace`、`metric`、`log`、`host` のいずれかを指定します。 |
+| `toKind` | パス | はい | 移動先のシグナルです。`trace`、`metric`、`log`、`host` のいずれかを指定します。 |
+| `ctx` | クエリ | はい | 移動元のシグナルを記述する JSON オブジェクトです。パディングなしの base64url でエンコードします。 |
+
+`ctx` オブジェクトには、次のオプションキーを指定できます。
+
+| キー | 型 | 説明 |
+|---|---|---|
+| `trace_id` | 文字列 | 移動元シグナルのトレースです。 |
+| `service` | 文字列 | 単一のサービス名です。 |
+| `services` | 配列 | サービス名の一覧です。 |
+| `host` | 文字列 | ホスト名です。 |
+| `time_range` | オブジェクト | `{ "from": "<RFC 3339>", "to": "<RFC 3339>" }`。デフォルトは直近 1 分間です。 |
+
+## 対応するシグナル間の移動
+
+| 移動元 → 移動先 | フィルター | クエリの初期値 |
+|---|---|---|
+| `trace` → `log` | `services` に基づく `service` と `trace_id` | なし |
+| `trace` → `metric` | `services` に基づく `service` | `promql`: `rate(http_requests_total{service="<first service>"}[1m])` |
+| `trace` → `host` | `host` に基づく `host` | なし |
+| `metric` → `trace` | `services` に基づく `service` と、サービスグラフが先頭のサービスについて報告する `peer_service` | なし |
+| `metric` → `log` | `services` に基づく `service` | なし |
+| `log` → `trace` | `trace_id` と `service` | なし |
+| `log` → `metric` | `services` または `service` に基づく `service` | `promql`: `rate(log_records_total{service="<service>"}[1m])` |
+| `host` → `trace` | `host` に基づく `host.name` | なし |
+
+単一のサービスで絞り込む場合は演算子 `eq` を使用し、複数のサービスで絞り込む場合は `in` を使用します。不明なシグナル種別を含め、上記以外の組み合わせでは `200` を返します。レスポンスには時間範囲を含めますが、フィルターは含めません。
+
+<RequestExample>
+```bash cURL
+CTX=$(printf '%s' '{"trace_id":"0af7651916cd43dd8448eb211c80319c","services":["checkout","payments"],"time_range":{"from":"2026-10-04T10:00:00Z","to":"2026-10-04T10:05:00Z"}}' | base64 | tr -d '\n=' | tr '+/' '-_')
+
+curl "http://localhost:5080/api/v1/web/correlation/trace/log?ctx=$CTX" \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "timeRange": { "from": "2026-10-04T10:00:00Z", "to": "2026-10-04T10:05:00Z" },
+  "filters": [
+    { "field": "service", "op": "in", "value": ["checkout", "payments"] },
+    { "field": "trace_id", "op": "eq", "value": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "prefill": {}
+}
+```
+</ResponseExample>
+
+**エラー**
+
+| ステータス | 原因 |
+|---|---|
+| `400` | `ctx` が指定されていない、有効な base64url ではない、またはデコード結果が JSON ではありません。`ctx` が指定されていない場合はプレーンテキストを返します。それ以外の場合は、`invalid_argument` とともに `invalid ctx base64: ...` または `invalid ctx json: ...` のメッセージを返します。 |
+| `403` | トークンに `traces.read` 権限がありません。 |

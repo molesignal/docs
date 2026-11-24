@@ -1,0 +1,106 @@
+---
+title: "ポリシー、スケジュール、ルーティングルールのインポートとエクスポート"
+description: "エスカレーションポリシー、オンコールスケジュール、ルーティングルールを、参照先を名前で指定したバンドルとしてエクスポートし、そのバンドルを組織にインポートします。"
+"en_link": "/en-US/api/alerting/oncall-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/oncall-transfer"
+"zh-Hant_link": "/zh-Hant/api/alerting/oncall-transfer"
+"ko_link": "/ko/api/alerting/oncall-transfer"
+"de_link": "/de/api/alerting/oncall-transfer"
+"es_link": "/es/api/alerting/oncall-transfer"
+"fr_link": "/fr/api/alerting/oncall-transfer"
+"pt-BR_link": "/pt-BR/api/alerting/oncall-transfer"
+---
+
+```http
+GET  /api/v1/alerts/escalations/export
+POST /api/v1/alerts/escalations/import
+GET  /api/v1/schedules/export
+POST /api/v1/schedules/import
+GET  /api/v1/alerts/routing/rules/export
+POST /api/v1/alerts/routing/rules/import
+```
+
+| 種類 | エクスポート | インポート | 形式 | リストキー |
+|---|---|---|---|---|
+| エスカレーションポリシー | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.escalation-policies/v1` | `policies` |
+| オンコールスケジュール | `schedules.read` | `schedules.create` | `molesignal.schedules/v1` | `schedules` |
+| ルーティングルール | `alerts.escalations.read` | `alerts.escalations.manage` | `molesignal.routing-rules/v1` | `rules` |
+
+## エクスポート
+
+クエリパラメーター `ids` には ID をカンマ区切りで指定します。空の場合はすべての項目をエクスポートします。レスポンスは次のようなバンドルです。
+
+```json
+{
+  "format": "molesignal.escalation-policies/v1",
+  "policies": [
+    {
+      "name": "Payments on-call",
+      "steps": [
+        {"targets": [{"kind": "schedule", "schedule": "Payments primary"}], "ackTimeoutSecs": 300, "minSeverity": null},
+        {"targets": [{"kind": "user", "user": "lead@example.com"}], "ackTimeoutSecs": 600, "minSeverity": null}
+      ],
+      "repeat": false,
+      "maxLoops": 1,
+      "urgencyRule": {"mode": "by_severity"}
+    }
+  ]
+}
+```
+
+各項目には定義が含まれますが、ID と組織は含まれません。参照には名前を使います。`user` はユーザーのメールアドレスです。`team`、`schedule`、`policy`、`calendar` は、それぞれチーム、オンコールスケジュール、エスカレーションポリシー、休日カレンダーの名前です。ローテーションの `members` にはメールアドレスが入ります。スケジュールには一時的な代替担当や時刻情報を含めません。ルーティングルールには順序上の位置や時刻情報を含めません。
+
+## インポート
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `content` | 文字列 | はい | 対象の種類の JSON または YAML バンドルです。上限は 4 MiB、500 項目です。スケジュールの場合は、[Opsgenie または PagerDuty からスケジュールを移行する](/ja/alerting/schedule-migration)で使用するファイルも指定できます。 |
+| `dryRun` | 真偽値 | いいえ | デフォルトは `true` で、書き込まずにインポートを試行します。`false` の場合は書き込みます。 |
+| `createOnly` | 真偽値 | いいえ | `true` の場合、同じ名前の既存項目は変更しません。 |
+
+各項目を名前で照合します。同じ名前の項目がなければ新規作成し、1 件だけあればフィールドごとに比較します。同じ名前の項目が複数ある場合や、ファイル内に同じ名前が 2 回出てくる場合は失敗します。参照先はすべて組織内に存在する必要があります。各項目には通常の保存時と同じ検証を行います。いずれかの項目が失敗すると、何も書き込みません。すべて成功すると、項目を順に書き込み、同期対象の項目ごとにフェデレーション変更イベントを送信します。さらに、監査イベントを 1 件記録します。種類に応じて `escalation_policies.imported`、`schedules.imported`、 `routing_rules.imported` のいずれかになります。
+
+- 既存のスケジュールをインポートする場合、一時的な代替担当、シフト交換、ファイルにない設定はそのまま維持します。
+- インポートしたルーティングルールはファイル内の順序で先頭に配置します。他のルールは元の順序のまま後ろに続きます。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/schedules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content schedules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "molesignal.schedules/v1",
+  "items": [
+    {"name": "Payments primary", "action": "update", "changes": ["rotations"], "id": "3KC9..."},
+    {"name": "Payments nights", "action": "create"},
+    {"name": "Search", "action": "error", "error": "no user is named `ann@example.com`"}
+  ],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` は `create`、`update`、`unchanged`、`skip`（`createOnly` が `true` の場合の既存項目、またはファイルに名前しかない PagerDuty のシフトベースのスケジュール）、`error` のいずれかです。書き込み後の `id` は、作成または更新した項目の ID です。`applied` は書き込みが行われたかどうかを示します。
+
+`format` は読み込んだ形式を示します。値はバンドル形式、`pagerduty`、`opsgenie` のいずれかです。スケジュールには、次のフィールドも含まれることがあります。
+
+| フィールド | 場所 | 説明 |
+|---|---|---|
+| `unknownMembers` | 項目 | 組織内のどのメンバーにも対応しないメールアドレスの一覧です。 |
+| `blockers` | 項目 | 引き継げないためにオンコール担当者が変わる要素です。1 件でもあれば、その項目は `error` になります。 |
+| `findings` | 項目、レポート | 省略された内容と、インポート元での表示と比較した結果です。 |
+
+ブロッカーや検出事項は `{"code": "...", "params": {...}}` で表します。`code` はメッセージを識別し、`params` はメッセージに埋め込む値を指定します。
+
+**エラー**
+
+| ステータス | 理由 |
+|---|---|
+| `400` | コンテンツが対象の種類のバンドルでもスケジュールのインポートで読み込めるファイルでもないか、別の形式を指定しているか、サイズまたは項目数が上限を超えています。 |
+| `403` | トークンに必要な権限がありません。 |

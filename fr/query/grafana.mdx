@@ -1,0 +1,182 @@
+---
+title: "Requêtes depuis Grafana"
+description: "Accédez aux métriques, aux logs et aux traces de MoleSignal dans les tableaux de bord, la vue Explore et les règles d’alerte de Grafana grâce au plug-in de source de données MoleSignal."
+"en_link": "/en-US/query/grafana"
+"zh-Hans_link": "/zh-Hans/query/grafana"
+"zh-Hant_link": "/zh-Hant/query/grafana"
+"ja_link": "/ja/query/grafana"
+"ko_link": "/ko/query/grafana"
+"de_link": "/de/query/grafana"
+"es_link": "/es/query/grafana"
+"pt-BR_link": "/pt-BR/query/grafana"
+---
+
+La source de données MoleSignal est un plugin Grafana. Grafana interroge les métriques avec PromQL, les journaux et les traces avec les requêtes par champ des pages **Journaux** et **Traces**, et n’importe quel flux avec SQL. La navigation entre signaux reste disponible : une ligne de journal ouvre la trace associée, un exemplaire ouvre sa trace et chaque résultat renvoie vers MoleSignal.
+
+<Note>
+Grafana lance le composant serveur du plugin comme processus enfant sur son serveur. Le serveur Grafana envoie toutes les requêtes à MoleSignal avec le jeton de la source de données ; les navigateurs n’accèdent jamais à MoleSignal. Grafana Cloud accède à une instance MoleSignal sur un réseau privé via Private data source connect.
+</Note>
+
+## Prérequis
+
+| Élément | Prérequis |
+|---|---|
+| Grafana | Version 12.3 ou ultérieure, y compris les versions 13.x. |
+| MoleSignal | Une version qui accepte le champ `step` de [`POST /api/v1/query`](/fr/api/query/execute) et le paramètre `expression` des requêtes de lecture des [journaux](/fr/api/web/logs) et des [traces](/fr/api/web/trace). **Enregistrer et tester** refuse les versions antérieures, qui renverraient des résultats non filtrés pour les requêtes par champ. |
+| Réseau | Le serveur Grafana doit pouvoir accéder au port HTTP de MoleSignal, 5080 par défaut. |
+| Jeton | Un jeton d’API d’un compte de service doté du rôle **Lecteur**. La source de données utilise `streams.read`, `streams.query`, `logs.read`, `traces.read` et `metrics.read` ; `dashboards.read` et `dashboards.annotations.read` pour les annotations et les variables ; `apm.deployments.read` pour les annotations de déploiement ; et `alerts.incidents.read` pour les annotations d’incident. |
+
+## Créer un jeton pour Grafana
+
+1. Ouvrez **Identité et accès → Comptes de service** et sélectionnez **Créer un compte de service**.
+2. Saisissez `grafana` dans le champ **Nom** et choisissez le rôle **Lecteur**.
+3. Sélectionnez **Créer le compte et le jeton**, puis copiez le jeton. Le jeton expire au bout de 365 jours et ne s’affiche qu’une seule fois.
+
+Pour limiter Grafana à la lecture, créez un jeton plus restrictif pour le compte : ouvrez **Identité et accès → Jetons d’API**, sélectionnez **Créer un jeton de compte de service**, choisissez le compte, puis choisissez la stratégie **Observateur en lecture seule** comme **Portée**. Consultez [Jetons d’API et comptes de service](/fr/identity/tokens).
+
+Chaque source de données lit les données d’une seule organisation : celle de son jeton. Tout utilisateur Grafana autorisé à utiliser la source de données peut lire les données auxquelles le jeton donne accès. Restreignez l’accès à la source de données avec les permissions de Grafana, ou attribuez à chaque équipe sa propre source de données et son propre jeton.
+
+## Installer le plugin
+
+Installez l’archive de la version avec la CLI de Grafana, ou extrayez-la dans le répertoire des plugins Grafana, `/var/lib/grafana/plugins` pour les paquets Linux et l’image Docker :
+
+```bash
+grafana cli --pluginUrl https://github.com/molesignal/molesignal-grafana-plugin/releases/download/v0.1.0/molesignal-datasource-0.1.0.zip plugins install molesignal-datasource
+```
+
+Le plugin ne porte pas encore de signature. Autorisez Grafana à le charger dans `grafana.ini` ou avec la variable d’environnement `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=molesignal-datasource`, puis redémarrez Grafana :
+
+```ini
+[plugins]
+allow_loading_unsigned_plugins = molesignal-datasource
+```
+
+## Ajouter la source de données
+
+1. Dans Grafana, ouvrez **Connexions → Sources de données**, sélectionnez **Ajouter une source de données**, puis choisissez **MoleSignal**.
+2. Saisissez l’**URL** de MoleSignal, par exemple `https://molesignal.example.com`, puis collez le **Jeton d’API**.
+3. Sélectionnez **Enregistrer et tester**.
+
+**Enregistrer et tester** lit la version de MoleSignal, vérifie que le jeton dispose des permissions `streams.read` et `streams.query`, compte les flux de chaque type et vérifie que MoleSignal prend en charge les requêtes par champ.
+
+| Paramètre | Valeur par défaut | Description |
+|---|---|---|
+| **URL** | | Adresse de MoleSignal, sans `/api/v1`. |
+| **Jeton d’API** | | Grafana stocke le jeton sous forme chiffrée sur son serveur. |
+| **Ignorer la vérification du certificat TLS** | Désactivé | À utiliser uniquement pour une instance de test avec un certificat autosigné. |
+| **Certificat d’autorité de certification** | | Certificat au format PEM de l’autorité de certification qui a signé le certificat de MoleSignal. |
+| **Flux de journaux** | | Flux qu’interroge par défaut une nouvelle requête de journaux. Les filtres ad hoc d’Explore proposent les champs de ce flux. |
+| **Champs de journal** | `message`, `level`, `trace_id` | Champs qui contiennent le message, son niveau et l’identifiant de sa trace. |
+| **Intervalle de collecte** | `15s` | Fréquence d’arrivée des métriques. `$__rate_interval` vaut au moins quatre fois cet intervalle. |
+| **Clusters fédérés** | Ce cluster | Liste des clusters ciblés par chaque requête SQL et PromQL, séparés par des virgules. |
+| **Adresse web de MoleSignal** | L’URL | Destination des liens **Ouvrir dans MoleSignal**. |
+| **Délai d’expiration (secondes)** | `60` | Durée d’attente maximale pour une requête à MoleSignal. |
+| **Requêtes simultanées** | `10` | Nombre de requêtes d’un même panneau, volet Explore ou d’une même règle d’alerte qui s’exécutent en parallèle. |
+
+## Types de requêtes
+
+| Type de requête | Données lues | Affichage |
+|---|---|---|
+| **PromQL** | Métriques, via une requête de plage à l’intervalle du panneau ou une requête instantanée | Séries temporelles, tableau et exemplaires |
+| **SQL** | N’importe quel flux | Tableau, séries temporelles ou lignes de journal |
+| **Journaux** | Enregistrements les plus récents d’un flux de journaux qui correspondent à une requête par champ | Lignes de journal |
+| **Trace** | Une trace par son identifiant | Vue de la trace |
+| **Recherche de traces** | Traces qui correspondent à une requête par champ | Tableau permettant d’ouvrir chaque trace |
+| **RED** | Requêtes par seconde, erreurs par seconde, taux d’erreur ou percentile de durée des spans qui correspondent à une requête par champ | Séries temporelles, à raison d’une par valeur de champ si **Par** indique un champ |
+| **Graphe de services** | Appels entre services | Graphe de nœuds |
+
+### PromQL
+
+Une requête de plage lit un point par pas. Le pas correspond à l’intervalle du panneau, sans descendre sous le **Pas minimal** ni dépasser 11 000 pas par série. **Légende** définit le nom de chaque série, avec `{{label}}` pour insérer la valeur d’un label. **Exemplaires** affiche les exemplaires de la série, qui ouvrent chacun leur trace. MoleSignal implémente un [sous-ensemble de PromQL](/fr/query/promql-subset).
+
+### Requêtes par champ
+
+**Journaux**, **Recherche de traces** et **RED** utilisent la même syntaxe de requête par champ que les pages **Journaux** et **Traces** de MoleSignal. Une requête s’interprète donc de la même façon dans les deux interfaces :
+
+```text
+level = 'error' AND (service.name = 'checkout' OR timeout)
+```
+
+| Élément | Signification |
+|---|---|
+| `AND`, `OR`, parenthèses | `AND` est prioritaire sur `OR`. Les parenthèses regroupent les conditions. |
+| `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains` | Comparent un champ à une valeur. |
+| `field in ('a', 'b')` | Correspond à l’une des valeurs dans les requêtes de traces. |
+| `MATCH(field, 'text')`, `MATCH_TEXT(field, 'words')` | Effectuent une recherche en texte intégral dans un champ des requêtes de journaux. |
+| Un mot sans guillemets ou une expression entre guillemets | Texte à rechercher. |
+
+La ligne **Ajouter une condition** construit une comparaison à partir d’un **Champ**, d’un **Opérateur** et d’une **Valeur**, puis l’ajoute avec `AND`. **RED** lit les **Spans d’entrée**, qui correspondent à la réception d’une requête par un service, ou **Tous les spans**.
+
+### SQL
+
+SQL lit n’importe quel flux. **Flux** indique le flux à utiliser pour planifier la requête. Si ce champ est vide, la planification utilise la table indiquée après `FROM`. **Mettre en forme** permet de choisir l’affichage : **Tableau**, **Série temporelle** ou **Journaux**. Ces macros utilisent la plage temporelle du panneau :
+
+| Macro | Résultat |
+|---|---|
+| `$__timeFilter(_timestamp)` | `_timestamp >= <from> AND _timestamp < <to>` |
+| `$__timeGroup(_timestamp, $__interval)` | `date_bin(INTERVAL '<interval>', _timestamp)` |
+| `$__timeFrom()`, `$__timeTo()` | Bornes de la plage sous forme d’horodatages |
+
+`$__interval`, `$__rate_interval` et `$__range` fonctionnent dans PromQL et SQL, y compris dans les règles d’alerte.
+
+## Explore
+
+| Action | Effet |
+|---|---|
+| Exécutez une requête de journaux | Affiche le volume de journaux par niveau au-dessus des lignes. |
+| Ouvrez le contexte d’une ligne | Affiche les 50 enregistrements qui précèdent la ligne et les 50 qui la suivent. |
+| Incluez ou excluez une valeur depuis les détails d’une ligne | Ajoute `field = 'value'` ou `field != 'value'` à la requête avec `AND`. |
+| Sélectionnez l’identifiant de trace d’une ligne ou un exemplaire | Ouvre la trace à côté de la requête. |
+| Sélectionnez **Ouvrir dans MoleSignal** | Ouvre la même requête et la même plage temporelle dans MoleSignal. |
+
+## Variables et filtres ad hoc
+
+Une variable de requête propose l’une des listes suivantes :
+
+| Liste | Valeurs |
+|---|---|
+| **Flux** | Les flux d’un type donné. |
+| **Champs** | Les champs d’un flux. |
+| **Valeurs des champs** | Les valeurs les plus fréquentes d’un champ d’un flux de logs. |
+| **Métriques** | Les noms des métriques, avec la possibilité de ne retenir que ceux qui contiennent un texte donné. |
+| **Valeurs des étiquettes** | Les valeurs d’une étiquette d’une métrique. |
+| **SQL** | La première colonne du résultat d’une requête. |
+
+Pour une variable à plusieurs valeurs sélectionnées, la syntaxe de la liste dépend du langage : `(a|b)` pour `=~` en PromQL, `'a', 'b'` pour `IN (...)` en SQL et `'a', 'b'` pour `in (...)` dans une requête sur les champs de traces.
+
+Les filtres ad hoc affinent les requêtes PromQL en ajoutant des critères de correspondance d’étiquettes à chaque sélecteur, et les requêtes sur les champs en ajoutant des conditions `AND`. Leurs clés et leurs valeurs proviennent du **Flux de logs** de la source de données.
+
+## Annotations
+
+Une requête d’annotation ajoute aux panneaux d’un tableau de bord des repères issus d’une seule **Code source** :
+
+| Code source | Repères |
+|---|---|
+| **Annotations** | Les annotations de MoleSignal, avec la possibilité de filtrer par **Tag**. |
+| **Déploiements** | Les déploiements enregistrés par [APM](/fr/apm/deployments), avec la possibilité de filtrer par service. |
+| **Incidents** | Les incidents du début à la résolution, avec la possibilité de filtrer par service. |
+
+## Alertes
+
+Les règles d’alerte Grafana exécutent les requêtes PromQL et SQL via le backend du plugin. La [gestion des alertes de MoleSignal](/fr/alerting) va plus loin avec des règles en temps réel, la gestion des incidents, les astreintes et l’escalade. MoleSignal peut recevoir une alerte déclenchée dans Grafana sous forme d’[alerte externe](/fr/alerting/sources#grafana).
+
+## Tableaux de bord
+
+L’onglet **Tableaux de bord** de la source de données importe deux tableaux de bord :
+
+| Tableau de bord | Contenu |
+|---|---|
+| **MoleSignal · Services** | Les requêtes, les erreurs et les durées de chaque service, le graphe des services et les traces les plus lentes. |
+| **MoleSignal · Logs** | Le volume de logs et les erreurs les plus récentes d’un flux de logs. |
+
+## Limites
+
+| Élément | Limite |
+|---|---|
+| Requête de logs | Les 1 000 entrées les plus récentes, ou jusqu’à 5 000 avec **Limite de lignes**. |
+| Recherche de traces | 100 traces, ou jusqu’à 5 000 avec **Limite de lignes**. |
+| Trace | Une trace qui a commencé dans les 31 derniers jours de la période sélectionnée. |
+| PromQL | 11 000 pas par série et 100 000 points par requête. Au-delà, MoleSignal conserve des points à intervalles réguliers dans chaque série. |
+| SQL | 10 000 lignes, ou jusqu’à 1 000 000 avec **Limite de lignes**. |
+
+Les applications Logs Drilldown, Traces Drilldown et Metrics Drilldown de Grafana utilisent uniquement Loki, Tempo et Prometheus. Elles ne peuvent donc pas ouvrir cette source de données.

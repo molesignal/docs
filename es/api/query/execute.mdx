@@ -1,0 +1,126 @@
+---
+title: "Ejecutar una consulta"
+description: "Ejecuta una consulta SQL o PromQL sobre los flujos de una organización."
+"en_link": "/en-US/api/query/execute"
+"zh-Hans_link": "/zh-Hans/api/query/execute"
+"zh-Hant_link": "/zh-Hant/api/query/execute"
+"ja_link": "/ja/api/query/execute"
+"ko_link": "/ko/api/query/execute"
+"de_link": "/de/api/query/execute"
+"fr_link": "/fr/api/query/execute"
+"pt-BR_link": "/pt-BR/api/query/execute"
+---
+
+```http
+POST /api/v1/query
+GET  /api/v1/query
+```
+
+Ejecuta una consulta y devuelve las filas, o inicia una tarea de búsqueda asíncrona si la consulta es grande. La llamada requiere `streams.query` o, para la telemetría del sistema, `sys.telemetry.read`.
+
+**Cuerpo**
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `orgId` | cadena | Sí | Incluye el campo. La API ignora su valor y usa la organización autenticada. |
+| `language` | cadena | Sí | `sql` o `promql`. |
+| `statement` | cadena | Sí | Texto de la consulta. |
+| `timeRange` | objeto | Sí | `{ "start": <microseconds>, "end": <microseconds> }`. |
+| `stream` | objeto | Para SQL | `{ "name": "app", "streamType": "logs" }` identifica la tabla principal. Ambos campos son obligatorios y el tipo debe ser `logs`, `metrics`, `traces`, `profiles` o `extend`. |
+| `limit` | entero | No | Límite de filas. En una consulta de rango, PromQL muestrea cada serie a intervalos regulares para ajustarse al límite. |
+| `step` | entero | No | Solo para PromQL. Intervalo de muestreo de una consulta de rango, en microsegundos. Con `step`, PromQL devuelve un valor por serie en cada paso de `start` a `end`. Sin `step`, devuelve el valor en `end`. Cada serie admite como máximo 11 000 pasos. Si el intervalo produce más pasos, la API devuelve `400`. |
+
+**Cadena de consulta de una solicitud GET**
+
+`GET /api/v1/query` acepta la misma consulta en la cadena de consulta. Así, puedes copiar la URL
+y volver a abrirla para repetir la lectura. Devuelve la misma respuesta que `POST`, admite los mismos encabezados y requiere el
+mismo permiso. Si la consulta es demasiado larga para una URL, envíala mediante `POST`: un proxy delante del
+servidor puede rechazar una línea de solicitud de más de 8 KB.
+
+| Parámetro | Obligatorio | Notas |
+|---|---|---|
+| `language` | Sí | `sql` o `promql`. |
+| `statement` | Sí | Texto de la consulta con codificación URL. |
+| `start`, `end` | Sí | Rango de tiempo en microsegundos. |
+| `stream`, `streamType` | Para SQL | Tabla principal y su tipo. Incluye ambos parámetros. |
+| `limit` | No | Límite de filas. |
+| `step` | No | Intervalo de muestreo de una consulta de rango de PromQL, en microsegundos. |
+
+**Encabezados y cadena de consulta**
+
+| Nombre | Efecto |
+|---|---|
+| `Prefer: respond-async` | Crea una tarea de búsqueda y devuelve `202`. Si la consulta lee `_audit`, la API la ejecuta en la propia solicitud de todos modos. |
+| `Prefer: respond-sync` | Ejecuta la consulta en la propia solicitud, incluso si el rango es amplio. |
+| `Accept: application/x-ndjson` | Transmite un objeto JSON por fila y, al final, un registro `{"__meta__": ...}`. |
+| `?clusters=local,remote` | Incluye clústeres remotos en una búsqueda federada. |
+
+<RequestExample>
+```bash cURL
+NOW=$(date +%s)000000
+
+curl -X POST http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+       \"statement\":\"SELECT level, count(*) AS n FROM app GROUP BY level\",
+       \"timeRange\":{\"start\":$((NOW-3600000000)),\"end\":$((NOW+60000000))},
+       \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+```
+
+```bash cURL (GET)
+NOW=$(date +%s)000000
+
+curl -G http://localhost:5080/api/v1/query \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'language=promql' \
+  --data-urlencode 'statement=sum(rate(http_requests_total[5m]))' \
+  --data-urlencode "start=$((NOW-3600000000))" \
+  --data-urlencode "end=$NOW" \
+  --data-urlencode 'step=60000000'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "columns": ["level", "n"],
+  "rows": [["error", 12], ["info", 40]],
+  "scannedRows": 10432,
+  "tookMs": 18
+}
+```
+</ResponseExample>
+
+Una respuesta de PromQL contiene una fila por valor. Una consulta de rango devuelve las columnas `_timestamp` (microsegundos) y `value`, además de una columna por etiqueta, con una fila por serie y paso. Una consulta sin `step` devuelve la columna `value` y las columnas de etiquetas, con una fila por serie.
+
+```json
+{
+  "columns": ["_timestamp", "value", "service.name"],
+  "rows": [[1761638400000000, 0.42, "checkout"], [1761638460000000, 0.40, "checkout"]],
+  "scannedRows": 2,
+  "tookMs": 6
+}
+```
+
+La API devuelve `202` si el tamaño estimado de la consulta alcanza `[querier].auto_async_threshold_rows`:
+
+```json
+{
+  "jobId": "3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "monitor": "/api/v1/query/jobs/3KE1WD4SrFXhyftdMJY0FN7fTFj",
+  "state": "pending"
+}
+```
+
+Consulta [Consultas](/es/query#rangos-de-tiempo-y-tareas-asincrónicas) para conocer los umbrales y los endpoints de las tareas.
+
+**Errores**
+
+| Estado | Causa |
+|---|---|
+| `400` | La API no puede planificar la consulta, falta la indicación `stream` para SQL (`query.stream hint is required`), el valor de `step` en PromQL no es positivo o genera más de 11 000 pasos en una serie, o la consulta leería más filas de las que permite `[querier].max_scan_rows`. Una solicitud `GET` también devuelve `400` si falta un parámetro obligatorio o si incluye `stream` sin `streamType`. |
+| `503` | En un clúster con roles separados, no hay ningún nodo `querier` activo (`no querier node is available`). |
+| `403` | El flujo no existe en la organización (`stream not found: <name>`), el token no tiene el permiso `streams.query` o la consulta lee `_audit` y el token no tiene el permiso `audit.read`. |
+| `422` | Falta un campo del cuerpo o su tipo es incorrecto, por ejemplo, `orgId` o `streamType`. La respuesta es texto sin formato. |
+| `429` | Las consultas del grupo de trabajo saturan el nodo y esta consulta agotó el tiempo de espera de [`[search.admission].max_wait_secs`](/es/configuration#control-de-admisión) sin que se liberara un cupo, o el grupo de trabajo alcanzó su límite para todo el clúster. |

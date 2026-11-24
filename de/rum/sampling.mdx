@@ -1,0 +1,175 @@
+---
+title: "RUM-Daten-Sampling"
+sidebarTitle: "Daten-Sampling"
+description: "Steuern Sie das Volumen der RUM-Sitzungen und Sitzungsaufzeichnungen mit Sampling-Raten im SDK, serverseitigen Aufbewahrungsfiltern und größenbegrenzten Warteschlangen auf dem Client."
+"en_link": "/en-US/rum/sampling"
+"zh-Hans_link": "/zh-Hans/rum/sampling"
+"zh-Hant_link": "/zh-Hant/rum/sampling"
+"ja_link": "/ja/rum/sampling"
+"ko_link": "/ko/rum/sampling"
+"es_link": "/es/rum/sampling"
+"fr_link": "/fr/rum/sampling"
+"pt-BR_link": "/pt-BR/rum/sampling"
+---
+
+Das Browser-RUM-SDK entscheidet beim Anlegen einer Sitzung, ob es sie in die Stichprobe aufnimmt. Diese Entscheidung gilt
+für die gesamte Sitzung in allen Tabs der Anwendung.
+
+## Sampling-Raten konfigurieren
+
+```ts
+const rum = init({
+  applicationId: 'checkout-web',
+  clientToken: 'mspat-your-client-token',
+  site: 'https://molesignal.example.com',
+  sessionSampleRate: 25,
+  sessionReplaySampleRate: 20,
+});
+```
+
+Beide Werte sind Prozentangaben von `0` bis `100`:
+
+- `sessionSampleRate` steuert, ob das SDK eine Sitzung und die zugehörigen RUM-Ereignisse meldet. Der Standardwert ist `100`.
+- `sessionReplaySampleRate` greift erst, wenn das SDK die Sitzung in die Stichprobe aufgenommen hat. Der Standardwert ist `0`.
+
+Die effektive Aufzeichnungsrate ergibt sich aus dem Produkt beider Raten. Im Beispiel melden etwa 25 % der
+Sitzungen RUM-Daten. Für etwa 5 % aller Sitzungen entsteht eine Aufzeichnung (`25% × 20%`).
+
+<Note>
+  Der Aufruf von `startSessionReplayRecording()` kann die Aufzeichnung für die aktuelle Sitzung in der Stichprobe starten. Die Methode
+  kann jedoch keine Sitzung aufnehmen, die `sessionSampleRate` ausgeschlossen hat.
+</Note>
+
+## Anteil der Sitzungen serverseitig speichern
+
+Eine Anwendung kann zusätzlich zum SDK-Sampling nur einen Anteil der empfangenen Sitzungen speichern, unabhängig vom sendenden Client. Öffnen Sie die
+Anwendung unter **RUM → Anwendungen** und suchen Sie nach **Gespeicherte Sitzungen**. **Anteil gespeicherter Sitzungen (%)** reicht von `0` bis `100`. Der Standardwert
+`100` speichert alle Sitzungen.
+
+Der Server speichert oder verwirft jede Sitzung als Ganzes. Er entscheidet anhand eines Hashwerts der Sitzungs-ID. So gilt auf jedem Knoten für alle Ereignisse und alle
+Aufzeichnungssegmente einer Sitzung dieselbe Entscheidung. Gespeicherte Sitzungen bleiben vollständig erhalten. Bei
+verworfen Sitzungen speichert der Server weder Ereignisse noch eine Zeile in `rum_sessions` oder eine Aufzeichnung. Nur die Fehler bleiben erhalten (siehe
+[Alle Fehler speichern](#alle-fehler-speichern)).
+
+Der Anteil bezieht sich auf die vom SDK gemeldeten Sitzungen. Bei `sessionSampleRate: 50` im SDK und `20` unter **Anteil gespeicherter Sitzungen** speichert der Server etwa
+10 % aller Sitzungen. Der Wert `0` speichert nichts. Damit lässt sich eine Anwendung pausieren, ohne
+ihre SDKs zu ändern. Die Antwort der [Datenannahme](/de/rum/events#antwort) gibt unter `sampled` an, wie viele Ereignisse das Sampling ausgelassen hat. So kann das
+SDK absichtlich ausgelassene Ereignisse von Datenverlust unterscheiden. Für ein Aufzeichnungssegment einer verworfenen Sitzung antwortet der Server mit `200` und `sampled: true`.
+
+Eine Änderung gilt für alle Ereignisse, die danach eintreffen. Bereits gespeicherte Sitzungen bleiben erhalten. Für eine Sitzung, die vor der Änderung begonnen hat,
+entscheidet ab diesem Zeitpunkt der neue Anteil, ob der Server sie speichert oder verwirft.
+
+Der Server speichert eine [von einem Test erzeugte Sitzung](/de/rum/test-traffic) vollständig, sofern kein Anwendungsfilter `session.type` verwendet. So geht eine Testsitzung nicht durch eine Sampling-Regel für echten Nutzerverkehr verloren.
+
+### Filter
+
+Ein Filter legt für passende Sitzungen einen eigenen Anteil fest. So lässt sich etwa jede Produktionssitzung und ein Zehntel der übrigen Sitzungen speichern. Fügen Sie
+Filter unter **Gespeicherte Sitzungen** hinzu. Ein Filter hat einen Namen, einen Anteil von `0` bis `100` und bis zu 5 Bedingungen. Eine Sitzung muss
+alle Bedingungen erfüllen. Ein Filter ohne Bedingungen passt auf jede Sitzung.
+
+Eine Bedingung vergleicht ein Sitzungsmerkmal mit einer Werteliste: Der Merkmalswert **ist** einer der Werte oder **ist nicht** in der Liste
+(ein fehlender Wert stimmt mit keinem der Werte überein). Groß- und Kleinschreibung spielen keine Rolle. `*` steht für beliebigen Text,
+sodass `2.*` auf alle Versionen der Reihe 2 passt. Pro Bedingung sind bis zu 20 Werte möglich, pro Anwendung bis zu 10 Filter.
+
+| Merkmal | Feld |
+|---|---|
+| Umgebung | `env` |
+| Dienst | `service` |
+| Version | `version` |
+| SDK-Plattform | `source` |
+| Sitzungstyp | `session.type` |
+| Land | `geo.country_iso_code` |
+| Browser | `browser.name` |
+| Betriebssystem | `os.name` |
+| Gerätetyp | `device.type` |
+
+Der Server prüft die Filter in der angegebenen Reihenfolge. **Der erste passende Filter bestimmt den Anteil der Sitzung**. Platzieren Sie daher
+spezifischere Filter vor allgemeineren. Für Sitzungen, auf die kein Filter passt, gilt die Einstellung unterhalb der Filter: **Anteil
+gespeicherter übriger Sitzungen (%)**. Ohne Filter ist dies der einzige Anteil für die Anwendung.
+
+<Note>
+  Für alle Ereignisse einer Sitzung muss dieselbe Entscheidung gelten. Eine Bedingung kann daher nur Merkmale prüfen, die während der Sitzung unverändert bleiben.
+  Aktivitäten während der Sitzung und erst später bekannte Identitätsmerkmale (etwa eine nach der Anmeldung gesetzte Benutzer-ID) können
+  nicht über die Speicherung der Sitzung entscheiden. Für Fehler gibt es weiter unten einen eigenen Schalter.
+</Note>
+
+Für ein Aufzeichnungssegment prüft der Server die enthaltenen Sitzungsmerkmale: Browser, geografische Herkunft sowie `env`, `service` und
+`version`, die das Browser- und das Flutter-SDK im Request-Body senden. Ein SDK lässt `env` oder `version` weg, wenn der jeweilige Wert nicht
+konfiguriert ist. Fehlt dem Segment ein Merkmal, speichert der Server es, wenn mindestens ein möglicherweise passender Filter es speichern würde.
+
+### Alle Fehler speichern
+
+Der Server speichert auch Fehler aus verworfenen Sitzungen, solange **Alle Fehler speichern** aktiviert ist. So geht ein seltener Fehler
+nicht mit seiner Sitzung verloren: Er erscheint als Problem und fließt in die Fehleranzahl ein. Für einen solchen Fehler gibt es nur eine Zeile in `rum_errors`. Für die zugehörige
+Sitzung gibt es weder eine Zeile noch Ansichten oder eine Aufzeichnung. Auf der Problemseite steht daher *Sitzung nicht gespeichert* anstelle eines Sitzungslinks.
+
+### Gesamtwerte sind Schätzungen
+
+Jede Zeile enthält in `retention.rate` den Anteil der gespeicherten Zeilen dieser Art (`25` für eine Sitzung, die ein Filter mit 25 % gespeichert hat). Der Grund für die Speicherung steht
+in `retention.filter`: die Filter-ID, `default` für den Anteil der übrigen Sitzungen oder `errors` für einen Fehler aus einer
+verworfenen Sitzung. Solange **Alle Fehler speichern** aktiviert ist, speichert der Server jeden Fehler. Der Wert für Fehler ist daher unabhängig von der Sitzung immer `100`.
+
+Seiten mit Gesamtwerten rechnen jede Zeile anhand ihres Anteils hoch. Eine bei einem Anteil von 25 % gespeicherte Sitzung zählt für vier. Die Seite zeigt
+**Geschätzt** und den Anteil gespeicherter Sitzungen an. Der Gesamtwert schätzt, wie hoch der Wert bei vollständiger Speicherung wäre.
+
+- Anzahlen, Summen und Durchschnittswerte werden hochgerechnet. Für Perzentile gelten dieselben Gewichtungsfaktoren.
+- Die Anzahl erfasster Personen sowie die kleinsten und größten Werte bleiben unverändert.
+- Funnel und Pfade gewichten Sitzungen anhand ihrer Anteile. Kohorten zur Nutzerbindung basieren auf Personen und werden daher nicht hochgerechnet.
+- Der Explorer listet die gespeicherten Zeilen auf und verwendet sie ohne Hochrechnung für seine Zählungen und Diagramme. Übergeben Sie `estimate=false`
+  an die [Aggregations-API](/de/api/rum#zeilen-auswerten), um dieselben Werte zu erhalten.
+- Für die **Mindestanzahl an Stichproben** zählt eine Alarmregel die tatsächlich gespeicherten Zeilen, nicht die hochgerechnete Anzahl.
+
+Sampling erhöht die statistische Unsicherheit: Ein Gesamtwert aus wenigen Sitzungen bleibt auch nach der Hochrechnung wenig aussagekräftig.
+
+## Anfangswerte wählen
+
+| Verkehrsprofil | Sitzungsrate | Aufzeichnungsrate für Sitzungen in der Stichprobe |
+|---|---:|---:|
+| Entwicklung oder kontrollierte QA | `100` | `100` |
+| Produktion mit geringem Volumen | `100` | `10`–`25` |
+| Produktion mit hohem Volumen | `10`–`50` | `1`–`10` |
+
+Diese Werte dienen als Ausgangspunkt und sind keine allgemeingültigen Standardwerte. Schätzen Sie vor dem Rollout das Ereignisvolumen, den Bedarf an Objektspeicher, die Aufbewahrungsdauer
+und die erforderliche Anzahl an Sitzungen pro Browser und Release ab.
+
+## Sitzungsgrenzen
+
+Das SDK speichert die Entscheidung im Sitzungscookie `_msrum_s_<applicationId>`, das alle Tabs der Anwendung gemeinsam nutzen.
+Eine neue Sitzung beginnt, sobald einer der beiden Grenzwerte erreicht ist:
+
+- `sessionInactivityTimeout`: standardmäßig 15 Minuten;
+- `maxSessionDuration`: standardmäßig 4 Stunden.
+
+Geben Sie beide Werte in Millisekunden an. Der zulässige Bereich reicht von einer Minute bis zu 24 Stunden.
+
+```ts
+sessionInactivityTimeout: 15 * 60_000,
+maxSessionDuration: 2 * 60 * 60_000,
+```
+
+Eine Änderung der Sampling-Einstellungen ändert die bereits gespeicherte Entscheidung für die aktuelle Sitzung nicht. Rufen Sie
+`stopSession()` auf oder löschen Sie das Cookie `_msrum_s_<applicationId>`, wenn Sie eine neue Konfiguration testen.
+
+## Clientseitiges Datenvolumen begrenzen
+
+Nutzen Sie die Transporteinstellungen, um Speicherbedarf und Anfragegrößen planbar zu halten:
+
+```ts
+flushInterval: 5_000,
+batchSize: 50,
+replayFlushInterval: 10_000,
+replayBatchSize: 100,
+maxQueueSize: 1_000,
+```
+
+Überwachen Sie nach jeder Änderung die Eingangsrate, den Speicherbedarf für Aufzeichnungen, die Browserlast und die Datenabdeckung für Analysen.
+Führen Sie Sampling-Änderungen schrittweise pro Anwendung und Release ein.
+
+<CardGroup cols={2}>
+  <Card title="Browser-RUM-SDK" icon="code" href="/de/rum/browser-sdk">
+    Prüfen Sie alle Initialisierungsoptionen.
+  </Card>
+  <Card title="Sitzungsaufzeichnung" icon="video" href="/de/rum/session-replay">
+    Konfigurieren Sie die Erfassung von Aufzeichnungen und die Optionen, die den Speicherbedarf beeinflussen.
+  </Card>
+</CardGroup>

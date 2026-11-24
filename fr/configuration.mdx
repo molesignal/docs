@@ -1,0 +1,604 @@
+---
+title: "Configuration"
+description: "Découvrez comment MoleSignal charge sa configuration et quelles variables d’environnement sont disponibles. Consultez la liste des paramètres et leurs valeurs par défaut."
+"en_link": "/en-US/configuration"
+"zh-Hans_link": "/zh-Hans/configuration"
+"zh-Hant_link": "/zh-Hant/configuration"
+"ja_link": "/ja/configuration"
+"ko_link": "/ko/configuration"
+"de_link": "/de/configuration"
+"es_link": "/es/configuration"
+"pt-BR_link": "/pt-BR/configuration"
+---
+
+MoleSignal lit un fichier TOML et les variables d’environnement `MS_`. Partez de l’exemple `conf/config.toml` fourni avec chaque version. Cet exemple répertorie tous les paramètres, et cette page les décrit un par un.
+
+```bash
+molesignal --config /etc/molesignal/config.toml
+```
+
+## Ordre de chargement de la configuration
+
+MoleSignal applique les paramètres dans l’ordre suivant. Chaque source remplace les valeurs définies par les sources précédentes.
+
+1. Les valeurs par défaut intégrées.
+2. Le fichier TOML spécifié avec `--config`.
+3. Les variables d’environnement `MS_`.
+
+Redémarrez le processus après toute modification d’un paramètre. Un processus en cours d’exécution consigne les modifications du fichier dans les journaux sans les appliquer.
+
+<Note>
+  La plupart des sections ignorent les clés non définies. Une faute de frappe reste donc sans effet et ne déclenche aucun avertissement. Les sections `[meta_database]`, `[object_store]` (dont `[object_store.retry]`), `[telemetry]` (dont `[telemetry.trace]` et `[telemetry.self_collect]`), `[apm]`, `[probe]`, `[otlp_grpc]`, `[notify]` et `[scheduled_reports.renderer]` rejettent les clés inconnues. Une faute de frappe empêche donc le processus de démarrer.
+</Note>
+
+La colonne **Par défaut** des tableaux de référence indique la valeur de l’exemple `conf/config.toml`. Si la valeur par défaut intégrée utilisée en l’absence de la clé diffère, la description le précise.
+
+## Variables d’environnement
+
+Chaque paramètre possède une variable d’environnement. Ajoutez le préfixe `MS_`, puis écrivez chaque niveau du chemin du paramètre en majuscules, en les séparant par un seul trait de soulignement.
+
+| Paramètre | Variable d’environnement |
+|---|---|
+| `[http].port` | `MS_HTTP_PORT` |
+| `[meta_database].dsn` | `MS_META_DATABASE_DSN` |
+| `[cluster].advertise_addr` | `MS_CLUSTER_ADVERTISE_ADDR` |
+| `[node].roles` | `MS_NODE_ROLES` |
+
+Écrivez les listes en syntaxe TOML, par exemple `MS_NODE_ROLES='["intake","querier"]'`. MoleSignal ne reconnaît pas les noms qui contiennent un point ou deux traits de soulignement consécutifs.
+
+MoleSignal lit ces variables séparément des paramètres :
+
+| Variable | Utilisation |
+|---|---|
+| `MS_CIPHER_KEY` | Clé racine des secrets que MoleSignal chiffre dans PostgreSQL. Fournissez 32 octets aléatoires encodés en base64. Sans cette clé, le processus utilise une clé de développement composée uniquement de zéros et consigne un avertissement. Ne changez jamais la clé sans exécuter `rewrap-kek`. Consultez la [liste de contrôle pour la production](/fr/deployment/production-checklist). |
+| `MS_AUTH_JWT_SECRET_OVERRIDE` | Impose le secret de signature des JWT à la place de celui que MoleSignal génère dans PostgreSQL au premier démarrage. |
+| `MS_SELF_TELEMETRY_CLUSTER_TOKEN` | Secret partagé qui authentifie les traces candidates et les données d’autotélémétrie que les nœuds aux rôles séparés se transmettent. Définissez la même valeur sur tous ces nœuds si la [capture des traces](#capture-des-traces-et-échantillonnage-en-fin-de-trace) (activée par défaut) ou `[telemetry.self_collect]` est activée. Sans ce secret, un nœud dépourvu du rôle `intake` refuse de démarrer. |
+| `MS_TRACE_FINGERPRINT_KEY` | Clé des empreintes HMAC-SHA-256 qui remplacent les valeurs que MoleSignal ne stocke jamais : la structure des requêtes SQL et les clés d’objet dans les [spans internes de MoleSignal](/fr/self-observability#traçage-distribué-du-backend), ainsi que les noms de bases de données dans les [dépendances APM](/fr/apm#dépendances). Utilisez au moins 16 octets ; MoleSignal ignore les valeurs plus courtes. Définissez la même valeur sur chaque nœud, car des clés différentes produisent des empreintes différentes. Sans clé, MoleSignal n’enregistre aucune empreinte et n’utilise pas de hachage sans clé à la place. MoleSignal lit la clé uniquement depuis l’environnement et ne l’inclut jamais dans les réponses de l’API, les journaux ou les spans. |
+| `MS_AGENT_OPENAI_API_KEY`, `MS_AGENT_ANTHROPIC_API_KEY`, `MS_AGENT_COMPATIBLE_API_KEY` | Clés d’API de secours pour les fournisseurs de modèles de Mole Agent en développement. Chaque clé possède une variable `_BASE_URL` correspondante. En production, configurez les fournisseurs directement dans MoleSignal. |
+| `RELEASE_CHANNEL` | Indique le niveau de maturité du déploiement : `alpha`, `beta`, `rc` ou `stable`. |
+| `RUST_LOG` | Remplace `[telemetry].log_level` si cette variable est définie. |
+| `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_ACCESS_KEY` | Identifiants Azure Blob pour le backend de stockage d’objets `azure`. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Chemin du fichier JSON du compte de service pour le backend de stockage d’objets `gcs`. |
+
+## Paramètres minimaux pour la production
+
+Configurez au minimum ces paramètres sur un nœud de production. Conservez les valeurs par défaut pour le reste du fichier.
+
+```toml
+[http]
+external_url = "https://molesignal.example.com"
+
+[meta_database]
+dsn = "postgres://molesignal:<password>@db.internal:5432/molesignal"
+
+[object_store]
+backend = "s3"
+bucket = "molesignal"
+region = "us-east-1"
+endpoint = ""          # empty for AWS S3, the service URL for S3-compatible storage
+access_key = ""        # prefer MS_OBJECT_STORE_ACCESS_KEY
+secret_key = ""        # prefer MS_OBJECT_STORE_SECRET_KEY
+
+[wal]
+dir = "/var/lib/molesignal/wal"
+
+[auth]
+root_email = "admin@example.com"
+root_password = "<initial password>"
+```
+
+Définissez aussi `MS_CIPHER_KEY` dans l’environnement. Consultez la [liste de contrôle pour la production](/fr/deployment/production-checklist) pour connaître toutes les étapes à suivre avant la mise en production.
+
+## Nœud
+
+La section `[node]` définit les rôles qu’un processus exécute. Consultez la section [Déploiement par rôle](/fr/deployment/role-based).
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `roles` | `["standalone"]` | Rôles à exécuter : `standalone`, `router`, `intake`, `querier`, `compactor`, `alert`. Le rôle `standalone` exécute tous les rôles dans un seul processus. |
+| `id` | vide | Identifiant du nœud, limité à 64 caractères. Si la valeur est vide, MoleSignal utilise le nom d’hôte du système d’exploitation. Définissez un identifiant distinct pour chaque processus si plusieurs processus s’exécutent sur le même hôte. |
+| `drain_timeout_secs` | `30` | Délai accordé pour vider le tampon des données d’ingestion après `SIGTERM` ou `SIGINT`. À l’expiration du délai, le processus s’arrête et un autre nœud d’ingestion prend en charge les données restantes. |
+
+## Points d’écoute
+
+### HTTP
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `bind` | `0.0.0.0` | Adresse d’écoute. |
+| `port` | `5080` | Port HTTP lorsque `[http.tls]` est désactivé. |
+| `gzip` | `true` | Compresse avec gzip les fichiers de l’interface web que le processus sert aux clients qui acceptent ce format. La compression ne s’applique pas aux réponses de l’API. Définissez cette clé sur `false` si un proxy inverse assure la compression. |
+| `external_url` | vide | Origine publique, par exemple `https://molesignal.example.com`. Si cette valeur est vide, l’interface web utilise l’origine du navigateur. Les extraits de code générés pour la prise en main utilisent cette valeur. Les domaines personnalisés des pages de statut l’utilisent comme cible CNAME. Mole Agent l’utilise pour les liens vers les comptes et les conversations dans la messagerie instantanée. L’adresse de rappel de Microsoft Teams utilise aussi cette origine, qui doit donc être en HTTPS. Consultez [Mole Agent dans la messagerie instantanée](/fr/im#sécurité-pour-teams). Les [clés d’accès](/fr/identity/mfa#prérequis-de-l’instance) sont liées au nom d’hôte de cette origine et nécessitent un nom de domaine accessible en HTTPS. Redémarrez après toute modification. |
+
+### HTTP avec TLS et ACME
+
+`[http.tls]` démarre un point d’écoute TLS et obtient automatiquement les certificats auprès d’un service ACME tel que Let's Encrypt.
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `enabled` | `false` | Activation de TLS. Si cette clé vaut `false`, MoleSignal ignore toutes les autres clés de cette section. |
+| `plain_port` | `80` | Port HTTP non chiffré pour les défis ACME HTTP-01 et la redirection vers HTTPS. |
+| `port` | `443` | Port HTTPS. |
+| `acme_directory` | `production` | `production`, `staging` (environnement de test de Let's Encrypt) ou une URL de répertoire personnalisée. |
+| `account_email` | vide | Adresse e-mail du compte ACME. Let's Encrypt exige cette adresse. |
+| `key_storage_dir` | `/var/lib/molesignal/acme` | Répertoire de stockage de la clé du compte ACME et des clés propres à chaque domaine. |
+| `issue_poll_secs` | `60` | Intervalle entre les vérifications des domaines en attente d’un certificat. |
+| `renewal_retry_secs` | `21600` | Intervalle entre les nouvelles tentatives de renouvellement et les vérifications d’expiration. |
+
+### gRPC interne
+
+`[grpc]` achemine le trafic entre les nœuds. N’exposez ce port que sur un réseau de confiance.
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `bind` | `0.0.0.0` | Adresse d’écoute. |
+| `port` | `5082` | Port. Les nœuds pairs l’utilisent aussi via `[cluster].advertise_addr`. |
+| `max_message_size` | `32` | Taille maximale d’un message gRPC, en MiB. |
+
+### OTLP gRPC
+
+`[otlp_grpc]` configure le récepteur OTLP gRPC. Aucune clé d’activation ne contrôle ce récepteur. Il écoute sur tous les nœuds qui exécutent le rôle `intake`, y compris les nœuds `standalone`.
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `bind` | `0.0.0.0` | Adresse d’écoute. |
+| `port` | `4317` | Port. |
+| `max_message_size` | `32` | Taille maximale d’un message gRPC, en MiB. |
+
+### Arrow Flight SQL
+
+`[flight_sql]` permet aux clients SQL comme DBeaver, JDBC et ADBC de se connecter. Chaque appel nécessite un jeton d’API. Consultez [Clients de base de données](/fr/query/database-clients).
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `enabled` | `false` | Démarre le point d’écoute. |
+| `bind` | `0.0.0.0` | Adresse d’écoute. |
+| `port` | `5083` | Port. |
+| `default_lookback_hours` | `24` | Période de recherche, en heures, pour les requêtes SQL sans filtre temporel. |
+| `max_message_size` | `32` | Taille maximale d’un message, en MiB. |
+
+### Agent de sondage
+
+`[probe]` configure les points de terminaison d’enregistrement et de contrôle des agents de sondage. Ces points de terminaison démarrent sur les nœuds `standalone` et `alert`. L’enregistrement utilise TLS avec authentification du serveur. Le flux de contrôle utilise des identités TLS mutuelles de courte durée. Consultez [Surveillance synthétique](/fr/synthetics).
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `bind` | `0.0.0.0` | Adresse d’écoute. |
+| `register_port` | `5084` | Port d’enregistrement. Il doit différer de `control_port`. |
+| `control_port` | `5085` | Port du flux de contrôle. |
+| `register_endpoint` | `https://localhost:5084` | URL publique `https://` que les agents utilisent pour s’enregistrer. La commande d’enregistrement à usage unique affiche cette URL. Renseignez cette valeur si le service se trouve derrière un proxy ou un répartiteur de charge. |
+| `control_endpoint` | `https://localhost:5085` | URL publique `https://` du flux de contrôle. |
+| `server_names` | `["localhost", "127.0.0.1"]` | Noms DNS et adresses IP dans le certificat du serveur. Incluez les noms d’hôte publics des points de terminaison. |
+| `certificate_days` | `30` | Durée de validité des certificats émis, de 1 à 365 jours. |
+| `max_message_size` | `32` | Taille maximale d’un message, en MiB. |
+
+### pprof
+
+`[profiling]` démarre un point d’écoute pprof local au nœud à des fins de diagnostic.
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `enabled` | `false` | Démarre le point d’écoute. |
+| `bind` | `127.0.0.1` | Adresse d’écoute. Utilisez une adresse de bouclage, sauf si `allow_remote` vaut `true`. |
+| `port` | `5086` | Port. Utilisez un port distinct de ceux des autres points d’écoute activés, y compris ceux des rôles que le nœud n’exécute pas. |
+| `allow_remote` | `false` | Autorise une adresse `bind` autre qu’une adresse de bouclage. L’accès à distance peut divulguer des informations sur l’exécution du processus. |
+
+## Stockage
+
+### Base de données des métadonnées
+
+`[meta_database]` configure la base de données PostgreSQL qui contient les métadonnées, les identités, le catalogue de fichiers et les ressources du produit.
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `dsn` | `postgres://molesignal:molesignal@localhost:5432/molesignal` | Chaîne de connexion PostgreSQL. Remplacez les identifiants d’exemple. |
+| `min_connections` | `2` | Nombre de connexions à ouvrir au démarrage, sans dépasser `max_connections`. |
+| `max_connections` | `16` | Nombre maximal de connexions dans le pool. |
+
+Au démarrage, MoleSignal applique à la base de données les migrations de schéma intégrées. Consultez [Mise à niveau](/fr/upgrade).
+
+### Stockage objet
+
+`[object_store]` configure le stockage des fichiers Parquet, des index de recherche et des objets binaires de profils. Backends : `local`, `s3`, `azure`, `gcs`. Utilisez `s3` pour AWS S3 et les services compatibles avec S3, comme RustFS, Cloudflare R2 et Alibaba Cloud OSS.
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `backend` | `local` | `local`, `s3`, `azure` ou `gcs`. |
+| `root` | `./data/objects` | Répertoire du backend `local`. Les autres backends ignorent ce paramètre. |
+| `bucket` | vide | Nom du bucket pour `s3` et `gcs`, ou nom du conteneur pour `azure`. Ce paramètre est obligatoire pour ces backends. |
+| `region` | vide | Région S3. Les services compatibles avec S3 indiquent la valeur attendue. |
+| `endpoint` | vide | URL du point de terminaison S3. Laissez ce champ vide pour AWS S3. Pour RustFS et les services similaires, utilisez une URL de la forme `http://host:9000`. |
+| `path_style` | `false` | `false` active l’adressage par hôte virtuel, requis par AWS S3 et Huawei Cloud OBS. Définissez `true` pour activer l’adressage par chemin, requis par RustFS et la plupart des services auto-hébergés. |
+| `access_key` | vide | Clé d’accès S3 ou clé d’accès au stockage Azure. |
+| `secret_key` | vide | Clé secrète S3. |
+| `credentials_file` | vide | Chemin d’un fichier contenant les lignes `access_key=<value>` et `secret_key=<value>`. Consultez l’ordre de priorité ci-dessous. |
+| `multipart_threshold_size` | `32` | Taille minimale d’un objet, en MiB, à partir de laquelle le transfert se fait en plusieurs parties. Les objets manifestes et les écritures soumises à une condition de version passent toujours par une seule requête. Le minimum est de 1. |
+| `multipart_part_size` | `8` | Taille d’une partie lors d’un transfert en plusieurs parties, en MiB, de 5 à 1 024. Les objets très volumineux utilisent des parties plus grandes pour ne pas dépasser 10 000 parties par transfert. |
+| `range_threshold_size` | `16` | Taille minimale d’une plage d’octets, en MiB, à partir de laquelle la lecture se divise en requêtes parallèles. Le minimum est de 1. |
+| `range_chunk_size` | `8` | Taille du bloc lu par requête, en MiB, de 1 à 1 024. |
+| `max_concurrency` | `8` | Nombre d’opérations simultanées sur le stockage objet par processus. |
+| `op_timeout_secs` | `30` | Délai maximal pour obtenir un créneau d’exécution, puis pour exécuter une opération sur le backend. |
+| `health_probe_interval_secs` | `30` | Intervalle entre les vérifications d’écriture, de lecture et de suppression en arrière-plan. Le minimum est de 5. |
+
+Les clients S3 et Azure prennent leurs identifiants dans la première des sources suivantes qui fournit à la fois une clé d’accès et une clé secrète :
+
+1. Les variables `MS_OBJECT_STORE_ACCESS_KEY` et `MS_OBJECT_STORE_SECRET_KEY`.
+2. Le fichier indiqué par `credentials_file`.
+3. Les clés `access_key` et `secret_key`.
+
+Le journal de démarrage indique la source retenue dans `object_store_credentials_source` : `env`, `file`, `inline` ou `none`. Pour la clé secrète, préférez une variable d’environnement ou un fichier d’identifiants à `config.toml`.
+
+Chaque partie d’un transfert et chaque bloc d’une lecture par plage constituent une opération sur le stockage objet. Chaque opération occupe un créneau d’exécution, fait l’objet de nouvelles tentatives indépendantes et apparaît dans les métriques `object_store_*`. Un transfert occupe au plus la moitié des créneaux, ce qui évite que les objets volumineux bloquent les autres opérations.
+
+En cas d’erreur transitoire sur un backend cloud, MoleSignal réessaie avec un délai d’attente exponentiel :
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `[object_store.retry].max_attempts` | `4` | Nombre total de tentatives par opération. |
+| `[object_store.retry].base_backoff_ms` | `100` | Délai avant la première nouvelle tentative. |
+| `[object_store.retry].max_backoff_ms` | `5000` | Délai maximal. |
+| `[object_store.retry].jitter_ratio` | `0.2` | Facteur de variation aléatoire appliqué à chaque délai, de `0` à `1`. |
+
+### Journal d’écriture anticipée
+
+`[wal]` configure le journal d’écriture anticipée (WAL) que chaque nœud conserve dans le stockage objet. Le nœud confirme une écriture seulement après avoir stocké l’objet WAL correspondant. Ainsi, aucun volume persistant n’est nécessaire. Consultez [Architecture](/fr/architecture#durabilité-et-reprise).
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `lease_secs` | `15` | Durée du bail d’écriture en secondes, au minimum `3`. Si un nœud cesse de renouveler son bail, un autre nœud d’ingestion prend le relais après cette durée à compter du dernier renouvellement, avec un délai supplémentaire pouvant atteindre un intervalle `takeover_interval_secs`. MoleSignal lit ce paramètre uniquement au démarrage. |
+| `max_group_size` | `8` | Taille maximale d’un objet WAL, en MiB. MoleSignal regroupe dans l’objet suivant les écritures qui arrivent pendant l’écriture de l’objet précédent du même jeu de données, dans la limite de cette taille. |
+| `put_timeout_secs` | `10` | Durée maximale d’une écriture d’objet. |
+| `put_attempts` | `3` | Nombre de tentatives par écriture d’objet. Si toutes échouent, MoleSignal refuse les écritures de l’objet avec un code `503`. Réessayez après ce refus. |
+| `takeover_interval_secs` | `5` | Intervalle auquel un nœud d’ingestion recherche les nœuds dont le bail d’écriture a expiré pour prendre le relais. |
+| `encrypt` | `false` | Chiffre chaque objet WAL avec la clé racine (`MS_CIPHER_KEY`). |
+| `max_takeover_size` | `512` | Quantité de mémoire, en MiB, qu’une reprise peut occuper avant de publier un segment. `0` équivaut à `1`. |
+
+### Ingestion
+
+`[intake]` contrôle les tampons en mémoire d’un nœud d’ingestion.
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `buffer_max_size` | `256` | Limite stricte, en MiB, du tampon de données brutes d’un flux. Le seuil adaptatif ne dépasse jamais cette limite. |
+| `max_buffer_memory_size` | `1024` | Mémoire totale réservée par les tampons actifs et détachés du processus, en MiB. |
+| `flush_interval_secs` | `30` | Intervalle maximal entre deux vidages de tampons. |
+| `flush_parallelism` | `4` | Nombre de vidages simultanés. |
+
+`[intake.rotation]` ajuste automatiquement la taille des fichiers Parquet :
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `adaptive_enabled` | `true` | Ajuste le seuil suivant de données brutes pour chaque flux selon le rapport entre la taille encodée et la taille brute des fichiers terminés. |
+| `target_file_size` | `128` | Taille cible des fichiers Parquet encodés, en MiB. |
+| `min_buffer_size` | `16` | Limite inférieure du seuil adaptatif, en MiB. |
+| `ewma_alpha` | `0.2` | Facteur de lissage du rapport, strictement supérieur à 0 et inférieur ou égal à 1. |
+
+`[intake.prometheus]` limite les données entrantes via `remote_write` de Prometheus :
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `max_labels_per_series` | `64` | Nombre d’étiquettes par série, hors `__name__`. |
+| `max_label_name_length` | `128` | Longueur maximale d’un nom d’étiquette, en octets UTF-8. |
+| `max_label_value_length` | `2048` | Longueur maximale d’une valeur d’étiquette, en octets UTF-8. |
+| `max_samples_per_batch` | `16384` | Nombre d’échantillons par lot interne. |
+
+`[intake.prometheus.cardinality]` contrôle l’admission des séries dans le processus qui reçoit la requête `remote_write`, avant le transfert du lot vers un nœud d’ingestion. Chaque processus compte les séries reçues. En présence de plusieurs routeurs, chacun applique donc les limites indépendamment :
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `enabled` | `true` | Applique les limites. |
+| `max_active_series_per_process` | `1000000` | Nombre de séries actives par processus. |
+| `max_new_series_per_minute` | `20000` | Nombre de nouvelles séries que le processus accepte par minute. |
+| `idle_ttl_secs` | `900` | Durée d’inactivité après laquelle une série libère sa place. |
+
+Configurez les limites par organisation et par métrique au niveau de la plateforme dans **Paramètres → Cardinalité des métriques**, dans l’organisation `_sys`. Chaque nœud relit ces limites toutes les 30 secondes et les applique aux séries qu’il compte.
+
+### Compactage et rétention
+
+`[compactor]` fusionne les fichiers et applique la rétention. Le compacteur s’exécute sur les nœuds `standalone` et `compactor`.
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `interval_secs` | `300` | Intervalle entre les cycles de compactage. |
+| `target_size` | `512` | Taille totale maximale des fichiers regroupés lors d’une fusion, en MiB, de `1` à `65536`. Le fichier fusionné atteint environ cette taille ou reste plus petit. Le compacteur lit les fichiers sources et transfère le résultat par parties. La mémoire utilisée pour la fusion n’augmente donc pas avec cette taille. Chaque fusion lit au plus 128 fichiers. Le compacteur fusionne les autres avec le résultat lors d’un cycle ultérieur. Si un fichier dépasse à lui seul la taille cumulée des autres fichiers de la fusion, le compacteur l’écarte. Il attend que les nouveaux fichiers atteignent ensemble sa taille avant de le fusionner, pour éviter de réécrire un gros fichier pour peu de nouvelles données. |
+| `max_concurrent_groups` | `4` | Nombre de flux qu’un nœud traite simultanément pendant un cycle. |
+
+Pour les flux sans règle de rétention propre, configurez la durée de conservation au niveau de la plateforme dans **Paramètres → Conservation des données**, dans l’organisation `_sys`. La valeur par défaut est de 30 jours. Configurez le sous-échantillonnage dans l’onglet **Rétention** de chaque flux de métriques. Consultez [Flux](/fr/streams).
+
+### Maintenance du catalogue
+
+Les sections `[storage.*]` contrôlent la maintenance en arrière-plan du catalogue de fichiers et du stockage objet.
+
+| Clé | Par défaut | Description |
+|---|---|---|
+| `[storage.catalog].seal_after_hours` | `48` | Nombre d’heures entre la fin d’une partition et son scellement. Le catalogue écrit alors le manifeste immuable de la partition et les filtres de Bloom de ses champs à correspondance exacte. Ces filtres permettent d’ignorer les fichiers de la partition lors d’une recherche de valeur exacte. Le compacteur ne traite plus les partitions scellées. Le délai laisse donc le temps de fusionner les partitions horaires d’une journée. `0` désactive le scellement. |
+| `[storage.catalog].manifest_cache_size` | `256` | Mémoire du cache des manifestes, en MiB. |
+| `[storage.catalog].interval_secs` | `300` | Intervalle entre les cycles de scellement. |
+| `[storage.catalog].batch_size` | `64` | Nombre de partitions par cycle. |
+| `[storage.index].enabled` | `true` | Crée les index de recherche manquants et reconstruit ceux qui utilisent un ancien format, à raison de quelques index par cycle. La maintenance du catalogue reconstruit les index des partitions scellées et les publie avec la génération suivante de leur manifeste. |
+| `[storage.index].interval_secs` | `30` | Intervalle. |
+| `[storage.index].batch_size` | `64` | Nombre de fichiers par cycle. |
+| `[storage.index].max_concurrency` | `2` | Nombre de constructions d’index simultanées. |
+| `[storage.index].retry_after_secs` | `300` | Délai avant une nouvelle tentative après l’échec de la construction d’un index. |
+| `[storage.gc].enabled` | `true` | Supprime les objets que le catalogue ne référence plus. |
+| `[storage.gc].interval_secs` | `30` | Intervalle. |
+| `[storage.gc].grace_period_secs` | `3600` | Durée d’attente de chaque objet dans la file de suppression. Avant la suppression définitive, MoleSignal vérifie à nouveau la référence dans le catalogue et la somme de contrôle. |
+| `[storage.gc].lease_secs` | `900` | Durée du bail sur un lot de suppressions pris en charge. |
+| `[storage.gc].batch_size` | `128` | Nombre d’objets par cycle. |
+| `[storage.gc].max_concurrency` | `4` | Nombre de suppressions simultanées. |
+| `[storage.reconciler].enabled` | `true` | Compare le catalogue au stockage objet. |
+| `[storage.reconciler].interval_secs` | `300` | Intervalle. |
+| `[storage.reconciler].batch_size` | `256` | Nombre d’objets par cycle. |
+| `[storage.reconciler].orphan_grace_secs` | `86400` | Âge au-delà duquel MoleSignal considère un objet non référencé comme orphelin. |
+| `[storage.reconciler].verify_checksums` | `true` | Vérifie les sommes de contrôle des objets lors du rapprochement. |
+
+## Requêtes
+
+### Limites et tâches asynchrones
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `[querier].concurrency` | `0` | Nombre de requêtes SQL pouvant s’exécuter en parallèle. `0` utilise le nombre de CPU. Cette valeur limite aussi le nombre de fichiers de données qu’une requête peut lire en même temps. |
+| `[querier].max_scan_rows` | `100000000` | Nombre maximal de lignes qu’une requête peut lire : les lignes des fichiers à lire, plus celles des tampons en mémoire. Le système rejette toute requête qui dépasse cette limite avec le code `400` avant de lire les données. Une requête PromQL applique la limite à chaque sélecteur, compte les lignes lues dans les métriques du sélecteur et s’arrête dès que le nombre de lignes dépasse la limite. `0` supprime la limite. |
+| `[querier].auto_async_threshold_rows` | `50000000` | Les requêtes dont le nombre estimé de lignes dépasse cette valeur deviennent des tâches de recherche asynchrones. `0` désactive la conversion. |
+| `[querier].estimate_throughput_per_sec` | `1000` | Nombre prudent de lignes par seconde utilisé pour estimer la taille des requêtes. |
+| `[search].max_result_rows` | `0` | Nombre maximal de lignes renvoyées par les requêtes sans `LIMIT` ni agrégation. `0` désactive la limite. Cette clé ne figure pas dans le fichier d’exemple. |
+| `[search_jobs].workers` | `2` | Nombre de tâches de recherche qui s’exécutent en même temps sur un même nœud. |
+| `[search_jobs].idle_poll_secs` | `2` | Délai initial entre les vérifications de secours. Ce délai augmente en l’absence d’activité. |
+| `[search_jobs].cleanup_interval_secs` | `3600` | Intervalle entre les suppressions de tâches expirées. |
+
+### Contrôle d’admission
+
+`[search.admission]` limite le nombre de requêtes d’un groupe de travail qui s’exécutent en même temps sur un nœud. Lorsque le groupe de travail atteint sa limite, les requêtes rejoignent une file d’attente et démarrent dans leur ordre d’arrivée. Si une requête attend plus de `max_wait_secs`, le système renvoie le code `429`. Les requêtes servies depuis le cache de résultats n’attendent pas. La limite s’applique aux requêtes envoyées via l’API de requête et Flight SQL, aux graphiques et aux statistiques de champs de l’explorateur, aux partages publics et aux tâches de recherche. L’évaluation des alertes et les autres tâches d’arrière-plan ne passent pas par la file d’attente. Cette section ne figure pas dans le fichier d’exemple.
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `default_max_concurrent` | Deux fois le nombre de CPU | Limite par nœud pour les groupes de travail sans entrée dans `groups`. `0` supprime la limite. |
+| `groups` | Vide | Table qui associe chaque nom de groupe de travail à sa limite par nœud. |
+| `role_map` | Vide | Table qui associe un rôle (`owner`, `admin`, `editor`, `viewer`) à un groupe de travail. Les rôles sans correspondance utilisent `default`. |
+| `max_wait_secs` | `60` | Durée maximale d’attente d’une place libre avant que le système renvoie le code `429`. Avec `0`, le système renvoie le code `429` dès que le groupe de travail atteint sa limite. |
+| `cluster_default_max_concurrent` | `0` | Limite indicative à l’échelle du cluster pour les groupes de travail sans entrée dans `cluster_groups`. Si une requête arrive alors que la limite est atteinte, le système renvoie immédiatement le code `429`. `0` supprime la limite. |
+| `cluster_groups` | Vide | Table qui associe chaque nom de groupe de travail à sa limite indicative à l’échelle du cluster. |
+| `cluster_sync_interval_secs` | `0` | Intervalle de publication de la charge des nœuds. `0` utilise 5. |
+| `cluster_stale_secs` | `0` | Au-delà de cette durée sans signal, les nœuds disparaissent de la vue du cluster. `0` utilise 30. |
+
+`/metrics` expose les métriques de la file d’attente de chaque groupe de travail sous les noms `query_admission_running`, `query_admission_waiting`, `query_admission_wait_seconds` et `query_admission_refusals_total`.
+
+### Caches
+
+Chaque couche utilise un cache LRU avec une durée de vie. Une capacité de `0` désactive la couche. Les taux de succès des caches apparaissent dans `/metrics` sous la forme `cache_<layer>_hit_ratio`.
+
+| Section | Capacité par défaut | TTL par défaut | Contenu |
+|---|---|---|---|
+| `[cache.index_handle]` | `10000` | `600` s | Descripteurs d’index de recherche ouverts. |
+| `[cache.query_result]` | `1000` | `60` s | Résultats des requêtes SQL sur des fenêtres temporelles closes. |
+| `[cache.tantivy_result]` | `1000000` | `600` s | Comptages de termes qui permettent d’écarter des fichiers. |
+| `[cache.tantivy_footer]` | `100000` | `3600` s | Pieds d’index qui évitent les lectures par plage. |
+
+Chaque section accepte les clés `capacity` et `ttl_secs`.
+
+`[cache.parquet_metadata]` conserve en mémoire les pieds de fichier Parquet déjà analysés, y compris les index de pages. Lorsqu’une requête ouvre un fichier dont les métadonnées figurent dans le cache, elle n’a pas besoin de lire le pied de fichier. La seule clé est `max_size`, exprimée en MiB, avec une valeur par défaut de `256`. `0` désactive le cache.
+
+`[cache.object]` met en cache sur le disque local des plages d’octets d’objets distants. Le backend de stockage objet `local` n’utilise pas ce cache.
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `enabled` | `true` | Active le cache. Une valeur de `0` pour `max_size` désactive aussi le cache. |
+| `root` | `./data/cache/objects` | Répertoire du cache. |
+| `max_size` | `10240` | Taille maximale du cache en MiB, soit 10 GiB. |
+| `block_size` | `4` | Taille des blocs en MiB, de 1 à 16. |
+| `memory_size` | `256` | Volume de blocs vérifiés à conserver en mémoire, en MiB. Les lectures suivantes d’un bloc en mémoire n’accèdent pas au disque. `0` conserve les blocs uniquement sur disque. |
+| `min_free_size` | `1024` | Espace disque libre à préserver en MiB, soit 1 GiB. |
+| `max_concurrent_fetches` | `16` | Nombre de récupérations simultanées de blocs. La valeur doit être supérieure à zéro. |
+| `max_concurrent_fetches_per_object` | `4` | Nombre de récupérations simultanées pour un même objet. La valeur doit être supérieure à zéro. |
+
+Lorsque le cache dépasse `max_size` ou que l’espace disque libre descend sous `min_free_size`, le cache évince en priorité les blocs les moins récemment utilisés. Lorsque le ramasse-miettes supprime un objet, le nœud qui effectue la suppression retire aussi les blocs de cet objet de son cache s’il a lu l’objet depuis son démarrage. Les autres nœuds évincent ces blocs selon les règles habituelles.
+
+### Cache incrémental des requêtes par plage
+
+`[search.stream_agg_cache]` met en cache les fenêtres closes des requêtes PromQL par plage, comme `rate(metric[5m])`. À chaque actualisation d’un tableau de bord, le système recalcule uniquement la fenêtre la plus récente.
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `max_size` | `256` | Mémoire allouée au cache en MiB, estimée d’après les séries et les fenêtres que chaque requête conserve. `0` désactive le cache. |
+| `ttl_secs` | `300` | Durée de vie d’une entrée. Couvre les données qui arrivent avec un retard supérieur à `safe_lookback_secs`. |
+| `safe_lookback_secs` | `300` | Le cache ne conserve que les fenêtres qui se terminent avant l’heure actuelle moins cette durée. |
+| `max_series_per_query` | `10000` | Nombre de séries mises en cache par empreinte. `0` supprime la limite. |
+
+## Cluster et limites de débit
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `[cluster].advertise_addr` | `127.0.0.1:5082` | Adresse du port gRPC interne que les nœuds pairs utilisent. Le système inscrit cette adresse dans la table `cluster_nodes`. Indiquez une adresse accessible à tous les nœuds pairs. |
+| `[cluster].heartbeat_interval_secs` | `5` | Intervalle entre les signaux de présence. |
+| `[cluster].peer_timeout_secs` | `15` | Au bout de cette durée sans signal de présence, le système considère le nœud pair comme absent. Un nouveau nœud de compactage attend aussi cette durée avant de prendre en charge des tâches. |
+| `[router.rate_limit].intake_qps` | `1000` | Nombre de requêtes d’ingestion par seconde et par organisation pour le rôle `router`. `0` supprime la limite. |
+| `[router.rate_limit].query_qps` | `100` | Nombre de requêtes de consultation par seconde et par organisation pour le rôle `router`. `0` supprime la limite. |
+| `[router.rate_limit].burst_multiplier` | `2` | Capacité du seau à jetons, exprimée en multiple du débit. |
+
+La limite de débit s’applique uniquement au rôle `router`, et chaque réplique du routeur comptabilise ses requêtes séparément. Consultez [Déploiement par rôle](/fr/deployment/role-based#limitation-du-débit).
+
+## Alertes et e-mails
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `[alert].eval_interval_secs` | `30` | Intervalle d’évaluation des règles. |
+| `[alert].dispatch_interval_secs` | `10` | Intervalle de traitement des escalades. |
+| `[alert].eval_timeout_secs` | `10` | Délai maximal d’évaluation d’une règle. Tout dépassement incrémente `alert_rule_eval_timeout_total` sans bloquer le cycle suivant. |
+| `[alert].default_ack_timeout_secs` | `300` | Valeur de `ack_timeout_secs` pour une étape d’escalade qui ne renseigne pas ce champ. MoleSignal enregistre cette valeur avec l’étape, de sorte qu’une modification ultérieure n’affecte pas les étapes déjà enregistrées. |
+
+`[notify.smtp]` configure l’envoi des e-mails de la plateforme, par exemple pour l’approbation des inscriptions. Les canaux de notification par e-mail conservent leurs propres identifiants dans des connecteurs chiffrés. SMTP reste désactivé tant que `host` est vide.
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `host` | vide | Serveur SMTP. Une valeur non vide active SMTP. |
+| `port` | `587` | Port. Avec la valeur intégrée `0`, MoleSignal utilise le port `587`. |
+| `username` | vide | Nom d’utilisateur. Laissez ce champ vide pour ne pas utiliser d’authentification. |
+| `password` | vide | Mot de passe de connexion. MoleSignal l’utilise uniquement si `username` est renseigné. |
+| `from` | `molesignal@example.com` | Adresse de l’expéditeur. Renseignez ce champ si SMTP est activé. La valeur intégrée est vide. |
+| `tls` | `starttls` | `none`, `starttls` ou `tls`. |
+| `timeout_secs` | `10` | Délai maximal de connexion et d’envoi. La valeur intégrée `0` correspond à 1 seconde. |
+
+## Authentification
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `session_ttl_secs` | `86400` | Durée de la session, soit 24 heures : elle correspond à la durée de vie du jeton d’actualisation. Pendant cette période, MoleSignal renouvelle le jeton d’accès toutes les 15 minutes. Dans l’organisation `_sys`, une session se termine au bout d’une heure au plus. |
+| `root_email` | `admin@example.com` | Adresse e-mail du compte racine. La valeur intégrée est vide. |
+| `root_password` | `admin` | Mot de passe du compte racine. La valeur intégrée est vide. Remplacez la valeur d’exemple. |
+
+MoleSignal crée le compte racine au premier démarrage si la base de données ne contient aucun utilisateur et si les deux valeurs sont renseignées. Modifier `root_password` par la suite ne change pas le mot de passe d’un compte existant. Modifiez plutôt le mot de passe dans l’interface web. À chaque démarrage, MoleSignal attribue le rôle d’administrateur de la plateforme au compte associé à `root_email`. Cette adresse doit donc correspondre à un compte existant.
+
+Au premier démarrage, MoleSignal génère le secret de signature JWT et le stocke dans PostgreSQL. Utilisez `MS_AUTH_JWT_SECRET_OVERRIDE` pour imposer un secret et `POST /api/v1/auth/jwt/rotate` pour le renouveler.
+
+## Auto-observabilité
+
+Les logs du processus et la télémétrie collectée en interne utilisent `[telemetry]`. Consultez [Auto-observabilité](/fr/self-observability).
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `[telemetry].log_level` | `info,tantivy=warn` | Filtre de logs au format `EnvFilter`. La valeur intégrée est `info`. `RUST_LOG` est prioritaire. |
+| `[telemetry].log_format` | `text` | `text` ou `json`. |
+| `[telemetry].log_output` | `console` | `console` ou `file`. |
+| `[telemetry].log_directory` | `logs` | Répertoire des fichiers de logs lorsque `log_output` vaut `file`. |
+| `[telemetry].log_rotation` | `daily` | `minutely`, `hourly`, `daily` ou `never`. |
+| `[telemetry].log_max_files` | `7` | Nombre de fichiers à conserver après rotation. |
+
+Les trois dernières clés figurent en commentaire dans le fichier d’exemple. Les valeurs indiquées s’appliquent lorsque `log_output` vaut `file`.
+
+### Télémétrie collectée en interne
+
+`[telemetry.self_collect]` écrit les métriques, les traces et les profils du processus dans la famille de flux réservée `_molesignal`. Ce réglage ne concerne que les signaux du processus lui-même : le service stocke les traces envoyées par les tenants, que la collecte interne soit activée ou non.
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `enabled` | `true` | Activation globale. La valeur intégrée est `false`. Pour les traces, activez aussi `[telemetry.trace].enabled`. |
+| `metrics_enabled` | `true` | Collecte les métriques du processus. |
+| `metrics_interval_secs` | `15` | Intervalle de collecte des métriques. |
+| `queue_capacity` | `8192` | Capacité de la file d’attente en mémoire pour chaque type de signal. |
+| `batch_max_events` | `256` | Nombre maximal d’événements par lot. |
+| `batch_max_delay_ms` | `1000` | Temps d’attente maximal pour remplir un lot. |
+| `flush_timeout_secs` | `5` | Délai pour vider les files d’attente à l’arrêt. |
+| `profiles_enabled` | `false` | Collecte les profils du processus. |
+| `profile_kinds` | `["cpu"]` | `cpu`, `heap` ou les deux. |
+| `profile_interval_secs` | `600` | Intervalle entre les profils. |
+| `profile_duration_secs` | `10` | Durée d’un profil CPU, de 1 à 120. |
+
+À la création, les flux `_molesignal` ont une durée de rétention de 7 jours. Modifiez cette durée dans l’onglet **Rétention** du flux, dans l’organisation `_sys`. La valeur persiste après un redémarrage.
+
+### Capture des traces et échantillonnage en fin de trace
+
+`[telemetry.trace]` contrôle les spans que le service enregistre sur sa propre activité et l’échantillonneur qui décide en fin de trace quelles traces conserver.
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `enabled` | `true` | Activation par défaut de la capture et de l’échantillonnage en fin de trace. La politique d’exécution peut encore changer tant que `force_disabled` vaut `false`. |
+| `force_disabled` | `false` | Option de déploiement prioritaire. La politique d’exécution accessible via `/api/v1/system/telemetry` ne peut pas la remplacer. |
+| `filter` | `info` | Filtre `EnvFilter` pour la capture et l’exportation des spans. Indépendant de `RUST_LOG` et de `log_level`. |
+| `deployment_environment` | `production` | Libellé de l’environnement. `development`, `dev` et `test` utilisent `development_sample_ratio`. Les autres valeurs utilisent `normal_sample_ratio`. |
+| `normal_sample_ratio` | `0.10` | Taux d’échantillonnage de base des traces normales hors développement, de 0,0 à 1,0. |
+| `development_sample_ratio` | `1.0` | Taux d’échantillonnage de base dans les environnements de développement, de 0,0 à 1,0. |
+| `decision_window_secs` | `30` | Temps pendant lequel l’échantillonneur regroupe les spans d’une trace avant de prendre une décision, de 5 à 120. |
+| `root_grace_millis` | `1000` | Délai d’attente des spans enfants tardifs après la fin du span racine. |
+| `decision_cache_secs` | `300` | Durée de vie d’une décision d’échantillonnage. Au moins `decision_window_secs`. |
+| `tail_max_traces` | `10000` | Nombre maximal de traces que l’échantillonneur peut garder en attente d’une décision. |
+| `tail_memory_size` | `256` | Limite de mémoire pour les traces en attente d’une décision, en MiB. |
+| `max_spans_per_trace` | `1000` | Nombre maximal de spans conservés par trace. |
+| `max_attributes_per_span` | `128` | Nombre maximal d’attributs conservés par span. |
+| `max_events_per_span` | `128` | Nombre maximal d’événements conservés par span. |
+| `max_links_per_span` | `128` | Nombre maximal de liens conservés par span. |
+| `max_string_length` | `4096` | Longueur maximale d’une chaîne d’attribut, d’événement ou de lien, en octets UTF-8. |
+| `shutdown_timeout_secs` | `10` | Délai pour arrêter le pipeline lors de l’arrêt du service. |
+
+`[telemetry.trace.slow_thresholds]` définit les seuils au-delà desquels un span est considéré comme lent, en millisecondes : `http_ms = 1000`, `query_ms = 5000`, `batch_intake_ms = 2000`, `database_ms = 200`, `object_store_ms = 500`, `external_ms = 1000`, `background_ms = 30000`.
+
+`[telemetry.trace.external]` exporte les traces vers un récepteur OTLP externe. L’exportation reste désactivée tant que `endpoint` est vide.
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `endpoint` | vide | Adresse du récepteur OTLP. |
+| `protocol` | `grpc` | `grpc` ou `http/protobuf`. Le service ne déduit jamais le protocole de l’URL. |
+| `timeout_ms` | `5000` | Délai d’expiration de la connexion et de l’exportation. |
+| `queue_capacity` | `8192` | Capacité de la file d’attente d’exportation. |
+| `batch_size` | `256` | Nombre de traces par lot. |
+| `gzip` | `false` | Compresse les données à envoyer. |
+| `allow_self_export` | `false` | Autorise l’exportation vers ce cluster MoleSignal. Cette option reste désactivée par défaut pour éviter les boucles. |
+| `headers` | aucun | En-têtes OTLP. Référencez les secrets avec `env:NAME` ou `secret:NAME`. N’écrivez jamais leur valeur. |
+| `custom_ca_file` | aucun | Fichier d’autorité de certification (CA) pour le certificat du serveur HTTPS. |
+| `client_certificate_file` | aucun | Certificat client mTLS. Renseignez-le avec `client_key_file`. |
+| `client_key_file` | aucun | Clé client mTLS. Renseignez-la avec `client_certificate_file`. |
+
+### APM
+
+`[apm]` contrôle la projection des données de surveillance des performances des applications. La projection démarre sur les nœuds qui gèrent les traces candidates ou qui exécutent l’agrégation du rôle `alert`. Consultez [APM](/fr/apm).
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `queue_capacity` | `65536` | Capacité de la file d’attente d’entrée, de 1024 à 1048576. |
+| `flush_interval_ms` | `5000` | Intervalle d’écriture des agrégats, de 100 à 60000. |
+| `flush_max_snapshots` | `10000` | Nombre maximal d’instantanés par écriture, de 1 à 100000. |
+| `shutdown_drain_secs` | `10` | Délai pour vider la file d’attente à l’arrêt, de 1 à 300. |
+| `late_grace_secs` | `300` | Délai pendant lequel le service accepte encore les données de trace tardives. Strictement supérieur à 0 et inférieur à la durée de rétention des données à chaud. |
+| `hot_retention_hours` | `24` | Durée de rétention des données à haute résolution, de 1 à 168. |
+| `rollup_retention_days` | `30` | Durée de rétention des agrégats, de 1 à 3650. |
+| `max_query_range_days` | `30` | Plage temporelle maximale d’une requête APM. Au plus `rollup_retention_days`. |
+| `max_exemplars_per_bucket` | `3` | Nombre maximal d’exemplaires par classe d’agrégation, de 1 à 16. |
+| `max_error_samples_per_group` | `8` | Nombre maximal d’échantillons d’erreurs par groupe, de 1 à 64. |
+| `[apm.histogram].schema_version` | `2` | Version du schéma des classes de latence. Incrémentez-la à chaque modification de `buckets_per_octave`. Utilisez au minimum `2` : la version `1` correspond aux classes fixes des anciens agrégats, qui restent lisibles. |
+| `[apm.histogram].buckets_per_octave` | `8` | Nombre de classes par doublement de la latence, de 1 à 16, sur une plage de 125 µs à environ 131 s. Le schéma inclut automatiquement `+Inf`. Avec `8`, l’écart entre deux bornes voisines est d’environ 9 % et la marge d’erreur sur un percentile est d’environ 4 %. |
+| `[apm.version_comparison].min_requests_per_version` | `1000` | Nombre minimal de requêtes pour inclure une version dans la comparaison. |
+
+Les limites de cardinalité définissent combien de services, de points de terminaison, de dépendances, d’opérations, de groupes d’erreurs, de versions et d’instances l’APM distingue sur une heure. Configurez-les au niveau de la plateforme dans **APM → Paramètres → Limites de cardinalité** avec l’autorisation `sys.settings.limits.manage`. Chaque nœud relit ces limites toutes les 30 secondes. Consultez [Paramètres APM](/fr/apm/settings#limites-de-cardinalité). Le service ne charge pas les fichiers de configuration qui contiennent encore une section `[apm.cardinality]`.
+
+## Fonctionnalités et intégrations
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `[functions].llm_eval_enabled` | `false` | Permet à `POST /api/v1/functions/run` d’exécuter une fonction LLM, à raison d’un appel au modèle par exécution. Consultez [Fonctions](/fr/functions#langages). L’étape **Résumé par IA** d’un [pipeline d’alertes](/fr/pipelines/alert-events#résumé-par-ia) ne dépend pas de ce paramètre. |
+| `[mmdb].db_path` | `/usr/share/molesignal/mmdb/dbip-city-lite.mmdb` | Base de données DB-IP City Lite. L’image de conteneur et l’archive de la version incluent, dans `mmdb/`, l’édition mensuelle disponible au moment de leur création. Consultez [Déployer MoleSignal](/fr/deployment). À l’ingestion, le RUM détermine le pays de chaque événement à partir de l’adresse IP du client. Sans ce fichier, les événements conservent le pays transmis par le client. La fonction VRL [`geoip_lookup`](/fr/functions#interroger-les-tables-et-géolocaliser-les-adresses-ip) lit le même fichier et renvoie `null` en son absence. |
+
+Données de géolocalisation IP fournies par [DB-IP](https://db-ip.com) sous licence [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
+Le binaire distribué inclut l’environnement d’exécution des fonctions JavaScript et VRL. Aucun des deux ne nécessite de paramètre. Consultez [Fonctions](/fr/functions).
+
+Les rapports planifiés au format PDF ou PNG utilisent Chrome en mode headless pour le rendu des pages :
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `[scheduled_reports.renderer].base_url` | `http://127.0.0.1:5173` | Origine depuis laquelle Chrome en mode headless charge les pages des rapports. Indiquez une URL absolue en `http` ou `https`. La valeur par défaut pointe vers le serveur de développement de l’interface web. Indiquez l’adresse de l’interface web accessible depuis le nœud. |
+| `[scheduled_reports.renderer].concurrent_renders` | `2` | Nombre de rendus simultanés. `0` équivaut à 1 et toute valeur supérieure à 4 est ramenée à 4. |
+| `[scheduled_reports.renderer].render_timeout_secs` | `30` | Délai maximal d’un rendu. `0` équivaut à 30 et toute valeur supérieure à 60 est ramenée à 60. |
+| `[scheduled_reports.renderer].viewport_width` | `1280` | Largeur en pixels de la zone d’affichage dans laquelle se charge une page de rapport. La page PDF ou l’image a la même largeur. |
+| `[scheduled_reports.renderer].viewport_height` | `800` | Hauteur en pixels de la zone d’affichage dans laquelle se charge une page de rapport. La hauteur de la page PDF ou de l’image correspond à celle du contenu de la page. |
+
+Si Chrome est indisponible, les exports PDF et PNG renvoient une erreur sans générer de fichier de remplacement.
+
+Les inspections planifiées des logs s’exécutent sur les nœuds dotés du rôle `alert`. Consultez [Inspections des logs](/fr/logs/inspections) :
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `[log_inspection].min_interval_secs` | `3600` | Intervalle minimal entre deux exécutions d’une même inspection. Toute valeur inférieure à 60 équivaut à 60. |
+| `[log_inspection].max_per_org` | `20` | Nombre maximal d’inspections planifiées par organisation. `0` n’en autorise aucune. |
+| `[log_inspection].concurrent_runs` | `2` | Nombre d’inspections qu’un nœud peut exécuter simultanément. `0` équivaut à 1. |
+| `[log_inspection].run_timeout_secs` | `300` | Durée maximale d’une exécution, appels aux modèles et requêtes compris. Toute valeur inférieure à 30 équivaut à 30 et toute valeur supérieure à 480 est ramenée à 480. |
+| `[log_inspection].report_retention_days` | `30` | Durée de conservation des rapports en jours. Le système supprime les rapports expirés toutes les heures. `0` équivaut à 1. |
+
+Le budget quotidien de jetons de Mole Agent s’applique à chaque organisation. Le rôle d’administration de l’organisation permet de définir une limite propre à celle-ci dans **Mole Agent → Paramètres → Utilisation**. Consultez [Mole Agent](/fr/agent#utilisation-et-budget). Les dossiers de compétences sont communs à toutes les organisations. Consultez [Compétences](/fr/agent#compétences) :
+
+| Clé | Valeur par défaut | Description |
+|---|---|---|
+| `[agent].daily_token_budget` | `0` | Nombre de jetons de modèle qu’une organisation peut utiliser par jour UTC, en entrée et en sortie. `0` signifie qu’aucune limite ne s’applique. |
+| `[agent].budget_warning_percent` | `80` | Pourcentage de la limite à partir duquel le chat affiche un avertissement. Toute valeur inférieure à 1 équivaut à 1 et toute valeur supérieure à 100 est ramenée à 100. |
+| `[agent].mcp_stdio_commands` | `[]` | Programmes que les serveurs MCP stdio de l’organisation peuvent lancer sur le serveur MoleSignal. Le premier mot de la commande du serveur MCP, par exemple `npx` ou `/opt/mcp/bin/server`, doit correspondre exactement à une entrée de la liste. Si la liste est vide, aucun serveur stdio ne s’exécute. La commande s’exécute avec les droits du compte utilisateur du processus MoleSignal. N’autorisez que des programmes de confiance. Sous forme de variable d’environnement : `MS_AGENT_MCP_STDIO_COMMANDS='["npx","uvx"]'`. |
+| `[agent].skill_paths` | `[]` | Dossiers du serveur dont chaque sous-dossier contenant un fichier `SKILL.md` définit une compétence accessible en lecture seule dans le produit pour toutes les organisations. Chaque nœud lit ces dossiers au démarrage, puis à chaque modification de leurs fichiers. Sous forme de variable d’environnement : `MS_AGENT_SKILL_PATHS='["/var/lib/molesignal/skills"]'`. |
+
+## Paramètres stockés dans la base de données
+
+PostgreSQL stocke ces paramètres. Modifiez-les depuis l’interface web ou via l’API. Ils n’ont pas de clés TOML :
+
+- Fournisseurs SSO (OIDC, OAuth 2.0, SAML et LDAP).
+- Clusters distants pour les requêtes fédérées.
+- Domaines et certificats des pages de statut, et application Slack qui permet d’ajouter une page de statut à Slack.
+- Canaux de notification, plannings d’astreinte et politiques d’escalade.
+- Fournisseurs de modèles, prompts, outils et politique d’approbation de Mole Agent.
+- Clés de chiffrement, règles de masquage des champs et politique de partage de l’organisation.

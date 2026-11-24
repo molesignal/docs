@@ -1,0 +1,156 @@
+---
+title: "Recherche dans les logs"
+description: "Listez les entrées d’un flux de logs page par page, comptez-les au fil du temps et décrivez les valeurs d’un champ."
+"en_link": "/en-US/api/web/logs"
+"zh-Hans_link": "/zh-Hans/api/web/logs"
+"zh-Hant_link": "/zh-Hant/api/web/logs"
+"ja_link": "/ja/api/web/logs"
+"ko_link": "/ko/api/web/logs"
+"de_link": "/de/api/web/logs"
+"es_link": "/es/api/web/logs"
+"pt-BR_link": "/pt-BR/api/web/logs"
+---
+
+Ces appels lisent un flux de journaux de l’organisation, comme le fait la page **Journaux**. Si le flux n’existe pas, l’appel renvoie un résultat vide. Tous les appels nécessitent `logs.read`, ou `sys.telemetry.read` dans le périmètre système.
+
+Pour chaque appel, utilisez `POST` avec un corps JSON ou `GET` avec les mêmes champs dans la chaîne de requête : `filters` et `freeText` sous forme de listes JSON sérialisées, et `where` sous forme d’objet JSON sérialisé. Si la requête est trop longue pour l’URL, envoyez-la en `POST`.
+
+## Critères de correspondance d’un appel
+
+Un appel sélectionne les enregistrements du flux qui se trouvent dans la fenêtre temporelle et satisfont tous les critères suivants :
+
+| Champ | Type | Notes |
+|---|---|---|
+| `filters` | liste | Tous les filtres doivent être satisfaits. Au maximum 32, en comptant ceux de `where`. |
+| `freeText` | liste | Mots ou expressions à rechercher dans le champ `message`, de 512 octets chacun au maximum. La recherche ne tient pas compte de la casse pour un mot d’au plus 40 octets composé de lettres minuscules et de chiffres. Pour tout autre texte, elle respecte la casse. Au maximum 8 éléments, en comptant les critères textuels de `where`. |
+| `where` | objet | Arbre de conditions permettant de définir des alternatives : un filtre, `{"text": "..."}`, `{"and": [...]}` ou `{"or": [...]}`. |
+| `expression` | chaîne | Requête sur les champs au format de la page **Journaux**. Elle remplace `filters`, `freeText` et `where` : utilisez l’une ou l’autre forme. |
+
+Un filtre est un objet qui contient `field`, `op`, `value` et `quoted`. Utilisez le nom du champ tel qu’il figure dans le flux.
+
+| Opérateur | Champs | Correspondance |
+|---|---|---|
+| `=`, `!=` | Tout champ scalaire | La valeur indiquée ou toutes les autres valeurs, respectivement. Avec une valeur vide, ces opérateurs vérifient si le champ a une valeur : `=` sélectionne les enregistrements dont le champ n’a pas de valeur. |
+| `>`, `>=`, `<`, `<=` | Nombres et horodatages | Les valeurs qui satisfont la comparaison. |
+| `contains` | Texte | La valeur à n’importe quel endroit dans le champ. |
+| `match` | Tout champ | La valeur en tant que sous-chaîne, sans distinction de casse. Une valeur vide ne correspond à rien. |
+| `match_text` | Texte avec un index de recherche en texte intégral | Recherche en texte intégral : mots, expressions et caractères génériques. Si le champ ne dispose pas d’un index de recherche en texte intégral, l’appel renvoie `400`. |
+
+`eq`, `ne` et `like` sont des alias de `=`, `!=` et `contains`, respectivement. `quoted` vaut `true` pour une valeur entre guillemets : un mot, jamais un nombre. Pour filtrer un champ JSON, utilisez SQL.
+
+`expression` accepte la syntaxe de la page **Journaux** : comparaisons, `MATCH(field, 'text')` et `MATCH_TEXT(field, 'words')`, mots à rechercher, expressions entre guillemets, opérateurs `AND` et `OR` sans distinction de casse, et parenthèses. `AND` est prioritaire sur `OR`. Le serveur convertit l’expression en `filters`, `freeText` et `where`, comme ceux qu’envoie la page, puis applique les vérifications ci-dessus. Le texte ne peut pas dépasser 8 KiB ni contenir plus de 32 niveaux de parenthèses imbriquées. Si le serveur ne peut pas interpréter une partie de l’expression, par exemple une parenthèse non fermée ou une comparaison sans valeur, il renvoie `400` et indique la partie concernée.
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/logs" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'stream=app' \
+  --data-urlencode "expression=level = 'error' AND (service.name = 'checkout' OR timeout)"
+```
+
+## Lister les enregistrements
+
+```http
+POST /api/v1/web/logs
+GET  /api/v1/web/logs
+```
+
+Renvoie les enregistrements correspondants, du plus récent au plus ancien, avec une pagination par curseur.
+
+| Champ | Type | Notes |
+|---|---|---|
+| `stream` | chaîne | Obligatoire. Flux de journaux. |
+| `from`, `to` | entier | Fenêtre temporelle en microsecondes. Par défaut, elle couvre les 24 dernières heures jusqu’à l’instant présent. `to` doit être supérieur à `from`. |
+| `filters`, `freeText`, `where`, `expression` | | Critères de correspondance de l’appel. |
+| `limit` | entier | Taille de page. Valeur par défaut : `20`. La valeur est ramenée dans l’intervalle de 1 à 5000. |
+| `cursor` | chaîne | Valeur de `nextCursor` ou de `previousCursor` d’une page déjà récupérée. Le curseur conserve la fenêtre temporelle et les critères de correspondance de la première page. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/web/logs \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"stream":"app","expression":"level = '\''error'\''","limit":2}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    { "_timestamp": 1790000000000000, "level": "error", "message": "db pool exhausted", "trace_id": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "nextCursor": "eyJ2IjoxLC...",
+  "previousCursor": null,
+  "hasMore": true
+}
+```
+</ResponseExample>
+
+Chaque élément contient les champs d’un enregistrement. `_timestamp` est exprimé en microsecondes. Une requête qui utilise un `cursor` avec un flux, une fenêtre temporelle, une valeur de `limit` ou des critères de correspondance différents renvoie `400`.
+
+## Compter les enregistrements au fil du temps
+
+```http
+POST /api/v1/web/logs/histogram
+GET  /api/v1/web/logs/histogram
+```
+
+Compte les enregistrements correspondants par intervalle de temps.
+
+| Champ | Type | Notes |
+|---|---|---|
+| `stream` | chaîne | Obligatoire. |
+| `from`, `to` | entier | Obligatoires. Fenêtre temporelle en microsecondes. |
+| `filters`, `freeText`, `where`, `expression` | | Critères de correspondance de l’appel. |
+| `bucketTime` | entier | Durée d’un intervalle en microsecondes. Au moins `1000`. |
+| `originTime` | entier | Début du premier intervalle. Ne doit pas être postérieur à `from`. |
+
+Une requête couvre au maximum 512 intervalles entre `originTime` et `to`.
+
+```json
+{
+  "bucketTime": 60000000,
+  "originTime": 1790000100000000,
+  "buckets": [{ "startTime": 1790000100000000, "total": 120, "errors": 4 }],
+  "split": true
+}
+```
+
+`buckets` liste les intervalles qui contiennent au moins un enregistrement, du plus ancien au plus récent. `errors` compte les enregistrements de niveau `ERROR` d’après le champ `level` ou `body_level`. Si le flux ne contient aucun de ces champs ou si les droits de lecture masquent le niveau, `split` vaut `false` et `errors` vaut `0`. Si le décompte est indisponible, l’appel renvoie `200` avec `buckets` vide et l’une des valeurs suivantes dans `unavailable` : `time_budget`, `busy` ou `scan_limit`, comme pour le [décompte des traces](/fr/api/web/trace#compter-les-traces-au-fil-du-temps).
+
+## Décrire un champ
+
+```http
+POST /api/v1/web/logs/field-stats
+GET  /api/v1/web/logs/field-stats
+```
+
+Décrit les valeurs d’un champ dans les enregistrements correspondants.
+
+| Champ | Type | Notes |
+|---|---|---|
+| `stream` | chaîne | Obligatoire. |
+| `from`, `to` | entier | Fenêtre temporelle en microsecondes. |
+| `filters`, `freeText`, `where`, `expression` | | Critères de correspondance de l’appel. |
+| `field` | chaîne | Obligatoire. Nom du champ tel qu’il figure dans le flux. |
+
+```json
+{
+  "kind": "text",
+  "total": 1840,
+  "present": 1840,
+  "distinct": 3,
+  "distinctExact": true,
+  "top": [{ "value": "info", "count": 1500 }, { "value": "warn", "count": 300 }, { "value": "error", "count": 40 }],
+  "topSkipped": false
+}
+```
+
+`kind` vaut `number`, `time`, `text` ou `bool`. `total` compte les enregistrements correspondants et `present` compte ceux dont le champ a une valeur. `top` liste les valeurs les plus fréquentes par ordre décroissant de fréquence. `topSkipped` vaut `true` lorsque presque toutes les valeurs diffèrent et que `top` n’en liste aucune. `range` indique la plus petite et la plus grande valeur sous forme de texte. Pour un champ numérique, la réponse inclut aussi `spread` et `bars`. `trend` compte les occurrences des valeurs les plus fréquentes sur la fenêtre temporelle. La réponse omet `trend` si aucune valeur ne se démarque par sa fréquence.
+
+## Erreurs
+
+| Statut | Cause |
+|---|---|
+| `400` | Un paramètre est invalide : `stream` est absent, `to` n’est pas supérieur à `from`, un filtre désigne un champ inconnu ou utilise un opérateur incompatible avec le type du champ, les listes ou l’arbre dépassent leurs limites, `expression` accompagne `filters`, `freeText` ou `where` ou contient une partie que le serveur ne peut pas interpréter, le curseur ne correspond pas à la requête, ou un paramètre de l’histogramme manque ou couvre plus de 512 intervalles. |
+| `403` | Le jeton ne dispose pas de l’autorisation `logs.read`. |

@@ -1,0 +1,152 @@
+---
+title: "Einführung in die API"
+description: "Basis-URLs, Authentifizierung, Berechtigungen, Konventionen für Anfragen, Paginierung, Streaming und Fehlerbehandlung."
+"en_link": "/en-US/api-reference"
+"zh-Hans_link": "/zh-Hans/api-reference"
+"zh-Hant_link": "/zh-Hant/api-reference"
+"ja_link": "/ja/api-reference"
+"ko_link": "/ko/api-reference"
+"es_link": "/es/api-reference"
+"fr_link": "/fr/api-reference"
+"pt-BR_link": "/pt-BR/api-reference"
+---
+
+MoleSignal stellt eine versionierte HTTP-API bereit. Die Produktendpunkte verwenden `/api/v1`. Die Zustandsprüfung, Prometheus-Metriken, öffentliche Freigabelinks und einige Kompatibilitätsprotokolle verwenden auch andere Pfade.
+
+## Basis-URL
+
+Für eine lokale Instanz:
+
+```text
+http://localhost:5080/api/v1
+```
+
+Ersetzen Sie in der Produktionsumgebung den Host durch die öffentliche Adresse der Bereitstellung. Diese Adresse ist der Wert von `[http].external_url`.
+
+## Authentifizierung
+
+Geschützte Endpunkte akzeptieren ein Bearer-Token im Header `Authorization`:
+
+```http
+Authorization: Bearer <token>
+```
+
+| Token | Bezug | Gültigkeit |
+|---|---|---|
+| API-Token | **Kontoeinstellungen → API-Token** oder [API-Token ausstellen](/de/api/auth/issue-token). API-Token haben das Format `mspat-<36>`. | Bis zum Widerruf oder bis zum festgelegten Ablaufzeitpunkt. |
+| Standard-Intake-Token | `GET /api/v1/me/api-tokens/default`. Nur für `logs.write`, `metrics.write`, `traces.write`, `profiles.write` und `apm.deploy`. | Läuft nicht ab. |
+| RUM-Client-Token | `GET /api/v1/auth/tokens/rum?applicationId=<id>`. Nur für `rum.write`. | Läuft nicht ab. |
+
+Verwenden Sie für Skripte und Collectors ein API-Token. Informationen zu Intake-Token finden Sie unter [Datenquelle](/de/intake#token-für-die-datenerfassung).
+
+Die Weboberfläche verwendet `POST /api/v1/auth/signin` zur Anmeldung. Der Endpunkt setzt Sitzungscookies, statt ein Token zurückzugeben. Der Header `Authorization` akzeptiert kein Sitzungstoken. Siehe [Anmelden](/de/api/auth/login).
+
+Bei der Authentifizierung entsteht ein IAM-Kontext mit dem Subjekt, dem aktiven Organisations- oder Plattformbereich und den effektiven Berechtigungen. Die Organisation einer Anfrage ergibt sich immer aus diesem Kontext. Der Anfragebody kann keine andere Organisation auswählen.
+
+## Öffentliche Routen und Routen mit eigener Authentifizierung
+
+Einige Routen akzeptieren kein Organisations-Bearer-Token. Stattdessen prüfen sie einen auf den jeweiligen Zweck beschränkten Berechtigungsnachweis oder eine Richtlinie:
+
+- Anmeldung, Registrierungsrichtlinie und Zurücksetzen des Passworts;
+- `GET /api/v1/healthz` und `/metrics` auf oberster Ebene;
+- Austausch von Token für öffentliche Ressourcenfreigaben und Anfragen zu Freigabesitzungen;
+- signierte Dateidownloads und öffentliche Avatare;
+- Endpunkte von Push-Konnektoren, die ein Push-Token prüfen.
+
+Auch öffentliche Routen sind nicht uneingeschränkt zugänglich. Der jeweilige Handler prüft die Registrierungsrichtlinie, ein Freigabetoken, ein Download-Token, eine Signatur oder den Berechtigungsnachweis des Konnektors.
+
+## Autorisierung
+
+Ein Endpunkt kann eine oder mehrere dieser Bedingungen voraussetzen:
+
+- eine Organisationsberechtigung wie `streams.query`;
+- eine Plattformberechtigung wie `sys.telemetry.read`;
+- Eigentümerschaft an einer Ressource, eine Beziehung zu ihr oder eine organisationsübergreifende Zugriffsfreigabe.
+
+`GET /api/v1/iam/capabilities` gibt die effektiven Berechtigungen des aktuellen Subjekts zurück. Leiten Sie Zugriffsrechte weder aus einem Rollennamen noch aus einem sichtbaren Menüeintrag ab.
+
+## Anfragen
+
+- Die meisten Anfragebodys enthalten JSON mit `Content-Type: application/json`.
+- Intake-Endpunkte für Kompatibilitätsprotokolle verwenden die Nutzdaten des jeweiligen Protokolls, etwa Protobuf, NDJSON oder einen gzip-komprimierten Body.
+- Der Intake lehnt Anfragebodys über 2 MiB mit `413` ab. Für natives JSON liegt das Limit bei 16 MiB.
+- Zeitangaben sind Ganzzahlen in Mikrosekunden seit der Unix-Epoche. Der Name eines Zeitpunkts bezeichnet das zugehörige Ereignis (`createdAt`, `expiresAt`). Wenn ein einzelnes Wort nicht eindeutig ist, endet der Name auf `Time` (`startTime`). Der Name einer Zeitdauer endet auf `Time` (`p95Time`), sofern er die Dauer nicht bereits ausdrückt (`duration`). Native Telemetriedatensätze verwenden `_timestamp`, ebenfalls in Mikrosekunden.
+- URL-kodieren Sie IDs in Pfaden und Stream-Namen.
+
+## Antworten und Fehler
+
+Bei Erfolg gibt der Endpunkt JSON zurück, sofern er die Daten nicht streamt oder eine Datei zum Download bereitstellt. Eine Fehlerantwort enthält einen Statuscode und einen JSON-Body mit einem maschinenlesbaren Fehlercode in `error` und einer Meldung in `message`:
+
+```json
+{
+  "error": "unauthorized",
+  "message": "unauthorized: missing Authorization Bearer token"
+}
+```
+
+Beim Fehler `validation_failed` enthält die Antwort zusätzlich ein Array `issues` mit einem Eintrag pro ungültigem Feld.
+
+| Status | `error` | Bedeutung |
+|---|---|---|
+| `400` | `invalid_argument`, `validation_failed` | Die Anfrage oder einer ihrer Parameter ist ungültig. |
+| `401` | `unauthorized` | Das Token fehlt, hat ein falsches Format, ist ungültig oder ist abgelaufen. |
+| `403` | `forbidden` | Die erforderliche Berechtigung, Beziehung oder der erforderliche Geltungsbereich fehlt. |
+| `404` | `not_found` | Die Ressource existiert nicht oder ist im autorisierten Geltungsbereich nicht sichtbar. |
+| `409` | `conflict` | Der Zustand steht im Konflikt mit der Anfrage oder die Anfrage verletzt eine Eindeutigkeitsbedingung. |
+| `413` | `payload_too_large` | Der Anfragebody überschreitet das Limit. |
+| `429` | `resource_exhausted` | Ein Ratenlimit greift. Beachten Sie den Header `Retry-After`, falls vorhanden. |
+| `499` | `cancelled` | Die Anfrage wurde abgebrochen. |
+| `503` | `unavailable` | Eine Abhängigkeit ist nicht verfügbar. |
+| `500` | `internal` | Ein interner Fehler ist aufgetreten. Der Antwortbody enthält die Meldung `internal error`. Details stehen nur im Serverlog. |
+
+Kann MoleSignal den Anfragebody nicht parsen, schlägt die Anfrage fehl, bevor sie den Endpunkt erreicht. Die Antwort enthält Klartext statt JSON:
+
+| Status | Bedeutung |
+|---|---|
+| `400` | Der Anfragebody enthält kein gültiges JSON. |
+| `415` | In der Anfrage fehlt `Content-Type: application/json`. |
+| `422` | Ein Feld fehlt oder hat den falschen Typ. Der Antworttext nennt das Feld. |
+
+Jede Antwort enthält die Header `X-Request-Id` und `X-Trace-Id`. Geben Sie beide an, wenn Sie einen serverseitigen Fehler melden.
+
+## Paginierung
+
+Endpunkte, die viele Zeilen zurückgeben können, akzeptieren `limit` und `cursor`. Die Antwort enthält `items` und `nextCursor`. Übergeben Sie `nextCursor` als `cursor`, um die nächste Seite abzurufen. Beenden Sie den Abruf, sobald `nextCursor` leer ist. Andere Listenendpunkte geben die vollständige Liste zurück. Details finden Sie auf der Seite des jeweiligen Endpunkts.
+
+## Abfragen und lang laufende Vorgänge
+
+Die Abfrageendpunkte geben reguläres JSON zurück, streamen NDJSON und führen lang laufende Abfragen als asynchrone Suchjobs aus. Ist eine Abfrage zu groß, antwortet der Endpunkt mit `202`, einer `jobId` und einem Pfad in `monitor`. Verarbeiten Sie beim Streaming auch Teilergebnisse und brechen Sie die Anfrage ab, sobald Sie das Ergebnis nicht mehr benötigen. Siehe [Abfrage](/de/query).
+
+MoleSignal liefert große Artefakte wie generierte Berichte, Profil-Blobs und Exporte als Dateien statt im JSON-Body aus. Der Abruf erfolgt über ein Download-Token mit begrenztem Geltungsbereich.
+
+## API erkunden
+
+<CardGroup cols={3}>
+  <Card title="API-Katalog" icon="list" href="/de/api/catalog">
+    Routengruppen, ihr Zweck und die erforderlichen Berechtigungen.
+  </Card>
+  <Card title="Authentifizierung" icon="key" href="/de/api/auth/login">
+    Melden Sie sich an und verwalten Sie API-Token.
+  </Card>
+  <Card title="Intake" icon="inbox" href="/de/api/intake/native-json">
+    Senden Sie Telemetriedaten als natives JSON oder in einem kompatiblen Protokollformat.
+  </Card>
+  <Card title="Abfrage" icon="magnifying-glass" href="/de/api/query/execute">
+    Führen Sie SQL-Abfragen, PromQL-kompatible Abfragen, Streaming-Abfragen und gespeicherte Abfragen aus.
+  </Card>
+  <Card title="APM" icon="gauge-high" href="/de/api/apm">
+    Rufen Sie Metriken zu Diensten, Transaktionen, Abhängigkeiten und Fehlern ab.
+  </Card>
+  <Card title="Streams" icon="database" href="/de/api/streams/list">
+    Erstellen, prüfen und konfigurieren Sie Streams.
+  </Card>
+  <Card title="Alerting" icon="bell" href="/de/api/alerting/list-rules">
+    Verwalten Sie Regeln, Vorfälle, Kanäle und Eskalationen.
+  </Card>
+  <Card title="Korrelation und Web" icon="diagram-project" href="/de/api/web/correlation">
+    Suche, Topologie, Traces und Navigation zwischen Signalen.
+  </Card>
+  <Card title="Plattform und Administration" icon="shield-halved" href="/de/api/admin/audit">
+    Audit-Log, Verschlüsselungsschlüssel und Systemzustand.
+  </Card>
+</CardGroup>

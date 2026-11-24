@@ -1,0 +1,346 @@
+---
+title: "Formato de eventos de RUM"
+sidebarTitle: "Formato de eventos"
+description: "Consulta el formato de los eventos JSON que los SDK de RUM y otros clientes envían a MoleSignal: el endpoint de ingesta y su respuesta, las reglas y los campos de cada tipo de evento."
+"en_link": "/en-US/rum/events"
+"zh-Hans_link": "/zh-Hans/rum/events"
+"zh-Hant_link": "/zh-Hant/rum/events"
+"ja_link": "/ja/rum/events"
+"ko_link": "/ko/rum/events"
+"de_link": "/de/rum/events"
+"fr_link": "/fr/rum/events"
+"pt-BR_link": "/pt-BR/rum/events"
+---
+
+Cada SDK de RUM envía los mismos eventos JSON a un único endpoint. Un cliente sin SDK, como una
+aplicación nativa que aún no dispone de uno, envía los mismos eventos mediante una solicitud HTTP.
+
+Un evento contiene un `type`, un `date`, la `session` y la `view` a las que pertenece, y un objeto que lleva
+el nombre de su tipo y contiene los detalles. El código fuente incluye el esquema JSON de los eventos en
+`contracts/rum/events/v1.schema.json`, junto con ejemplos de eventos válidos y no válidos.
+
+## Envía eventos
+
+```http
+POST /api/v1/rum/events
+Authorization: Bearer mspat-<36>
+Content-Type: application/json
+```
+
+| Parte | Regla |
+|---|---|
+| Credencial | El [token de cliente](/es/rum/applications#token-de-cliente) de la aplicación, que otorga `rum.write` solo para esa aplicación. Si usas otra credencial con `rum.write`, indica la aplicación en `application.id` de cada evento. |
+| Cuerpo | Un arreglo JSON de eventos. También puedes enviar un solo objeto de evento o usar NDJSON (`Content-Type: application/x-ndjson`, un evento por línea). |
+| Compresión | `Content-Encoding: gzip` es opcional. El endpoint no acepta ninguna otra codificación. |
+| Tamaño | Como máximo 5000 eventos y 5 MiB tras la descompresión. Si la solicitud supera esos límites, el endpoint devuelve `413`. |
+
+<RequestExample>
+```bash cURL
+curl -X POST "http://localhost:5080/api/v1/rum/events" \
+  -H "authorization: Bearer $RUM_CLIENT_TOKEN" \
+  -H "content-type: application/json" \
+  -d '[{
+    "type": "error",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34", "url": "https://shop.example.com/checkout" },
+    "error": {
+      "id": "e7b1c9a2-3d4f-4b65-8a90-1c2d3e4f5a61",
+      "message": "Payment provider timeout",
+      "source": "custom",
+      "handling": "handled"
+    }
+  }]'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "accepted": 1,
+  "rejected": []
+}
+```
+</ResponseExample>
+
+## La respuesta
+
+La respuesta informa del resultado de cada evento por separado, por lo que un evento no válido no invalida el resto de la solicitud.
+
+| Campo | Significado |
+|---|---|
+| `accepted` | La cantidad de eventos aceptados: los que el endpoint no rechaza ni cuenta en `sampled`. Si una [canalización en tiempo real](/es/pipelines#flujos-de-rum) descarta un evento de forma intencional, también cuenta aquí, aunque MoleSignal no lo almacene. |
+| `rejected` | Una entrada por cada evento rechazado, con su posición en la solicitud (`index`, a partir de `0`) y el motivo (`reason`). |
+| `sampled` | La cantidad de eventos omitidos de forma intencional porque la aplicación [conserva una parte de sus sesiones](/es/rum/sampling#conserva-un-porcentaje-de-las-sesiones-en-el-servidor) y esos eventos pertenecen a sesiones que no conserva. Si la aplicación conserva todos los errores, los errores de esas sesiones no cuentan aquí. El campo solo aparece si hay eventos omitidos. El endpoint no los rechaza ni los cuenta en `accepted`. |
+
+Si todos los eventos de una solicitud son no válidos, el endpoint devuelve `200` con `accepted` en `0`. Si el
+endpoint no puede leer la solicitud, esta falla por completo: `400` si el cuerpo no es JSON, si el
+`Content-Encoding` no es compatible o si no se puede decodificar el flujo gzip; `401` o `403` si falta el token,
+si está revocado o si no tiene `rum.write`; `413` si la solicitud supera los límites anteriores.
+
+El endpoint rechaza un evento por uno de estos motivos:
+
+| Motivo | Causa |
+|---|---|
+| Un mensaje que indica el campo | El evento no se ajusta al esquema: falta un campo obligatorio, un valor tiene el tipo incorrecto o no figura entre los valores permitidos, o un número es negativo. |
+| `date is more than a day in the future` | El reloj del dispositivo está muy adelantado. |
+| `application.id is not the application of the client token` | El evento indica una aplicación distinta de la que está asociada al token. |
+| ``application `<id>` does not exist`` | La aplicación se eliminó o nunca se creó. |
+| `application.id is required` | La credencial no es un token de cliente y el evento no indica ninguna aplicación. |
+| `line is not JSON` | El endpoint no puede interpretar una línea del cuerpo NDJSON. |
+| ``<stream>: realtime transform `<step>` …`` | Un paso de la [canalización en tiempo real](/es/pipelines#flujos-de-rum) del flujo falló al procesar el evento, modificó una columna que la canalización conserva o descartó una vista o una métrica vital. |
+
+El SDK notifica los eventos rechazados mediante su función de devolución de llamada de error y no los reenvía.
+
+## Reglas
+
+- `date` indica cuándo comenzó el evento, en milisegundos desde la época Unix. El `date` de una `view` indica el inicio de la
+  vista y nunca cambia entre revisiones.
+- Expresa todas las duraciones y todos los tiempos relativos al inicio de una vista, como `performance.lcp.timestamp`
+  o `resource.dns.start`, como un **número entero de nanosegundos**. Redondea antes de enviar.
+- Cuando cambie algún dato de una vista, vuelve a enviarla con un `view.revision` mayor y los recuentos acumulados hasta ese momento.
+  MoleSignal conserva la revisión más alta. Los recuentos son acumulativos, nunca incrementales.
+- El cliente no envía eventos de sesión. MoleSignal obtiene los datos de la sesión a partir de sus vistas: inicio y fin,
+  duración, recuentos, páginas de entrada y salida, y si se grabó una reproducción.
+- `session.start`, en milisegundos desde la época Unix, es opcional, pero se espera que lo envíes. Si un nodo aún no conoce la sesión,
+  usa ese valor para distinguir una sesión que empezó hace poco de otra cuyo seguimiento perdió.
+- `application.id` es opcional. MoleSignal usa la aplicación asociada al token de cliente y rechaza cualquier otro
+  valor.
+- MoleSignal escribe `geo` y `network` e ignora los valores que envíes. También ignora `retention`: `retention.rate` es el porcentaje de
+  filas de ese tipo que se conservaron y `retention.filter` indica qué hizo que se conservara la fila (el ID de un [filtro](/es/rum/sampling#filtros),
+  `default` o `errors` para un error de una sesión que no se conservó). MoleSignal usa estos campos para calcular los totales.
+- MoleSignal acepta y conserva los campos que no figuran en el esquema. Si un campo del esquema tiene un tipo o
+  un valor incorrecto, MoleSignal rechaza el evento.
+- `error.frames` contiene la traza de pila estructurada a la que MoleSignal aplica los mapas de código fuente, los archivos de mapeo y los archivos de símbolos
+  nativos. `error.stack` contiene la misma traza de pila en texto para mostrarla y buscar en ella.
+
+## Atributos de cada evento
+
+| Atributo | Tipo | Notas |
+|---|---|---|
+| `type` | cadena | Obligatorio: `view`, `action`, `error`, `resource`, `long_task`, `vital` o `log`. |
+| `date` | entero | Obligatorio. Milisegundos desde la época Unix. |
+| `source` | cadena | Obligatorio: `browser`, `android`, `ios`, `flutter`, `react-native`, `kotlin-multiplatform`, `unity`, `roku`, `electron` u `other`. |
+| `session` | objeto | Obligatorio. `id` es obligatorio. `type` puede ser `user` (predeterminado), `synthetics` o `ci_test`. `start` se expresa en milisegundos desde la época Unix. `has_replay` es un booleano. |
+| `view` | objeto | Obligatorio. `id` es obligatorio. `url`, `name`, `referrer` e `in_foreground` son opcionales. |
+| `application.id` | cadena | Opcional. Consulta las reglas anteriores. |
+| `service`, `env`, `version` | cadena | Las dimensiones de una versión publicada. MoleSignal usa `version` como clave para buscar los mapas de código fuente y los símbolos. |
+| `build_version`, `build_id` | cadena | El número de compilación y el identificador de compilación asociado a los artefactos de depuración que se cargaron. |
+| `action.id` | cadena | La acción que inició este evento, si la hay. |
+| `usr` | objeto | `id`, `name`, `email` y `anonymous_id`. MoleSignal conserva las demás claves en `usr.extra`. |
+| `account` | objeto | `id` y `name`. |
+| `tab.id` | cadena | La pestaña del navegador. |
+| `connectivity` | objeto | `status`, `interfaces`, `effective_type` y `cellular` (`technology`, `carrier_name`). |
+| `display.viewport` | objeto | `width` y `height`. |
+| `browser`, `os`, `device` | objeto | Nombre y versión del navegador, sistema operativo y datos del dispositivo: tipo (`mobile`, `desktop`, `tablet`, `tv`, `gaming_console`, `bot` u `other`), modelo, marca, arquitectura, configuración regional, zona horaria, batería y memoria. |
+| `sdk` | objeto | `name`, `version`, `session_sample_rate` y `replay_sample_rate`. |
+| `context` | objeto | Atributos de formato libre de la aplicación. |
+| `feature_flags` | objeto | Evaluaciones de indicadores de funcionalidad en formato libre. Consulta cada clave como `feature_flags.<key>`. Para más información, consulta [indicadores de funcionalidad](/es/rum/feature-flags). |
+| `synthetics` | objeto | Datos que una comprobación sintética aporta sobre la sesión que ejecuta: `test_id`, `result_id` y `location_id`. Consulta [tráfico de pruebas](/es/rum/test-traffic). |
+| `ci_test` | objeto | `test_execution_id`, para una sesión que ejecuta una prueba de CI. |
+
+Los identificadores admiten `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` y `-`, con un máximo de 128 caracteres. Los atributos de texto de
+`usr`, `account` y del dispositivo admiten hasta 256 caracteres.
+
+## Vista
+
+Un evento `view` incluye un objeto `view` con los siguientes campos, además de `url`, `name` e `id`, descritos arriba.
+
+| Campo | Notas |
+|---|---|
+| `revision` | Obligatorio. Empieza en `1` y aumenta en uno cada vez que se vuelve a enviar la vista. |
+| `time_spent` | Obligatorio. Tiempo que la vista permaneció abierta, en nanosegundos. |
+| `url` | Obligatorio. |
+| `is_active` | `false` en la última revisión de una vista que finalizó. |
+| `loading_type` | `initial_load`, `route_change`, `bf_cache`, `activity_display`, `activity_redisplay`, `fragment_display`, `fragment_redisplay`, `view_controller_display`, `view_controller_redisplay` o `session_renewal`. |
+| `loading_time`, `first_byte`, `dom_interactive`, `dom_content_loaded`, `dom_complete`, `load_event`, `network_settled_time`, `interaction_to_next_view_time` | Tiempos de navegación en nanosegundos. |
+| `performance.fcp`, `performance.lcp`, `performance.fid`, `performance.inp`, `performance.cls`, `performance.fbc` | Web Vitals. LCP incluye `timestamp`, `target_selector`, `resource_url` y `sub_parts` (`load_delay`, `load_time`, `render_delay`). INP incluye `duration`, `timestamp`, `target_selector` y `sub_parts` (`input_delay`, `processing_duration`, `presentation_delay`). CLS incluye `score`. |
+| `custom_timings` | Objeto con mediciones de tiempo identificadas por nombre. |
+| `scroll` | Alcance del desplazamiento por la página: `max_depth` (píxeles CSS desde la parte superior de la página hasta la parte inferior de la ventana), `max_depth_scroll_top`, `max_scroll_height` y `max_scroll_height_time` (nanosegundos). Son los valores del [mapa de calor](/es/rum/heatmaps) de desplazamiento. |
+| `action`, `error`, `resource`, `long_task`, `frustration`, `crash`, `frozen_frame` | Objetos con el formato `{ "count": n }` que contienen los recuentos acumulados. |
+| `memory_average`, `memory_max`, `cpu_ticks_count`, `cpu_ticks_per_second`, `refresh_rate_average`, `refresh_rate_min`, `slow_frames_rate`, `freeze_rate` | Mediciones en dispositivos móviles. |
+| `flutter_build_time`, `flutter_raster_time` | `{ min, max, average, metric_max }` en nanosegundos. |
+
+## Acción
+
+| Campo | Notas |
+|---|---|
+| `id` | Obligatorio. |
+| `type` | Obligatorio: `custom`, `click`, `tap`, `scroll`, `swipe`, `application_start` o `back`. |
+| `loading_time` | Nanosegundos. |
+| `target` | Incluye `name`, `selector`, `width` y `height` del elemento; `path`, que indica su posición en la página solo mediante etiquetas y posiciones; y `offset`, con las coordenadas `x` e `y` del clic dentro del elemento. |
+| `position` | Coordenadas `x` e `y` del puntero. |
+| `page_position` | Coordenadas `x` e `y` del clic en la página, en píxeles CSS. |
+| `name_source` | Origen del nombre: `custom_attribute`, `mask_placeholder`, `standard_attribute`, `text_content`, `mask_disallowed` o `blank`. |
+| `frustration.type` | Lista de valores `rage_click`, `dead_click`, `error_click`, `rage_tap` o `error_tap`. |
+| `error`, `crash`, `long_task`, `resource` | Objetos con el formato `{ "count": n }`. |
+
+## Error
+
+| Campo | Notas |
+|---|---|
+| `id`, `message`, `source` | Obligatorios. `source` puede ser `network`, `source`, `console`, `logger`, `agent`, `webview`, `custom` o `report`. |
+| `type` | Clase del error, como `TypeError`. |
+| `stack` | Traza de pila en formato de texto. |
+| `frames` | Hasta 1000 marcos de pila: `file`, `function`, `class`, `module`, `line`, `column`, `debug_id`, `build_id`, `relative_address`, `instruction_addr`, `image_addr` y `artifact_kind` (`javascript_sourcemap`, `flutter_symbols`, `android_native_symbols` o `apple_dsym`). |
+| `fingerprint` | Opcional, hasta 128 caracteres. Los errores de una misma aplicación con la misma huella forman un solo [problema](/es/rum/errors), sin importar sus mensajes ni sus trazas de pila. Si omites este campo, MoleSignal agrupa los errores por tipo, mensaje y los primeros marcos de pila del código de la aplicación, y escribe el ID del problema en `error.issue_id`. MoleSignal reemplaza cualquier valor enviado como `issue_id`. |
+| `handling` | `handled` o `unhandled`. |
+| `is_crash`, `category`, `source_type` | `category` puede ser `ANR`, `App Hang`, `Exception`, `Watchdog Termination`, `Memory Warning` o `Network`. |
+| `resource` | Solicitud fallida asociada a un error de tipo `network`: `method`, `status_code` y `url`. |
+| `causes`, `threads`, `binary_images` | Causas encadenadas, trazas de pila de los hilos e imágenes binarias cargadas. |
+
+## Recurso
+
+| Campo | Notas |
+|---|---|
+| `type`, `url` | Obligatorios. `type` puede ser `document`, `xhr`, `beacon`, `fetch`, `css`, `js`, `image`, `font`, `media`, `other` o `native`. |
+| `method`, `status_code` | `status_code` es `0` si la solicitud no recibió respuesta. |
+| `duration` | Nanosegundos. |
+| `size`, `encoded_body_size`, `decoded_body_size`, `transfer_size` | Bytes. |
+| `redirect`, `dns`, `connect`, `ssl`, `first_byte`, `download`, `worker` | Fases, cada una con el formato `{ start, duration }` y valores en nanosegundos. |
+| `trace_id`, `span_id` | Contexto de traza W3C de la solicitud. MoleSignal vincula la sesión con la traza del backend mediante `trace_id`. |
+| `graphql` | `operation_type`, `operation_name`, `payload` y `variables`. |
+| `request.headers`, `response.headers` | Objetos que contienen encabezados. |
+
+## Tarea larga
+
+| Campo | Notas |
+|---|---|
+| `duration` | Obligatorio. Nanosegundos. |
+| `entry_type` | `long-task` o `long-animation-frame`. |
+| `start_time`, `blocking_duration`, `render_start`, `style_and_layout_start`, `first_ui_event_timestamp` | Nanosegundos con respecto al inicio de la vista. |
+| `is_frozen_frame` | `true` si un fotograma de una aplicación móvil se congela. |
+| `scripts` | Scripts de un fotograma de animación largo, cada uno con `duration`, `source_url`, `source_function_name`, `invoker` e `invoker_type`. |
+
+## Métrica vital
+
+| Campo | Notas |
+|---|---|
+| `id`, `type` | Obligatorios. `type` puede ser `duration`, `app_launch` u `operation_step`. |
+| `name`, `duration` | Obligatorios para `duration`. |
+| `app_launch_metric`, `startup_type` | Obligatorios para `app_launch` junto con `duration`: `ttid` o `ttfd`, y `cold_start` o `warm_start`. |
+| `step_type`, `operation_key`, `failure_reason` | Para `operation_step`: `start`, `update`, `retry` o `end`. |
+
+## Log
+
+Un evento `log` incluye `level` y `message` en el nivel superior para que el flujo se lea como cualquier otro flujo de logs. También incluye un objeto `log`. Consulta [Logs del navegador](/es/rum/logs).
+
+| Campo | Notas |
+|---|---|
+| `level` | Obligatorio: `debug`, `info`, `warn` o `error`. |
+| `message` | Obligatorio. |
+| `log.id` | Obligatorio. |
+| `log.logger` | Nombre del registrador. |
+| `log.origin` | `logger`, `console`, `report` o `sdk`. |
+| `log.error_type`, `log.stack` | Datos del error al que se refiere el log. |
+
+## Qué agrega MoleSignal
+
+- **Ubicación:** el país, la subdivisión, la ciudad, el continente y las coordenadas asociados a la dirección IP del cliente, que MoleSignal consulta en
+  la base de datos DB-IP City Lite. MoleSignal solo conserva la dirección IP si la configuración de la aplicación lo indica.
+- **Navegador, sistema y dispositivo:** si un evento del navegador no incluye estos datos, MoleSignal los extrae del encabezado `User-Agent`.
+  MoleSignal clasifica los rastreadores web como `device.type: bot`. Los valores que envía un SDK tienen prioridad.
+- **Partes de la URL:** `view.url_host`, `view.url_path` y `view.url_path_group`, y los campos equivalentes para `resource.url`.
+- **Scripts de tareas largas:** `long_task.top_script.source_url`, `long_task.top_script.function` y `long_task.top_script.invoker_type`, que MoleSignal toma de la entrada de `long_task.scripts` con el mayor tiempo de ejecución. Si el navegador no informa de ningún script, estos campos quedan vacíos. MoleSignal descarta los valores que el cliente envíe en estos campos.
+- **Sesiones:** MoleSignal genera la fila de `rum_sessions` de cada sesión a partir de sus vistas.
+
+Antes de almacenar un evento, MoleSignal aplica la configuración de la aplicación: omite las sesiones que no debe conservar y reemplaza el
+[texto confidencial](/es/rum/privacy#elimina-el-texto-confidencial-al-recibir-los-eventos) que la configuración indica que debe eliminar.
+
+MoleSignal trata la dirección IP y la ubicación según la [configuración de la aplicación](/es/rum/applications#recopilación).
+
+## Dónde se almacenan los eventos
+
+Cada tipo cuenta con su propio flujo estándar de Registros, que se crea con la primera aplicación. Los flujos tienen un
+esquema fijo, por lo que un valor de un tipo incorrecto nunca modifica una columna.
+
+| Flujo | Filas |
+|---|---|
+| `rum_sessions` | Una fila derivada por cada sesión. |
+| `rum_views` | Una fila por cada vista. |
+| `rum_actions` | Una fila por cada acción. |
+| `rum_errors` | Una fila por cada error. |
+| `rum_resources` | Una fila por cada solicitud. Es el flujo con más filas, así que configura un período de retención más corto en sus ajustes. |
+| `rum_long_tasks` | Una fila por cada tarea de larga duración. |
+| `rum_vitals` | Una fila por cada métrica vital. |
+| `rum_logs` | Una fila por cada registro. |
+
+Solo el sistema de ingesta de RUM escribe en estos flujos. Una canalización en tiempo real puede modificar las partes personalizadas de un evento al recibirlo: `context`, `usr.extra`, `feature_flags` y `extra`. Una canalización programada puede leer los flujos. Consulta [Flujos de RUM](/es/pipelines#flujos-de-rum).
+
+Las columnas usan los nombres aplanados de los campos del evento, como `view.performance.lcp.timestamp` y `resource.status_code`.
+Explora las columnas en el [explorador de RUM](/es/rum/explorer) o consulta los flujos con SQL en **Registros**.
+
+## Ejemplo
+
+Una solicitud con una vista que se vuelve a enviar, una solicitud fallida y el error que provocó:
+
+```json
+[
+  {
+    "type": "view",
+    "date": 1790000000000,
+    "source": "browser",
+    "service": "web-frontend",
+    "env": "production",
+    "version": "1.4.0",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f", "type": "user", "start": 1789999990000 },
+    "view": {
+      "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34",
+      "url": "https://shop.example.com/checkout",
+      "name": "/checkout",
+      "revision": 3,
+      "time_spent": 8200000000,
+      "loading_time": 1200000000,
+      "performance": { "lcp": { "timestamp": 900000000, "target_selector": "img.hero" } },
+      "error": { "count": 1 },
+      "resource": { "count": 22 }
+    },
+    "usr": { "id": "u-42" },
+    "context": { "plan": "pro" }
+  },
+  {
+    "type": "resource",
+    "date": 1790000001500,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "resource": {
+      "type": "fetch",
+      "method": "POST",
+      "url": "https://api.example.com/orders",
+      "status_code": 500,
+      "duration": 482000000,
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "span_id": "00f067aa0ba902b7"
+    }
+  },
+  {
+    "type": "error",
+    "date": 1790000001600,
+    "source": "browser",
+    "session": { "id": "6f1c2b7e-1d5a-4c6b-9a3e-0a1b2c3d4e5f" },
+    "view": { "id": "a91e0d52-7b8c-4f10-8d63-5e2f7c9a1b34" },
+    "error": {
+      "id": "0a9b8c7d-6e5f-4a3b-8c1d-2e3f4a5b6c70",
+      "message": "Failed to fetch https://api.example.com/orders: 500",
+      "source": "network",
+      "type": "ServerError",
+      "handling": "handled",
+      "resource": { "method": "POST", "status_code": 500, "url": "https://api.example.com/orders" }
+    }
+  }
+]
+```
+
+<CardGroup cols={2}>
+  <Card title="Aplicaciones de RUM" icon="grid" href="/es/rum/applications">
+    Crea la aplicación a la que se vincula un token de cliente.
+  </Card>
+  <Card title="Explorador de RUM" icon="magnifying-glass" href="/es/rum/explorer">
+    Busca eventos por tipo y campo.
+  </Card>
+</CardGroup>

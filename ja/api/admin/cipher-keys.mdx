@@ -1,0 +1,109 @@
+---
+title: "暗号化キー"
+description: "組織のフィールド暗号化キーの一覧取得、作成、ローテーション、削除を行います。"
+"en_link": "/en-US/api/admin/cipher-keys"
+"zh-Hans_link": "/zh-Hans/api/admin/cipher-keys"
+"zh-Hant_link": "/zh-Hant/api/admin/cipher-keys"
+"ko_link": "/ko/api/admin/cipher-keys"
+"de_link": "/de/api/admin/cipher-keys"
+"es_link": "/es/api/admin/cipher-keys"
+"fr_link": "/fr/api/admin/cipher-keys"
+"pt-BR_link": "/pt-BR/api/admin/cipher-keys"
+---
+
+暗号化キーは、ストリームが暗号化対象として指定したフィールドを暗号化します。各キーは 32 バイトの AES-256-GCM キーです。MoleSignal は `MS_CIPHER_KEY` のルートキーでキー素材をラップし、キー素材自体は返しません。[セキュリティ](/ja/security#フィールドレベルの暗号化)を参照してください。
+
+新しい値の暗号化には、常にデフォルトキー `__field_default__` の最新バージョンを使用します。MoleSignal は、ストリームがこのキーを初めて必要としたときに作成します。ほかの名前付きキーや各キーの以前のバージョンも、それらを使って書き込んだ値の復号に引き続き使用できます。
+
+| 操作 | エンドポイント | 権限 |
+|---|---|---|
+| キーの一覧を取得 | `GET /api/v1/cipher_keys` | `org.cipher_keys.read` |
+| キーを取得 | `GET /api/v1/cipher_keys/{name}` | `org.cipher_keys.read` |
+| キーを作成 | `POST /api/v1/cipher_keys` | `org.cipher_keys.manage` |
+| キーをローテーション | `POST /api/v1/cipher_keys/{name}/rotate` | `org.cipher_keys.rotate` |
+| キーを削除 | `DELETE /api/v1/cipher_keys/{name}` | `org.cipher_keys.manage` |
+| デフォルトキーをローテーション | `POST /api/v1/field_encryption/rotate` | `org.cipher_keys.rotate` |
+
+## キーのメタデータ
+
+一覧取得、取得、作成、ローテーションの各リクエストは、キーバージョンのメタデータを返します。一覧取得リクエストはすべてのキーの全バージョンを返し、同じ名前のバージョンは新しい順に並べます。
+
+```json
+{
+  "id": "3KEZizkQsvBwoWQihNO6OdxRiSf",
+  "name": "payments-key",
+  "alg": "aes-256-gcm",
+  "version": 1,
+  "createdAt": 1790000000000000,
+  "rotatedAt": null
+}
+```
+
+一度もローテーションしていないキーの `rotatedAt` は `null` です。取得リクエストは最新バージョンを返します。
+
+## キーを作成する
+
+```http
+POST /api/v1/cipher_keys
+```
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `name` | 文字列 | はい | キーの名前です。既存の名前を指定すると `409` を返し、メッセージでローテーション用のリクエストを案内します。 |
+| `keyMaterialB64` | 文字列 | はい | ランダムな 32 バイトを、パディング付きの標準 base64 でエンコードした値です。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/cipher_keys \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "{\"name\": \"payments-key\", \"key_material_b64\": \"$(openssl rand -base64 32)\"}"
+```
+</RequestExample>
+
+レスポンスには、上記のキーのメタデータが含まれます。
+
+## キーをローテーションする
+
+```http
+POST /api/v1/cipher_keys/{name}/rotate
+```
+
+作成リクエストと同様に、リクエストボディに `keyMaterialB64` を指定します。新しいキー素材でバージョンを追加し、以前のバージョンは復号用に保持します。存在しない名前を指定すると `404` を返します。先に作成リクエストでキーを作成してください。
+
+## キーを削除する
+
+```http
+DELETE /api/v1/cipher_keys/{name}
+```
+
+指定した名前のキーの全バージョンを削除し、`{"deleted": true}` を返します。存在しない名前を指定すると `404` を返します。保存済みのデータがそのキーに依存しているかどうかは確認しません。
+
+<Warning>
+  削除したキーで暗号化した値は、以後復号できません。キーを削除する前に、そのキーに依存する暗号化フィールドを確認してください。
+</Warning>
+
+## デフォルトキーをローテーションする
+
+```http
+POST /api/v1/field_encryption/rotate
+```
+
+サーバーで新しいキー素材を生成して `__field_default__` の新しいバージョンを追加し、復号キャッシュをすぐに更新します。新しい書き込みには新しいバージョンを使用し、既存の値は引き続き読み取れます。組織にデフォルトキーがまだない場合は、バージョン 1 として作成します。リクエストボディは空で、レスポンスには新しいキーの識別子とバージョンが含まれます。
+
+```json
+{
+  "keyId": "3KEZj3uxMx5OOFX6NiYv3VFnfmD",
+  "version": 2
+}
+```
+
+**エラー**
+
+| ステータス | 原因 |
+|---|---|
+| `400` | `keyMaterialB64` が有効な base64 ではないか、デコード結果が 32 バイトちょうどではありません（`key_material must be 32 bytes, got 5`）。 |
+| `403` | トークンにリクエストの実行に必要な権限がありません。 |
+| `404` | 取得、ローテーション、削除のリクエストで、指定した名前のキーが見つかりませんでした。 |
+| `409` | 指定した名前のキーがすでに存在します。 |
+| `422` | 必須フィールドがありません。レスポンスはプレーンテキストです。 |

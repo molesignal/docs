@@ -1,0 +1,105 @@
+---
+title: "升級"
+description: "如何將 MoleSignal 部署升級至新版本：備份、結構描述遷移、各種部署方式的升級步驟與復原。"
+"en_link": "/en-US/upgrade"
+"zh-Hans_link": "/zh-Hans/upgrade"
+"ja_link": "/ja/upgrade"
+"ko_link": "/ko/upgrade"
+"de_link": "/de/upgrade"
+"es_link": "/es/upgrade"
+"fr_link": "/fr/upgrade"
+"pt-BR_link": "/pt-BR/upgrade"
+---
+
+MoleSignal 目前仍處於 1.0 之前的階段。各版本的變更記錄在[更新日誌](/zh-Hant/changelog)頁面中。升級前請先閱讀，並將每次升級視為必須先備份的變更。
+
+## 升級前
+
+1. 閱讀從目前版本到目標版本之間各版本的發行說明。
+2. 備份 PostgreSQL 與物件儲存，請參閱[備份與還原](/zh-Hant/backup-restore)。
+3. 記下目前執行的版本。`molesignal --version` 會輸出版本號碼，`GET /api/v1/version` 會傳回版本、commit、建置 ID、發行管道與版本類型。這項請求需要 Bearer Token。
+4. 如果部署較為關鍵，請先在還原的資料庫副本上演練一次升級。
+
+## schema 變更如何生效
+
+執行檔內嵌資料庫遷移。每次啟動時，執行檔都會先將遷移套用至 PostgreSQL，再開始提供服務。遷移失敗時，程序會結束。PostgreSQL 的鎖定機制會讓遷移依序執行，因此可以安全地同時啟動多個節點。`_molesignal_schema_meta` 資料表會記錄已套用的版本。
+
+遷移只能向前進行：
+
+- 版本比資料庫舊的執行檔會拒絕啟動，並回報 `migration <version> was previously applied but is missing in the resolved migrations`。
+- 如果執行檔包含已套用遷移的修改版本，就會拒絕啟動，並回報 `migration <version> was previously applied but has been modified`。預先發行的建置版本可能會修改基準 schema，因此不保證其他建置版本能開啟由某個建置版本建立的資料庫。
+
+若要回到舊版本，請使用升級前的備份還原資料庫與物件。
+
+## 升級步驟
+
+<Tabs>
+  <Tab title="Docker Compose">
+    修改 Compose 檔案中 `image` 的標籤，然後拉取映像檔並重建容器：
+
+    ```bash
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone pull
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up -d
+    ```
+
+    請保留具名磁碟區，其中存放 PostgreSQL 與 RustFS 的資料。WAL 位於 RustFS 中。
+  </Tab>
+  <Tab title="執行檔與 systemd">
+    停止服務，更換執行檔與 GeoIP 資料庫，再啟動服務：
+
+    ```bash
+    sudo systemctl stop molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo install -Dm644 mmdb/dbip-city-lite.mmdb \
+      /usr/share/molesignal/mmdb/dbip-city-lite.mmdb
+    sudo systemctl start molesignal
+    sudo journalctl -u molesignal -n 50
+    ```
+
+    舊版本曾安裝 `/usr/share/molesignal/mmdb/GeoLite2-City.mmdb`。請刪除該檔案；如果 `/etc/molesignal/config.toml` 中的 `[mmdb].db_path` 仍指向該檔案，請改為 `dbip-city-lite.mmdb`。
+
+    比對新版本的 `conf/config.toml` 與已安裝的檔案。未設定的新增項目會使用內建預設值，但預設值若有變動，可能會影響部署。
+  </Tab>
+  <Tab title="Helm">
+    先閱讀 [Chart 變更記錄](https://github.com/molesignal/molesignal-helm/blob/main/CHANGELOG.md)，再使用同一份 values 檔案升級：
+
+    ```bash
+    helm repo update
+    helm upgrade molesignal molesignal/molesignal --namespace molesignal --values values.yaml
+    ```
+
+    未設定 `image.tag` 時，Chart 會使用映像檔標籤 `latest`。若要升級至指定的 MoleSignal 版本，請在 values 檔案中設定 `image.tag`。
+
+    升級不會變更已產生的金鑰。`standalone` 與 `intake` Pod 的預設終止寬限期為 60 秒：`terminationGracePeriodSeconds` 必須大於 `[node].drain_timeout_secs`。
+
+    在 `distributed` 模式下，`helm upgrade` 會同時替換所有工作負載的 Pod，不符合[依角色分工的叢集](#依角色分工的叢集)所列的順序。
+  </Tab>
+  <Tab title="Kubernetes 資訊清單">
+    修改資訊清單中的映像檔標籤，然後套用資訊清單：
+
+    ```bash
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    kubectl -n molesignal rollout status deployment/intake
+    ```
+
+    將 `terminationGracePeriodSeconds` 設為大於 `[node].drain_timeout_secs`，讓 Pod 有時間在停止前將資料寫入儲存空間。
+  </Tab>
+</Tabs>
+
+程序收到 `SIGTERM` 或 `SIGINT` 後，最多會等待 `[node].drain_timeout_secs`，讓待處理的資料寫入儲存空間，接著結束。未能寫入的記錄會留在物件儲存的 WAL 中，由其他 intake 節點或重新啟動後的原節點發布。
+
+## 依角色分工的叢集
+
+依角色分工的叢集共用同一個 schema。舊版本的節點在重新啟動前會繼續使用新的 schema，而且不同版本之間不保證相容。請在同一個維護時段內升級所有節點：
+
+1. 先停止 `router` 節點，再停止 `intake` 與 `querier` 節點，最後停止 `compactor` 與 `alert` 節點。
+2. 啟動一個新版本的節點，等待 `GET /api/v1/healthz` 傳回 `200`。該節點會套用遷移。
+3. 啟動其餘節點。
+
+## 驗證升級
+
+- 日誌中沒有遷移錯誤，且 `GET /api/v1/healthz` 傳回 `200`。
+- `GET /api/v1/version` 傳回新版本。
+- 查詢近期資料時能傳回資料列，且持續收到新記錄。
+- `/metrics` 中的 `storage_reconciler_issues_total` 沒有增加。

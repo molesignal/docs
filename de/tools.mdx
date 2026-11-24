@@ -1,0 +1,216 @@
+---
+title: "Tool-Katalog und Tool-Ausführung"
+sidebarTitle: "Tools"
+description: "Erfahren Sie, wie der gemeinsame Tool-Katalog von MoleSignal, die schrittweise Tool-Erkennung, die Mandantenisolierung, die Risikorichtlinie und die Freigaben funktionieren und welche Produktbereiche die Tools abdecken."
+"en_link": "/en-US/tools"
+"zh-Hans_link": "/zh-Hans/tools"
+"zh-Hant_link": "/zh-Hant/tools"
+"ja_link": "/ja/tools"
+"ko_link": "/ko/tools"
+"es_link": "/es/tools"
+"fr_link": "/fr/tools"
+"pt-BR_link": "/pt-BR/tools"
+---
+
+MoleSignal bildet Produktfunktionen, die sich per KI bedienen lassen, in einem protokollneutralen **Tool-Katalog** ab. Mole
+Agent und Inbound MCP verwenden dieselben `ToolSpec`-Verträge und dieselbe serverseitige Laufzeitumgebung, statt
+die Geschäftslogik in jedem Adapter zu duplizieren.
+
+Der aktuelle Katalog enthält **254 registrierte Tools**. Jedes Tool definiert einen stabilen Namen, eine maßgebliche
+Beschreibung, Ein- und Ausgabeschemas, erforderliche IAM-Berechtigungen, eine Risikostufe, einen Zugriffsmodus,
+Annotationen und zulässige Ausführungskanäle.
+
+<CardGroup cols={2}>
+  <Card title="Operationen auf Produktebene" icon="wrench">
+    Tools bilden klar abgegrenzte Produktaktionen ab, etwa das Abfragen von Logs, das Testen eines Alerts oder das Aktualisieren
+    eines einzelnen Dashboard-Panels. Beliebige HTTP-Anfragen sind nicht möglich.
+  </Card>
+  <Card title="Sicherer Mandantenkontext" icon="shield">
+    Der authentifizierte Adapter fügt die aufrufende Identität und die Organisation zum Kontext hinzu. `userId` und
+    `orgId` bestimmen nie den Mandanten, in dessen Kontext das Tool ausgeführt wird.
+  </Card>
+  <Card title="Kontext nach Bedarf" icon="magnifying-glass">
+    Häufig verwendete Tools bleiben sichtbar. Weitere Tools sucht das System nur bei Bedarf. So bleiben der
+    Modellkontext und der Tokenverbrauch begrenzt.
+  </Card>
+  <Card title="Einheitlicher Ausführungspfad" icon="arrows-rotate">
+    Bei der Ausführung setzt das System Berechtigungen, Richtlinien, Zeitlimits, Ausgabegrenzen, Idempotenz und Genehmigungen erneut durch.
+    Es stellt außerdem sicher, dass die Verifizierung und die Audit-Protokollierung erfolgen.
+  </Card>
+</CardGroup>
+## Granularität von Tools
+
+Ein gutes MoleSignal-Tool erfüllt einen klaren Zweck und liefert ein klar begrenztes Ergebnis.
+
+- Verwenden Sie je ein Tool für einen atomaren Lesevorgang, eine Vorabprüfung oder eine Änderung.
+- Trennen Sie die Vorgänge zum Auflisten, Abrufen, Erstellen, Aktualisieren, Löschen, Testen, Auslösen, Abbrechen und Wiederholen.
+- Stellen Sie Produktfunktionen statt direkter Routen oder frei konfigurierbarer Anfragegeneratoren bereit.
+- Geben Sie strukturierte, begrenzte Ergebnisse zurück, die sich für ein Modell und einen Audit-Eintrag eignen.
+- Nehmen Sie keine Klartext-Zugangsdaten, Binärübertragungen, Rohdatenannahme, Shell-Ausführung oder Browsersteuerung
+  in den Katalog auf.
+
+Mit dieser Granularität steuern IAM und Tool-Richtlinien den konkreten Vorgang, statt pauschalen Zugriff
+auf eine ganze Gruppe von HTTP-Ressourcen zu gewähren.
+
+## Ausführungskanäle
+
+Für jeden Ausführungskanal ist ausdrücklich festgelegt, welche Tools verfügbar sind.
+
+| Ausführungskanal | Suche und Ausführung |
+|---|---|
+| Mole Agent | Häufig verwendete Tools sowie `tool_search → tools_call` für integrierte Tools und autorisierte Outbound-MCP-Tools, die erst bei Bedarf geladen werden. |
+| Inbound MCP | Häufig verwendete Lesetools und Genehmigungsfunktionen sowie `tool_search → call_read_tool` oder `call_managed_tool`. |
+| Automatisierung | Nur Tools, die ausdrücklich für die Automatisierung freigegeben sind. Dazu zählen `query_logs`, `get_stream_schema`, `search_field_values` und `analyze_log_patterns` für [geplante Log-Inspektionen](/de/logs/inspections). |
+
+Der Server prüft die Verfügbarkeit im jeweiligen Kanal sowohl beim Erstellen der Tool-Liste als auch unmittelbar vor
+der Ausführung. Die Kanalbeschränkung gilt auch ohne Aufruf von `tools/list`.
+
+## Tool-Suche in Inbound MCP
+
+Inbound MCP hält `tools/list` kompakt. Je nach Berechtigung kann die Antwort Folgendes enthalten:
+
+- sieben angeheftete Lesetools: `query_logs`, `query_metrics`, `list_streams`,
+  `get_stream_schema`, `list_traces`, `get_trace` und `get_incident`;
+- Genehmigungsfunktionen: `list_agent_approvals`, `get_agent_approval` und
+  `execute_agent_approval`;
+- Ausführungsfunktionen: `list_agent_executions` und `get_agent_execution`;
+- `tool_search`, `call_read_tool` und `call_managed_tool`.
+
+IAM und Tool-Richtlinien können jedes Produkt-Tool aus dieser Liste entfernen.
+
+### Autorisierten Katalog durchsuchen
+
+Rufen Sie `tool_search` mit einem Produktbegriff oder einem Funktionsbereich auf:
+
+```json
+{
+  "query": "status page incident",
+  "limit": 10,
+  "includeSchema": true
+}
+```
+
+Das Ergebnis enthält nur Tools, die in Inbound MCP verfügbar sind, deren Nutzung die Tool-Richtlinie des Arbeitsbereichs zulässt
+und für die die Zugangsdaten berechtigen. Auf Anfrage enthält jeder Treffer das Schema und die tatsächlich geltenden
+Ausführungsmetadaten.
+
+### Lesevorgang oder Vorabprüfung ausführen
+
+Übergeben Sie den gefundenen Namen und die Argumente an `call_read_tool`:
+
+```json
+{
+  "name": "list_status_page_incidents",
+  "arguments": {
+    "pageId": "status-page-id",
+    "view": "current"
+  }
+}
+```
+
+Setzen Sie `asTask` auf `true`, um den Lesevorgang als persistente Aufgabe auszuführen, wenn der MCP-Client die Erweiterung
+Tasks als unterstützt meldet. Rufen Sie mit den MCP-Aufgabenmethoden den Status der zurückgegebenen Aufgabe ab, aktualisieren Sie sie oder brechen Sie sie ab.
+
+### Verwaltete Änderung ausführen
+
+Übergeben Sie einen eindeutigen Idempotenzschlüssel an `call_managed_tool`:
+
+```json
+{
+  "name": "update_annotation",
+  "arguments": {
+    "annotationId": "annotation-id",
+    "title": "Deployment rollback started"
+  },
+  "idempotencyKey": "8d7788d2-9b4e-44bd-bf35-61a5690f0064"
+}
+```
+
+MoleSignal reserviert den Schlüssel für die authentifizierte Identität, bevor es einen Genehmigungseintrag erstellt oder
+die Änderung ausführt. Bei einer Wiederholung derselben Anfrage gibt MoleSignal das gespeicherte Ergebnis oder den aktuellen
+Ausführungsstatus zurück. MoleSignal lehnt die Wiederverwendung des Schlüssels mit anderen Argumenten ab.
+
+## Risiko und Ausführungsrichtlinie
+
+Die Risikostufe des Tools bestimmt einen sicheren Standardmodus. Die Tool-Richtlinie des Arbeitsbereichs kann einen strengeren Ausführungsmodus
+vorgeben.
+
+| Risiko | Standardmodus | Bedeutung |
+|---|---|---|
+| L0 | Automatisch | Klar abgegrenzte, rein lesende Vorgänge. |
+| L1 | Bestätigung | Änderungen mit geringem Risiko erfordern eine Bestätigung im MCP-Host, sofern die Richtlinie keine automatische Ausführung vorsieht. |
+| L2 | Einfache Genehmigung | Eine Genehmigung in MoleSignal ist erforderlich. |
+| L3 | Doppelte Genehmigung | Zwei Genehmigungen in MoleSignal sind erforderlich. |
+| L4 | Deaktiviert | Riskante oder destruktive Remote-Vorgänge sind standardmäßig nicht verfügbar. |
+
+Auch bei automatischen verwalteten Änderungen erstellt MoleSignal einen revisionsfähigen Genehmigungseintrag. Im Bestätigungsmodus kann
+MCP Eingaben in mehreren Runden abfragen. Bei einfacher und doppelter Genehmigung wartet MoleSignal auf die Freigaben.
+Sobald die erforderlichen Freigaben vorliegen, kann die ursprünglich anfragende Identität `execute_agent_approval` mit einem neuen
+`idempotencyKey` aufrufen, um den Vorgang abzuschließen.
+
+Vor der Ausführung prüft die Laufzeitumgebung erneut:
+
+1. die authentifizierte Identität und den Status der Organisation;
+2. die erforderlichen IAM-Berechtigungen und den Berechtigungsmodus;
+3. die Verfügbarkeit im Ausführungskanal und die aktuelle Tool-Richtlinie;
+4. das Eingabeschema, den Zustand der Zielressource und das Risiko;
+5. das Zeitlimit, die maximale Antwortgröße und die Idempotenz;
+6. die Verifizierung nach dem Vorgang und die Audit-Protokollierung.
+
+## Funktionsumfang des Katalogs
+
+Der Katalog umfasst Produktfunktionen, die sich sicher und sinnvoll für KI-gestützte Untersuchungen
+und die Administration nutzen lassen.
+
+| Bereich | Ausgewählte Funktionen |
+|---|---|
+| Logs, Metriken und Streams | Telemetriedaten abfragen, Schemas und Einstellungen prüfen, zeitlich benachbarte Ereignisse suchen und Metriklabels oder Zeitreihen untersuchen; Logs nach Mustern gruppieren und mit einem Referenzzeitraum vergleichen; zusammenfassen, wann sich eine Metrik zu verändern begann, wie stark die Änderung war und welche Zeitreihen und Labels dazu beitrugen; prüfen, ob die Daten für Analysen geeignet sind (ob Service, Umgebung und Trace-ID erfasst werden, ob ein Service in allen Signalen denselben Namen trägt und ob Metriknamen Einheiten enthalten); geplante Log-Prüfungen und zugehörige Berichte einsehen oder eine Prüfung sofort ausführen. |
+| Traces, APM, RUM und Profile | Traces, Servicetopologie, Sitzungen, Fehler, Abhängigkeiten, Flammendiagramme und Korrelationen zwischen Signalen untersuchen; APM-Analysen einsehen und anhand der Serviceübersicht nachvollziehen, welche Komponenten ein Service erreicht; den Servicekatalog nach Name, Alias, Beschreibung oder Tag durchsuchen; Core Web Vitals pro Seite zusammenfassen; eine RUM-Anwendung zusammenfassen, Probleme auflisten und einsehen, Ursachen für Frust bei der Nutzung benennen, das Wasserfalldiagramm einer einzelnen Ansicht einsehen und beliebige RUM-Streams aggregieren. |
+| Alarme und Vorfälle | Vorfälle und den Bereitschaftsstatus einsehen; ähnliche Vorfälle der letzten 90 Tage finden und Deployments, Konfigurationsänderungen und Feature-Flags im zeitlichen Umfeld eines Zeitpunkts oder Vorfalls auflisten; Alarmregeln erstellen, aktualisieren, löschen, testen oder auslösen; Vorfälle bestätigen oder beheben. |
+| Dashboards, Berichte und Annotationen | Dashboards, Ordner, Panels, Annotationen, Berichtsvorlagen, Zeitpläne und Zustellungen verwalten. |
+| Suchaufträge und gespeicherte Ansichten | Persistente Suchaufträge starten, prüfen, abbrechen, erneut ausführen oder löschen und gespeicherte Ansichten verwalten. |
+| Pipelines, Funktionen, Datenanreicherung und Konnektoren | Geplante Ausführungen prüfen, Funktionen verwalten, Transformationen testen und Metadaten zur Datenanreicherung oder zu Konnektoren einsehen. |
+| Synthetisches Monitoring und Statusseiten | Monitore und Ergebnisse prüfen, Monitore ausführen oder pausieren, den Lebenszyklus und die Automatisierung von Statusseiten verwalten und einen Postmortem-Entwurf für einen Vorfall erstellen. |
+| Benachrichtigungen | Konnektoren, Richtlinien, Vorlagen und Zustellungen prüfen; eine Zustellung wiederholen oder bestätigen. |
+| IAM und Administration | Benutzerkonten, Teams, Rollen, Berechtigungen, Audit-Ereignisse, Dienstkonten und Metadaten von API-Tokens einsehen; den Status von Anmeldedaten verwalten, ohne auf Geheimnisse zuzugreifen. |
+| Steuerung von Mole Agent | Untersuchungen, Genehmigungen, Ausführungen und Automatisierungen prüfen und anschließend bei entsprechender Berechtigung einen genehmigten Vorgang ausführen. |
+
+Rufen Sie `get_platform_capabilities` auf, um eine nach Zugriffsschnittstelle gefilterte Übersicht der Funktionen abzurufen. Rufen Sie `tool_search` auf, um
+die Namen und Schemas der aktuell freigegebenen Tools abzurufen, statt eine statische Liste zu verwenden.
+
+## Identität und Schutz von Geheimnissen
+
+- Die zur Authentifizierung verwendeten Anmeldedaten liefern `userId` und `orgId` für den Aufruf.
+- `get_user_profile` und `get_user_preferences` akzeptieren den optionalen Parameter `target_user_id` nur zur
+  Auswahl einer Ressource. Der Lesezugriff auf Daten eines anderen Mitglieds erfordert `org.members.read` und eine Prüfung
+  der Organisationsmitgliedschaft.
+- Tools zum Lesen und Auflisten geben nur Metadaten zu Anmeldedaten zurück.
+- Inbound MCP bietet `create_api_token` und `create_service_account` nicht an, weil beide
+  einmalig einen Klartextwert ausgeben. Erstellen Sie diese Anmeldedaten in der Weboberfläche.
+- Bestehende Dienstkonten und API-Tokens lassen sich weiterhin auflisten, aktualisieren, aktivieren, deaktivieren,
+  widerrufen oder löschen. Nutzen Sie dafür freigegebene Tools, die keine Geheimnisse offenlegen.
+- `query_logs`, `search_around`, `search_field_values`, `get_stream_schema` und die Ressourcen für Stream-Schemas
+  verweigern unabhängig von den Anmeldedaten den Zugriff auf den [`_audit`-Stream](/de/settings/data-security#audit-stream).
+
+Der Katalog schließt Anmeldung, Registrierung, das Zurücksetzen von Passwörtern, öffentliche Routen ohne
+Authentifizierung, die direkte Annahme von OTLP- oder Prometheus-Daten, externe Webhooks, Uploads und Downloads von Binärdateien, das Leeren von Knoten,
+Laufzeit-Profiling sowie beliebige HTTP-Anfragen, Shell-Befehle und Browseraktionen bewusst aus.
+
+## MCP-Ressourcen, Prompts und Aufgaben
+
+Inbound MCP stellt außerdem nach IAM-Berechtigungen gefilterte Ressourcen für Plattformfunktionen, den Tool-Katalog,
+Genehmigungen, Ausführungen, Suchaufträge und Stream-Schemas bereit. Integrierte Prompts für Mole Agent sowie Prompts der Organisation und des aktuellen Kontos
+stehen über `prompts/list` und `prompts/get` zur Verfügung.
+
+Länger dauernde Lesevorgänge können als MCP-Aufgaben ausgeführt werden. Fortschrittsmeldungen, Ressourcenabonnements und
+Benachrichtigungen über Katalogänderungen stehen zur Verfügung, wenn die ausgehandelte MCP-Protokollversion
+diese Funktionen unterstützt.
+
+<CardGroup cols={2}>
+  <Card title="MCP-Client verbinden" icon="plug" href="/de/inbound-mcp">
+    Aktivieren Sie den Endpunkt und stellen Sie die Verbindung mit OAuth 2.1 oder einem API-Token her.
+  </Card>
+  <Card title="Mole Agent" icon="robot" href="/de/agent">
+    Nutzen Sie denselben zugriffsgesteuerten Katalog über den integrierten Agenten für Betriebsaufgaben.
+  </Card>
+</CardGroup>

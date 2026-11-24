@@ -1,0 +1,187 @@
+---
+title: "Incidents majeurs"
+description: "Déclarez un incident majeur, désignez un responsable de l’incident, un responsable de la communication et une personne chargée de prendre des notes, puis ouvrez un canal de crise et lancez une réunion. Répartissez les tâches à l’aide d’une liste de contrôle et publiez les mises à jour dans un seul fil."
+"en_link": "/en-US/api/alerting/major-incidents"
+"zh-Hans_link": "/zh-Hans/api/alerting/major-incidents"
+"zh-Hant_link": "/zh-Hant/api/alerting/major-incidents"
+"ja_link": "/ja/api/alerting/major-incidents"
+"ko_link": "/ko/api/alerting/major-incidents"
+"de_link": "/de/api/alerting/major-incidents"
+"es_link": "/es/api/alerting/major-incidents"
+"pt-BR_link": "/pt-BR/api/alerting/major-incidents"
+---
+
+Un incident à fort impact qui mobilise plusieurs personnes peut être déclaré majeur : il comporte alors trois rôles et peut disposer
+d’une salle de crise (une discussion Feishu ou Slack) et d’une réunion. Il comprend une liste de tâches. Les mises à jour sont publiées dans la salle de crise et
+déclenchent des notifications pour les personnes concernées. L’organisation peut aussi définir une règle qui déclare majeurs les nouveaux incidents correspondants
+dès leur création. Pour savoir comment utiliser cette fonctionnalité dans l’interface, consultez [Incidents majeurs et post-mortems](/fr/alerting/major-incidents).
+
+| Méthode et chemin | Fonction | Autorisation |
+|---|---|---|
+| `GET /api/v1/alerts/incidents/{id}/response` | Renvoie les informations sur la gestion de l’incident majeur et ses tâches. | `alerts.incidents.read` sur l’incident |
+| `POST /api/v1/alerts/incidents/{id}/declare` | Déclare l’incident majeur. | `alerts.incidents.escalate` sur l’incident |
+| `PUT /api/v1/alerts/incidents/{id}/roles` | Attribue un rôle ou annule son attribution. | `alerts.incidents.update` sur l’incident |
+| `POST /api/v1/alerts/incidents/{id}/tasks` | Ajoute une tâche. | `alerts.incidents.update` sur l’incident |
+| `PUT /api/v1/alerts/incidents/{id}/tasks/{taskId}` | Modifie le titre, la personne responsable ou l’état d’achèvement d’une tâche. | `alerts.incidents.update` sur l’incident |
+| `DELETE /api/v1/alerts/incidents/{id}/tasks/{taskId}` | Supprime une tâche. | `alerts.incidents.update` sur l’incident |
+| `POST /api/v1/alerts/incidents/{id}/status-updates` | Publie une mise à jour. | `alerts.incidents.update` sur l’incident |
+| `GET /api/v1/alerts/response/settings` | Renvoie les paramètres de gestion des incidents majeurs de l’organisation. | `alerts.response.read` |
+| `PUT /api/v1/alerts/response/settings` | Enregistre les paramètres de gestion des incidents majeurs de l’organisation. | `alerts.response.manage` |
+
+MoleSignal consigne la déclaration, l’attribution des rôles, l’ouverture de la salle de crise, l’ajout et l’achèvement des tâches, ainsi que la publication des mises à jour
+dans la [chronologie](/fr/api/alerting/incident-timeline) de l’incident. Le journal d’audit consigne aussi la déclaration et l’enregistrement
+des paramètres.
+
+## Déclarer un incident majeur
+
+```http
+POST /api/v1/alerts/incidents/{id}/declare
+```
+
+| Champ | Type | Obligatoire | Remarques |
+|---|---|---|---|
+| `commanderId` | string | Non | Identifiant de la personne qui pilote l’incident. Par défaut, il s’agit de la personne qui le déclare. |
+
+L’API renvoie un incident déjà déclaré sans le modifier et refuse de déclarer un incident résolu. La déclaration
+suit les paramètres de l’organisation :
+
+1. MoleSignal crée une tâche pour chaque élément de la liste de contrôle définie dans les paramètres.
+2. Le champ `meeting` détermine le mode de création de la réunion : avec `feishu_vc`, une application Feishu planifie une réunion Feishu de 6 heures au nom de
+   la personne qui pilote l’incident ; `tencentMeeting` planifie une réunion Tencent Meeting de 6 heures ; `zoom` lance une réunion instantanée ;
+   `googleMeet` crée un espace de réunion ; `fixed_url` utilise le lien de réunion fixe.
+3. Le connecteur configuré (application Feishu, application Slack, DingTalk ou WeCom) crée une discussion de groupe nommée
+   `[severity] incident summary`. Il y ajoute les personnes affectées à l’incident, celles qui occupent un rôle et les parties prenantes (à partir des
+   identités liées à ce connecteur). La personne qui pilote l’incident est propriétaire des groupes DingTalk et WeCom. Le connecteur publie un
+   message d’ouverture avec les liens vers l’incident et la réunion.
+4. Les connecteurs de tickets configurés avec `onMajorIncident` créent un [ticket](/fr/api/alerting/tickets).
+
+MoleSignal tente de créer la salle de crise, la réunion et les tickets. En cas d’échec, MoleSignal se contente de le journaliser et la déclaration
+reste valide.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/declare \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"commanderId": "<user-id>"}'
+```
+</RequestExample>
+
+La déclaration, la lecture et l’attribution de rôles renvoient `{ "response": { ... }, "tasks": [ ... ] }` ; `response` vaut
+`null` si l’incident n’a pas été déclaré majeur.
+
+<ResponseExample>
+```json 200
+{
+  "response": {
+    "incidentId": "<incident-id>",
+    "orgId": "<organization-id>",
+    "declaredAt": 1790000000000000,
+    "declaredBy": "<user-id>",
+    "roles": { "commander": "<user-id>" },
+    "warRoom": {
+      "platform": "lark_app",
+      "connectorId": "<connector-id>",
+      "chatId": "oc_5ad11d72b830411d72b836c20",
+      "url": "https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=<token>"
+    },
+    "meetingUrl": "https://vc.feishu.cn/j/123456789",
+    "updatedAt": 1790000000000000
+  },
+  "tasks": [
+    {
+      "id": "3KJ9a1C7vXe2Rf8MbN4qLw0TzHd",
+      "orgId": "<organization-id>",
+      "incidentId": "<incident-id>",
+      "title": "Open a status page incident",
+      "assigneeId": null,
+      "done": false,
+      "doneBy": null,
+      "doneAt": null,
+      "position": 0,
+      "createdBy": "<user-id>",
+      "createdAt": 1790000000000000
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Champ | Remarques |
+|---|---|
+| `declaredBy` | Identifiant de la personne qui a déclaré l’incident majeur ; `null` si la règle de l’organisation a déclenché la déclaration. |
+| `roles` | Associe les rôles `commander` (pilotage de l’incident), `communications` (responsabilité des communications) et `scribe` (prise de notes) aux identifiants utilisateur. Les rôles non attribués sont absents. |
+| `warRoom` | Salle de crise : `platform` (`lark_app`, `slackApp`, `dingtalk_app` ou `wecom_app`), connecteur, identifiant de la discussion et lien pour la rejoindre. Les groupes DingTalk et WeCom n’ont pas de lien d’accès : `url` est donc vide. Sans salle de crise, `warRoom` vaut `null`. |
+| `meetingUrl` | Lien de la réunion ; `null` en l’absence de réunion. |
+
+## Rôles et tâches
+
+Pour attribuer un rôle, envoyez `{ "role": "scribe", "userId": "<user-id>" }` ; utilisez `null` comme valeur de `userId` pour annuler l’attribution.
+Déclarez d’abord l’incident majeur.
+
+Pour ajouter une tâche, envoyez `{ "title": "…", "assigneeId": "<user-id>" }` avec un titre de 1 à 200 caractères.
+La limite est de 50 tâches par incident. Pour modifier une tâche, envoyez uniquement les champs à modifier : `title`, `assigneeId` (`null`
+annule l’affectation) et `done`. Lorsque la tâche est terminée, MoleSignal renseigne `doneBy` et `doneAt`. L’ajout et la modification renvoient la
+tâche. La suppression renvoie `{ "deleted": true }`.
+
+## Publier une mise à jour
+
+```http
+POST /api/v1/alerts/incidents/{id}/status-updates
+```
+
+| Champ | Type | Remarques |
+|---|---|---|
+| `impact` | string | Impact. |
+| `current` | string | État actuel. |
+| `next` | string | Étapes suivantes. |
+
+Renseignez au moins un champ et limitez chaque champ à 2 000 caractères. Déclarez d’abord
+l’incident majeur. MoleSignal consigne la mise à jour dans la chronologie, la publie dans la salle de crise et la transmet au moteur de
+notification sous la forme de l’événement `incident.status_update`. Le moteur l’envoie aux personnes affectées à l’incident, à celles qui occupent un rôle et aux
+parties prenantes définies dans les paramètres, selon la règle intégrée
+[Mise à jour d’un incident majeur : notifier les parties prenantes](/fr/notification-channels#politiques-intégrées).
+L’attribut `status_update` de l’événement contient `impact`, `current`, `next` et `author`. L’API renvoie
+`{ "sent": true }`.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/status-updates \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"impact": "EU checkout failing for 30% of users", "current": "Rolling back v2026.10.28", "next": "Confirm the error rate drops"}'
+```
+</RequestExample>
+
+## Paramètres de l’organisation
+
+```http
+PUT /api/v1/alerts/response/settings
+```
+
+| Champ | Type | Remarques |
+|---|---|---|
+| `warRoomConnectorId` | string | Connecteur de notification qui crée les salles de crise. Il doit pouvoir créer des discussions de groupe : `lark_app`, `slackApp`, `dingtalk_app` ou `wecom_app`. Avec `null`, MoleSignal ne crée pas de salle de crise. |
+| `meeting` | string | `none` (par défaut, sans réunion), `feishu_vc`, `tencentMeeting`, `zoom`, `googleMeet` ou `fixed_url`. |
+| `meetingUrl` | string | Lien de la réunion pour `fixed_url`. Il doit commencer par `https://`. |
+| `meetingConnectorId` | string | Pour `feishu_vc` : connecteur d’application Feishu qui planifie les réunions. Avec `null`, MoleSignal utilise le connecteur de la salle de crise, qui doit alors être une application Feishu. |
+| `tencentMeeting` | object | Obligatoire pour `tencentMeeting` : `appId`, `sdkId` (si disponible) et `secretId` de l’application personnalisée, ainsi que le `userid` de la personne qui crée la réunion. |
+| `zoom` | object | Obligatoire pour `zoom` : `accountId` et `clientId` de l’application OAuth de serveur à serveur, ainsi que `host` (adresse e-mail ou identifiant utilisateur). |
+| `googleMeet` | object | Obligatoire pour `googleMeet` : `organizer` (adresse e-mail de la personne pour laquelle le compte de service crée les réunions). |
+| `secrets` | object | En écriture seule : nouveaux secrets de réunion, sous les clés `tencentMeeting.secretKey`, `zoom.clientSecret` ou `googleMeet.credentials` (contenu de la clé JSON du compte de service). Laissez une valeur vide pour conserver la valeur existante. MoleSignal conserve uniquement le secret du service de réunion sélectionné. |
+| `checklist` | array | Éléments convertis en tâches lors de la déclaration. Maximum de 30 éléments de 200 caractères chacun. |
+| `stakeholderIds` | array | Parties prenantes à ajouter aux salles de crise et à notifier lors des mises à jour. |
+| `auto` | object | Déclaration automatique : `{ "enabled": true, "minSeverity": "critical", "conditions": [ ... ] }`. MoleSignal déclare immédiatement majeur tout nouvel incident dont la gravité atteint ou dépasse `minSeverity` et dont les étiquettes satisfont à `conditions`. Dans ce cas, `declaredBy` vaut `null`. Rédigez les `conditions` comme dans les [règles de routage](/fr/api/alerting/create-routing-rule). |
+
+Envoyez l’objet de paramètres complet dans le corps de la requête. L’API renvoie les paramètres enregistrés. Avant le premier enregistrement, la lecture
+renvoie les valeurs par défaut. MoleSignal chiffre les secrets avec la clé racine avant de les stocker. La lecture n’expose que `secretsSet`,
+qui contient les clés des secrets configurés, ainsi que le champ `war_room_types`, en lecture seule, qui répertorie les types de connecteurs capables de
+créer des salles de crise.
+
+**Erreurs**
+
+| Statut | Motif |
+|---|---|
+| `400` | L’incident est résolu ou n’a pas encore été déclaré majeur, un champ ne respecte pas ses limites ou le connecteur n’est pas une application Feishu ou Slack de cette organisation. |
+| `403` | Une autorisation manque ou l’incident se trouve hors du périmètre d’accès. |
+| `404` | L’incident ou la tâche n’existe pas. |

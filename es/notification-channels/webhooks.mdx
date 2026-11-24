@@ -1,0 +1,317 @@
+---
+title: "Conectores de notificación por webhook"
+description: "Configura el envío mediante webhooks de Slack, Lark y genéricos, con opciones para reemplazar el destino, firmar las solicitudes y cifrar las credenciales."
+"en_link": "/en-US/notification-channels/webhooks"
+"zh-Hans_link": "/zh-Hans/notification-channels/webhooks"
+"zh-Hant_link": "/zh-Hant/notification-channels/webhooks"
+"ja_link": "/ja/notification-channels/webhooks"
+"ko_link": "/ko/notification-channels/webhooks"
+"de_link": "/de/notification-channels/webhooks"
+"fr_link": "/fr/notification-channels/webhooks"
+"pt-BR_link": "/pt-BR/notification-channels/webhooks"
+---
+
+Actualmente, MoleSignal ofrece tres tipos de conectores de webhook: webhook de Slack, webhook de Lark y
+webhook JSON genérico. Crea conectores de webhook en **Configuración → Notificaciones → Conectores**.
+
+Consulta primero [Canales y entrega de notificaciones](/es/notification-channels) para conocer la vinculación de identidades,
+la creación de políticas, las rutas de respaldo o el historial de entregas.
+
+## Compara los tipos de webhook
+
+| Conector | Formato de la solicitud | Autenticación | Tipos de destino |
+|---|---|---|---|
+| `slack_webhook` | `{ "text": "..." }` | Credencial en la URL del webhook | `fixed_group`, `webhook` |
+| `lark_webhook` | `msg_type: text` de Lark | Credencial en la URL, firma opcional | `fixed_group`, `webhook` |
+| `webhook` | JSON del evento de MoleSignal o cuerpo de la plantilla de notificación | Encabezados JSON personalizados, firma opcional | Todos los tipos de destino |
+
+Con `fixed_group`, el conector envía la notificación a la URL configurada. Con `webhook`, el valor del destino debe
+ser una URL absoluta y reemplaza la URL configurada para esa entrega.
+
+## Webhook de Slack
+
+Configura una URL de webhook entrante y un tiempo de espera de 1 a 60 segundos:
+
+```json
+{
+  "webhookUrl": "https://hooks.slack.com/services/T000/B000/secret",
+  "timeoutSecs": 10
+}
+```
+
+MoleSignal combina el título y el cuerpo en Markdown del mensaje y envía lo siguiente:
+
+```json
+{
+  "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
+}
+```
+
+Una respuesta HTTP 2xx indica que la entrega se realizó correctamente. Ante cualquier otra respuesta o si se agota el tiempo de espera, MoleSignal marca la entrega como fallida.
+
+## Webhook de Lark
+
+Configura la URL de un bot personalizado de Lark o Feishu. Agrega el secreto de firma del bot solo si la verificación
+de firmas está habilitada:
+
+```json
+{
+  "webhookUrl": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
+  "secret": "replace-with-signing-secret",
+  "timeoutSecs": 10
+}
+```
+
+Sin un secreto de firma, MoleSignal envía lo siguiente:
+
+```json
+{
+  "msg_type": "text",
+  "content": {
+    "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
+  }
+}
+```
+
+Con un secreto de firma, MoleSignal genera una marca de tiempo Unix en segundos, construye
+`timestamp + "\n" + secret`, usa ese valor como clave HMAC-SHA256 para un mensaje vacío y
+codifica el resultado en Base64. La solicitud incluye ambos campos:
+
+```json
+{
+  "timestamp": "1599360473",
+  "sign": "base64-signature",
+  "msg_type": "text",
+  "content": {
+    "text": "[Critical] Checkout error rate is high\nThe error rate exceeded 5%."
+  }
+}
+```
+
+MoleSignal requiere un estado HTTP satisfactorio y un valor de cero en `code` o `status_code` en la
+respuesta de Lark.
+
+<Note>
+  Mantén sincronizado el reloj del servidor de MoleSignal. Lark rechaza las solicitudes firmadas cuya marca de tiempo es demasiado antigua.
+</Note>
+
+## Webhook genérico
+
+Configura la URL predeterminada, el método, el cuerpo, el secreto de firma, los encabezados y el tiempo de espera:
+
+```json
+{
+  "url": "https://notify.example.com/molesignal",
+  "method": "post",
+  "body": "event",
+  "signingSecret": "<at-least-16-characters>",
+  "headers": {
+    "X-Environment": "production"
+  },
+  "timeoutSecs": 10
+}
+```
+
+El método puede ser `post`, `put` o `patch`. Los nombres y valores de los encabezados deben ajustarse a la sintaxis HTTP.
+No uses `Content-Type` ni los nombres `X-MoleSignal-*` que se indican a continuación.
+
+### Cuerpo
+
+Cuando `body` tiene el valor `event` (la opción predeterminada, **Evento de MoleSignal** en la consola), el cuerpo usa JSON para que
+otros sistemas puedan procesarlo:
+
+```json
+{
+  "version": 2,
+  "event": {
+    "id": "alert.triggered:3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "type": "alert.triggered",
+    "occurredAt": "2026-10-28T08:00:00Z",
+    "organizationId": "<organization-id>"
+  },
+  "alert": {
+    "id": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "status": "open",
+    "severity": "critical",
+    "title": "High error rate · checkout",
+    "url": "https://molesignal.example.com/alerts/incidents/3KEDNEyqouYJeBDTLTMTBui7XHW",
+    "startedAt": "2026-10-28T08:00:00Z",
+    "acknowledgedAt": null,
+    "resolvedAt": null,
+    "acknowledgedBy": null,
+    "resolvedBy": null,
+    "assignees": ["<user-id>"],
+    "teamId": "<team-id>",
+    "service": "checkout",
+    "environment": "production",
+    "affectedServices": ["checkout"],
+    "labels": { "service": "checkout", "env": "production" },
+    "annotations": { "runbook_url": "https://runbooks.example.com/checkout" },
+    "value": 120.0,
+    "threshold": 50.0
+  },
+  "rule": { "id": "<rule-id>", "name": "High error rate", "description": "Share of 5xx answers." },
+  "target": { "type": "fixed_group", "value": "platform-oncall", "metadata": {} },
+  "message": {
+    "title": "[CRITICAL] High error rate · checkout",
+    "text": "The error rate exceeded 5%.",
+    "markdown": "**Checkout** error rate exceeded 5%.",
+    "html": null,
+    "metadata": { "event_type": "alert.triggered", "alert_id": "3KEDNEyqouYJeBDTLTMTBui7XHW" }
+  }
+}
+```
+
+| Campo | Contenido |
+|---|---|
+| `version` | Versión de la estructura del cuerpo. La versión actual, `2`, usa camelCase en las claves de la estructura; `data` conserva los atributos originales del evento. No se eliminan campos: la versión solo aumenta cuando un cambio rompe la compatibilidad con los lectores. |
+| `event` | `id`, `type` (por ejemplo, `alert.triggered`, `alert.escalated`, `oncall.shift.starting`), `occurredAt` y `organizationId` de la notificación. |
+| `alert` | Solo para notificaciones de alerta: estado, severidad, título, dirección del incidente (si se configuró `http.external_url`), fechas y horas de inicio, confirmación y resolución, responsables asignados, equipo, servicio, entorno, etiquetas, anotaciones, valor y umbral. Las fechas y horas usan el formato RFC 3339 en UTC. El cuerpo identifica a las personas y los equipos mediante sus ID. |
+| `rule` | Regla de la alerta: `id`, `name`, `description`. |
+| `escalation` | Solo para notificaciones de escalamiento: `step`, `loop`, `reason` (motivo del envío; consulta [Actúa ante un incidente](/es/alerting/incidents#actuar-sobre-un-incidente)) y `target` (`kind` e `id`). |
+| `data` | Para notificaciones que no son alertas, como un relevo de guardia o una falta de cobertura, contiene los atributos originales del evento. |
+| `target` | Destino de esta entrega: `type`, `value`, `metadata`. |
+| `message` | Mensaje generado: `title`, `text`, `markdown`, `html`, `metadata`. |
+
+Cuando `body` tiene el valor `template` (**Cuerpo de la plantilla de notificación**), MoleSignal usa como cuerpo la plantilla que seleccionó la política de notificación
+para el canal de webhook y la envía tal como está escrita. Para las plantillas JSON, usa `application/json` y aplica el escape a los valores
+como cadenas JSON. Para otros formatos, usa `text/plain; charset=utf-8`. Si la política no seleccionó una plantilla para
+el canal de webhook, MoleSignal envía el cuerpo de la plantilla general o el del mensaje del evento. Consulta
+[Condiciones](/es/notification-channels#condiciones) para saber cómo escribir plantillas.
+
+### Encabezados y firma
+
+| Encabezado | Contenido |
+|---|---|
+| `Content-Type` | `application/json` o `text/plain; charset=utf-8` si el cuerpo de la plantilla no es JSON. |
+| `X-MoleSignal-Event` | Tipo de notificación. Coincide con `event.type`. |
+| `X-MoleSignal-Delivery` | ID de esta entrega. El receptor puede usarlo para descartar solicitudes duplicadas. |
+| `X-MoleSignal-Timestamp` | Solo si hay un secreto de firma: hora de envío en tiempo Unix, en segundos. |
+| `X-MoleSignal-Sign` | Solo si hay un secreto de firma: `sha256=<hex>`, el HMAC-SHA256 de `<timestamp>.<body>` calculado con el secreto de firma. |
+
+El receptor vuelve a calcular la firma sobre el cuerpo sin procesar con el mismo secreto, la compara con
+`X-MoleSignal-Sign` en tiempo constante y rechaza las solicitudes con una marca de tiempo que difiera demasiado de la hora actual, por ejemplo, en más de 5
+minutos. Calcula la firma sobre los bytes originales, no sobre un JSON que hayas analizado y vuelto a serializar:
+
+<CodeGroup>
+```python Python
+import hashlib, hmac, time
+
+def verify(secret: str, headers, body: bytes, tolerance: int = 300) -> bool:
+    timestamp = headers.get("X-MoleSignal-Timestamp", "")
+    signature = headers.get("X-MoleSignal-Sign", "")
+    if not timestamp.isdigit() or abs(time.time() - int(timestamp)) > tolerance:
+        return False
+    mac = hmac.new(secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256)
+    return hmac.compare_digest("sha256=" + mac.hexdigest(), signature)
+```
+
+```javascript Node.js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+export function verify(secret, headers, body, toleranceSecs = 300) {
+  const timestamp = headers['x-molesignal-timestamp'] ?? '';
+  const signature = Buffer.from(headers['x-molesignal-sign'] ?? '');
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > toleranceSecs) return false;
+  const expected = Buffer.from(
+    'sha256=' + createHmac('sha256', secret).update(`${timestamp}.`).update(body).digest('hex'),
+  );
+  return expected.length === signature.length && timingSafeEqual(expected, signature);
+}
+```
+
+```go Go
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+func verify(secret string, r *http.Request, body []byte, tolerance time.Duration) bool {
+	timestamp := r.Header.Get("X-MoleSignal-Timestamp")
+	seconds, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil || time.Since(time.Unix(seconds, 0)).Abs() > tolerance {
+		return false
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp + "."))
+	mac.Write(body)
+	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(expected), []byte(r.Header.Get("X-MoleSignal-Sign")))
+}
+```
+</CodeGroup>
+
+Usa un secreto de firma de al menos 16 caracteres, como el que genera `openssl rand -hex 32`. Los destinos HTTP
+de los conectores usan el mismo método de firma. Consulta [Conectores](/es/connectors).
+
+### Respuestas y solicitudes salientes
+
+Cualquier respuesta 2xx indica que la entrega se realizó correctamente. Si la respuesta contiene `X-Request-ID`, MoleSignal registra el valor
+del encabezado como ID del mensaje del proveedor. MoleSignal solo se conecta a las direcciones a las que resuelve el host,
+rechaza las direcciones de metadatos de la nube y no sigue redirecciones. MoleSignal nunca
+[combina las notificaciones de webhook](/es/notification-channels#agrupar-notificaciones).
+
+## Crea y prueba mediante la API
+
+Crea un conector de webhook genérico:
+
+```bash
+curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors" \
+  -H "Authorization: Bearer $MS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "platform webhook",
+    "connectorType": "webhook",
+    "enabled": true,
+    "config": {
+      "url": "https://notify.example.com/molesignal",
+      "method": "post",
+      "body": "event",
+      "signingSecret": "<at-least-16-characters>",
+      "headers": {"Authorization": "Bearer <token>"},
+      "timeoutSecs": 10
+    }
+  }'
+```
+
+Guarda el `id` que devuelve la API para el conector y luego envía una prueba:
+
+```bash
+curl -X POST "$MOLESIGNAL_URL/api/v1/notify/connectors/$CONNECTOR_ID/test" \
+  -H "Authorization: Bearer $MS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "targetType": "fixed_group",
+    "target": "platform-oncall",
+    "message": {
+      "title": "MoleSignal connector test",
+      "text": "Webhook delivery is working."
+    }
+  }'
+```
+
+Al listar, consultar, crear o actualizar conectores, la API devuelve `***` en los campos de configuración sensibles.
+Al actualizar un conector existente, envía el valor `***` sin cambios para conservar el secreto almacenado.
+
+## Seguridad y limitaciones
+
+- MoleSignal cifra en reposo toda la configuración del conector.
+- Las respuestas de la API enmascaran `url`, `webhookUrl`, `headers`, `secret`, `signingSecret`, los tokens y las contraseñas.
+- Trata la URL de un webhook como una credencial, incluso si no configuraste un secreto adicional.
+- Prefiere `https`. Usa `http` solo en una red de confianza.
+- Restringe el acceso saliente de MoleSignal a los destinos que necesitan los conectores.
+- Un conector deshabilitado no puede enviar pruebas ni notificaciones.
+
+<Note>
+  DingTalk, WeCom, Teams, Google Chat, Telegram, Discord, Mattermost, Webex, Matrix, PagerDuty y
+  Amazon SNS tienen sus propios conectores. Consulta
+  [Configura cada proveedor](/es/notification-channels#configura-cada-proveedor). Si el destino requiere
+  otra estructura JSON, defínela en una plantilla de webhook JSON y selecciona **Cuerpo de la plantilla de notificación** como
+  cuerpo. No necesitas un intermediario para transformar el contenido.
+</Note>

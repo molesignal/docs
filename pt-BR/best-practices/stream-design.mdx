@@ -1,0 +1,106 @@
+---
+title: "Projete streams e campos que continuem úteis"
+sidebarTitle: "Estrutura de streams e campos"
+description: "Decida como dividir os dados em streams, padronize os nomes dos campos, indexe os campos usados em filtros e proteja os valores sensíveis antes de integrar a primeira fonte de grande volume."
+"en_link": "/en-US/best-practices/stream-design"
+"zh-Hans_link": "/zh-Hans/best-practices/stream-design"
+"zh-Hant_link": "/zh-Hant/best-practices/stream-design"
+"ja_link": "/ja/best-practices/stream-design"
+"ko_link": "/ko/best-practices/stream-design"
+"de_link": "/de/best-practices/stream-design"
+"es_link": "/es/best-practices/stream-design"
+"fr_link": "/fr/best-practices/stream-design"
+---
+
+É difícil alterar fluxos e campos quando dados, dashboards e regras de alerta já dependem deles. O tipo de um campo
+fica fixo na primeira gravação, não é possível marcá-lo como criptografado depois, e renomeá-lo invalida todas as
+consultas salvas. Dedique uma hora ao planejamento antes de conectar a primeira fonte de alto volume.
+
+## Separe os fluxos conforme os requisitos
+
+Crie um fluxo separado só quando os dados exigirem condições diferentes: outro período de retenção, outra
+regra de acesso, outro esquema ou um limite diferente para o intervalo de consulta. Caso contrário, mantenha os dados juntos e diferencie-os
+por campos.
+
+| Situação | Recomendação | Contrapartida |
+|---|---|---|
+| Logs de depuração retidos por 3 dias e logs de auditoria por um ano | Dois fluxos `logs`, cada um com sua própria retenção. | Consultas que precisam dos dois tipos usam dois fluxos. |
+| Muitos serviços com logs de mesma estrutura | Um fluxo com `service.name` em cada evento. | A retenção e o acesso não podem variar por serviço. |
+| Um grande volume de dados brutos que um pipeline distribui entre fluxos | Um fluxo de origem com **Consultável** desativado e um pipeline de roteamento. | Os eventos brutos ficam armazenados até o fim do período de retenção. Defina um período curto. |
+| Cada servidor Prometheus | Um fluxo `metrics` por fonte. | Uma consulta que abrange várias fontes precisa indicar vários fluxos. |
+| Um fluxo por pod, versão ou cliente | Evite. Use campos em vez de fluxos. | Muitos fluxos pequenos multiplicam os arquivos e quebram os dashboards a cada mudança. |
+
+O MoleSignal cria o fluxo na primeira gravação. Assim, um erro de digitação no emissor cria um fluxo novo sem aviso.
+Confira a [lista de fluxos](/pt-BR/streams#lista-de-fluxos) após conectar cada fonte e crie com antecedência os
+fluxos importantes, com a retenção e os campos criptografados definidos.
+
+## Defina os nomes dos campos antes de enviar dados
+
+Use os nomes do OpenTelemetry sempre que existirem e adote o mesmo nome para o mesmo conceito em todos os
+sinais. A navegação entre sinais e o APM dependem desses nomes.
+
+| Campo | Conteúdo | Por que usar |
+|---|---|---|
+| `service.name` | O nome do serviço, igual em logs, traces e métricas. | Associa cada sinal a um serviço. |
+| `deployment.environment.name` | `production`, `staging` e assim por diante. | Permite filtrar todas as páginas por ambiente. |
+| `service.version` | A versão lançada. | Permite comparar implantações no APM. |
+| `trace_id`, `span_id` | Defina os dois campos em cada linha de log gravada durante uma requisição. | Permite abrir o trace direto da linha de log. |
+| `level` | Uma grafia padronizada, como `error`, `warn` e `info` em minúsculas. | O histograma de logs usa o índice para contar as ocorrências por nível. |
+| `host.name`, `k8s.pod.name` | Onde o evento ocorreu. | Ajuda a localizar o problema em uma máquina específica. |
+
+Mantenha o mesmo tipo de campo em todos os emissores: o MoleSignal rejeita com `type mismatch on field` um campo que chega como número de um
+serviço e como texto de outro. Normalize esses campos em um
+pipeline com **Converter tipo** antes do armazenamento. Nunca reutilize o nome de um campo existente para outro
+significado. Crie um campo novo.
+
+## Indexe os campos usados em filtros
+
+O [tipo de índice](/pt-BR/streams#esquema-e-campos) determina a velocidade do filtro. Campos novos não recebem índice,
+com exceção de alguns nomes conhecidos. Revise os campos que dashboards e alertas usam nos filtros:
+
+- **Correspondência exata** para identificadores comparados por inteiro: `trace_id`, `user_id`, `order_id`,
+  `service.name`.
+- **Pesquisa de texto completo** para buscar palavras em campos de texto livre, como `message`.
+- **Índice de salto** para números e valores de tempo comparados com `<` e `>`, como `duration_ms`.
+- Nenhum índice para campos que servem apenas para exibição.
+
+A alteração do índice vale para novos dados. Os arquivos antigos recebem o índice quando o compactador os mescla. Altere o índice em
+**Fluxos → Campos e índices** e clique em **Salvar e aplicar**.
+
+## Evite alta cardinalidade nos rótulos
+
+Um rótulo de métrica com valores sem limite definido, como um ID de usuário, um ID de requisição ou uma URL completa, cria uma
+série para cada valor. Ao atingir os [limites de cardinalidade](/pt-BR/settings/platform#cardinalidade-de-métricas), o MoleSignal passa a rejeitar
+novas séries de toda a organização. Coloque esses valores em logs ou atributos de spans, onde não há custo
+por valor, e restrinja os rótulos de métricas a conjuntos limitados, como serviço, modelo de rota, método e
+classe de status.
+
+Armazene em uma [tabela de enriquecimento](/pt-BR/extend-tables) os dados de referência que, de outra forma, se repetiriam em cada evento, como a equipe responsável por um serviço ou o
+plano de um cliente. O pipeline consulta essa tabela durante o
+processamento.
+
+## Proteja os valores sensíveis desde o início
+
+| Necessidade | Ferramenta | Quando se aplica |
+|---|---|---|
+| Nunca armazenar um valor, como o número de um cartão | Uma [expressão regular](/pt-BR/settings/data-security#padrões-de-regex) com **Ocultar dados na ingestão** ou uma etapa do pipeline que remove o campo. | Na ingestão, de forma definitiva. |
+| Armazenar um valor, mas permitir acesso a poucos usuários | Um campo criptografado, declarado na criação do fluxo e lido com `decrypt()`. | Desde a criação do fluxo. |
+| Ocultar um valor na maioria dos resultados de consulta | [Mascaramento de campos](/pt-BR/settings/data-security#mascaramento-de-campos). | Durante a consulta, no resultado. |
+
+Prefira remover o valor no emissor ou no coletor. Um valor que nunca sai da fonte não pode
+vazar pelo MoleSignal.
+
+## Critérios de aceitação
+
+- Cada fluxo tem um responsável, uma finalidade e um período de retenção definido de acordo com essa finalidade.
+- É possível seguir uma requisição conhecida da linha de log até o trace com um clique.
+- Os campos usados nos filtros de dashboards e regras têm um índice adequado.
+- Nenhum rótulo de métrica aceita valores sem limite definido, e **Cardinalidade** em Métricas mostra contagens estáveis de séries.
+- Os eventos de teste com marcadores de dados sensíveis chegam com esses dados ocultos, mascarados ou criptografados, conforme planejado.
+
+## Guias relacionados
+
+- [Fluxos](/pt-BR/streams)
+- [Pipelines](/pt-BR/pipelines)
+- [Configurações de segurança de dados](/pt-BR/settings/data-security)
+- [Implante a telemetria de um novo serviço](/pt-BR/best-practices/service-onboarding)

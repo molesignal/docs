@@ -1,0 +1,247 @@
+---
+title: "Gérer les pipelines"
+description: "Listez, inspectez, modifiez, exécutez, mettez en pause et supprimez les pipelines."
+"en_link": "/en-US/api/intake/scheduled-pipelines"
+"zh-Hans_link": "/zh-Hans/api/intake/scheduled-pipelines"
+"zh-Hant_link": "/zh-Hant/api/intake/scheduled-pipelines"
+"ja_link": "/ja/api/intake/scheduled-pipelines"
+"ko_link": "/ko/api/intake/scheduled-pipelines"
+"de_link": "/de/api/intake/scheduled-pipelines"
+"es_link": "/es/api/intake/scheduled-pipelines"
+"pt-BR_link": "/pt-BR/api/intake/scheduled-pipelines"
+---
+
+| Opération | Point de terminaison | Autorisation |
+|---|---|---|
+| Lister | `GET /api/v1/scheduled_pipelines` | `pipelines.read` |
+| Créer | `POST /api/v1/scheduled_pipelines` | `pipelines.create`, et `audit.read` si le pipeline lit `_audit` |
+| Récupérer | `GET /api/v1/scheduled_pipelines/{id}` | `pipelines.read` |
+| Mettre à jour | `PUT /api/v1/scheduled_pipelines/{id}` | `pipelines.edit` pour modifier la configuration, avec `audit.read` si le pipeline lit `_audit`, et `pipelines.pause` si `enabled` change |
+| Supprimer | `DELETE /api/v1/scheduled_pipelines/{id}` | `pipelines.delete` |
+| Historique des exécutions | `GET /api/v1/scheduled_pipelines/{id}/runs` | `pipelines.read` |
+| Limites du jour | `GET /api/v1/scheduled_pipelines/{id}/limits` | `pipelines.read` |
+| Rattrapage | `POST /api/v1/scheduled_pipelines/{id}/backfill` | `pipelines.run`, et `audit.read` si le pipeline lit `_audit` |
+
+## Lister
+
+La liste renvoie tous les pipelines avec l’état de leur dernière exécution et un récapitulatif sur 24 heures :
+
+<ResponseExample>
+```json 200
+[
+  {
+    "id": "3KBHcb6imgQq7FXBsROGTIRHOyg",
+    "name": "normalize-app",
+    "sourceStream": "app_raw",
+    "targetStream": "app",
+    "functionSteps": { "mode": "scheduled", "signalType": "logs", "sources": ["app_raw", "nginx_raw"], "steps": [ ... ] },
+    "cron": "every:5m",
+    "lookbackSecs": 300,
+    "enabled": true,
+    "lastRunAt": 1790000000000000,
+    "readUntil": { "appRaw": 1789999940000000, "nginxRaw": 1789999940000000 },
+    "retry": null,
+    "alertRecord": null,
+    "auditReaderId": null,
+    "auditReader": null,
+    "createdAt": 1789900000000000,
+    "updatedAt": 1789900000000000,
+    "lastRunState": "succeeded",
+    "lastRunStartedAt": 1790000000000000,
+    "lastRunFinishedAt": 1790000000250000,
+    "lastRunScannedRows": 1200,
+    "lastRunError": null,
+    "runs24h": 288,
+    "succeededRuns24h": 288,
+    "failedRuns24h": 0
+  }
+]
+```
+</ResponseExample>
+
+Chaque élément contient les champs de [Récupérer](#récupérer), les détails de la dernière exécution dans `lastRunState`, `lastRunStartedAt`, `lastRunFinishedAt`, `lastRunScannedRows` (le nombre d’événements lus) et `lastRunError`, ainsi que les décomptes des exécutions des dernières 24 heures.
+
+## Récupérer
+
+```http
+GET /api/v1/scheduled_pipelines/{id}
+```
+
+Renvoie le pipeline avec la position de lecture de chaque source et la nouvelle tentative planifiée :
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KBHcb6imgQq7FXBsROGTIRHOyg",
+  "name": "normalize-app",
+  "sourceStream": "app_raw",
+  "targetStream": "app",
+  "functionSteps": { "mode": "scheduled", "signalType": "logs", "sources": ["app_raw", "nginx_raw"], "steps": [ ... ] },
+  "cron": "every:5m",
+  "lookbackSecs": 300,
+  "enabled": true,
+  "lastRunAt": 1790000000000000,
+  "readUntil": { "appRaw": 1789999940000000, "nginxRaw": 1789999640000000 },
+  "retry": {
+    "source": "nginx_raw",
+    "attempt": 2,
+    "nextAt": 1790000030000000,
+    "error": "read: <reason>"
+  },
+  "alertRecord": null,
+  "auditReaderId": null,
+  "auditReader": null,
+  "createdAt": 1789900000000000,
+  "updatedAt": 1789900000000000
+}
+```
+</ResponseExample>
+
+| Champ | Remarques |
+|---|---|
+| `readUntil` | Position de lecture de chaque source, en microsecondes. Le pipeline a traité les événements antérieurs à cette position. Le champ ne contient aucune entrée pour une source que le pipeline n’a pas encore lue. |
+| `retry` | Nouvelle tentative planifiée la plus proche pour une fenêtre en échec, ou `null`. `source` indique le nom de la source, `attempt` le numéro de la prochaine tentative, `nextAt` la date et l’heure prévues et `error` la cause de l’échec de la dernière tentative. |
+| `alertRecord` | Décomptes d’un pipeline d’alertes pour le dernier jour UTC où il a reçu un événement : `day` (`YYYY-MM-DD`), `processed`, `dropped` et `failed`. `last_dropped` et `last_failed` décrivent le dernier événement écarté et le dernier échec de ce jour, avec, pour chacun, `atTime`, `rule` (la règle, la source d’alerte ou le contrôle synthétique) et `reason`. Un décompte absent vaut 0. Le champ vaut `null` pour les autres pipelines et pour un pipeline d’alertes qui n’a pas encore reçu d’événement. Consultez [Décomptes journaliers](/fr/pipelines/alert-events#compteurs-quotidiens). |
+| `auditReaderId` | Identifiant du compte dont le pipeline utilise les droits pour lire `_audit` : le dernier compte à avoir enregistré le pipeline. Le champ vaut `null` si le pipeline ne lit pas `_audit`. Consultez [Flux d’audit](/fr/settings/data-security#flux-d’audit). |
+| `auditReader` | `id`, `displayName` et `email` de ce compte, accessibles aux comptes disposant de `pipelines.read`. Le champ vaut `null` si le compte n’existe plus ou si ses informations sont inaccessibles. Dans ce cas, `auditReaderId` reste inchangé. |
+
+Consultez [Planification et positions de lecture](/fr/pipelines#planification-et-positions-de-lecture) et [Nouvelles tentatives et événements en échec](/fr/pipelines#nouvelles-tentatives-et-rejets).
+
+## Mettre à jour et supprimer
+
+`PUT` accepte le même corps de requête que [Créer un pipeline](/fr/api/intake/create-pipeline) et remplace la configuration. Une modification limitée à `enabled` exige `pipelines.pause`. Toute autre requête `PUT`, même sans modification, exige `pipelines.edit`. Le passage de `enabled` de `false` à `true` réinitialise les positions de lecture : le pipeline relit chaque source en remontant de `lookbackSecs`. `DELETE` renvoie `{"deleted": true}`.
+
+Pour un pipeline qui lit `_audit`, `PUT` détermine aussi les droits que le pipeline utilise pour cette lecture. Consultez [Flux d’audit](/fr/settings/data-security#flux-d’audit).
+
+| Effet de la requête `PUT` | Exigences supplémentaires | Droits utilisés par le pipeline pour lire `_audit` |
+|---|---|---|
+| Modifie la configuration | `audit.read` et un jeton qui n’appartient pas à un compte de service | Les droits du compte à l’origine de la requête à partir de cette mise à jour. |
+| Ne modifie rien | Aucune | Les droits du compte à l’origine de la requête si ce compte dispose de `audit.read` et si le jeton n’appartient pas à un compte de service. Sinon, les droits restent inchangés et la requête ne renvoie aucune erreur. |
+| Modifie uniquement `enabled` | Aucune | Inchangés. |
+
+## Historique des exécutions
+
+```http
+GET /api/v1/scheduled_pipelines/{id}/runs?limit=50&beforeTime=<cursor>
+```
+
+Renvoie les exécutions d’un pipeline planifié, de la plus récente à la plus ancienne. Les pipelines en temps réel et les pipelines d’alertes ne consignent aucune exécution.
+
+<ResponseExample>
+```json 200
+[
+  {
+    "id": "3KE7Yq0d3jvXm5cJ8r2bWQzN1aP",
+    "pipelineId": "3KBHcb6imgQq7FXBsROGTIRHOyg",
+    "state": "succeeded",
+    "startedAt": 1790000000000000,
+    "finishedAt": 1790000000250000,
+    "scannedRows": 1200,
+    "writtenRows": 1150,
+    "droppedRows": 48,
+    "failedRows": 2,
+    "attempt": 1,
+    "error": null,
+    "warning": "stream `app` rejected 2 event(s): <reason>"
+  }
+]
+```
+</ResponseExample>
+
+| Champ | Remarques |
+|---|---|
+| `state` | `running`, `succeeded`, `failed` ou `cancelled`. |
+| `startedAt`, `finishedAt` | Dates et heures de début et de fin de l’exécution. `finishedAt` vaut `null` tant que l’exécution est en cours. |
+| `scannedRows` | Nombre d’événements que l’exécution a lus dans ses sources. |
+| `writtenRows` | Nombre d’événements que toutes les destinations ont acceptés. |
+| `droppedRows` | Nombre d’événements qu’une étape a écartés avec `abort` ou que la déduplication a supprimés. |
+| `failedRows` | Nombre d’événements qui ont provoqué l’échec d’une étape, que le pipeline a redirigés vers une source ou qu’une destination n’a pas acceptés. |
+| `attempt` | `1` pour la première tentative. La valeur est supérieure à `1` si l’exécution a retraité une fenêtre en échec. |
+| `error` | Cause de l’échec de l’exécution : une fenêtre en échec, avec la nouvelle tentative planifiée, ou un flux cible qui n’a accepté aucun des événements qui lui étaient destinés alors que le pipeline ne dispose pas de flux d’événements en échec. |
+| `warning` | Problème qui n’a pas fait échouer l’exécution, comme des événements en échec, rejetés ou non livrés, ou une fenêtre ignorée après épuisement des tentatives. |
+
+`scannedRows` correspond à la somme de `writtenRows`, `droppedRows` et `failedRows`.
+
+## Limites du jour
+
+```http
+GET /api/v1/scheduled_pipelines/{id}/limits
+```
+
+Renvoie les volumes que les [étapes de quota et de limitation de débit](/fr/pipelines#comptage-et-limitation) d’un pipeline en temps réel ont laissés passer ou ont bloqués depuis 00:00 UTC, d’après les décomptes de tous les nœuds. Les nœuds additionnent leurs décomptes toutes les 5 secondes. Le résultat ne contient aucune ligne pour une étape qui n’a rien comptabilisé aujourd’hui.
+
+<ResponseExample>
+```json 200
+{
+  "dayStart": 1790035200000000,
+  "buckets": [
+    {
+      "step": "daily",
+      "bucket": "[\"checkout\"]",
+      "admittedEvents": 1000000,
+      "admittedBytes": 524288000,
+      "overEvents": 1240,
+      "overBytes": 650117
+    },
+    {
+      "step": "per-host",
+      "bucket": "",
+      "admittedEvents": 86400,
+      "admittedBytes": 45298483,
+      "overEvents": 12,
+      "overBytes": 6291
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Champ | Remarques |
+|---|---|
+| `step` | Nom de l’étape. |
+| `bucket` | Champ vide pour un quota non segmenté ou une limitation de débit. Pour un quota segmenté, le champ contient une liste JSON des valeurs des champs de segmentation, dans l’ordre de ces champs, avec `null` lorsqu’un événement n’a pas de valeur pour un champ, ou `*` pour les groupes au-delà du plafond de 1 000. |
+| `admittedEvents`, `admittedBytes` | Volumes admis dans la limite fixée. |
+| `overEvents`, `overBytes` | Volumes au-delà de la limite : l’étape les écarte, les laisse passer ou les envoie vers un autre flux, selon sa configuration. |
+
+## Rattrapage
+
+```http
+POST /api/v1/scheduled_pipelines/{id}/backfill
+```
+
+| Champ | Type | Remarques |
+|---|---|---|
+| `startTime` | entier | Début de la fenêtre, en microsecondes. |
+| `endTime` | entier | Fin de la fenêtre. La valeur doit être supérieure à `startTime` et la fenêtre ne doit pas dépasser 31 jours. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backfill \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"startTime": 1790000000000000, "endTime": 1790086400000000}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 202
+{
+  "jobs": [
+    {
+      "source": "app_raw",
+      "jobId": "3KE6epTrWXts1oa2ePEKIHKxG19",
+      "monitor": "/api/v1/query/jobs/3KE6epTrWXts1oa2ePEKIHKxG19"
+    },
+    {
+      "source": "nginx_raw",
+      "jobId": "3KE6eqAbXq0n2yLr7VvTq9cUo4D",
+      "monitor": "/api/v1/query/jobs/3KE6eqAbXq0n2yLr7VvTq9cUo4D"
+    }
+  ]
+}
+```
+</ResponseExample>
+
+Le rattrapage soumet une tâche de recherche par source. Chaque tâche lit sa source sur la fenêtre, applique les étapes, puis écrit et livre les événements et conserve les événements en échec comme le fait une exécution planifiée. Les positions de lecture du pipeline restent inchangées. Suivez chaque tâche avec son chemin `monitor`. Consultez [Requêtes](/fr/query#plages-temporelles-et-tâches-asynchrones).
+
+Un pipeline en temps réel ou un pipeline d’alertes renvoie `400` (`realtime and alert pipelines do not support backfill`). Un pipeline qui lit `_audit` renvoie `403` si le jeton ne dispose pas de `audit.read` ou s’il appartient à un compte de service. Au moment de l’exécution, la tâche vérifie à nouveau les droits du compte qui l’a soumise et échoue si ce compte ne dispose plus de `audit.read`.

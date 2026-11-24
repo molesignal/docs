@@ -1,0 +1,149 @@
+---
+title: "Servicekarte"
+sidebarTitle: "Servicekarte"
+description: "Eine Live-Ansicht der Aufrufbeziehungen zwischen Services, die automatisch aus Trace-Spans erstellt wird."
+"en_link": "/en-US/apm/service-map"
+"zh-Hans_link": "/zh-Hans/apm/service-map"
+"zh-Hant_link": "/zh-Hant/apm/service-map"
+"ja_link": "/ja/apm/service-map"
+"ko_link": "/ko/apm/service-map"
+"es_link": "/es/apm/service-map"
+"fr_link": "/fr/apm/service-map"
+"pt-BR_link": "/pt-BR/apm/service-map"
+---
+
+Die **Service-Karte** zeigt Aufrufe zwischen Services und deren Zustand anhand von Anfragerate, Fehlerrate
+und Latenz (den **RED**-Metriken). MoleSignal erstellt die Karte automatisch aus vorhandenen Traces.
+Für das normale Tracing ist keine zusätzliche Instrumentierung nötig.
+
+<Info>
+  Die Service-Karte und [APM](/de/apm) nutzen dieselben Trace-Daten, werten sie aber unterschiedlich aus.
+  Die Service-Karte verknüpft über Servicegrenzen hinweg übergeordnete und untergeordnete Spans zur Topologie. APM erstellt begrenzte
+  Aggregate für Services, Transaktionen, Abhängigkeiten, Fehler und Versionen.
+</Info>
+
+## So entsteht die Karte
+
+Beim Eingang von Spans ordnet MoleSignal jedem Span seinen übergeordneten Span zu. Spans aus **verschiedenen
+Services** bilden eine Aufrufkante — *aufrufender Service → aufgerufener Service* — und die Kante übernimmt
+Dauer und Fehlerstatus des untergeordneten Spans. Span-Paare innerhalb desselben Service gelten als intern und
+erscheinen nicht als Kanten. Eine Kante gehört zur Umgebung des aufrufenden Service (`deployment.environment.name` oder
+`deployment.environment`), andernfalls zu der des aufgerufenen Service. Spans, die eine
+[Echtzeit-Pipeline](/de/pipelines#traces) verwirft, bleiben unberücksichtigt.
+
+MoleSignal sammelt Kanten pro Servicepaar in **Ein-Minuten-Intervallen** und schreibt sie im
+Hintergrund in den Speicher. So zeigt die Karte den aktuellen Traffic mit etwa einer halben Minute Verzögerung.
+
+### Arbeitsspeicher- und Speichermodus
+
+Standardmäßig (Modus `intake`) verknüpft der Knoten, der die Spans entgegennimmt, diese **im Arbeitsspeicher**. Das hält
+die Latenz gering. Bei einem Deployment mit mehreren Knoten lassen sich Spans desselben Aufrufs, die auf verschiedenen Knoten landen,
+nicht im Arbeitsspeicher verknüpfen. Daher kann die Karte solche Kanten zu selten erfassen. Sie zeigt keine Kanten ohne passende Spans an.
+
+Für eine vollständige Karte über alle Knoten hinweg wählen Sie unter **Einstellungen → Allgemein → Datenquelle der Service-Karte**
+den Modus **storage**. Ein einzelner Knoten erstellt den Graphen dann regelmäßig aus **gespeicherten Traces** neu und berücksichtigt
+jeden Span unabhängig vom Empfangsknoten. Dadurch entsteht eine Verzögerung von 1–2 Minuten. MoleSignal speichert die Einstellung
+in der Datenbank und übernimmt sie zur Laufzeit. Ein Neustart ist nicht nötig.
+
+## Erforderliche Trace-Daten
+
+Die Karte benötigt Traces mit:
+
+- einem Ressourcenattribut **`service.name`** für jeden Span (OTLP-Exporter setzen dieses Attribut) und
+- **Beziehungen zwischen übergeordneten und untergeordneten Spans**, die über Servicegrenzen hinweg verlaufen, also einem Client-Span in einem
+  Service, dessen untergeordneter Server-Span in einem anderen Service läuft.
+
+Die Standardinstrumentierung von OpenTelemetry liefert beides. Richten Sie den Tracer auf einen beliebigen
+[Trace-Empfangsendpunkt](/de/intake). MoleSignal füllt die Karte automatisch.
+
+## Topologie
+
+Der Topologie-Endpunkt aggregiert die Daten eines Zeitfensters zu Knoten (Services) und Kanten (Aufrufen):
+
+```http
+GET /api/v1/web/topology?from=2026-06-14T00:00:00Z&to=2026-06-14T01:00:00Z
+Authorization: Bearer <jwt>
+```
+
+```json
+{
+  "nodes": [
+    { "id": "checkout", "name": "checkout", "rps": 42.0, "errorRate": 0.01, "p95Ms": 120.0, "spanCount": 151200 }
+  ],
+  "edges": [
+    { "source": "checkout", "target": "payments", "rps": 41.0, "errRate": 0.02, "p95Ms": 95.0 }
+  ]
+}
+```
+
+| Feld | Bedeutung |
+|---|---|
+| `rps` | Anfragen pro Sekunde im Zeitfenster. |
+| `errorRate` / `errRate` | Anteil der Anfragen mit dem Status `ERROR` (0–1). |
+| `p95Ms` | Höchstes 95. Perzentil der Latenz aller Ein-Minuten-Intervalle im Zeitfenster, in Millisekunden. |
+| `spanCount` | Gesamtzahl der für den Knoten im Zeitfenster erfassten Spans. |
+
+## Rohdaten des Servicegraphs
+
+Die Rohdaten enthalten für jede Minute eine Momentaufnahme der Kanten. Um etwa den Verlauf einer einzelnen Abhängigkeit
+als Diagramm darzustellen, fragen Sie den Servicegraph direkt ab:
+
+```http
+GET /api/v1/traces/service_graph?from=1717200000000000&to=1717286400000000&service=checkout
+Authorization: Bearer <jwt>
+```
+
+`from` und `to` geben Mikrosekunden seit der Unix-Epoche an. Der optionale Filter `service` liefert Kanten,
+bei denen der ausgewählte Service auf einer der beiden Seiten des Aufrufs steht. Jede Zeile enthält `environment`,
+`request_count`, `error_count` und `p50_us` / `p95_us` / `p99_us` für ein Servicepaar in einer Minute.
+
+## In der Benutzeroberfläche
+
+- **APM → Service-Karte** zeigt die Services einer Umgebung, ihre Aufrufe untereinander, weitere Aufrufziele
+  sowie die Topics, an die sie Nachrichten senden und aus denen sie Nachrichten lesen. Siehe [die APM-Service-Karte](#die-apm-service-karte).
+- **Abhängigkeiten** auf der APM-Seite eines Service zeigt wie die APM-Karte den Service mit seinen Aufrufern und Aufrufzielen
+  und listet die eingehenden Aufrufe auf. Wählen Sie einen Aufruf aus, um ihn im selben Seitenpanel zu öffnen.
+- Der Tab **Servicegraph** auf der Seite „Traces“ zeigt die Karte für die Traces, die der Abfrage entsprechen.
+
+Alle Service-Karten verwenden dieselbe Darstellung: Ein farbiger Ring zeigt den Zustand des Knotens. Darin stehen Typ,
+Name, Anfragen pro Sekunde, Fehlerrate und P95. Die Pfeildicke entspricht dem Aufrufvolumen. Ab einer Fehlerrate von 5 % ist der Pfeil rot,
+ab 1 % orange.
+
+Wechseln Sie von einem beliebigen Service oder einer beliebigen Kante über die
+[signalübergreifende Korrelation](/de/correlation) direkt zu den zugehörigen Traces und Logs.
+
+## Die APM-Service-Karte
+
+**APM → Service-Karte** verknüpft den Servicegraph mit den APM-Auswertungen für die Umgebung und den
+Namespace, die Sie in der Filterleiste auswählen:
+
+| Knoten | Datenquelle |
+|---|---|
+| Service | Servicegraph mit den RED-Metriken und dem Zustand aus der APM-Übersicht. |
+| Datenbank, Cache, externer HTTP- oder RPC-Endpunkt | Ausgehende Aufrufe aus den APM-Abhängigkeiten, nach Ziel gruppiert. |
+| Service ohne eigene Telemetriedaten | Ein Aufruf, der den Service in `peer.service` nennt, wenn der Service selbst keine Spans sendet. |
+| Topic | Aufrufe, die Nachrichten an das Messaging-Ziel senden, und Messaging-Endpunkte, die Nachrichten daraus lesen. |
+
+Die Pfeildicke entspricht dem Aufrufvolumen, die Farbe der Fehlerrate. Als Vergleich dient der unmittelbar vorhergehende, gleich lange
+Zeitraum: Aufrufe, die nur im aktuellen Zeitraum vorkommen, tragen die Kennzeichnung **Neu**. Weggefallene Aufrufe erscheinen gestrichelt
+mit ihrem Knoten und der Kennzeichnung **Nicht mehr vorhanden**. Wählen Sie einen Knoten aus, um seine Aufrufer, seine Aufrufziele und den **langsamsten Pfad** ab
+diesem Knoten hervorzuheben. Der Pfad folgt an jedem Knoten dem Aufruf mit dem höchsten P95. Die Karte oberhalb des Graphen listet die Aufrufe des Knotens auf. Wählen Sie einen Aufruf aus,
+um im Seitenpanel den zeitlichen Verlauf von Anfragen, Fehlern und Latenz sowie Details zum Aufruf zu sehen:
+
+- bei einem Service die von allen Aufrufern insgesamt angesprochenen Endpunkte und die Fehlergruppen des aufgerufenen Service;
+- bei einer Datenbank, einem Cache oder einem externen Endpunkt die Operationen des Aufrufs;
+- bei einem Topic die Wartezeit der Nachrichten vom Ende der Veröffentlichung bis zum Beginn der
+  Verarbeitung durch den Consumer. MoleSignal nutzt dafür die letzten Verarbeitungsvorgänge im Trace-Speicher (höchstens 200) und ordnet jeden dem
+  über Span-Links referenzierten Span zu. Fehlt ein solcher Link, verwendet MoleSignal den übergeordneten Span.
+
+Bei mehr als 60 Knoten fasst die Karte zunächst jeden Namespace zu einem Knoten zusammen. Wählen Sie den Knoten aus, um
+den Namespace auszuklappen. Mit **Namespaces einklappen** klappen Sie alle Namespaces ein oder aus. Die Karte zeigt höchstens die 400 Knoten mit dem höchsten Aufrufvolumen.
+
+<CardGroup cols={2}>
+  <Card title="API für Topologie und Servicegraph" icon="diagram-project" href="/de/api/web/topology">
+    Fragen Sie die Endpunkte für die Topologie und die Rohdaten des Servicegraphs über HTTP ab.
+  </Card>
+  <Card title="Application Performance Monitoring" icon="gauge-high" href="/de/apm">
+    Pflegen Sie den Servicekatalog und analysieren Sie Service-Endpunkte, Abhängigkeiten, Fehler und Deployments.
+  </Card>
+</CardGroup>

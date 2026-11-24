@@ -1,0 +1,156 @@
+---
+title: "日誌查詢"
+description: "分頁列出日誌資料流的記錄、依時間統計記錄筆數，並描述指定欄位的值。"
+"en_link": "/en-US/api/web/logs"
+"zh-Hans_link": "/zh-Hans/api/web/logs"
+"ja_link": "/ja/api/web/logs"
+"ko_link": "/ko/api/web/logs"
+"de_link": "/de/api/web/logs"
+"es_link": "/es/api/web/logs"
+"fr_link": "/fr/api/web/logs"
+"pt-BR_link": "/pt-BR/api/web/logs"
+---
+
+這些呼叫會讀取組織的一個日誌資料流，讀取方式與**日誌**頁面相同。資料流不存在時，會傳回空結果。所有呼叫都需要 `logs.read`，系統範圍內則需要 `sys.telemetry.read`。
+
+每個呼叫都接受包含 JSON 請求主體的 `POST`，或在查詢字串中包含相同欄位的 `GET`：將 `filters` 和 `freeText` 寫成 JSON 清單文字，將 `where` 寫成 JSON 物件文字。查詢太長而無法放入網址時，請使用 `POST` 傳送。
+
+## 呼叫比對的記錄
+
+呼叫會比對時間範圍內同時符合下列各項的記錄：
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `filters` | list | 必須全部符合的篩選條件。與 `where` 中的篩選條件合計最多 32 個。 |
+| `freeText` | list | 在 `message` 欄位中搜尋的詞或片語，每個最長 512 位元組。由英文字母和數字組成、長度不超過 40 位元組的小寫詞，比對時不區分大小寫；其餘文字按原樣比對。與 `where` 中的文字合計最多 8 個。 |
+| `where` | object | 表示多個可選分支的條件樹：一個篩選條件、`{"text": "..."}`、`{"and": [...]}` 或 `{"or": [...]}`。 |
+| `expression` | string | 採用**日誌**頁面語法的欄位查詢。用來取代 `filters`、`freeText` 和 `where`，不可混用。 |
+
+篩選條件是包含 `field`、`op`、`value` 和 `quoted` 的物件。欄位名稱使用資料流中的欄位名稱。
+
+| 運算子 | 欄位 | 比對 |
+|---|---|---|
+| `=`、`!=` | 任意純量欄位 | 該值，或該值以外的值。值為空時，檢查欄位是否有值：`=` 比對該欄位沒有值的記錄。 |
+| `>`、`>=`、`<`、`<=` | 數字和時間戳記 | 比較結果。 |
+| `contains` | 文字 | 該值出現在欄位中的任意位置。 |
+| `match` | 任意欄位 | 該值以子字串出現，不區分大小寫。值為空時，不比對任何記錄。 |
+| `match_text` | 已建立全文索引的文字 | 全文搜尋：多個詞、片語和萬用字元。欄位沒有全文索引時，會傳回 `400`。 |
+
+`eq`、`ne` 和 `like` 分別是 `=`、`!=` 和 `contains` 的別名。值加上引號時，`quoted` 為 `true`，表示該值是詞，而不是數字。這裡無法篩選 JSON 欄位，請改用 SQL 查詢。
+
+`expression` 接受**日誌**頁面的查詢文字：比較運算、`MATCH(field, 'text')` 和 `MATCH_TEXT(field, 'words')`、要搜尋的詞、引號括住的片語、不區分大小寫的 `AND` 和 `OR`（`AND` 優先），以及括號。伺服器會將文字解析成頁面會傳送的 `filters`、`freeText` 和 `where`，再依照上述規則驗證。文字最長 8 KiB，括號最多可巢狀 32 層。若有無法解析的部分（例如括號未閉合，或比較值為空），伺服器會傳回 `400` 並指出該部分。
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/logs" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'stream=app' \
+  --data-urlencode "expression=level = 'error' AND (service.name = 'checkout' OR timeout)"
+```
+
+## 列出記錄
+
+```http
+POST /api/v1/web/logs
+GET  /api/v1/web/logs
+```
+
+依時間從新到舊傳回符合條件的記錄，並使用游標分頁。
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `stream` | string | 必填，日誌資料流。 |
+| `from`、`to` | integer | 以微秒表示的時間範圍，預設為截至目前的最近 24 小時。`to` 必須大於 `from`。 |
+| `filters`、`freeText`、`where`、`expression` | | 呼叫比對的記錄。 |
+| `limit` | integer | 每頁記錄數，預設為 `20`，範圍為 1 到 5000。 |
+| `cursor` | string | 先前某一頁的 `nextCursor` 或 `previousCursor`。游標會保留第一頁的時間範圍和比對條件。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/web/logs \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"stream":"app","expression":"level = '\''error'\''","limit":2}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    { "_timestamp": 1790000000000000, "level": "error", "message": "db pool exhausted", "trace_id": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "nextCursor": "eyJ2IjoxLC...",
+  "previousCursor": null,
+  "hasMore": true
+}
+```
+</ResponseExample>
+
+每一項包含一筆記錄的欄位，`_timestamp` 以微秒為單位。若請求帶有 `cursor`，卻變更資料流、時間範圍、`limit` 或比對條件，就會收到 `400`。
+
+## 依時間統計記錄數量
+
+```http
+POST /api/v1/web/logs/histogram
+GET  /api/v1/web/logs/histogram
+```
+
+依時間分桶統計符合條件的記錄。
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `stream` | string | 必填。 |
+| `from`、`to` | integer | 必填，以微秒表示的時間範圍。 |
+| `filters`、`freeText`、`where`、`expression` | | 呼叫比對的記錄。 |
+| `bucketTime` | integer | 每個時間桶的長度，以微秒為單位，至少為 `1000`。 |
+| `originTime` | integer | 第一個時間桶的起點，不得晚於 `from`。 |
+
+每個請求從 `originTime` 到 `to` 最多可涵蓋 512 個時間桶。
+
+```json
+{
+  "bucketTime": 60000000,
+  "originTime": 1790000100000000,
+  "buckets": [{ "startTime": 1790000100000000, "total": 120, "errors": 4 }],
+  "split": true
+}
+```
+
+`buckets` 只會列出含有記錄的時間桶，依時間從早到晚排列。`errors` 統計層級為 `ERROR` 的記錄，層級取自 `level` 或 `body_level`。如果資料流沒有這兩個欄位，或讀取者無法查看層級，`split` 為 `false`，`errors` 為 `0`。無法完成統計時，呼叫仍會傳回 `200`，`buckets` 為空，並附上 `unavailable`：`time_budget`、`busy` 或 `scan_limit`，含義與[追蹤統計](/zh-Hant/api/web/trace#按時間統計追蹤數量)相同。
+
+## 描述欄位
+
+```http
+POST /api/v1/web/logs/field-stats
+GET  /api/v1/web/logs/field-stats
+```
+
+描述特定欄位在符合條件的記錄中的值。
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `stream` | string | 必填。 |
+| `from`、`to` | integer | 以微秒表示的時間範圍。 |
+| `filters`、`freeText`、`where`、`expression` | | 呼叫比對的記錄。 |
+| `field` | string | 必填，使用資料流中的欄位名稱。 |
+
+```json
+{
+  "kind": "text",
+  "total": 1840,
+  "present": 1840,
+  "distinct": 3,
+  "distinctExact": true,
+  "top": [{ "value": "info", "count": 1500 }, { "value": "warn", "count": 300 }, { "value": "error", "count": 40 }],
+  "topSkipped": false
+}
+```
+
+`kind` 為 `number`、`time`、`text` 或 `bool`。`total` 是符合條件的記錄數，`present` 是其中該欄位有值的記錄數。`top` 依出現次數從多到少列出最常見的值；如果幾乎每個值都不同，`topSkipped` 為 `true`，且不列出這些值。`range` 以文字列出最小值和最大值。數字欄位也會提供 `spread` 和 `bars`。`trend` 統計最常見的值隨時間的變化；如果沒有明顯較常見的值，就不會提供 `trend`。
+
+## 錯誤
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | 參數無效：缺少 `stream`、`to` 不大於 `from`、篩選條件使用未知欄位或欄位類型不支援的運算子、清單或條件樹超出限制、同時提供 `expression` 和 `filters`、`freeText` 或 `where`、`expression` 含有無法解析的部分、游標與查詢不符，或統計缺少參數或涵蓋超過 512 個時間桶。 |
+| `403` | 權杖缺少 `logs.read`。 |

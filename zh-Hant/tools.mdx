@@ -1,0 +1,181 @@
+---
+title: "Tool Catalog 與執行模型"
+sidebarTitle: "Tools"
+description: "瞭解 MoleSignal 的共用 Tool Catalog、漸進式探索、租用戶隔離、風險原則、核准流程與涵蓋的產品領域。"
+"en_link": "/en-US/tools"
+"zh-Hans_link": "/zh-Hans/tools"
+"ja_link": "/ja/tools"
+"ko_link": "/ko/tools"
+"de_link": "/de/tools"
+"es_link": "/es/tools"
+"fr_link": "/fr/tools"
+"pt-BR_link": "/pt-BR/tools"
+---
+
+MoleSignal 將 AI 可操作的產品功能建模為不受通訊協定限制的 **Tool Catalog**。Mole Agent 與 Inbound MCP 共用 `ToolSpec` 契約及同一套伺服器端執行環境，不在不同的配接器中重複實作業務邏輯。
+
+目前目錄包含 **254 個已註冊的工具**。每個工具都宣告固定名稱、標準描述、輸入與輸出結構描述、所需的 IAM 權限、風險等級、存取模式、註解，以及允許公開的介面。
+
+<CardGroup cols={2}>
+  <Card title="產品層級操作" icon="wrench">
+    工具代表查詢日誌、測試警示或更新單一儀表板面板等範圍明確的產品操作，而不是任意 HTTP 要求。
+  </Card>
+  <Card title="租戶安全性內容" icon="shield">
+    驗證配接器會注入呼叫者與組織的身分。不得使用 `userId` 和 `orgId` 選擇執行操作的租戶。
+  </Card>
+  <Card title="漸進式載入上下文" icon="magnifying-glass">
+    常用工具一律顯示，其他工具只在需要時搜尋，以控制模型的上下文大小與權杖用量。
+  </Card>
+  <Card title="統一執行路徑" icon="arrows-rotate">
+    執行時一律重新檢查權限、原則、逾時、輸出限制、冪等性、核准、驗證與稽核。
+  </Card>
+</CardGroup>
+## 工具粒度
+
+設計良好的 MoleSignal 工具只代表一項明確的維運意圖，並傳回範圍明確的結果。
+
+- 每個工具只執行一次不可分割的讀取、預檢或變更。
+- 分別為 list、get、create、update、delete、test、trigger、cancel 與 retry 建模。
+- 公開產品概念，不公開原始路由或可建構任意要求的工具。
+- 傳回適合模型處理及記錄於稽核紀錄的結構化結果，並限制結果範圍。
+- 工具目錄不納入明文憑證、二進位資料傳輸、原始資料擷取、Shell 執行與瀏覽器控制。
+
+這種粒度讓 IAM 與工具原則能控制個別操作，而不必對整組 HTTP 資源授予廣泛權限。
+
+## 介面
+
+每個執行介面都明確指定要公開的工具。
+
+| 介面 | 探索與執行方式 |
+|---|---|
+| Mole Agent | 提供常用工具，並以 `tool_search → tools_call` 按需探索內建工具與已授權的 Outbound MCP 工具。 |
+| Inbound MCP | 提供常用的唯讀工具與核准控制工具，以及 `tool_search → call_read_tool` 或 `call_managed_tool`。 |
+| 自動化 | 只公開明確加入自動化介面的工具。`query_logs`、`get_stream_schema`、`search_field_values` 與 `analyze_log_patterns` 已加入，供[排程日誌巡檢](/zh-Hant/logs/inspections)使用。 |
+
+伺服器端會在產生工具清單時及執行前，檢查工具是否在該介面公開。即使略過 `tools/list`，仍無法繞過這項限制。
+
+## Inbound MCP 漸進式探索
+
+Inbound MCP 會維持 `tools/list` 的精簡。授權後的回應可包含：
+
+- 7 個固定提供的唯讀工具：`query_logs`、`query_metrics`、`list_streams`、`get_stream_schema`、`list_traces`、`get_trace` 與 `get_incident`；
+- 核准控制：`list_agent_approvals`、`get_agent_approval` 與 `execute_agent_approval`；
+- 執行控制：`list_agent_executions` 與 `get_agent_execution`；
+- `tool_search`、`call_read_tool` 與 `call_managed_tool`。
+
+IAM 與工具原則可將任何產品工具從清單中移除。
+
+### 搜尋目錄中已授權的工具
+
+使用產品關鍵字或領域呼叫 `tool_search`：
+
+```json
+{
+  "query": "status page incident",
+  "limit": 10,
+  "includeSchema": true
+}
+```
+
+結果只會列出在 Inbound MCP 公開、經工作區工具原則啟用，且憑證具備 IAM 授權的工具。要求提供結構描述時，每個相符項目也會傳回結構描述與實際執行的中繼資料。
+
+### 執行讀取或預檢
+
+將搜尋到的名稱與參數傳給 `call_read_tool`：
+
+```json
+{
+  "name": "list_status_page_incidents",
+  "arguments": {
+    "pageId": "status-page-id",
+    "view": "current"
+  }
+}
+```
+
+MCP 用戶端宣告支援 Tasks 擴充功能時，可將 `asTask` 設為 `true`，把讀取操作轉為持久性工作，再使用 MCP Task 方法輪詢、更新或取消工作。
+
+### 執行受控變更
+
+呼叫 `call_managed_tool` 時，傳入唯一的冪等金鑰：
+
+```json
+{
+  "name": "update_annotation",
+  "arguments": {
+    "annotationId": "annotation-id",
+    "title": "Deployment rollback started"
+  },
+  "idempotencyKey": "8d7788d2-9b4e-44bd-bf35-61a5690f0064"
+}
+```
+
+MoleSignal 會在建立核准紀錄或執行變更前，為目前通過驗證的主體預先保留該金鑰。重複送出相同要求時，MoleSignal 會傳回已儲存的結果或進行中狀態；使用相同金鑰傳入不同參數時，MoleSignal 會拒絕要求。
+
+## 風險與執行原則
+
+工具風險等級提供安全的預設值，並可透過工作區工具原則設定更嚴格的執行模式。
+
+| 風險 | 預設模式 | 含義 |
+|---|---|---|
+| L0 | 自動執行 | 範圍明確的唯讀操作。 |
+| L1 | 使用者確認 | 除非原則設定為自動執行，否則低風險變更須由 MCP 主機確認。 |
+| L2 | 單人核准 | 需要一名 MoleSignal 核准人員。 |
+| L3 | 雙人核准 | 需要兩名 MoleSignal 核准人員。 |
+| L4 | 停用 | 預設不開放高風險或破壞性的遠端操作。 |
+
+即使受控變更採自動執行，系統仍會建立可供稽核的核准紀錄。確認模式可使用 MCP 多輪輸入；單人與雙人核准模式則會等待 MoleSignal 內的審核。核准人數達標後，原始要求的發起方可使用另一個 `idempotencyKey` 呼叫 `execute_agent_approval`，完成操作。
+
+執行前，執行環境會重新檢查：
+
+1. 通過驗證的主體與組織狀態；
+2. 所需的 IAM 權限與權限模式；
+3. 工具在介面上的公開設定與目前的工具原則；
+4. 輸入結構描述、目標資源狀態與風險；
+5. 逾時、回應大小限制與冪等性；
+6. 操作後驗證與稽核紀錄。
+
+## 工具目錄涵蓋範圍
+
+工具目錄涵蓋適合由 AI 執行調查與管理的安全產品操作。
+
+| 領域 | 代表性功能 |
+|---|---|
+| 日誌、指標與資料流 | 查詢遙測資料、檢查結構描述與設定、搜尋前後相近的事件，或探索指標標籤或時間序列；將日誌歸納成模式並與對照時段比較，摘要指標何時開始變動、變動幅度，以及哪些序列和標籤造成變動；檢查資料是否就緒（是否記錄服務、環境與追蹤 ID、同一服務在各類訊號中是否使用相同名稱，以及指標名稱是否包含單位）；讀取排程日誌巡檢及其報告，或立即執行一次巡檢。 |
+| 追蹤、APM、RUM 與效能剖析 | 檢查追蹤、服務拓撲、工作階段、錯誤、相依性、火焰圖與跨訊號關聯；讀取 APM 洞察，以及服務在服務地圖上的影響範圍；依名稱、別名、說明或標籤搜尋服務目錄；依頁面彙整 Core Web Vitals；彙整單一 RUM 應用程式的效能、列出並讀取問題、說明使用者操作受阻的原因、讀取單次檢視的載入瀑布圖，以及彙總任意 RUM 資料流。 |
+| 警示與事件 | 讀取事件與值班狀態；尋找過去 90 天內的類似事件，列出指定時間點或事件前後的部署、設定與功能旗標變更；建立、更新、刪除、測試或觸發警示規則；確認或解決事件。 |
+| 儀表板、報告與註解 | 管理儀表板、資料夾、面板、註解、報告範本、排程與傳送。 |
+| 搜尋工作與已儲存的檢視 | 提交、檢查、取消、重試或刪除持久性搜尋工作，並管理已儲存的檢視。 |
+| 管線、函式、資料擴充與連接器 | 檢查排程執行狀況、管理函式、測試轉換，並讀取資料擴充或連接器的中繼資料。 |
+| 合成監控與狀態頁面 | 檢查監控項目與結果、執行或暫停監控項目、管理狀態頁面的生命週期與自動化，並撰寫事件事後檢討草稿。 |
+| 通知 | 檢查連接器、原則、範本與傳送狀態，並重試或確認傳送。 |
+| IAM 與管理 | 讀取使用者、團隊、角色、功能、稽核事件、服務帳號與 API 權杖的中繼資料；管理憑證狀態，不涉及機密值。 |
+| Mole Agent 控制 | 檢查調查、核准、執行與自動化狀態，並在取得授權後執行已核准的操作。 |
+
+使用 `get_platform_capabilities` 取得依目前介面篩選的功能摘要。使用 `tool_search` 取得目前已授權的工具名稱與結構描述，不要依賴靜態清單。
+
+## 身分與機密資料的界線
+
+- 驗證憑證會提供呼叫者的 `userId` 與 `orgId`。
+- `get_user_profile` 與 `get_user_preferences` 的選用參數 `target_user_id` 僅用於選取資源。讀取其他成員的資料時，必須具備 `org.members.read` 權限，並確認目標成員隸屬於目前的組織。
+- 讀取與列出工具只會傳回憑證中繼資料。
+- Inbound MCP 不公開 `create_api_token` 與 `create_service_account`，因為兩者都會產生只顯示一次的明文值；請在網頁介面中建立。
+- 仍可透過已授權且不涉及機密值的工具，列出、更新、啟用、停用、撤銷或刪除現有的服務帳號與 API 權杖。
+- 無論使用何種憑證，`query_logs`、`search_around`、`search_field_values`、`get_stream_schema` 和資料流結構描述資源都會拒絕存取 [`_audit` 資料流](/zh-Hant/settings/data-security#稽核資料流)。
+
+工具目錄明確排除登入、註冊、重設密碼、無須登入的公開路由、原始 OTLP 或 Prometheus 資料擷取、外部 Webhook、二進位資料上傳與下載、節點排空、執行階段效能剖析，以及任意 HTTP 要求、Shell 執行與瀏覽器操作。
+
+## MCP 資源、提示詞與工作
+
+Inbound MCP 也會公開經 IAM 篩選的平台功能、工具目錄、核准、執行、搜尋工作與資料流結構描述資源。使用 `prompts/list` 和 `prompts/get` 可取得內建、組織層級及目前使用者的 Mole Agent 提示詞。
+
+耗時較長的讀取操作可作為 MCP 工作執行。如果協商後採用的 MCP 通訊協定版本支援，也可使用進度通知、資源訂閱與目錄變更通知。
+
+<CardGroup cols={2}>
+  <Card title="連線至 MCP 用戶端" icon="plug" href="/zh-Hant/inbound-mcp">
+    啟用端點，並透過 OAuth 2.1 或 API 權杖建立連線。
+  </Card>
+  <Card title="Mole Agent" icon="robot" href="/zh-Hant/agent">
+    透過內建的維運代理程式使用同一套受控工具目錄。
+  </Card>
+</CardGroup>

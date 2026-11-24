@@ -1,0 +1,144 @@
+---
+title: "API de inicio de sesión"
+sidebarTitle: "Iniciar sesión"
+description: "Inicia una sesión en el navegador con un correo electrónico y una contraseña."
+"en_link": "/en-US/api/auth/login"
+"zh-Hans_link": "/zh-Hans/api/auth/login"
+"zh-Hant_link": "/zh-Hant/api/auth/login"
+"ja_link": "/ja/api/auth/login"
+"ko_link": "/ko/api/auth/login"
+"de_link": "/de/api/auth/login"
+"fr_link": "/fr/api/auth/login"
+"pt-BR_link": "/pt-BR/api/auth/login"
+---
+
+```http
+POST /api/v1/auth/signin
+```
+
+Inicia una sesión en la interfaz web. Esta ruta **no requiere autenticación**. La respuesta establece las cookies de sesión y devuelve en `login` la identidad de la cuenta que inició sesión. El cuerpo no contiene ningún token. Si la cuenta usa autenticación multifactor, consulta [El segundo paso](#el-segundo-paso).
+
+**Cuerpo**
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `email` | cadena | Sí | |
+| `password` | cadena | Sí | |
+| `remember` | booleano | No | Mantiene la sesión después de cerrar el navegador. El valor predeterminado es `false`. |
+
+<RequestExample>
+```bash cURL
+curl -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+  -H 'content-type: application/json' \
+  -d '{"email":"admin@example.com","password":"admin"}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "login": {
+    "userId": "<user-id>",
+    "email": "admin@example.com",
+    "displayName": "root",
+    "orgId": "<organization-id>",
+    "orgName": "default",
+    "displayRole": "Owner",
+    "roles": [
+      {
+        "id": "<role-id>",
+        "key": "owner",
+        "name": "Owner",
+        "builtin": true
+      }
+    ],
+    "scope": "organization"
+  }
+}
+```
+</ResponseExample>
+
+El inicio de sesión selecciona la primera organización a la que pertenece la cuenta y que permite el acceso. En su lugar, los programas envían un token de API en el encabezado `Authorization`. El encabezado no acepta tokens de sesión. Consulta [Emitir un token de API](/es/api/auth/issue-token).
+
+## Demasiados intentos fallidos
+
+Si hay demasiados intentos fallidos de contraseña, el servidor responde con `429`, un encabezado `Retry-After` con el tiempo de espera en segundos y el código `signin_limited`. El texto es el mismo tanto si la cuenta existe como si no. El servidor no comprueba la contraseña. Si la contraseña es incorrecta o la cuenta no existe, el servidor responde con `401`. Si la contraseña es correcta pero la cuenta está deshabilitada o pendiente, responde con `403` e indica el motivo. Consulta [Límites de inicio de sesión](/es/settings/platform#límites-de-inicio-de-sesión).
+
+```json
+{
+  "error": "resource_exhausted",
+  "code": "signin_limited",
+  "message": "too many failed password attempts; try again in 14 minutes"
+}
+```
+
+## El segundo paso
+
+Si la cuenta usa [autenticación multifactor](/es/identity/mfa), la contraseña por sí sola no establece cookies. La respuesta incluye `mfa` en lugar de `login` e indica los métodos disponibles para completar el inicio de sesión:
+
+```json
+{
+  "mfa": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp", "recovery_code"],
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| Endpoint | Propósito |
+|---|---|
+| `POST /api/v1/auth/signin/verify` | Completa el inicio de sesión. Recibe `challenge` y `method` (`totp` o `recovery_code`) junto con `code`, o `method` con el valor `passkey` junto con `ceremony` y `credential`. Devuelve `{"login": …}` con las cookies de sesión y, si se usa un código de recuperación, también devuelve `recoveryCodesLeft`. |
+| `POST /api/v1/auth/signin/verify/passkey` | Recibe `challenge` y devuelve `ceremony` y `options` para verificar una clave de acceso. Pasa `options` a `navigator.credentials.get()` y envía `ceremony` junto con el resultado. Solo puedes usar `ceremony` una vez. |
+
+## Configuración de un segundo factor al iniciar sesión
+
+Si la organización [exige autenticación multifactor](/es/identity/sso#requisitos-de-inicio-de-sesión) y la cuenta aún no tiene un segundo factor, la respuesta incluye `enroll` en lugar de `login`:
+
+```json
+{
+  "enroll": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp"],
+    "organizationName": "default",
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| Endpoint | Propósito |
+|---|---|
+| `POST /api/v1/auth/signin/enroll/totp` | Recibe `challenge` y devuelve `setup`, `secret`, `otpauthUrl`, `qrSvg` y `expiresAt`. |
+| `POST /api/v1/auth/signin/enroll/totp/confirm` | Recibe `challenge`, `setup` y `code`. Devuelve `{"login": …, "recoveryCodes": […]}` con las cookies de sesión. |
+| `POST /api/v1/auth/signin/enroll/passkey/options` | Recibe `challenge` y devuelve `ceremony` y `options` para `navigator.credentials.create()`. |
+| `POST /api/v1/auth/signin/enroll/passkey` | Recibe `challenge`, `ceremony`, `credential` y, de forma opcional, `name`. Devuelve `{"login": …, "recoveryCodes": […]}` con las cookies de sesión. |
+
+Si la organización [solo permite el inicio de sesión único](/es/identity/sso#requisitos-de-inicio-de-sesión), el servidor responde con `403` al intento de inicio de sesión con contraseña. Si la cuenta pertenece a varias organizaciones, el inicio de sesión selecciona la primera que permite el acceso.
+
+## Inicio de sesión con clave de acceso
+
+Una [clave de acceso](/es/identity/mfa#con-una-llave-de-acceso-sin-contraseña) permite iniciar sesión sin contraseña ni segundo paso.
+
+| Endpoint | Propósito |
+|---|---|
+| `POST /api/v1/auth/signin/passkey/options` | Devuelve `ceremony` y `options`. Responde con `400` si el valor de `[http].external_url` de la instancia no puede identificar a la [parte de confianza](/es/identity/mfa#requisitos-de-la-instancia) de la clave de acceso. |
+| `POST /api/v1/auth/signin/passkey` | Recibe `ceremony`, `credential` y, de forma opcional, `remember`. Devuelve `{"login": …}` con las cookies de sesión. |
+
+## Cookies de sesión
+
+| Cookie | Ruta | Contenido | Duración |
+|---|---|---|---|
+| `accessToken` | `/api` | El token de acceso, que el navegador envía con cada solicitud a la API. | 15 minutos. Renuévalo con `POST /api/v1/auth/refresh`. |
+| `refreshToken` | `/api/v1/auth` | El token de renovación, que solo sirve para renovar el token de acceso. | Hasta que termine la sesión, tras el intervalo que define `[auth].session_ttl_secs` desde el inicio de sesión. El valor predeterminado es de 24 horas. |
+
+Ambas cookies tienen los atributos `HttpOnly` y `SameSite=Strict`. También tienen `Secure` cuando el navegador accede a MoleSignal mediante HTTPS. Sin `remember`, el navegador elimina las cookies al cerrarse. Ambos tokens son JWT firmados. El servidor no los almacena y valida cada uno comprobando su firma, su propósito y su vencimiento. Si deshabilitas o eliminas la cuenta, la sesión termina con la siguiente solicitud.
+
+## Endpoints de sesión
+
+| Endpoint | Propósito |
+|---|---|
+| `POST /api/v1/auth/refresh` | Emite un nuevo token de acceso a partir del token de renovación y responde con `204` y una nueva cookie `accessToken`. La sesión conserva su fecha y hora de vencimiento. Si la sesión venció, la cuenta está deshabilitada o falta la cookie, responde con `401` y elimina ambas cookies. |
+| `GET /api/v1/auth/session` | Devuelve la identidad de la sesión actual con la misma estructura que `login` en la respuesta de inicio de sesión. |
+| `POST /api/v1/auth/signout` | Elimina ambas cookies y responde con `204`. |
+
+Toda solicitud que modifique datos y use la cookie de sesión debe provenir de una página de MoleSignal. Si una solicitud del navegador incluye un valor de `Sec-Fetch-Site` distinto de `same-origin`, el servidor responde con `403`.

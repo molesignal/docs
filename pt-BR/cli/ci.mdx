@@ -1,0 +1,158 @@
+---
+title: "CI e versões"
+description: "Registre implantações no APM, envie mapas de código-fonte para RUM e símbolos de apps móveis e valide uma versão com verificações sintéticas e comparações entre versões. Use a CLI do MoleSignal também para enviar a saída das tarefas da CI a um stream."
+"en_link": "/en-US/cli/ci"
+"zh-Hans_link": "/zh-Hans/cli/ci"
+"zh-Hant_link": "/zh-Hant/cli/ci"
+"ja_link": "/ja/cli/ci"
+"ko_link": "/ko/cli/ci"
+"de_link": "/de/cli/ci"
+"es_link": "/es/cli/ci"
+"fr_link": "/fr/cli/ci"
+---
+
+Os comandos desta página chamam a API do MoleSignal e usam um token de API: defina `MOLESIGNAL_URL` e
+`MOLESIGNAL_TOKEN` no pipeline ou passe `--url` e `--token`. Crie o token em
+**Identidade e acesso → Tokens de API** com uma função que tenha a permissão indicada em cada comando.
+
+## Registre uma implantação
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production
+```
+
+A implantação aparece na linha do tempo do serviço no APM, que compara a versão implantada com a
+anterior. No CI, o commit, o repositório, o pull request, o autor e o link da execução
+vêm do ambiente do GitHub Actions, GitLab CI/CD, Jenkins, CircleCI, Buildkite,
+Bitbucket Pipelines ou Azure Pipelines. Fora do CI, o commit e o repositório vêm do git.
+A função do token precisa da permissão `apm.deploy`.
+
+Ao receber um comando após `--`, a CLI o executa primeiro, registra o sucesso ou a falha da implantação conforme
+o resultado e retorna o mesmo código de saída do comando:
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production -- ./scripts/deploy.sh
+```
+
+| Opção | Significado |
+|---|---|
+| `--service <name>` | Nome do serviço que os spans informam em `service.name`. Obrigatório. |
+| `--version <version>` | Versão implantada, conforme `service.version`. Obrigatória para registrar a implantação. |
+| `--env <environment>` | Ambiente, conforme `deployment.environment.name`. |
+| `--namespace <namespace>` | `service.namespace` do serviço. |
+| `--kind <kind>` | `deployment` (padrão), `configuration` ou `feature_flag`. |
+| `--status <status>` | `succeeded` (padrão), `failed` ou `rolled_back` para a versão indicada em `--version`. |
+| `--commit`, `--repository`, `--pull-request`, `--author`, `--ci-url` | Valores que substituem os fornecidos pelo CI ou pelo git. |
+| `--description <text>` | Texto exibido ao passar o cursor sobre a implantação. |
+| `--time <time>` | Horário da implantação, em vez do horário atual. |
+| `--dry-run` | Mostra o que o comando registraria, sem registrar nada. |
+
+Consulte os mesmos campos em [Registre implantações a partir do CI](/pt-BR/apm/deployments#registre-implantações-pela-ci).
+
+## Envie mapas de código-fonte
+
+```bash
+molesignal source-maps upload dist/assets --application checkout-web --service web-frontend --release "$VERSION"
+```
+
+O comando envia todos os arquivos `.map` encontrados nas pastas sem alterar os nomes. Cada nome deve corresponder ao do
+bundle implantado, com o sufixo `.map`. O comando compacta os arquivos com gzip durante o envio, quatro por vez. Use `--concurrency` para alterar
+esse limite. O comando rejeita mapas com o mesmo nome para evitar que um sobrescreva o outro.
+`--application`, `--service` e `--release` devem corresponder aos campos que o SDK de RUM informa:
+`applicationId`, `service` e `version`. Para Flutter Web, adicione `--platform flutter` e o
+`--debug-id` usado na compilação do aplicativo. A função do token precisa da permissão `debug_artifacts.manage`.
+
+`--dry-run` lista os arquivos sem enviá-los. `molesignal source-maps list` lista os mapas enviados,
+e `molesignal source-maps delete <id>` exclui um mapa.
+
+## Envie símbolos de aplicativos móveis e símbolos nativos
+
+```bash
+molesignal symbols upload build/molesignal-symbols --application checkout-app --service checkout --release 2.4.0 --debug-id "$BUILD_ID"
+```
+
+O comando identifica cada arquivo pelo tipo:
+
+| Arquivo | Envio |
+|---|---|
+| `app.android-arm64.symbols` gerado por `--split-debug-info` | Símbolos do Flutter. A plataforma e a arquitetura vêm do nome do arquivo. `--debug-id` é o `MOLESIGNAL_DEBUG_ID` usado na compilação do aplicativo. |
+| `mapping.txt` | Mapeamento do R8 do Android. |
+| Uma biblioteca ELF, como `libapp.so` | Símbolos nativos do Android. O comando lê a arquitetura e o ID da compilação no arquivo. |
+| Um `.dSYM` da Apple | Um envio por arquitetura do binário. O comando lê o UUID de cada arquitetura no arquivo. |
+
+`--debug-id`, `--platform` e `--arch` substituem os valores identificados no arquivo. Para um dSYM, `--arch` limita o envio a uma
+arquitetura. `--dry-run` lista cada arquivo com os IDs extraídos dele. `molesignal symbols list`
+e `molesignal symbols delete <id>` listam e excluem os arquivos enviados, respectivamente. A função do token precisa da permissão
+`debug_artifacts.manage`. Consulte [Mapas de código-fonte e símbolos do RUM](/pt-BR/rum/source-maps) para saber como o RUM associa
+os quadros da pilha aos símbolos.
+
+## Verifique uma versão
+
+`molesignal synthetics run <check> --wait --yes` executa uma verificação sintética em cada local configurado
+e retorna `1` se alguma execução falhar. `molesignal services compare <service> <baseline> <candidate>
+--fail-on-regression` retorna `1` se a versão candidata apresentar uma regressão. Consulte
+[Incidentes e alterações](/pt-BR/cli/changes#execute-verificações-sintéticas) e
+[Métricas, traces e serviços](/pt-BR/cli/observe#compare-duas-versões).
+
+## Envie linhas para um fluxo de logs
+
+`molesignal send` envia cada linha da entrada padrão para um fluxo de logs: se a linha contiver um objeto JSON, usa os campos do objeto;
+caso contrário, usa a linha como `message`. O comando envia os logs em lotes à medida que chegam, o que permite acompanhar
+um arquivo:
+
+```bash
+tail -f /var/log/app.log | molesignal send app_logs --field service=billing
+```
+
+`--field name=value` adiciona um campo a cada log, `--raw` envia cada linha como uma mensagem e
+`--batch` define o número máximo de logs por solicitação, `500` por padrão. Se o servidor estiver ocupado, o comando tenta novamente. O
+comando retorna `1` se o MoleSignal rejeitar algum log. A função do token precisa da permissão `logs.write`, assim como
+a de um token de ingestão.
+
+## Guarde a saída de um job
+
+`molesignal run` executa um comando, exibe a saída normalmente e envia cada linha para um fluxo de logs.
+No fim, envia mais um log com o código de saída e a duração da execução. Retorna o mesmo código de saída do comando:
+
+```bash
+molesignal run jobs --name nightly-backup -- ./backup.sh --full
+```
+
+Cada log contém os campos `message`, `output` (`stdout` ou `stderr`), `command`, `run_id` e
+`host`. O último log inclui também `exit_code`, `duration_ms` e `level`. `--quiet` oculta a saída
+no terminal, e `--field` adiciona um campo.
+
+## GitHub Actions
+
+Salve o endereço e o token como segredos do repositório e adicione etapas ao job de implantação.
+Use `if: always()` para registrar a implantação mesmo em caso de falha:
+
+```yaml
+- name: Upload source maps
+  run: npx -y @molesignal/cli source-maps upload dist/assets --application checkout-web --service web-frontend --release "${{ github.sha }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+
+- name: Report the deployment
+  if: always()
+  run: npx -y @molesignal/cli deploy --service checkout --version "${{ github.sha }}" --env production --status "${{ job.status == 'success' && 'succeeded' || 'failed' }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+```
+
+## GitLab CI/CD
+
+Adicione `MOLESIGNAL_URL` e `MOLESIGNAL_TOKEN` como variáveis mascaradas de CI/CD e execute o comando de implantação
+pela CLI:
+
+```yaml
+deploy:
+  stage: deploy
+  environment: production
+  script:
+    - npx -y @molesignal/cli deploy --service checkout --version "$CI_COMMIT_SHORT_SHA" -- ./scripts/deploy.sh
+```
+
+O ambiente vem de `environment`. O commit, o merge request e o link do job vêm do GitLab.

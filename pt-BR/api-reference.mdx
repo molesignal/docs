@@ -1,0 +1,152 @@
+---
+title: "Introdução à API"
+description: "Conheça as URLs base e as convenções de requisição, além de autenticação, permissões, paginação, streaming e tratamento de erros."
+"en_link": "/en-US/api-reference"
+"zh-Hans_link": "/zh-Hans/api-reference"
+"zh-Hant_link": "/zh-Hant/api-reference"
+"ja_link": "/ja/api-reference"
+"ko_link": "/ko/api-reference"
+"de_link": "/de/api-reference"
+"es_link": "/es/api-reference"
+"fr_link": "/fr/api-reference"
+---
+
+O MoleSignal disponibiliza uma API HTTP versionada. Os endpoints do produto usam `/api/v1`. A verificação de integridade, as métricas do Prometheus, os links públicos de compartilhamento e alguns protocolos de compatibilidade também usam outros caminhos.
+
+## URL base
+
+Para uma instância local:
+
+```text
+http://localhost:5080/api/v1
+```
+
+Em produção, substitua o host pelo endereço público da implantação, definido no valor de `[http].external_url`.
+
+## Autenticação
+
+Os endpoints protegidos aceitam um token bearer no cabeçalho `Authorization`:
+
+```http
+Authorization: Bearer <token>
+```
+
+| Token | Como obter | Validade |
+|---|---|---|
+| Token de API | **Configurações da conta → Tokens de API** ou [Emitir um token de API](/pt-BR/api/auth/issue-token). Os tokens seguem o formato `mspat-<36>`. | Até a revogação ou a data de expiração escolhida. |
+| Token padrão de ingestão | `GET /api/v1/me/api-tokens/default`. Limitado a `logs.write`, `metrics.write`, `traces.write`, `profiles.write` e `apm.deploy`. | Não expira. |
+| Token de cliente RUM | `GET /api/v1/auth/tokens/rum?applicationId=<id>`. Limitado a `rum.write`. | Não expira. |
+
+Use um token de API para scripts e coletores. Consulte [Fonte de dados](/pt-BR/intake#tokens-de-ingestão) para saber mais sobre os tokens de ingestão.
+
+A interface web usa `POST /api/v1/auth/signin` para fazer login. O endpoint define cookies de sessão em vez de retornar um token. O cabeçalho `Authorization` não aceita tokens de sessão. Consulte [Fazer login](/pt-BR/api/auth/login).
+
+A autenticação cria um contexto de IAM com a identidade autenticada, o escopo ativo da organização ou da plataforma e as permissões efetivas. A organização da solicitação sempre vem desse contexto. Não é possível selecionar outra organização no corpo da solicitação.
+
+## Rotas públicas e com autenticação própria
+
+Algumas rotas não aceitam um token bearer da organização. Em vez disso, validam uma credencial mais restrita ou uma política:
+
+- login, política de cadastro e redefinição de senha;
+- `GET /api/v1/healthz` e `/metrics` no nível raiz;
+- troca de credenciais para compartilhamento público de recursos e solicitações de sessão de compartilhamento;
+- downloads de arquivos com assinatura e avatares públicos;
+- endpoints de conectores push, que validam um token push.
+
+Uma rota pública não dá acesso irrestrito. O código que processa a solicitação verifica a política de cadastro, um token de compartilhamento, um token de download, uma assinatura ou a credencial do conector.
+
+## Autorização
+
+Um endpoint pode exigir uma ou mais destas condições:
+
+- uma permissão da organização, como `streams.query`;
+- uma permissão da plataforma, como `sys.telemetry.read`;
+- a titularidade de um recurso, um vínculo com ele ou uma concessão de acesso entre organizações.
+
+`GET /api/v1/iam/capabilities` retorna as permissões efetivas da identidade atual. Não deduza o acesso pelo nome de uma função nem pela presença de um item no menu.
+
+## Solicitações
+
+- A maioria dos corpos usa JSON com `Content-Type: application/json`.
+- Os endpoints de ingestão para compatibilidade usam o payload do protocolo correspondente, como Protobuf, NDJSON ou um corpo compactado com gzip.
+- Os endpoints de ingestão retornam `413` quando o corpo da solicitação excede 2 MiB ou, no caso da ingestão em JSON nativo, 16 MiB.
+- Os valores de tempo são inteiros em microssegundos desde a época Unix. O nome de um instante indica o evento (`createdAt`, `expiresAt`) e inclui `Time` quando uma única palavra não é clara (`startTime`). O nome de uma duração termina em `Time` (`p95Time`), a menos que já indique uma duração (`duration`). Os registros de telemetria nativa usam `_timestamp`, também em microssegundos.
+- Aplique a codificação de URL aos IDs nos caminhos e aos nomes dos streams.
+
+## Respostas e erros
+
+Uma resposta bem-sucedida usa JSON, exceto quando o endpoint transmite dados em streaming ou fornece um arquivo para download. Uma resposta de erro inclui um código de status e um corpo JSON com um código `error` legível por máquina e um campo `message`:
+
+```json
+{
+  "error": "unauthorized",
+  "message": "unauthorized: missing Authorization Bearer token"
+}
+```
+
+Um erro `validation_failed` inclui um array `issues` com uma entrada por campo inválido.
+
+| Status | `error` | Significado |
+|---|---|---|
+| `400` | `invalid_argument`, `validation_failed` | A solicitação ou um de seus parâmetros é inválido. |
+| `401` | `unauthorized` | O token está ausente, malformado, inválido ou expirado. |
+| `403` | `forbidden` | Falta a permissão, o vínculo ou o escopo necessário. |
+| `404` | `not_found` | O recurso não existe ou não está visível no escopo autorizado. |
+| `409` | `conflict` | Há um conflito de estado ou de unicidade. |
+| `413` | `payload_too_large` | O corpo excede o limite. |
+| `429` | `resource_exhausted` | Há um limite de taxa. Respeite o cabeçalho `Retry-After` quando estiver presente. |
+| `499` | `cancelled` | Houve um cancelamento da solicitação. |
+| `503` | `unavailable` | Uma dependência está indisponível. |
+| `500` | `internal` | Ocorreu uma falha interna. O corpo contém a mensagem `internal error`, e os detalhes ficam no log do servidor. |
+
+Se a API não conseguir interpretar o corpo da solicitação, ela falha antes de chegar ao endpoint. Nesse caso, a resposta usa texto simples em vez de JSON:
+
+| Status | Significado |
+|---|---|
+| `400` | O corpo não contém JSON válido. |
+| `415` | A solicitação não inclui `Content-Type: application/json`. |
+| `422` | Um campo está ausente ou tem o tipo incorreto. O texto identifica o campo. |
+
+Todas as respostas incluem os cabeçalhos `X-Request-Id` e `X-Trace-Id`. Inclua os dois ao relatar uma falha no servidor.
+
+## Paginação
+
+Os endpoints que podem retornar muitas linhas aceitam `limit` e `cursor`. A resposta inclui `items` e `nextCursor`. Passe `nextCursor` como `cursor` para ler a próxima página e pare quando `nextCursor` estiver vazio. Os demais endpoints de listagem retornam a lista completa. Consulte a página de cada endpoint.
+
+## Consultas e operações de longa duração
+
+Os endpoints de consulta retornam JSON convencional, transmitem NDJSON em streaming e executam consultas longas como tarefas de busca assíncronas. Se a consulta for grande demais, a API retorna `202` com um `jobId` e um caminho em `monitor`. Ao consumir respostas em streaming, trate a entrega parcial e cancele a solicitação quando não precisar mais do resultado. Consulte [Consultas](/pt-BR/query).
+
+Para obter artefatos grandes, como relatórios gerados, blobs de perfis e exportações, use um token de download com escopo restrito. A API entrega esses artefatos como arquivos, não no corpo JSON.
+
+## Explore a API
+
+<CardGroup cols={3}>
+  <Card title="Catálogo da API" icon="list" href="/pt-BR/api/catalog">
+    Grupos de rotas, suas finalidades e as permissões exigidas.
+  </Card>
+  <Card title="Autenticação" icon="key" href="/pt-BR/api/auth/login">
+    Faça login e gerencie tokens de API.
+  </Card>
+  <Card title="Ingestão" icon="inbox" href="/pt-BR/api/intake/native-json">
+    Envie telemetria em JSON nativo e em formatos compatíveis com os protocolos.
+  </Card>
+  <Card title="Consultas" icon="magnifying-glass" href="/pt-BR/api/query/execute">
+    Execute consultas SQL, compatíveis com PromQL, em streaming e salvas.
+  </Card>
+  <Card title="APM" icon="gauge-high" href="/pt-BR/api/apm">
+    Consulte métricas de serviços, transações, dependências e erros.
+  </Card>
+  <Card title="Streams" icon="database" href="/pt-BR/api/streams/list">
+    Crie, inspecione e configure streams.
+  </Card>
+  <Card title="Alertas" icon="bell" href="/pt-BR/api/alerting/list-rules">
+    Gerencie regras, incidentes, canais e escalonamentos.
+  </Card>
+  <Card title="Correlação e web" icon="diagram-project" href="/pt-BR/api/web/correlation">
+    Busca, topologia, traces e navegação entre sinais.
+  </Card>
+  <Card title="Plataforma e administração" icon="shield-halved" href="/pt-BR/api/admin/audit">
+    Log de auditoria, chaves de criptografia e integridade.
+  </Card>
+</CardGroup>

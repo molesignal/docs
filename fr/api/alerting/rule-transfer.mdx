@@ -1,0 +1,100 @@
+---
+title: "Importer et exporter des règles"
+description: "Exportez des règles d’alerte dans un lot qui indique leurs références, ou importez un lot ou un fichier de règles d’alerte Prometheus."
+"en_link": "/en-US/api/alerting/rule-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/rule-transfer"
+"zh-Hant_link": "/zh-Hant/api/alerting/rule-transfer"
+"ja_link": "/ja/api/alerting/rule-transfer"
+"ko_link": "/ko/api/alerting/rule-transfer"
+"de_link": "/de/api/alerting/rule-transfer"
+"es_link": "/es/api/alerting/rule-transfer"
+"pt-BR_link": "/pt-BR/api/alerting/rule-transfer"
+---
+
+```http
+GET  /api/v1/alerts/rules/export
+POST /api/v1/alerts/rules/import
+```
+
+## Exportation
+
+Nécessite `alerts.rules.read`. Le paramètre de requête `ids` accepte des identifiants de règles séparés par des virgules ; laissez-le vide pour exporter toutes les
+règles. La réponse contient un lot :
+
+```json
+{
+  "format": "molesignal.alert-rules/v1",
+  "exportedAt": "2026-10-28T08:00:00Z",
+  "rules": [
+    {
+      "name": "High error rate",
+      "description": "",
+      "enabled": true,
+      "kind": "scheduled",
+      "query": {"language": "promql", "statement": "sum(rate(http_requests_total{code=~\"5..\"}[5m]))", "periodSecs": 60, "stream": {"name": "http_requests_total", "streamType": "metrics"}},
+      "trigger": {"operator": "gt", "threshold": 5, "forPeriods": 2, "silenceSecs": 300},
+      "thresholds": [],
+      "severity": "error",
+      "escalationPolicy": "Payments on-call",
+      "labels": {"service": "checkout"},
+      "annotations": {}
+    }
+  ]
+}
+```
+
+Chaque règle conserve sa définition complète, sans son identifiant, son organisation, son état d’évaluation ni ses horodatages.
+`escalationPolicy` contient le nom de la politique d’escalade et n’apparaît pas pour la politique par défaut ; le champ
+`query.composite.rules` d’une règle composite contient les noms de ses règles enfants. L’adresse de signalement d’une règle de
+type heartbeat ne figure pas dans le lot.
+
+## Importation
+
+Nécessite `alerts.rules.manage`.
+
+| Champ | Type | Obligatoire | Description |
+|---|---|---|---|
+| `content` | chaîne | Oui | Un lot (JSON ou YAML, avec `format`) ou un fichier de règles d’alerte Prometheus (`groups` à la racine ou `spec.groups` dans une ressource `PrometheusRule`) ; jusqu’à 4 MiB et 500 règles. |
+| `dryRun` | booléen | Non | `true` par défaut pour simuler l’importation ; `false` pour enregistrer les règles. |
+| `createOnly` | booléen | Non | Avec `true`, l’importation laisse intactes les règles existantes du même nom. |
+
+L’importation recherche chaque règle par son nom : elle crée une règle si le nom est nouveau, compare les champs un à un si une seule règle porte ce nom et
+échoue si plusieurs règles portent ce nom ou si le fichier le répète. L’importation applique les mêmes contrôles que lors de l’enregistrement d’une règle. Si une règle échoue à ces contrôles,
+l’importation n’enregistre rien. Sinon, elle enregistre les règles dans une seule transaction, envoie un événement de modification de la fédération
+pour chaque règle et consigne un seul événement d’audit `alert_rules.imported`. Consultez
+[Importation et exportation](/fr/alerting/rules#importer-et-exporter-des-règles) pour savoir comment convertir une règle Prometheus en
+règle MoleSignal.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content rules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "prometheus",
+  "items": [
+    {"name": "HighErrorRate", "action": "create", "ruleId": "3KF1..."},
+    {"name": "DiskFull", "action": "update", "changes": ["query", "trigger"], "ruleId": "3KC9..."},
+    {"name": "TargetDown", "action": "error", "error": "no escalation policy is named `ops`"}
+  ],
+  "notes": ["recording rule `job:errors:rate5m` in group `api` is not imported"],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` prend la valeur `create`, `update`, `unchanged`, `skip` (règle existante avec `createOnly`) ou `error`.
+`applied` indique si l’importation a enregistré des modifications.
+
+**Erreurs**
+
+| Statut | Motif |
+|---|---|
+| `400` | Le contenu n’est ni un lot ni un fichier de règles Prometheus, indique un autre format, est trop volumineux ou contient trop de règles. |
+| `403` | Le jeton ne dispose pas de l’autorisation requise. |

@@ -1,0 +1,247 @@
+---
+title: "パイプラインの管理"
+description: "パイプラインの一覧表示、詳細確認、編集、実行、一時停止、削除を行います。"
+"en_link": "/en-US/api/intake/scheduled-pipelines"
+"zh-Hans_link": "/zh-Hans/api/intake/scheduled-pipelines"
+"zh-Hant_link": "/zh-Hant/api/intake/scheduled-pipelines"
+"ko_link": "/ko/api/intake/scheduled-pipelines"
+"de_link": "/de/api/intake/scheduled-pipelines"
+"es_link": "/es/api/intake/scheduled-pipelines"
+"fr_link": "/fr/api/intake/scheduled-pipelines"
+"pt-BR_link": "/pt-BR/api/intake/scheduled-pipelines"
+---
+
+| 操作 | エンドポイント | 権限 |
+|---|---|---|
+| 一覧取得 | `GET /api/v1/scheduled_pipelines` | `pipelines.read` |
+| 作成 | `POST /api/v1/scheduled_pipelines` | `pipelines.create`。`_audit` を読み取る場合は `audit.read` も必要です。 |
+| 取得 | `GET /api/v1/scheduled_pipelines/{id}` | `pipelines.read` |
+| 更新 | `PUT /api/v1/scheduled_pipelines/{id}` | 設定の変更には `pipelines.edit` が必要です。`_audit` を読み取る場合は `audit.read`、`enabled` を変更する場合は `pipelines.pause` も必要です。 |
+| 削除 | `DELETE /api/v1/scheduled_pipelines/{id}` | `pipelines.delete` |
+| 実行履歴 | `GET /api/v1/scheduled_pipelines/{id}/runs` | `pipelines.read` |
+| 本日の制限状況 | `GET /api/v1/scheduled_pipelines/{id}/limits` | `pipelines.read` |
+| バックフィル | `POST /api/v1/scheduled_pipelines/{id}/backfill` | `pipelines.run`。`_audit` を読み取る場合は `audit.read` も必要です。 |
+
+## 一覧取得
+
+すべてのパイプラインについて、直近の実行状態と過去24時間の集計を返します。
+
+<ResponseExample>
+```json 200
+[
+  {
+    "id": "3KBHcb6imgQq7FXBsROGTIRHOyg",
+    "name": "normalize-app",
+    "sourceStream": "app_raw",
+    "targetStream": "app",
+    "functionSteps": { "mode": "scheduled", "signalType": "logs", "sources": ["app_raw", "nginx_raw"], "steps": [ ... ] },
+    "cron": "every:5m",
+    "lookbackSecs": 300,
+    "enabled": true,
+    "lastRunAt": 1790000000000000,
+    "readUntil": { "appRaw": 1789999940000000, "nginxRaw": 1789999940000000 },
+    "retry": null,
+    "alertRecord": null,
+    "auditReaderId": null,
+    "auditReader": null,
+    "createdAt": 1789900000000000,
+    "updatedAt": 1789900000000000,
+    "lastRunState": "succeeded",
+    "lastRunStartedAt": 1790000000000000,
+    "lastRunFinishedAt": 1790000000250000,
+    "lastRunScannedRows": 1200,
+    "lastRunError": null,
+    "runs24h": 288,
+    "succeededRuns24h": 288,
+    "failedRuns24h": 0
+  }
+]
+```
+</ResponseExample>
+
+各項目には、[取得](#取得)のフィールド、直近の実行情報（`lastRunState`、`lastRunStartedAt`、`lastRunFinishedAt`、`lastRunScannedRows`（読み取ったイベント数）、`lastRunError`）、過去24時間の実行回数が含まれます。
+
+## 取得
+
+```http
+GET /api/v1/scheduled_pipelines/{id}
+```
+
+パイプラインの情報に加え、各ソースの読み取り位置と予定されている再試行を返します。
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KBHcb6imgQq7FXBsROGTIRHOyg",
+  "name": "normalize-app",
+  "sourceStream": "app_raw",
+  "targetStream": "app",
+  "functionSteps": { "mode": "scheduled", "signalType": "logs", "sources": ["app_raw", "nginx_raw"], "steps": [ ... ] },
+  "cron": "every:5m",
+  "lookbackSecs": 300,
+  "enabled": true,
+  "lastRunAt": 1790000000000000,
+  "readUntil": { "appRaw": 1789999940000000, "nginxRaw": 1789999640000000 },
+  "retry": {
+    "source": "nginx_raw",
+    "attempt": 2,
+    "nextAt": 1790000030000000,
+    "error": "read: <reason>"
+  },
+  "alertRecord": null,
+  "auditReaderId": null,
+  "auditReader": null,
+  "createdAt": 1789900000000000,
+  "updatedAt": 1789900000000000
+}
+```
+</ResponseExample>
+
+| フィールド | 説明 |
+|---|---|
+| `readUntil` | 各ソースの読み取り位置です。単位はマイクロ秒です。この位置より前のイベントは処理済みです。まだ読み取っていないソースのエントリはありません。 |
+| `retry` | 処理に失敗した時間範囲のうち、最も早く予定されている再試行です。該当する再試行がなければ `null` です。`source` はソース名、`attempt` は次の試行番号、`nextAt` は再試行の予定時刻、`error` は前回の試行で発生したエラーです。 |
+| `alertRecord` | アラートパイプラインがイベントを受け取った直近の日（UTC）の集計です。`day`（`YYYY-MM-DD`）、`processed`、`dropped`、`failed` に加え、その日の直近の破棄と失敗をそれぞれ `last_dropped` と `last_failed` で返します。それぞれに `atTime`、`rule`（ルール、アラートソース、またはシンセティックチェック）、`reason` が含まれます。件数がない項目は 0 です。他の種類のパイプラインや、まだイベントを受け取っていないアラートパイプラインでは `null` です。[日次集計](/ja/pipelines/alert-events#日次集計)を参照してください。 |
+| `auditReaderId` | パイプラインが `_audit` を読み取る際に使用する権限の所有者です。最後にパイプラインを保存したユーザーが該当します。`_audit` を読み取らないパイプラインでは `null` です。[監査ストリーム](/ja/settings/data-security#監査ストリーム)を参照してください。 |
+| `auditReader` | `pipelines.read` を持つ呼び出し元に、該当ユーザーの `id`、`displayName`、`email` を返します。ユーザーが存在しなくなった場合やユーザー情報を読み取れない場合は `null` になりますが、`auditReaderId` は変わりません。 |
+
+[スケジュールと読み取り位置](/ja/pipelines#スケジュールと読み取り位置)と[再試行とデッドレター](/ja/pipelines#再試行とデッドレター)を参照してください。
+
+## 更新と削除
+
+`PUT` は[パイプラインの作成](/ja/api/intake/create-pipeline)と同じリクエストボディを受け取り、設定を置き換えます。`enabled` だけを変更する場合は `pipelines.pause` が必要です。それ以外の `PUT` には、何も変更しない場合も含め、`pipelines.edit` が必要です。`enabled` を `false` から `true` に変更すると読み取り位置がリセットされ、各ソースを再び `lookbackSecs` 分さかのぼって読み取ります。`DELETE` は `{"deleted": true}` を返します。
+
+`_audit` を読み取るパイプラインでは、`PUT` によって読み取りに使用する権限の所有者も決まります。[監査ストリーム](/ja/settings/data-security#監査ストリーム)を参照してください。
+
+| `PUT` の内容 | 追加の要件 | パイプラインが `_audit` の読み取りに使う権限 |
+|---|---|---|
+| 設定を変更する | `audit.read` と、サービスアカウントに属さないトークン | 以後は呼び出し元の権限を使用します。 |
+| 何も変更しない | なし | 呼び出し元が `audit.read` を持ち、トークンがサービスアカウントに属さない場合、以後は呼び出し元の権限を使用します。それ以外の場合は変更せず、エラーも返しません。 |
+| `enabled` のみを変更する | なし | 変更しません。 |
+
+## 実行履歴
+
+```http
+GET /api/v1/scheduled_pipelines/{id}/runs?limit=50&beforeTime=<cursor>
+```
+
+スケジュール済みパイプラインの実行履歴を新しい順に返します。リアルタイムパイプラインとアラートパイプラインは実行履歴を記録しません。
+
+<ResponseExample>
+```json 200
+[
+  {
+    "id": "3KE7Yq0d3jvXm5cJ8r2bWQzN1aP",
+    "pipelineId": "3KBHcb6imgQq7FXBsROGTIRHOyg",
+    "state": "succeeded",
+    "startedAt": 1790000000000000,
+    "finishedAt": 1790000000250000,
+    "scannedRows": 1200,
+    "writtenRows": 1150,
+    "droppedRows": 48,
+    "failedRows": 2,
+    "attempt": 1,
+    "error": null,
+    "warning": "stream `app` rejected 2 event(s): <reason>"
+  }
+]
+```
+</ResponseExample>
+
+| フィールド | 説明 |
+|---|---|
+| `state` | `running`、`succeeded`、`failed`、または `cancelled` です。 |
+| `startedAt`, `finishedAt` | 実行の開始時刻と終了時刻です。実行中は `finishedAt` が `null` になります。 |
+| `scannedRows` | 実行時にソースから読み取ったイベント数です。 |
+| `writtenRows` | すべての送信先が受け付けたイベント数です。 |
+| `droppedRows` | ステップが `abort` で破棄したか、重複排除で除外したイベント数です。 |
+| `failedRows` | ステップで処理に失敗した、ソースにルーティングされた、または送信先が受け付けなかったイベント数です。 |
+| `attempt` | 初回の試行では `1` です。処理に失敗した時間範囲を再試行した場合は、値が大きくなります。 |
+| `error` | 実行が失敗した理由です。処理に失敗した時間範囲と予定されている再試行、またはデッドレターストリームがないパイプラインでイベントを1件も受け付けなかった送信先ストリームを示します。 |
+| `warning` | 実行全体の失敗には至らなかった問題です。処理に失敗したイベント、拒否されたか配信できなかったイベント、再試行後にスキップした時間範囲などが該当します。 |
+
+`scannedRows` は `writtenRows`、`droppedRows`、`failedRows` の合計です。
+
+## 本日の制限状況
+
+```http
+GET /api/v1/scheduled_pipelines/{id}/limits
+```
+
+リアルタイムパイプラインの[クォータとスロットリングのステップ](/ja/pipelines#カウントと制限)について、当日の 00:00 UTC 以降に制限内で通過した分と制限を超過した分を、全ノードの集計で返します。各ノードは5秒ごとに集計値を加算します。当日にカウントがないステップの行は返しません。
+
+<ResponseExample>
+```json 200
+{
+  "dayStart": 1790035200000000,
+  "buckets": [
+    {
+      "step": "daily",
+      "bucket": "[\"checkout\"]",
+      "admittedEvents": 1000000,
+      "admittedBytes": 524288000,
+      "overEvents": 1240,
+      "overBytes": 650117
+    },
+    {
+      "step": "per-host",
+      "bucket": "",
+      "admittedEvents": 86400,
+      "admittedBytes": 45298483,
+      "overEvents": 12,
+      "overBytes": 6291
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| フィールド | 説明 |
+|---|---|
+| `step` | ステップの名前です。 |
+| `bucket` | 分割しないクォータとスロットリングでは空です。分割するクォータでは、分割に使うフィールドの値を指定順に並べた JSON リストです。イベントに値がないフィールドは `null` になり、上限の1,000バケットを超えた分は `*` になります。 |
+| `admittedEvents`, `admittedBytes` | 制限内で通過したイベント数とバイト数です。 |
+| `overEvents`, `overBytes` | 制限を超過したイベント数とバイト数です。ステップの設定に従って、破棄、通過、または別のストリームへの送信を行います。 |
+
+## バックフィル
+
+```http
+POST /api/v1/scheduled_pipelines/{id}/backfill
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `startTime` | 整数 | 時間範囲の開始時刻です。単位はマイクロ秒です。 |
+| `endTime` | 整数 | 時間範囲の終了時刻です。`startTime` より大きい値を指定し、時間範囲は31日以内にしてください。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/scheduled_pipelines/$PIPELINE_ID/backfill \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"startTime": 1790000000000000, "endTime": 1790086400000000}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 202
+{
+  "jobs": [
+    {
+      "source": "app_raw",
+      "jobId": "3KE6epTrWXts1oa2ePEKIHKxG19",
+      "monitor": "/api/v1/query/jobs/3KE6epTrWXts1oa2ePEKIHKxG19"
+    },
+    {
+      "source": "nginx_raw",
+      "jobId": "3KE6eqAbXq0n2yLr7VvTq9cUo4D",
+      "monitor": "/api/v1/query/jobs/3KE6eqAbXq0n2yLr7VvTq9cUo4D"
+    }
+  ]
+}
+```
+</ResponseExample>
+
+バックフィルはソースごとに検索ジョブを1件送信します。各ジョブは指定した時間範囲のデータをソースから読み取り、ステップを適用します。書き込み、配信、デッドレターの保持はスケジュール実行と同じ方法で行います。パイプラインの読み取り位置は変わりません。各ジョブの進行状況は `monitor` パスで確認してください。[クエリ](/ja/query#時間範囲と非同期ジョブ)を参照してください。
+
+リアルタイムパイプラインとアラートパイプラインは `400`（`realtime and alert pipelines do not support backfill`）を返します。`_audit` を読み取るパイプラインでは、トークンに `audit.read` がない場合や、トークンがサービスアカウントに属する場合に `403` を返します。ジョブは実行時に送信元の権限を再確認し、`audit.read` が失われていれば失敗します。

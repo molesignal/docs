@@ -1,0 +1,86 @@
+---
+title: "ネイティブ JSON 取り込み"
+description: "レコードを JSON 形式でストリームに POST します。"
+"en_link": "/en-US/api/intake/native-json"
+"zh-Hans_link": "/zh-Hans/api/intake/native-json"
+"zh-Hant_link": "/zh-Hant/api/intake/native-json"
+"ko_link": "/ko/api/intake/native-json"
+"de_link": "/de/api/intake/native-json"
+"es_link": "/es/api/intake/native-json"
+"fr_link": "/fr/api/intake/native-json"
+"pt-BR_link": "/pt-BR/api/intake/native-json"
+---
+
+```http
+POST /api/v1/intake/{type}/{stream}
+```
+
+1件のレコードオブジェクトまたはレコードの配列をストリームにPOSTします。初回の書き込み時にストリームが作成され、新しいフィールドが現れるたびにスキーマが更新されます。この呼び出しには、シグナルに対応する権限（`logs.write`、`metrics.write`、`traces.write`のいずれか）が必要です。デフォルトの取り込みトークンと、書き込みロールを持つサービスアカウントのトークンを使用できます。
+
+**パスパラメーター**
+
+| パラメーター | 型 | 備考 |
+|---|---|---|
+| `type` | string | `logs`、`metrics`、`traces`のいずれかです。それ以外の値を指定すると`404`を返します。 |
+| `stream` | string | 英字、数字、`_`、`-`、`.`で構成されるストリーム名です。`_molesignal`や`_audit`などの[プラットフォームストリーム](/ja/streams#プラットフォームストリーム)を指定すると`403`を返します。 |
+
+**ボディ**
+
+JSONオブジェクト、またはJSONオブジェクトの配列です。配列の各要素はオブジェクトである必要があります。リクエストボディの上限は16 MiBです。`Content-Encoding: gzip`を指定して送信したボディは解凍され、解凍後のボディにも16 MiBの上限が適用されます。
+
+| フィールド | 備考 |
+|---|---|
+| `_timestamp` | Unixエポックからの経過時間をマイクロ秒で表したイベント時刻です。省略すると、サーバーが受信した時刻を使用します。 |
+| `metric_name` | `metrics`の場合に、レコードが属するメトリクスを指定します。メトリクスストリームには、1つのソースのメトリクスを格納します。`metric_name`がないレコードは、ストリームと同じ名前のメトリクスに属します。 |
+| その他のフィールド | ストリームのフィールドとして保存します。以降のレコードでは、そのフィールドにストリームに保存済みの型と同じ型を使用する必要があります。 |
+
+**トレースの書き込み**
+
+`traces`に書き込んだスパンは、受信したまま保存されます。[テイルサンプリング](/ja/configuration#トレースのキャプチャとテールサンプリング)は適用されず、トレース一覧が参照するサマリーも生成されません。トレースのすべての機能を使用するには、[OTLP](/ja/api/intake/otlp)経由でスパンを送信してください。
+
+| 機能 | これらのスパンの扱い |
+|---|---|
+| **トレース**ページの**トレース**タブとそのヒストグラム | 表示されません。 |
+| Mole Agentの`list_traces`ツールと**RUM**の**関連トレース** | 検出されません。 |
+| **APM** | 集計されません。 |
+| **トレース**ページの**スパン**タブと**REDドリルダウン**、およびIDで開いたトレースの詳細 | 確認できます。 |
+| **サービスグラフ** | 集計されます。 |
+
+組織に複数のトレースストリームがある場合、トレース一覧とMole Agentはそのうち1つを読み取り、サマリーがあるストリームを優先します。そのため、このエンドポイントからのみ書き込んだストリームが、OTLP経由で書き込んだストリームの表示を妨げることはありません。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/logs/app \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "accepted": 1, "rejected": 0, "errors": [] }
+```
+</ResponseExample>
+
+スキーマと一致しないレコードだけが拒否され、バッチ内の残りのレコードは受け付けられます。
+
+```json
+{
+  "accepted": 1,
+  "rejected": 1,
+  "errors": [
+    { "index": 0, "reason": "type mismatch on field `level`: expected Utf8, got Number" }
+  ]
+}
+```
+
+**エラー**
+
+| ステータス | 原因 |
+|---|---|
+| `400` | ストリーム名またはJSONが無効か、配列にオブジェクトではない要素が含まれています（`event #1 must be a JSON object`）。 |
+| `401` | トークンが指定されていないか、無効です。 |
+| `403` | トークンに必要な権限がないか、指定したストリームがプラットフォームストリームです。 |
+| `413` | 解凍前または解凍後のボディが16 MiBを超えています。 |
+| `429` | ルーターのレート制限に達したか、ノードの取り込みバッファーがいっぱいです（`intake buffer memory limit exceeded`）。レスポンスには`Retry-After`が含まれます。 |

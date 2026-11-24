@@ -1,0 +1,106 @@
+---
+title: "Streams und Felder nachhaltig planen"
+sidebarTitle: "Streams und Felder planen"
+description: "Legen Sie vor der Anbindung der ersten großen Datenquelle fest, wie Sie Daten auf Streams verteilen, Felder einheitlich benennen, Filterfelder indexieren und vertrauliche Werte schützen."
+"en_link": "/en-US/best-practices/stream-design"
+"zh-Hans_link": "/zh-Hans/best-practices/stream-design"
+"zh-Hant_link": "/zh-Hant/best-practices/stream-design"
+"ja_link": "/ja/best-practices/stream-design"
+"ko_link": "/ko/best-practices/stream-design"
+"es_link": "/es/best-practices/stream-design"
+"fr_link": "/fr/best-practices/stream-design"
+"pt-BR_link": "/pt-BR/best-practices/stream-design"
+---
+
+Streams und Felder lassen sich nur schwer ändern, sobald Daten, Dashboards und Alarmregeln von ihnen abhängen. Der
+Datentyp eines Feldes steht beim ersten Schreiben fest. Eine Verschlüsselung lässt sich nicht nachträglich aktivieren, und das Umbenennen eines Feldes macht alle
+gespeicherten Abfragen für dieses Feld unbrauchbar. Planen Sie eine Stunde für den Entwurf ein, bevor Sie die erste Quelle mit hohem Datenaufkommen anbinden.
+
+## Streams nach unterschiedlichen Anforderungen aufteilen
+
+Erstellen Sie nur dann einen eigenen Stream, wenn für die Daten andere Vorgaben gelten: eine andere Aufbewahrungsdauer, eine andere
+Zugriffsregel, ein anderes Schema oder eine andere Begrenzung des Abfragezeitraums. Lassen Sie die Daten andernfalls zusammen und unterscheiden Sie sie
+anhand von Feldern.
+
+| Situation | Empfehlung | Nachteil |
+|---|---|---|
+| Debug-Logs bleiben 3 Tage gespeichert, Audit-Logs ein Jahr | Zwei `logs`-Streams mit jeweils eigener Aufbewahrungsdauer. | Abfragen, die beide Log-Arten benötigen, greifen auf zwei Streams zu. |
+| Viele Dienste mit derselben Log-Struktur | Ein Stream mit `service.name` in jedem Ereignis. | Aufbewahrungsdauer und Zugriff lassen sich nicht pro Dienst festlegen. |
+| Ein Rohdatenstrom mit hohem Durchsatz, den eine Pipeline auf mehrere Streams verteilt | Ein Quellstream mit deaktivierter Option **Abfragbar** und eine Routing-Pipeline. | Die Rohereignisse bleiben bis zum Ende der Aufbewahrungsdauer gespeichert. Halten Sie diese daher kurz. |
+| Je Prometheus-Server | Ein `metrics`-Stream pro Quelle. | Eine quellenübergreifende Abfrage muss mehrere Streams angeben. |
+| Ein Stream pro Pod, Version oder Kunde | Vermeiden Sie das. Verwenden Sie stattdessen Felder. | Viele kleine Streams erzeugen mehr Dateien und machen Dashboards bei jeder Änderung unbrauchbar. |
+
+MoleSignal erstellt einen Stream beim ersten Schreibvorgang. Ein Tippfehler im Sender erzeugt daher unbemerkt einen neuen Stream.
+Prüfen Sie nach dem Anbinden jeder Quelle die [Stream-Liste](/de/streams#die-stream-liste) und erstellen Sie
+wichtige Streams vorab mit der gewünschten Aufbewahrungsdauer und den zu verschlüsselnden Feldern.
+
+## Feldnamen vor dem Senden festlegen
+
+Verwenden Sie die OpenTelemetry-Namen, wo es sie gibt. Verwenden Sie für dieselben Inhalte in jedem
+Signal denselben Namen. Signalübergreifende Sprünge und APM hängen davon ab.
+
+| Feld | Inhalt | Zweck |
+|---|---|---|
+| `service.name` | Der Dienstname, einheitlich in Logs, Traces und Metriken. | Ordnet jedes Signal einem Dienst zu. |
+| `deployment.environment.name` | `production`, `staging` und so weiter. | Ermöglicht auf jeder Seite das Filtern nach Umgebung. |
+| `service.version` | Die veröffentlichte Version. | Ermöglicht den Vergleich von Deployments in APM. |
+| `trace_id`, `span_id` | Setzen Sie beide Felder in jeder Log-Zeile, die bei der Verarbeitung einer Anfrage entsteht. | Ermöglicht den Sprung von einer Log-Zeile zum zugehörigen Trace. |
+| `level` | Eine einheitliche Schreibweise, etwa `error`, `warn`, `info` in Kleinbuchstaben. | Das Log-Histogramm zählt Einträge je Log-Level anhand des Index. |
+| `host.name`, `k8s.pod.name` | Der Ort, an dem das Ereignis auftrat. | Grenzt ein Problem auf einen Rechner ein. |
+
+Verwenden Sie für ein Feld bei allen Sendern denselben Datentyp. Liefert ein Dienst eine Zahl und ein
+anderer Text, weist MoleSignal den abweichenden Typ mit `type mismatch on field` zurück. Vereinheitlichen Sie solche Felder in einer
+Pipeline mit **Datentyp umwandeln**, bevor MoleSignal sie speichert. Verwenden Sie einen vorhandenen Feldnamen nie für eine neue
+Bedeutung. Fügen Sie stattdessen ein neues Feld hinzu.
+
+## Filterfelder indizieren
+
+Der [Indextyp](/de/streams#schema-und-felder) bestimmt, wie schnell ein Filter arbeitet. Neue Felder erhalten keinen Index,
+mit Ausnahme einiger bekannter Feldnamen. Prüfen Sie, nach welchen Feldern Dashboards und Alarme filtern:
+
+- **Exakte Übereinstimmung** für Kennungen, deren gesamter Wert beim Vergleich zählt: `trace_id`, `user_id`, `order_id`,
+  `service.name`.
+- **Volltextsuche** für Freitextfelder wie `message`, in denen Sie nach einzelnen Wörtern suchen.
+- **Skip-Index** für Zahlen und Zeitwerte, die Sie mit `<` und `>` vergleichen, etwa `duration_ms`.
+- Kein Index für Felder, die Sie nur anzeigen.
+
+Eine Indexänderung gilt für neue Daten. Bei älteren Dateien greift sie, sobald der Kompaktor sie zusammenführt. Ändern Sie den Index unter
+**Streams → Felder und Indizes** und klicken Sie dann auf **Speichern und anwenden**.
+
+## Kardinalität von Metrik-Labels begrenzen
+
+Ein Metrik-Label mit unbegrenzt vielen möglichen Werten, etwa einer Benutzer-ID, einer Anfrage-ID oder einer vollständigen URL, erzeugt für jeden Wert eine neue
+Zeitreihe. Sobald die [Kardinalitätsgrenzen](/de/settings/platform#metrikkardinalität) erreicht sind, nimmt MoleSignal für die gesamte Organisation
+keine neuen Zeitreihen mehr an. Legen Sie solche Werte in Logs oder Span-Attributen ab. Dort verursachen einzelne Werte keine
+zusätzlichen Kosten. Beschränken Sie Metrik-Labels auf begrenzte Wertemengen wie Dienst, Routenvorlage, Methode und
+Statusklasse.
+
+Hinterlegen Sie Referenzdaten, die sonst in jedem Ereignis stehen würden, etwa das für einen Dienst zuständige Team oder den
+Tarif eines Kunden, in einer [Erweiterungstabelle](/de/extend-tables). Die Pipeline schlägt diese Daten bei der
+Verarbeitung nach.
+
+## Vertrauliche Werte von Anfang an schützen
+
+| Anforderung | Werkzeug | Zeitpunkt |
+|---|---|---|
+| Einen Wert wie eine Kartennummer nie speichern | Ein [Regex-Muster](/de/settings/data-security#regex-muster) mit **Bei der Erfassung schwärzen** oder ein Pipeline-Schritt, der das Feld entfernt. | Bei der Erfassung und unwiderruflich. |
+| Einen Wert speichern, aber nur wenigen Leseberechtigten zugänglich machen | Ein verschlüsseltes Feld. Legen Sie es beim Erstellen des Streams fest und lesen Sie es mit `decrypt()` aus. | Ab dem Erstellen des Streams. |
+| Einen Wert in den meisten Abfrageergebnissen verbergen | [Feldmaskierung](/de/settings/data-security#feldmaskierung). | Bei der Abfrage, im Ergebnis. |
+
+Entfernen Sie den Wert möglichst schon im Sender oder im Collector. Ein Wert, der die Quelle nie verlässt, kann
+nicht aus MoleSignal nach außen gelangen.
+
+## Abnahmekriterien
+
+- Für jeden Stream stehen die Zuständigkeit, der Zweck und eine bewusst gewählte Aufbewahrungsdauer fest.
+- Bei einer bekannten Anfrage führt ein Klick von der Log-Zeile zum zugehörigen Trace.
+- Felder, nach denen Dashboards und Regeln filtern, haben einen geeigneten Index.
+- Kein Metrik-Label hat eine unbegrenzte Wertemenge. Unter **Kardinalität** im Bereich **Metriken** bleibt die Anzahl der Zeitreihen stabil.
+- Testereignisse mit Markierungen für vertrauliche Inhalte kommen wie vorgesehen geschwärzt, maskiert oder verschlüsselt an.
+
+## Weiterführende Anleitungen
+
+- [Streams](/de/streams)
+- [Pipelines](/de/pipelines)
+- [Datensicherheitseinstellungen](/de/settings/data-security)
+- [Telemetrie für einen neuen Dienst einführen](/de/best-practices/service-onboarding)

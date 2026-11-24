@@ -1,0 +1,94 @@
+---
+title: "Backup e restauração"
+description: "Saiba o que incluir no backup, como manter o PostgreSQL e o armazenamento de objetos consistentes e como restaurar uma implantação do MoleSignal."
+"en_link": "/en-US/backup-restore"
+"zh-Hans_link": "/zh-Hans/backup-restore"
+"zh-Hant_link": "/zh-Hant/backup-restore"
+"ja_link": "/ja/backup-restore"
+"ko_link": "/ko/backup-restore"
+"de_link": "/de/backup-restore"
+"es_link": "/es/backup-restore"
+"fr_link": "/fr/backup-restore"
+---
+
+O MoleSignal mantém o estado no PostgreSQL, no armazenamento de objetos e nas configurações e nos segredos. Os nós mantêm apenas caches nos discos locais. Faça backup de cada um desses componentes e teste a restauração antes de depender dos backups.
+
+## O que incluir no backup
+
+| Estado | Conteúdo | Backup |
+|---|---|---|
+| PostgreSQL | Usuários, organizações, tokens, fluxos, dashboards, regras de alerta e o catálogo de arquivos que mapeia fluxos para objetos | Obrigatório |
+| Armazenamento de objetos | Arquivos de dados Parquet, índices de pesquisa, blobs de perfis e objetos do log de gravação antecipada (WAL) de registros ainda não persistidos (`wal/v1/`) | Obrigatório |
+| `MS_CIPHER_KEY` | Chave raiz dos segredos no PostgreSQL | Obrigatório. Armazene a chave separadamente do backup do banco de dados. |
+| Configuração | `config.toml`, variáveis de ambiente e `MS_AUTH_JWT_SECRET_OVERRIDE`, se estiver em uso | Obrigatório |
+| Diretório do ACME (`[http.tls].key_storage_dir`) | Chave da conta do ACME e chaves dos domínios | Opcional. É possível emitir os certificados novamente. |
+| Diretório de cache (`[cache.object].root`) | Cópia local de intervalos de objetos remotos | Não faça backup. |
+
+## Mantenha a consistência entre o banco de dados e os objetos
+
+O catálogo de arquivos no PostgreSQL referencia objetos no bucket. Ao persistir os dados, o MoleSignal primeiro envia o objeto e depois o registra no catálogo. A compactação e a retenção removem primeiro a referência do catálogo. O coletor de lixo exclui o objeto mais tarde, depois de `[storage.gc].grace_period_secs` (3600 segundos por padrão).
+
+Siga esta ordem para garantir a consistência do backup:
+
+1. Faça o backup do PostgreSQL.
+2. Copie o bucket logo em seguida e conclua a cópia dentro do período de carência.
+
+Se a cópia terminar dentro do período de carência, ela conterá todos os objetos que o backup do banco de dados referencia. Se a cópia demorar mais, aumente `grace_period_secs` antes do backup ou ative o versionamento do bucket e restaure os objetos para o estado em que estavam no momento do backup do banco de dados.
+
+## Faça backup do PostgreSQL
+
+Use os recursos de backup do serviço PostgreSQL, como snapshots agendados com recuperação para um ponto no tempo. Para um banco de dados autogerenciado, use uma exportação lógica em implantações pequenas:
+
+```bash
+pg_dump --format=custom --file=molesignal.dump "postgres://molesignal@db.internal:5432/molesignal"
+```
+
+## Faça backup do armazenamento de objetos
+
+Use a replicação ou o versionamento de buckets do provedor. Outra opção é agendar uma cópia para um segundo bucket:
+
+```bash
+aws s3 sync s3://molesignal s3://molesignal-backup
+```
+
+Para um serviço compatível com S3, como o RustFS, adicione `--endpoint-url`. Faça o backup com credenciais que não tenham permissão para excluir objetos do bucket de backup.
+
+## Restaure o backup
+
+<Steps>
+  <Step title="Pare todos os nós">
+    Pare todos os processos do MoleSignal para impedir gravações durante a substituição dos dados.
+  </Step>
+  <Step title="Restaure o PostgreSQL">
+    Restaure o backup em um banco de dados vazio:
+
+    ```bash
+    pg_restore --no-owner --dbname "postgres://molesignal@db.internal:5432/molesignal" molesignal.dump
+    ```
+  </Step>
+  <Step title="Restaure os objetos">
+    Copie o backup para o bucket que os nós usam. Restaure o bucket para o estado em que estava no momento do backup do banco de dados ou em um momento posterior.
+
+    O reconciliador coloca na fila de objetos órfãos os objetos que o catálogo restaurado não referencia. O coletor de lixo os exclui depois de `[storage.reconciler].orphan_grace_secs` (24 horas por padrão). Se ainda precisar dos objetos mais recentes, copie-os primeiro para outro local.
+  </Step>
+  <Step title="Restaure os segredos e a configuração">
+    Forneça a configuração e a mesma `MS_CIPHER_KEY` que a implantação usava no momento do backup. Um nó com uma chave diferente não consegue descriptografar os segredos armazenados e falha na inicialização com um erro como `open Probe CA key`.
+  </Step>
+  <Step title="Deixe a ingestão assumir o WAL">
+    A restauração do bucket recupera os objetos do WAL. Assim que os nós estiverem em execução, um nó de ingestão publica o WAL de cada gravador listado no banco de dados restaurado, após a concessão desse gravador expirar. O nó não publica os objetos do WAL de gravadores registrados depois do backup do banco de dados.
+  </Step>
+  <Step title="Inicie e verifique">
+    Inicie os nós e aguarde até que `GET /api/v1/healthz` retorne `200`. Faça login, abra um fluxo e execute uma consulta no intervalo restaurado.
+
+    Em `/metrics`, verifique se `storage_reconciler_issues_total` tem entradas com `reason="missing"`. Essas entradas indicam que o catálogo referencia objetos que não estão no bucket.
+  </Step>
+</Steps>
+
+## Cenários de falha
+
+| Perda | Efeito | Recuperação |
+|---|---|---|
+| Disco local de um nó | Nenhum dado com recebimento confirmado é perdido. O sistema recria os caches. | Substitua o nó. Outro nó de ingestão publica o WAL do nó perdido depois de `[wal].lease_secs`. Consulte [Durabilidade e tomada de controle](/pt-BR/architecture#durabilidade-e-transferência-de-responsabilidade). |
+| PostgreSQL | A perda elimina todos os metadados e torna os objetos inacessíveis. | Restaure o backup mais recente. Não é possível recuperar os dados gravados após esse backup, pois os objetos correspondentes não têm entradas no catálogo. |
+| Bucket | As consultas no intervalo perdido falham. | Restaure o bucket. Entradas do catálogo sem objetos correspondentes aparecem como `missing` em `/metrics`. |
+| `MS_CIPHER_KEY` | Os nós não conseguem descriptografar os segredos armazenados e falham na inicialização. | Restaure a chave a partir do gerenciador de segredos. Sem a chave, não é possível recuperar as colunas criptografadas. |

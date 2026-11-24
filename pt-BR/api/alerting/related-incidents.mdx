@@ -1,0 +1,137 @@
+---
+title: "Incidentes semelhantes e alterações recentes"
+description: "Liste incidentes anteriores semelhantes a este, além das implantações, alterações de configuração e flags de funcionalidade registradas perto do momento em que ele foi disparado."
+"en_link": "/en-US/api/alerting/related-incidents"
+"zh-Hans_link": "/zh-Hans/api/alerting/related-incidents"
+"zh-Hant_link": "/zh-Hant/api/alerting/related-incidents"
+"ja_link": "/ja/api/alerting/related-incidents"
+"ko_link": "/ko/api/alerting/related-incidents"
+"de_link": "/de/api/alerting/related-incidents"
+"es_link": "/es/api/alerting/related-incidents"
+"fr_link": "/fr/api/alerting/related-incidents"
+---
+
+As duas chamadas exigem a permissão `alerts.incidents.read` no incidente.
+
+## Incidentes semelhantes
+
+```http
+GET /api/v1/alerts/incidents/{id}/similar
+```
+
+Busca os incidentes mais semelhantes entre os que foram abertos na mesma organização nos 90 dias anteriores ao disparo deste incidente.
+Retorna até 5, em ordem decrescente de pontuação. Em caso de empate, os mais recentes aparecem primeiro. A busca exclui os incidentes mesclados a este e o
+incidente ao qual este foi mesclado. A pontuação é a soma dos valores das linhas abaixo. Para aparecer na lista, um incidente precisa de
+pelo menos 2 pontos:
+
+| Critério | Valor em `reasons` | Pontuação |
+|---|---|---|
+| Mesma impressão digital do alerta | `fingerprint` | 5 |
+| Mesma regra (quando a impressão digital é diferente) | `rule` | 3 |
+| Serviços em comum | `services` | sobreposição × 2 |
+| Rótulos semelhantes: os pares chave-valor em comum representam pelo menos 0,3 do total de pares em cada incidente | `labels` | proporção × 2 |
+| Título semelhante: similaridade por trigramas de pelo menos 0,3, calculada da mesma forma que o `pg_trgm` do PostgreSQL, inclusive para textos em chinês | `title` | similaridade × 2 |
+| Encaminhamento para a mesma equipe | `team` | 1 |
+
+A sobreposição é a razão entre o tamanho da interseção dos dois conjuntos e o tamanho da união.
+
+<RequestExample>
+```bash cURL
+curl http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/similar \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "incidents": [
+    {
+      "id": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+      "summary": "High error rate · checkout",
+      "severity": "critical",
+      "status": "resolved",
+      "createdAt": 1789400000000000,
+      "resolvedAt": 1789401800000000,
+      "resolvedBy": "<user-id>",
+      "score": 7.6,
+      "reasons": ["fingerprint", "services", "labels", "team"],
+      "notes": 2,
+      "rootCause": "Connection pool exhausted after the payments client stopped releasing connections."
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Campo | Descrição |
+|---|---|
+| `score`, `reasons` | A pontuação e os critérios que contribuíram para ela. Consulte a tabela acima. |
+| `resolvedBy` | Quem resolveu o incidente. Retorna `null` se a regra voltou ao normal por conta própria ou se o incidente ainda está ativo. |
+| `notes` | Número de [notas](/pt-BR/api/alerting/add-incident-note) do incidente. |
+| `rootCause` | A primeira frase com conteúdo da [análise de causa raiz por IA](/pt-BR/api/alerting/incident-rca), com até 200 caracteres. Ignora títulos e linhas em branco. Não inclui o campo se não houver análise. |
+
+## Alterações recentes
+
+```http
+GET /api/v1/alerts/incidents/{id}/changes
+```
+
+Lista as [alterações relatadas](/pt-BR/apm/deployments#registre-implantações-pela-ci) no período que vai de 30
+minutos antes do disparo do incidente a 10 minutos depois. Inclui os serviços do incidente (os serviços
+afetados e o serviço indicado pelo rótulo `service`), além dos serviços a jusante. Retorna até 20 alterações, das mais antigas às mais recentes.
+Identifica os serviços a jusante no mapa de serviços do APM, considerando até os 3 primeiros serviços do incidente. Sem
+um mapa de serviços, considera apenas os serviços do próprio incidente. Se houve uma edição na regra do incidente nas 24 horas
+anteriores ao disparo, inclui também uma alteração do tipo `rule`.
+
+<RequestExample>
+```bash cURL
+curl http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/changes \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "from": 1789998200000000,
+  "to": 1790000600000000,
+  "changes": [
+    {
+      "kind": "deployment",
+      "at": 1789999100000000,
+      "service": "payments",
+      "downstream": true,
+      "version": "v2026.10.28",
+      "status": "succeeded",
+      "commit": "9f2c1e4",
+      "author": "dana",
+      "link": "https://ci.example.com/pipelines/4821"
+    },
+    {
+      "kind": "rule",
+      "at": 1789960000000000,
+      "downstream": false,
+      "ruleId": "3KEDBLvTYO6DnWi8H9S9MNLpPT7",
+      "ruleName": "Checkout error rate"
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Campo | Descrição |
+|---|---|
+| `from`, `to` | O intervalo consultado, em microssegundos desde a época Unix. |
+| `kind` | `deployment`, `configuration`, `feature_flag` ou `rule` (indica uma edição na regra do incidente). |
+| `downstream` | `true` quando a alteração corresponde a um serviço a jusante, e não a um serviço do próprio incidente. |
+| `version`, `status`, `commit`, `description`, `author` | Valores informados no relatório. A resposta omite os campos que o relatório não inclui. |
+| `link` | O endereço informado do pipeline ou, na ausência dele, o endereço da solicitação de pull. |
+| `ruleId`, `ruleName` | A regra associada a uma alteração do tipo `rule`. |
+
+**Erros**
+
+| Status | Motivo |
+|---|---|
+| `403` | O token não tem a permissão `alerts.incidents.read` ou não tem acesso a este incidente. |
+| `404` | O incidente não existe. |

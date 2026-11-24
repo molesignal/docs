@@ -1,0 +1,86 @@
+---
+title: "原生 JSON 擷取"
+description: "使用 POST 將 JSON 格式的記錄傳送至資料串流。"
+"en_link": "/en-US/api/intake/native-json"
+"zh-Hans_link": "/zh-Hans/api/intake/native-json"
+"ja_link": "/ja/api/intake/native-json"
+"ko_link": "/ko/api/intake/native-json"
+"de_link": "/de/api/intake/native-json"
+"es_link": "/es/api/intake/native-json"
+"fr_link": "/fr/api/intake/native-json"
+"pt-BR_link": "/pt-BR/api/intake/native-json"
+---
+
+```http
+POST /api/v1/intake/{type}/{stream}
+```
+
+向資料流 POST 一個記錄物件或一組記錄。首次寫入時會建立資料流，schema 會隨新增欄位而更新。此呼叫需要對應資料類型的寫入權限：`logs.write`、`metrics.write` 或 `traces.write`。預設接入 Token 和具備寫入角色的服務帳號 Token 都可使用。
+
+**路徑參數**
+
+| 參數 | 類型 | 說明 |
+|---|---|---|
+| `type` | string | `logs`、`metrics` 或 `traces`，其他值會傳回 `404`。 |
+| `stream` | string | 資料流名稱，可包含字母、數字、`_`、`-` 和 `.`。[平台資料流](/zh-Hant/streams#平台資料串流)（例如 `_molesignal` 或 `_audit`）會傳回 `403`。 |
+
+**請求本文**
+
+一個 JSON 物件或一組 JSON 物件，每個元素都必須是物件。請求本文上限為 16 MiB。系統會解壓縮帶有 `Content-Encoding: gzip` 的請求本文，解壓縮後同樣不得超過 16 MiB。
+
+| 欄位 | 說明 |
+|---|---|
+| `_timestamp` | 事件時間，以 Unix 紀元起算的微秒數。未指定時，使用伺服器接收時間。 |
+| `metric_name` | 對於 `metrics`，此欄位表示記錄所屬的指標。一個指標資料流存放同一來源的所有指標；沒有 `metric_name` 的記錄歸入與資料流同名的指標。 |
+| 其他任意欄位 | 儲存為資料流的欄位。後續記錄必須使用該欄位在資料流中的既有類型。 |
+
+**寫入追蹤**
+
+系統會直接儲存寫入 `traces` 的 Span，不執行[尾端取樣](/zh-Hant/configuration#追蹤擷取與尾端取樣)，也不產生追蹤清單讀取的摘要。需要完整的追蹤功能時，請透過 [OTLP](/zh-Hant/api/intake/otlp) 傳送。
+
+| 位置 | 這些 Span |
+|---|---|
+| **追蹤**頁面的**追蹤**分頁及其直方圖 | 不顯示。 |
+| Mole Agent 的 `list_traces`、**使用者體驗**的**關聯追蹤** | 查不到。 |
+| **應用程式效能** | 不計入。 |
+| **追蹤**頁面的 **Span** 分頁、**RED 向下鑽研**，以及依 trace ID 開啟的詳細資料 | 可用。 |
+| **服務圖** | 計入。 |
+
+組織有多個追蹤資料流時，追蹤清單和 Mole Agent 只會讀取其中一個，並優先選擇有摘要的資料流。因此，只透過這個端點寫入的資料流不會蓋過透過 OTLP 寫入的資料流。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/logs/app \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "accepted": 1, "rejected": 0, "errors": [] }
+```
+</ResponseExample>
+
+系統會個別拒絕與 schema 衝突的記錄，仍會接收同一批中的其他記錄：
+
+```json
+{
+  "accepted": 1,
+  "rejected": 1,
+  "errors": [
+    { "index": 0, "reason": "type mismatch on field `level`: expected Utf8, got Number" }
+  ]
+}
+```
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | 資料流名稱無效、JSON 無效，或陣列元素不是物件（`event #1 must be a JSON object`）。 |
+| `401` | 缺少 Token，或 Token 無效。 |
+| `403` | Token 缺少這項權限，或資料流是平台資料流。 |
+| `413` | 請求本文超過 16 MiB（解壓縮前或解壓縮後）。 |
+| `429` | 觸發路由器的速率限制，或節點的接收緩衝區已滿（`intake buffer memory limit exceeded`）。回應包含 `Retry-After`。 |

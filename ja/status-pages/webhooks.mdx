@@ -1,0 +1,403 @@
+---
+title: "ステータスページの Webhook 購読"
+description: "公開ステータスページの通知を受け取る HTTPS エンドポイントの登録方法を説明します。購読の確認、リクエスト形式、ペイロードのフィールド、再試行、購読解除を取り上げます。"
+"en_link": "/en-US/status-pages/webhooks"
+"zh-Hans_link": "/zh-Hans/status-pages/webhooks"
+"zh-Hant_link": "/zh-Hant/status-pages/webhooks"
+"ko_link": "/ko/status-pages/webhooks"
+"de_link": "/de/status-pages/webhooks"
+"es_link": "/es/status-pages/webhooks"
+"fr_link": "/fr/status-pages/webhooks"
+"pt-BR_link": "/pt-BR/status-pages/webhooks"
+---
+
+Webhook 購読では、公開ステータスページで変更が公開されるたびに、HTTPS エンドポイントへ JSON の `POST` リクエストを送信します。サービスのステータスをチャットルーム、チケット管理システム、社内ステータスボードなどに反映するために使用します。
+
+コンポーネント、インシデント、メンテナンス、購読者の管理画面については、まず[ステータスページ](/ja/status-pages)を参照してください。
+
+## 購読の仕組み
+
+<Steps>
+  <Step title="エンドポイントを登録する">
+    公開ページまたは API からエンドポイントの URL を送信します。登録直後の購読は確認待ちになります。
+  </Step>
+  <Step title="確認リクエストを受信する">
+    MoleSignal はエンドポイントに `status_page_subscription_confirmation` リクエストを 1 回送信します。エンドポイントが 2xx ステータスを返さない場合、登録は失敗します。
+  </Step>
+  <Step title="トークンで購読を確認する">
+    リクエスト内の `confirmUrl` を開くか、確認用エンドポイントに `token` を送信します。確認が完了すると、購読が有効になります。
+  </Step>
+  <Step title="更新を受信する">
+    確認後に公開された変更は、変更ごとに 1 件のリクエストで配信されます。確認前に公開された変更は配信されません。
+  </Step>
+</Steps>
+
+## エンドポイントの要件
+
+| 要件 | ルール |
+|---|---|
+| ページの公開範囲 | 公開ページのみが対象です。非公開ページでは、確認済みのメール購読のみを受け付けます。 |
+| スキーム | `https` のみを使用できます。 |
+| 認証情報 | URL にユーザー名やパスワードを含めることはできません。 |
+| ホスト | `localhost`、`*.localhost`、`*.local` は使用できません。ホストはパブリック IP アドレスに名前解決できる必要があります。プライベート、ループバック、リンクローカル、キャリアグレード NAT、ドキュメント用のアドレス範囲は使用できません。 |
+| 長さ | 3〜2048 文字で、制御文字を含めることはできません。 |
+| レスポンス | 10 秒以内に 2xx ステータスを返す必要があります。リダイレクトは追跡しないため、3xx レスポンスは失敗として扱います。 |
+
+MoleSignal は配信のたびにホストを名前解決し直し、毎回同じアドレスのルールを適用します。
+
+## 購読
+
+公開ページで **購読** を選択し、**配信チャネル** に **Webhook** を設定します。エンドポイントの URL を入力し、**確認リクエストを送信** を選択します。
+
+API を使用する場合は、ステータスページを配信するオリジンにリクエストを送信します。
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<slug>/subscriptions" \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "webhook", "target": "https://hooks.example.com/status"}'
+```
+
+特定のコンポーネントの更新だけを受け取るには、`componentIds` に対象コンポーネントの `id` を指定します。各 `id` は `GET /api/v1/public/status-pages/<slug>` で確認できます。ページ全体を購読するには、`componentIds` を省略するか空のリストを送信します。グループは選択できません。グループ内のコンポーネントを個別に指定します。
+
+この呼び出しに認証は不要です。登録に成功すると `202 Accepted` が返ります。
+
+```json
+{
+  "accepted": true,
+  "confirmationRequired": true
+}
+```
+
+| ケース | 結果 |
+|---|---|
+| 新しいエンドポイント | 確認リクエストを送信します。 |
+| すでに有効なエンドポイント | `202` を返し、`status_page_subscription_manage` リクエストを送信します。選択済みのコンポーネントとトークンは変更しません。 |
+| 確認リクエストを受信してから 10 分未満のエンドポイント | `202` を返し、確認リクエストは再送しません。 |
+| 10 分経過後も確認待ち、または購読を解除済みのエンドポイント | 新しいトークンで確認リクエストを送信します。以前のトークンは無効になります。 |
+| 確認リクエストに対するレスポンスが 2xx ではない場合 | 呼び出しは `503` とエラーコード `unavailable` を返して失敗します。エンドポイントを修正してから再登録してください。 |
+| エンドポイントの要件を満たさない URL | 呼び出しは `400` とエラーコード `invalid_argument` を返して失敗します。 |
+| 確認待ちまたは有効な購読者が合計 10,000 人に達しているページ | 呼び出しは `429` とエラーコード `resource_exhausted` を返して失敗します。 |
+
+<Note>
+  購読用のリンクは `http.external_url` をもとに生成します。ページのカスタムドメインが有効な場合は、そのドメインを使用します。`http.external_url` が空の場合、登録は `503` を返して失敗します。
+</Note>
+
+## リクエスト形式
+
+エンドポイントに送信するすべてのリクエストは、同じ形式を使用します。
+
+| プロパティ | 値 |
+|---|---|
+| メソッド | `POST` |
+| `Content-Type` | `application/json` |
+| `User-Agent` | `MoleSignal-Status-Page/1.0` |
+| ボディ | 1 つの JSON オブジェクト。`type` フィールドはペイロードの種類を示します。 |
+| タイムアウト | 10 秒 |
+| 成功 | 任意の 2xx ステータス。レスポンスボディは無視します。 |
+
+リクエストに署名ヘッダーはありません。正規のリクエストを識別するには、推測しにくい値を登録する URL のパスまたはクエリ文字列に含め、その値がないリクエストを拒否してください。管理画面には、Webhook の送信先のスキームとホストのみが表示されます。表示例： `https://hooks.example.com/***`。
+
+`type` に応じて処理を振り分けます。ペイロードにフィールドが追加されてもエンドポイントが動作するように、未知のフィールドや `type` の値は無視してください。
+
+## 確認リクエスト
+
+MoleSignal は登録ごとに 1 回、次のペイロードを送信します。
+
+```json
+{
+  "type": "status_page_subscription_confirmation",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "confirmUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=confirm&subscriptionToken=<token>",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>",
+  "components": ["Public API"],
+  "token": "<token>"
+}
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `type` | 文字列 | 常に `status_page_subscription_confirmation` です。 |
+| `pageName` | 文字列 | ステータスページの名前です。 |
+| `pageSlug` | 文字列 | ステータスページのスラッグです。以下の API パスで使用します。 |
+| `confirmUrl` | 文字列 | ブラウザーで開くと購読が確認されるページの URL です。 |
+| `manageUrl` | 文字列 | **購読の管理**を開く URL です。この画面でコンポーネントを変更できます。 |
+| `unsubscribeUrl` | 文字列 | ブラウザーで開くと購読を解除するページの URL です。 |
+| `components` | 文字列の配列 | 購読対象のコンポーネント名です。ページ全体を購読する場合は空です。 |
+| `token` | 文字列 | 購読トークンです。購読の確認と、その後の解除に使用します。 |
+
+`confirmUrl` を開くか、トークンを送信して購読を確認します。
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/confirm" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+購読の確認に成功すると `200 OK` が返ります。
+
+```json
+{
+  "accepted": true,
+  "confirmationRequired": false
+}
+```
+
+不明なトークン、再登録で置き換えられたトークン、または購読の解除に使用済みのトークンを送信すると、 `400` とエラーコード `invalid_argument` が返ります。
+
+<Warning>
+  トークンを保管してください。更新のペイロードにはトークンが含まれません。エンドポイントの所有者が購読を解除するために使用できる認証情報は、このトークンだけです。
+</Warning>
+
+## 購読管理リクエスト
+
+すでに有効なエンドポイントを再登録すると、MoleSignal は新しい確認リクエストの代わりに、購読管理用のリンクをエンドポイントに送信します。送信は 10 分につき最大 1 回です。
+
+```json
+{
+  "type": "status_page_subscription_manage",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>",
+  "components": [],
+  "token": "<token>"
+}
+```
+
+フィールドは、確認リクエストから `confirmUrl` を除いたものと同じです。
+
+## 更新ペイロード
+
+すべてのタイムスタンプは、Unix エポック（UTC）からの経過時間をマイクロ秒単位の整数で表します。コンポーネント名、インシデントのタイトル、メッセージは、ページの運用チームが入力したとおりに送信し、翻訳しません。
+
+コンポーネントを指定した購読では、指定したコンポーネントのいずれかを含む更新だけを受信します。更新を **購読者に通知**をオフにして公開すると、何も送信しません。各更新ペイロードには、購読に関する以下のリンクも含まれます。
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `manageUrl` | string | **購読の管理**を開くページの URL です。 |
+| `unsubscribeUrl` | string | 購読を解除するページの URL です。 |
+
+### インシデントとメンテナンスの更新
+
+MoleSignal は、インシデントやメンテナンスの更新を公開するたびに `incident_update` を送信します。計画メンテナンスでは、同じペイロードの `incidentKind` に `maintenance` を設定します。下書きでは何も送信しません。
+
+| イベント | リクエストの送信タイミング | `status` |
+|---|---|---|
+| インシデント | インシデントを公開したとき。 | 公開時に選択したステータスです。通常は `investigating` です。 |
+| インシデント | 以降の更新を公開するたび。 | `investigating`、`identified`、`in_progress`、`monitoring` のいずれかです。 |
+| インシデント | インシデントが解決したとき。 | `resolved` |
+| メンテナンス | メンテナンスを公開したとき。 | 通常は `scheduled` です。 |
+| メンテナンス | 予定済みのメンテナンスのタイトル、予定時刻、コンポーネント、メッセージのいずれかを編集したとき。 | `scheduled` |
+| メンテナンス | 予定開始時刻に自動で作業を開始したとき、またはチームが作業を開始済みにしたとき。 | `in_progress` |
+| メンテナンス | チームが作業を完了またはキャンセルしたとき。 | `completed` または `cancelled` |
+
+インシデントの更新例：
+
+```json
+{
+  "type": "incident_update",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "incidentKind": "incident",
+  "title": "Elevated error rates on the public API",
+  "impact": "major",
+  "status": "identified",
+  "message": "A configuration change to the edge proxies is rejecting a share of requests. The change is being rolled back.",
+  "occurredAt": 1779529680000000,
+  "nextUpdateAt": 1779531480000000,
+  "startedAt": 1779529260000000,
+  "endedAt": null,
+  "componentNames": ["Public API", "Web dashboard"]
+}
+```
+
+メンテナンスの告知例：
+
+```json
+{
+  "type": "incident_update",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "incidentKind": "maintenance",
+  "title": "Database upgrade in the EU region",
+  "impact": "maintenance",
+  "status": "scheduled",
+  "message": "The primary database of the EU region is upgraded on May 25 from 10:00 to 10:30 UTC. Writes can take a few seconds longer during the switch-over.",
+  "occurredAt": 1779443280000000,
+  "nextUpdateAt": null,
+  "startedAt": 1779703200000000,
+  "endedAt": null,
+  "componentNames": ["EU region"]
+}
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `type` | string | 常に `incident_update` です。 |
+| `pageName` | string | ステータスページの名前です。 |
+| `pageSlug` | string | ステータスページのスラッグです。 |
+| `incidentId` | string | インシデントまたはメンテナンスの識別子です。同じインシデントまたはメンテナンスの更新では変わりません。 |
+| `incidentKind` | string | 予定外の事象は `incident`、計画メンテナンスは `maintenance` です。 |
+| `title` | string | 更新を公開した時点のインシデントまたはメンテナンスのタイトルです。 |
+| `impact` | string | インシデントの場合は `minor`、`major`、`critical` のいずれかです。計画メンテナンスの場合は `maintenance` です。 |
+| `status` | string | この更新で設定するステータスです。下の表を参照してください。 |
+| `message` | string | 更新の本文です。 |
+| `occurredAt` | integer | 更新を公開した時刻です。 |
+| `nextUpdateAt` | integer or null | この更新で案内した次回更新の期限です。案内がなければ `null` です。 |
+| `startedAt` | integer | メンテナンスの予定開始時刻、またはインシデントの開始時刻です。 |
+| `endedAt` | integer or null | インシデントを解決した時刻、またはメンテナンスを完了もしくはキャンセルした時刻です。それまでは `null` です。 |
+| `componentNames` | array of strings | 影響を受けたコンポーネントのうち、ステータスページに表示するものの名前を表示順に並べた配列です。非表示またはアーカイブ済みのコンポーネントは含めません。該当するコンポーネントがなければ空の配列です。 |
+
+| `incidentKind` | `status` の値 | 最終ステータス |
+|---|---|---|
+| `incident` | `investigating`、`identified`、`in_progress`、`monitoring`、`resolved` | `resolved` |
+| `maintenance` | `scheduled`、`in_progress`、`completed`、`cancelled` | `completed` または `cancelled` |
+
+メンテナンスでは、どの更新でも `startedAt` は予定開始時刻を示します。この値が変わるのは、チームがメンテナンスの予定を変更したときです。作業開始後もこの値は予定開始時刻を示します。実際の開始時刻は、`in_progress` の更新の `occurredAt` です。メンテナンスには予定終了時刻がないため、作業が完了またはキャンセルするまで `endedAt` は `null` です。
+
+<Note>
+  自動開始はデフォルトでオンです。オンの場合、MoleSignal は予定開始時刻に `in_progress` の更新を公開し、`incident_update` として送信します。オフの場合、その時刻には何も送信しません。次のリクエストは、チームが次の更新を公開したときに送信します。
+</Note>
+
+### メンテナンスのリマインダー
+
+MoleSignal は、予定済みのメンテナンスが始まる前に `maintenance_reminder` を送信します。開始の何分前に送信するかはメンテナンスごとに設定します。デフォルトは 60 分前です。リマインダーは更新ではないため、メンテナンスのタイムラインには表示しません。
+
+```json
+{
+  "type": "maintenance_reminder",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqM4cJt8WnB1vKp6RyD9sHgLu",
+  "title": "Database upgrade in the EU region",
+  "occurredAt": 1779699600000000,
+  "startedAt": 1779703200000000,
+  "componentNames": ["EU region"]
+}
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `type` | string | 常に `maintenance_reminder` です。 |
+| `pageName` | string | ステータスページの名前です。 |
+| `pageSlug` | string | ステータスページのスラッグです。 |
+| `incidentId` | string | メンテナンスの識別子です。同じメンテナンスの `incident_update` ペイロードと同じ値です。 |
+| `title` | string | リマインダーを送信した時点のメンテナンスのタイトルです。 |
+| `occurredAt` | integer | リマインダーを送信した時刻です。 |
+| `startedAt` | integer | メンテナンスの予定開始時刻です。 |
+| `componentNames` | array of strings | 影響を受けたコンポーネントのうち、ステータスページに表示するものの名前を表示順に並べた配列です。非表示またはアーカイブ済みのコンポーネントは含めません。 |
+
+予定開始時刻ごとにリマインダーを 1 回送信します。予定を変更した場合は、新しい開始時刻の前に再度送信します。ただし、リマインダーの送信予定時刻を過ぎてからメンテナンスを告知または再スケジュールした場合、開始の何分前に送信するかの設定値が `0` の場合、またはステータスが `scheduled` でなくなった場合は、送信しません。
+
+### コンポーネントのステータス変更
+
+MoleSignal は、ステータスページに表示するコンポーネントのステータスが変わると `component_status_changed` を送信します。コンポーネントを作成したときの初期ステータスでは送信しません。非表示またはアーカイブ済みのコンポーネントについても何も送信しません。
+
+```json
+{
+  "type": "component_status_changed",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "componentId": "2xZqD1hWk9TfM5vBn7QsR3yLgUe",
+  "componentName": "Public API",
+  "status": "degraded_performance",
+  "occurredAt": 1779529440000000
+}
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `type` | string | 常に `component_status_changed` です。 |
+| `pageName` | string | ステータスページの名前です。 |
+| `pageSlug` | string | ステータスページのスラッグです。 |
+| `componentId` | string | コンポーネントの識別子です。コンポーネントの名前を変更しても変わりません。 |
+| `componentName` | string | ステータスが変わった時点のコンポーネント名です。 |
+| `status` | string | 新しいステータスです。`operational`、`degraded_performance`、`partial_outage`、`major_outage`、`maintenance` のいずれかです。 |
+| `occurredAt` | integer | 新しいステータスが適用された時刻です。 |
+
+インシデントの影響を受けるコンポーネントについては、`component_status_changed` を送信しません。 `incident_update` ペイロードの `componentNames` に、それらのコンポーネント名を含めます。
+
+<Note>
+  変更を公開した時点で非表示のコンポーネントは、購読者に名前を通知しません。そのコンポーネントのステータスが変わっても何も送信せず、`incident_update` の `componentNames` にも含めません。インシデントやメンテナンスの影響が非表示のコンポーネントだけに及ぶ場合も、`componentNames` を空の配列にして送信します。コンポーネントの表示と非表示を切り替えるだけでは、何も送信しません。
+</Note>
+
+### ポストモーテム
+
+解決済みインシデントのポストモーテムまたはその改訂版を **購読者に通知**をオンにして公開すると、MoleSignal は `postmortem_published` を送信します。
+
+```json
+{
+  "type": "postmortem_published",
+  "pageName": "Acme Cloud",
+  "pageSlug": "acme-cloud",
+  "incidentId": "2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "title": "Elevated error rates on the public API",
+  "impact": "major",
+  "revision": false,
+  "occurredAt": 1779616080000000,
+  "startedAt": 1779529260000000,
+  "endedAt": 1779533520000000,
+  "componentNames": ["Public API"],
+  "postmortem": "## What happened\n\nA configuration change to the edge proxies rejected a share of requests.",
+  "incidentUrl": "https://status.example.com/status/acme-cloud/incidents/2xZqK7mPd4VnT8sLw3RbY6cHfJa",
+  "manageUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=manage&subscriptionToken=<token>",
+  "unsubscribeUrl": "https://status.example.com/status/acme-cloud#subscriptionAction=unsubscribe&subscriptionToken=<token>"
+}
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `type` | string | 常に `postmortem_published` です。 |
+| `incidentId` | string | インシデントの識別子です。同じインシデントの `incident_update` ペイロードと同じ値です。 |
+| `title` | string | インシデントのタイトルです。 |
+| `impact` | string | `minor`、`major`、`critical` のいずれかです。 |
+| `revision` | boolean | 公開済みの本文を改訂版で置き換えた場合は `true` です。 |
+| `occurredAt` | integer | ポストモーテムを公開した時刻です。 |
+| `postmortem` | string | 入力したとおりの Markdown 形式のポストモーテムです。 |
+| `incidentUrl` | string | 公開ページ上のインシデントの URL です。 |
+
+`pageName`、`pageSlug`、`startedAt`、`endedAt`、`componentNames` は `incident_update` と同じです。
+
+## 配信と再試行
+
+| 動作 | 詳細 |
+|---|---|
+| 遅延 | 通常、変更から30秒以内に配信を開始します。 |
+| 試行回数 | 更新ごとに最大5回試行します。 |
+| 再試行までの待機時間 | 失敗するたびに、順に1分、5分、30分、2時間待ってから再試行します。 |
+| 失敗の判定 | 10秒以内に2xxステータスが返らない場合は失敗とみなします。リダイレクトも失敗に含みます。 |
+| 再試行の打ち切り | 5回目の試行に失敗すると、配信を失敗として記録し、再送しません。 |
+| 配信保証 | 少なくとも1回配信します。同じ配信が複数回届いたり、順序が前後したりすることがあります。 |
+
+再試行では、同じ本文を送信します。ペイロードには配信IDが含まれないため、 `type`、`incidentId` または `componentId`、および `occurredAt` の組み合わせで重複を排除してください。同じインシデントの更新は `occurredAt` 順に並べてください。
+
+購読が終了した場合や、ページをアーカイブした場合、またはページを非公開に切り替えた場合は、そのエンドポイント向けの更新を新たにキューに追加しません。
+
+ページ管理者は **ステータスページ → 購読者 → 配信履歴** で、各配信の試行履歴、状態、最後のエラーを確認できます。成功または失敗した配信の記録は、ページに設定した配信履歴の保持期間（30日、60日、90日、180日、365日のいずれか）が過ぎると削除します。
+
+## 購読を解除する
+
+確認リクエストに含まれる `unsubscribeUrl` を開くか、トークンを送信してください。
+
+```bash
+curl -X POST "$STATUS_PAGE_ORIGIN/api/v1/public/status-pages/<page_slug>/subscriptions/unsubscribe" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token>"}'
+```
+
+この呼び出しは、`"accepted": true` を含む `200 OK` を返します。そのエンドポイントへの配信がまだ待機中の場合は、キャンセルします。
+
+`status_pages.subscribers.manage` 権限があれば、**ステータスページ → 購読者** で購読者の購読を解除したり、確認待ちの購読者に対して **確認メッセージを再送** を選択したりできます。再送すると、新しいトークンを発行します。
+
+<CardGroup cols={2}>
+  <Card title="ステータスページ" icon="signal" href="/ja/status-pages">
+    ページを作成し、インシデントやメンテナンスの情報を公開し、購読者を管理します。
+  </Card>
+  <Card title="Webhook通知コネクター" icon="webhook" href="/ja/notification-channels/webhooks">
+    Slack、Lark、または汎用Webhookにアラート通知を送信します。
+  </Card>
+</CardGroup>

@@ -1,0 +1,156 @@
+---
+title: "Búsqueda de registros"
+description: "Enumera página por página los registros de un flujo, cuenta cuántos hay a lo largo del tiempo y describe los valores de un campo."
+"en_link": "/en-US/api/web/logs"
+"zh-Hans_link": "/zh-Hans/api/web/logs"
+"zh-Hant_link": "/zh-Hant/api/web/logs"
+"ja_link": "/ja/api/web/logs"
+"ko_link": "/ko/api/web/logs"
+"de_link": "/de/api/web/logs"
+"fr_link": "/fr/api/web/logs"
+"pt-BR_link": "/pt-BR/api/web/logs"
+---
+
+Estas llamadas leen un flujo de registros de la organización, tal como lo hace la página **Registros**. Si el flujo no existe, devuelven un resultado vacío. Todas las llamadas requieren `logs.read` o, en el ámbito del sistema, `sys.telemetry.read`.
+
+Cada llamada admite `POST` con un cuerpo JSON o `GET` con los mismos campos en la cadena de consulta: `filters` y `freeText` como texto de una lista JSON, y `where` como texto de un objeto JSON. Si la consulta es demasiado larga para la URL, envíala con `POST`.
+
+## Qué registros coinciden con una llamada
+
+Una llamada selecciona los registros del flujo que están dentro del intervalo y cumplen todas estas condiciones:
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `filters` | lista | Filtros que deben cumplirse todos. Se admiten hasta 32 en total, incluidos los filtros de `where`. |
+| `freeText` | lista | Palabras o frases que se buscan en el campo `message`, de hasta 512 bytes cada una. Si una palabra está en minúsculas, solo contiene letras y dígitos y ocupa hasta 40 bytes, la búsqueda no distingue entre mayúsculas y minúsculas. El resto del texto se busca tal como se escribe. Se admiten hasta 8 elementos de texto en total, incluidos los de `where`. |
+| `where` | objeto | Árbol de condiciones que permite combinar alternativas: un filtro, `{"text": "..."}`, `{"and": [...]}` o `{"or": [...]}`. |
+| `expression` | cadena | Consulta de campos con la sintaxis de la página **Registros**. Sustituye a `filters`, `freeText` y `where`: envía la expresión o esos campos, pero no ambos. |
+
+Un filtro es un objeto con `field`, `op`, `value` y `quoted`. Usa el nombre que tiene el campo en el flujo.
+
+| Operador | Campos | Coincidencias |
+|---|---|---|
+| `=`, `!=` | Cualquier campo escalar | El valor indicado o cualquier valor distinto, respectivamente. Si el valor está vacío, comprueba si el campo tiene algún valor: `=` selecciona los registros en los que el campo no tiene valor. |
+| `>`, `>=`, `<`, `<=` | Números y marcas de tiempo | Los valores que satisfacen la comparación. |
+| `contains` | Texto | El valor en cualquier parte del campo. |
+| `match` | Cualquier campo | El valor como subcadena, sin distinguir entre mayúsculas y minúsculas. Un valor vacío no coincide con ningún registro. |
+| `match_text` | Texto con un índice de texto completo | Búsqueda de texto completo con palabras, frases y comodines. Si el campo no tiene un índice de texto completo, la llamada devuelve `400`. |
+
+`eq`, `ne` y `like` son alias de `=`, `!=` y `contains`, respectivamente. `quoted` es `true` si el valor se escribe entre comillas: es una palabra, nunca un número. No puedes filtrar un campo JSON de esta forma. Consúltalo con SQL.
+
+`expression` admite el texto de la página **Registros**: comparaciones, `MATCH(field, 'text')` y `MATCH_TEXT(field, 'words')`, palabras de búsqueda, frases entre comillas, `AND` y `OR` sin distinción entre mayúsculas y minúsculas, y paréntesis. `AND` tiene prioridad sobre `OR`. El servidor convierte la expresión en los campos `filters`, `freeText` y `where` que envía la página y los valida como se indica arriba. El texto admite hasta 8 KiB y hasta 32 niveles de paréntesis anidados. Si el servidor no puede interpretar una parte, como un paréntesis sin cerrar o una comparación sin valor, devuelve `400` e identifica esa parte.
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/logs" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'stream=app' \
+  --data-urlencode "expression=level = 'error' AND (service.name = 'checkout' OR timeout)"
+```
+
+## Listar registros
+
+```http
+POST /api/v1/web/logs
+GET  /api/v1/web/logs
+```
+
+Devuelve los registros coincidentes, del más reciente al más antiguo, con paginación mediante cursor.
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `stream` | cadena | Obligatorio. El flujo de registros. |
+| `from`, `to` | entero | El intervalo en microsegundos. De forma predeterminada, abarca las últimas 24 horas hasta el momento actual. `to` debe ser mayor que `from`. |
+| `filters`, `freeText`, `where`, `expression` | | Criterios de coincidencia de la llamada. |
+| `limit` | entero | Tamaño de página. El valor predeterminado es `20`. Los valores fuera del rango de 1 a 5000 se ajustan al límite más cercano. |
+| `cursor` | cadena | El `nextCursor` o `previousCursor` de una página anterior. Conserva el intervalo y los criterios de coincidencia de la primera página. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/web/logs \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"stream":"app","expression":"level = '\''error'\''","limit":2}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    { "_timestamp": 1790000000000000, "level": "error", "message": "db pool exhausted", "trace_id": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "nextCursor": "eyJ2IjoxLC...",
+  "previousCursor": null,
+  "hasMore": true
+}
+```
+</ResponseExample>
+
+Cada elemento contiene los campos de un registro. `_timestamp` se expresa en microsegundos. Si una solicitud incluye un `cursor` y cambia el flujo, el intervalo, `limit` o los criterios de coincidencia, la llamada devuelve `400`.
+
+## Contar registros a lo largo del tiempo
+
+```http
+POST /api/v1/web/logs/histogram
+GET  /api/v1/web/logs/histogram
+```
+
+Cuenta los registros coincidentes por intervalo de agrupación.
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `stream` | cadena | Obligatorio. |
+| `from`, `to` | entero | Obligatorios. El intervalo en microsegundos. |
+| `filters`, `freeText`, `where`, `expression` | | Criterios de coincidencia de la llamada. |
+| `bucketTime` | entero | Duración de cada intervalo de agrupación, en microsegundos. Como mínimo, `1000`. |
+| `originTime` | entero | Inicio del primer intervalo de agrupación. No puede ser posterior a `from`. |
+
+Una solicitud abarca como máximo 512 intervalos de agrupación entre `originTime` y `to`.
+
+```json
+{
+  "bucketTime": 60000000,
+  "originTime": 1790000100000000,
+  "buckets": [{ "startTime": 1790000100000000, "total": 120, "errors": 4 }],
+  "split": true
+}
+```
+
+`buckets` enumera los intervalos de agrupación que contienen al menos un registro, del más antiguo al más reciente. `errors` cuenta los registros con nivel `ERROR`, según el valor de `level` o `body_level`. `split` es `false` si el flujo no tiene ninguno de esos campos o si quien consulta no puede ver el nivel. En ese caso, `errors` es `0`. Si el recuento no está disponible, la llamada devuelve `200` con `buckets` vacío y uno de estos valores en `unavailable`: `time_budget`, `busy` o `scan_limit`, al igual que el [recuento de trazas](/es/api/web/trace#contar-trazas-por-intervalo-de-tiempo).
+
+## Describir un campo
+
+```http
+POST /api/v1/web/logs/field-stats
+GET  /api/v1/web/logs/field-stats
+```
+
+Describe los valores que toma un campo en los registros coincidentes.
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `stream` | cadena | Obligatorio. |
+| `from`, `to` | entero | El intervalo en microsegundos. |
+| `filters`, `freeText`, `where`, `expression` | | Criterios de coincidencia de la llamada. |
+| `field` | cadena | Obligatorio. El nombre del campo en el flujo. |
+
+```json
+{
+  "kind": "text",
+  "total": 1840,
+  "present": 1840,
+  "distinct": 3,
+  "distinctExact": true,
+  "top": [{ "value": "info", "count": 1500 }, { "value": "warn", "count": 300 }, { "value": "error", "count": 40 }],
+  "topSkipped": false
+}
+```
+
+`kind` puede ser `number`, `time`, `text` o `bool`. `total` cuenta los registros coincidentes y `present` cuenta los que tienen un valor. `top` enumera los valores más frecuentes en orden decreciente de frecuencia. `topSkipped` es `true` cuando casi todos los valores son distintos y no se enumera ninguno. `range` indica los valores mínimo y máximo como texto. Si el campo es numérico, la respuesta incluye también `spread` y `bars`. `trend` cuenta los valores más frecuentes a lo largo del intervalo y no aparece si ningún valor es más frecuente que los demás.
+
+## Errores
+
+| Estado | Causa |
+|---|---|
+| `400` | Un parámetro no es válido: falta `stream`; `to` no es mayor que `from`; un filtro indica un campo desconocido o usa un operador que el tipo del campo no admite; las listas o el árbol superan sus límites; `expression` se envía junto con `filters`, `freeText` o `where`, o contiene una parte que el servidor no puede interpretar; el cursor no coincide con la consulta; o falta un parámetro del histograma o este abarca más de 512 intervalos de agrupación. |
+| `403` | El token no tiene el permiso `logs.read`. |

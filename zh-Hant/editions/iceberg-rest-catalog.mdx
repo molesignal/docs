@@ -1,0 +1,134 @@
+---
+title: "Iceberg REST Catalog"
+sidebarTitle: "Iceberg REST Catalog"
+description: "透過受管理的 Apache Iceberg REST Catalog，使用 Spark、Trino、Flink、DuckDB 查詢 MoleSignal 遙測資料。"
+tag: "enterprise cloud"
+"en_link": "/en-US/editions/iceberg-rest-catalog"
+"zh-Hans_link": "/zh-Hans/editions/iceberg-rest-catalog"
+"ja_link": "/ja/editions/iceberg-rest-catalog"
+"ko_link": "/ko/editions/iceberg-rest-catalog"
+"de_link": "/de/editions/iceberg-rest-catalog"
+"es_link": "/es/editions/iceberg-rest-catalog"
+"fr_link": "/fr/editions/iceberg-rest-catalog"
+"pt-BR_link": "/pt-BR/editions/iceberg-rest-catalog"
+---
+
+<Warning>
+  規劃中，適用於企業版與 MoleSignal Cloud。此功能仍在設計階段，尚未納入任何發行版本，開放原始碼版不提供此功能。本頁所述的名稱、範圍與行為可能在發布前調整。
+</Warning>
+
+Iceberg REST Catalog 將組織的遙測資料發布為 [Apache Iceberg](https://iceberg.apache.org) 資料表。在組織自行選擇的基礎架構上執行的查詢引擎連線至 Catalog 後，即可將資料流識別為資料表，並直接從物件儲存讀取 Parquet 檔案。MoleSignal 負責資料表、中繼資料、權限、租戶邊界與資料位置；組織自行選擇與操作引擎、執行查詢並管理運算資源。
+
+## 職責分工
+
+MoleSignal 負責：
+
+- **資料表。** 每個開放的資料流都會呈現為唯讀的 Iceberg 資料表，結構描述與資料流一致。
+- **中繼資料。** 快照、資料檔案與統計資訊一律與合併和保留原則保持一致。
+- **權限。** Catalog 決定各主體可以列出及讀取哪些資料表。
+- **租戶隔離。** 各組織只能看到自己的資料表和檔案。
+- **資料位置。** MoleSignal 決定檔案的儲存位置，並針對該位置簽發短期有效的唯讀憑證。
+
+組織自行負責：
+
+- **引擎。** Apache Spark、Trino、Apache Flink、DuckDB，或任何支援 Iceberg REST Catalog 規格的用戶端。
+- **工作負載。** 查詢、ETL 管線、機器學習工作與 BI 儀表板。
+- **運算資源與成本。** 叢集、排程與結果儲存。
+
+## 連線流程
+
+<Steps>
+  <Step title="身分驗證">
+    引擎向 Catalog 端點提供 API 權杖或服務帳號憑證。
+  </Step>
+  <Step title="探索資料表">
+    Catalog 列出該主體可讀取的資料流，並依資料流類型分組。
+  </Step>
+  <Step title="載入資料表">
+    Catalog 傳回同一份一致性快照的結構描述、分割區與資料檔案，並附上該資料表儲存位置的短期唯讀憑證。
+  </Step>
+  <Step title="讀取檔案">
+    引擎直接從物件儲存讀取 Parquet 檔案。檔案內容不經過 MoleSignal。
+  </Step>
+</Steps>
+
+## 選擇存取方式
+
+| | Iceberg REST Catalog | [Arrow Flight SQL](/zh-Hant/query/database-clients) |
+|---|---|---|
+| 查詢執行位置 | 組織自己的引擎 | MoleSignal |
+| 典型用途 | 依時間範圍進行的批次分析、ETL、機器學習與 BI | 資料庫用戶端的互動式 SQL |
+| 欄位遮罩 | 不生效，請參閱[資料保護邊界](#資料保護邊界) | 生效 |
+| 版本 | 企業版與 Cloud（規劃中） | 所有版本 |
+
+如需執行受治理的互動式查詢，請使用 Flight SQL 或查詢 API。若需要在引擎端使用自有運算資源掃描大範圍的時間區間，請使用 Catalog。
+
+## 開放的內容
+
+- **一個資料流對應一個資料表。** 命名空間與資料流類型一致：`logs`、`metrics`、`traces`、`profiles`。
+- **欄與資料流的結構描述一致。** `_timestamp` 位於第一欄，採用 UTC，精確到微秒。JSON 欄位為字串。加密欄位維持密文。
+- **檔案依事件時間分割。** 依時間範圍篩選時，可略過不相關的檔案。
+- **不開放。** 儲存在記憶體中的 Extend 資料表，以及 MoleSignal 為內部功能維護的衍生讀取模型。
+
+## 存取控制
+
+- **身分驗證。** 使用 API 權杖（`mspat-<36>`）或服務帳號憑證，與 HTTP API、Flight SQL 使用的憑證相同。
+- **授權。** Catalog 使用獨立的權限控管存取，權限名稱將在發布時確定。讀取資料表需要該權限與 `streams.query`。
+- **租戶隔離。** 每個組織都有獨立的 Catalog 範圍。儲存憑證僅適用於所要求的資料表檔案，短時間內即會到期，且不允許寫入或刪除。
+- **稽核。** 憑證簽發與開放範圍變更都會記錄為稽核事件。
+
+## 資料保護邊界
+
+<Warning>
+  直接讀取 Parquet 檔案的引擎會看到儲存的原始值。欄位遮罩規則僅適用於 MoleSignal 查詢和 Flight SQL 的結果，不適用於引擎直接讀取的檔案。加密欄位在檔案中維持加密，引擎讀到的是密文。
+</Warning>
+
+因此，存取 Catalog 等同於存取已開放資料流的原始資料：
+
+- 僅將 Catalog 權限授予有權讀取未遮罩資料的主體。
+- 管理員決定 Catalog 開放哪些資料流。符合生效中欄位遮罩規則的資料流，須經管理員明確允許才會開放。
+- Metrics 資料流不適用欄位遮罩，依一般開放設定處理。
+
+## 資料新鮮度與一致性
+
+- 快照只列出已提交的檔案。仍在擷取緩衝區中的記錄，要等到下一次寫入儲存空間後才會顯示。
+- 合併和保留原則的執行結果會反映在下一份快照中。物件儲存會在寬限期內保留因合併而被取代的檔案，讓已依舊快照規劃的工作能夠完成。執行時間超過寬限期的工作需要重新規劃。
+
+## 支援的引擎
+
+Catalog 遵循開放的 Iceberg REST Catalog 規格。驗證目標如下：
+
+| 引擎 | 狀態 |
+|---|---|
+| Apache Spark | 規劃中 |
+| Trino | 規劃中 |
+| Apache Flink | 規劃中 |
+| DuckDB | 規劃中 |
+| PyIceberg 及其他 REST Catalog 用戶端 | 預期可用，尚未驗證 |
+
+已驗證的版本和連線設定將在發布時公布。
+
+## 首個版本的限制
+
+- **唯讀。** Catalog 拒絕寫入、建立資料表和變更結構描述。請在資料流上修改結構描述和保留原則。
+- **僅提供目前的快照。** 不提供時間旅行、分支和標籤。
+- **不支援檢視表或多資料表交易。**
+- **不代管組織自有的資料表。** 引擎可同時掛載多個 Catalog，因此可將結果與組織自行維運的 Catalog 中的資料表關聯，也可將結果寫入這些資料表。
+- **僅支援可簽發限定存取範圍之憑證的物件儲存。** `local` 物件儲存後端無法向外部引擎提供檔案。
+
+## 可用性
+
+| 版本 | 可用性 |
+|---|---|
+| 開放原始碼版 | 不包含此功能。如需從外部透過 SQL 存取，請使用 [Arrow Flight SQL](/zh-Hant/query/database-clients)。 |
+| 企業版 | 規劃中。需要引擎可存取的物件儲存，以及包含此功能的授權。 |
+| MoleSignal Cloud | 規劃中。各區域會在組織資料所在的同一區域提供 Catalog。 |
+
+<CardGroup cols={2}>
+  <Card title="使用資料庫用戶端連線" icon="database" href="/zh-Hant/query/database-clients">
+    現在即可透過 Arrow Flight SQL 查詢 MoleSignal。
+  </Card>
+  <Card title="安全性與多租戶" icon="shield" href="/zh-Hant/security">
+    租戶隔離、欄位遮罩與欄位加密。
+  </Card>
+</CardGroup>

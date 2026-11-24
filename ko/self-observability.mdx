@@ -1,0 +1,181 @@
+---
+title: "자체 관측성"
+description: "MoleSignal 자체의 로그, 메트릭, 트레이스, 프로파일, 상태 및 노드 로컬 진단을 관리합니다."
+"en_link": "/en-US/self-observability"
+"zh-Hans_link": "/zh-Hans/self-observability"
+"zh-Hant_link": "/zh-Hant/self-observability"
+"ja_link": "/ja/self-observability"
+"de_link": "/de/self-observability"
+"es_link": "/es/self-observability"
+"fr_link": "/fr/self-observability"
+"pt-BR_link": "/pt-BR/self-observability"
+---
+
+프로세스 로그는 설정된 콘솔 또는 파일로 계속 출력합니다. MoleSignal은 플랫폼 메트릭,
+트레이스, 프로파일을 보호된 `_sys` 조직에 기록합니다. 저장된 각 신호는 해당 스트림 유형과 함께
+정확히 `_molesignal`이라는 스트림 이름을 사용합니다.
+
+| 신호 | 유형별 스트림 | 내용 |
+|---|---|---|
+| 메트릭 | `metrics/_molesignal` | 카운터, 게이지, 히스토그램, 요약입니다. |
+| 트레이스 | `traces/_molesignal` | 테일 샘플링을 거친 표준 형식의 완료된 스팬입니다. |
+| 프로파일 | `profiles/_molesignal` | 오브젝트 스토리지의 pprof 블롭에 연결된 프로파일 메타데이터입니다. |
+
+`sys.telemetry.read` 권한이 있는 시스템 범위에서만 이 스트림을 쿼리할 수 있습니다.
+
+## 자체 텔레메트리 수집 활성화
+
+```toml
+[telemetry.self_collect]
+enabled = true
+metrics_enabled = true
+metrics_interval_secs = 15
+queue_capacity = 8192
+batch_max_events = 256
+batch_max_delay_ms = 1000
+flush_timeout_secs = 5
+profile_kinds = ["cpu"]
+profile_interval_secs = 600
+profile_duration_secs = 10
+```
+
+저장 대상을 테넌트 조직으로 변경할 수 없습니다. 공개 수집, 스트림 변경 작업 및
+파이프라인으로는 `_molesignal`을 생성하거나 덮어쓰거나 삭제할 수 없습니다.
+
+스트림을 생성할 때 리텐션을 7일로 설정합니다. 리텐션과 메트릭 스트림의 다운샘플링 설정은
+`_sys` 조직에서 해당 스트림의 **리텐션** 탭에서 변경합니다. 재시작해도 설정값은 유지됩니다.
+
+역할을 분리한 배포에서는 수집 역할이 없는 노드가 자체 텔레메트리를 정상 상태의 수집 노드로 전달합니다.
+모든 역할에 동일한 `MS_SELF_TELEMETRY_CLUSTER_TOKEN`을 설정합니다.
+
+## 백엔드 분산 트레이싱
+
+MoleSignal은 HTTP, gRPC, Flight SQL, 데이터베이스, 오브젝트 스토리지, 수집, 쿼리,
+백그라운드 워커, Agent 단계를 계측합니다.
+
+스팬은 OpenTelemetry 시맨틱 규칙 1.43.0을 따릅니다. 표준 속성은 표준 이름을 그대로 사용하고,
+MoleSignal이 추가하는 속성은 `molesignal.`로 시작합니다. 각 스팬은
+`semantic_conventions_version`에 버전을 기록합니다.
+
+수신한 W3C 컨텍스트는 검증하거나 교체합니다. 외부 배기지로는 조직 접근 권한을 부여하지 않습니다.
+민감한 요청 본문, SQL 값, 자격 증명, 프롬프트, 모델 출력, 도구 인수는
+스팬에 기록하지 않습니다.
+
+SQL 스팬은 구문의 값을 `?`로 바꾼 뒤 키를 사용해 계산한 지문인 `molesignal.db.query.fingerprint`를 담을 수 있습니다.
+오브젝트 스토리지 스팬은 오브젝트 키에서 별도의 키를 사용해 계산한 지문인 `molesignal.object.key_fingerprint`를 담을 수 있습니다.
+이렇게 하면 SQL 구문이나 오브젝트 키를 저장하지 않고도 각각에 해당하는 스팬을 그룹화할 수 있습니다.
+지문은 다음 환경 변수에 16바이트 이상의 값이 설정된 동안에만 기록합니다.
+[`MS_TRACE_FINGERPRINT_KEY`](/ko/configuration#환경-변수)
+
+테일 샘플러는 다음 우선순위에 따라 트레이스 보존 여부를 결정합니다.
+
+1. 배포 또는 런타임 설정으로 비활성화
+2. 신뢰할 수 있는 디버그 요청에 따른 강제 보존
+3. 오류가 발생한 트레이스
+4. 느린 트레이스
+5. 정책 규칙을 지정된 순서대로 적용
+6. 일반 샘플링 비율을 결정론적으로 적용
+
+샘플러와 자체 수집 및 내보내기 큐에는 한도가 있으며, 문제가 생겨도 서비스 트래픽은 차단하지 않습니다.
+카디널리티가 고정된 구성 요소 메트릭은 `/metrics`에서, 상세 상태는
+`GET /api/v1/system/telemetry`에서 확인합니다.
+
+## 노드 로컬 pprof
+
+진단 리스너는 기본적으로 비활성화되어 있습니다:
+
+```toml
+[profiling]
+enabled = true
+bind = "127.0.0.1"
+port = 5086
+allow_remote = false
+```
+
+동일한 설정 키는 `MS_PROFILING_ENABLED`, `MS_PROFILING_BIND`, `MS_PROFILING_PORT`,
+`MS_PROFILING_ALLOW_REMOTE`로 설정할 수도 있습니다. `bind`에는 `localhost`와 같은 호스트 이름이 아니라 IP 주소를 지정합니다. 포트는
+활성화된 다른 리스너의 포트와 달라야 합니다. 노드에서 실행하지 않는 역할의 리스너도 포함하며,
+포트가 겹치면 시작 시 프로세스가 중지됩니다. [pprof](/ko/configuration#pprof)를 참조합니다.
+
+프로파일을 캡처합니다:
+
+```bash
+curl --fail --output cpu.pb.gz \
+  'http://127.0.0.1:5086/debug/pprof/profile?seconds=30'
+
+curl --fail --output heap.pb.gz \
+  'http://127.0.0.1:5086/debug/pprof/heap'
+```
+
+리스너는 루프백에 바인딩한 상태로 유지하고 SSH 터널을 사용합니다. 원격 노출에는
+`allow_remote = true` 설정, 네트워크 접근 제어, 리스너 앞단의 TLS, 관리자용
+Bearer 자격 증명이 필요합니다.
+
+## 상태 확인 및 단계적 배포
+
+- `/api/v1/healthz`는 공개 엔드포인트로, 프로세스의 동작 여부와 의존성 상태를 보고합니다. 컨테이너와 로드 밸런서의 프로브에 사용합니다.
+- `/api/v1/readyz`는 노드가 시작된 후 트래픽을 받을 준비가 되었는지 보고합니다. Bearer 토큰이 필요합니다.
+- `/metrics`는 테넌트 레이블 없이 Prometheus 메트릭을 노출합니다.
+- `X-Request-Id`와 `X-Trace-Id`는 요청을 보존된 트레이스와 연결합니다.
+
+분산 트레이싱을 처음 도입할 때는 `telemetry.trace.force_disabled = true`로 시작합니다. 시스템 리소스와
+개인정보 보호 요건을 확인하고 카나리에서 활성화한 후, 저장된 런타임 정책의 적용 범위를 확대합니다.
+
+## 구성 요소 메트릭
+
+모든 노드는 `/metrics`에서 아래 메트릭을 노출합니다. 레이블 값은 미리 정해진 목록에서만 가져오며
+조직, 트레이스, 경로 또는 객체 키를 식별하지 않습니다. `_sys` 조직에서는
+기본 제공 대시보드 **MoleSignal 자체 텔레메트리 및 런타임**과 **MoleSignal 트레이싱 및 APM**이
+이 메트릭을 차트로 표시합니다.
+
+### 자체 텔레메트리 및 메타데이터 데이터베이스
+
+| 메트릭 | 레이블 | 의미 |
+|---|---|---|
+| `self_telemetry_accepted_total` | `signal` | `_molesignal` 스트림에 전달하기 위해 수신한 레코드 수입니다. |
+| `self_telemetry_dropped_total` | `signal`, `reason` | `_molesignal` 스트림으로 전달하는 중에 삭제한 레코드 수입니다. `reason`은 `queue_full`, `queue_closed`, `trace_candidate_queue`, `delivery_failed`, `flush_timeout`, `persistence_failed` 중 하나입니다. 예약된 프로파일을 캡처하지 못한 경우에는 `capture_busy`, `unavailable`, `invalid_duration`, `capture_failed` 중 하나입니다. |
+| `self_telemetry_batches_total` | `signal`, `outcome` | 전송한 배치 수입니다. `outcome`은 `success` 또는 `error`입니다. |
+| `self_telemetry_retries_total` | `signal`, `reason` | `intake` 역할이 없는 노드가 수집 노드로 배치 전달을 재시도한 횟수입니다. 사유는 `no_intake`, `connect`, `push` 중 하나입니다. |
+| `self_telemetry_queue_depth`, `self_telemetry_queue_capacity` | `signal` | 트레이스 큐에서 대기 중인 스팬 수와 큐 용량(`queue_capacity`)입니다. `traces`에만 큐가 있습니다. |
+| `self_telemetry_last_success_unixtime` | `signal` | 마지막 배치 전송이 성공한 시각입니다. Unix 에포크 이후 경과한 초로 표시합니다. |
+| `self_telemetry_profile_available` | `kind` | 현재 빌드가 이 플랫폼에서 `cpu` 또는 `heap` 프로파일을 캡처할 수 있으면 `1`, 아니면 `0`입니다. |
+| `db_pool_connections` | `pool`, `state` | 메타데이터 데이터베이스 연결 풀(`pool="meta"`)의 연결 수입니다. `total`, `idle`, `checked_out`과 설정된 `min`, `max`를 표시합니다. |
+| `db_pool_acquire_duration_seconds` | `pool` | 풀에서 연결을 가져오기까지 대기한 시간입니다. 이후 SQL 문을 실행하는 시간은 포함하지 않습니다. |
+
+`signal`은 `metrics`, `traces`, `profiles` 중 하나입니다. 레코드를 삭제해도 프로세스는 계속 실행되며,
+`_molesignal` 스트림에는 데이터 누락이 발생합니다.
+
+### APM 프로젝션
+
+프로젝션은 트레이스 후보를 소유한 노드에서 실행하고, 롤업은 `alert` 역할을 맡은 노드에서 실행합니다.
+[APM](/ko/configuration#apm)을 참조합니다.
+
+| 메트릭 | 레이블 | 의미 |
+|---|---|---|
+| `molesignal_apm_facts_total` | `result` | 프로젝션에 도달한 스팬 수를 결과별로 집계합니다. 결과는 `accepted`, `duplicate_skip`, `late_kept`, `late_dropped`, `queue_full`, `stopped`, `cardinality_rejected`, `extract_failed`, `flush_failed` 중 하나입니다. `flush_failed`는 스팬이 아니라 쓰기 실패 횟수를 집계합니다. |
+| `molesignal_apm_cardinality_total` | `reason` | [카디널리티 한도](/ko/apm/settings#카디널리티-한도)를 초과한 스팬 수입니다. `service_rejected`, `transaction_overflow` 등 초과한 한도별로 집계합니다. 거부한 서비스의 스팬은 집계에서 제외합니다. 다른 한도를 초과하면 스팬 이름을 **기타**로 집계하거나 세부 정보를 생략합니다. |
+| `molesignal_apm_queue` | `resource` | 프로젝션 큐에서 대기 중인 스팬 수(`depth`)와 큐 용량(`capacity`, `[apm].queue_capacity`)입니다. |
+| `molesignal_apm_flushes_total` | `result` | PostgreSQL에 집계 데이터를 쓴 횟수입니다. 결과는 `success` 또는 `failure`입니다. |
+| `molesignal_apm_flush_duration_seconds` | | 쓰기 작업 한 건에 걸린 시간입니다. |
+| `molesignal_apm_rollups_total` | `result` | 분 단위 집계 데이터를 시간 단위로 롤업한 횟수입니다. 결과는 `success` 또는 `failure`입니다. |
+| `molesignal_apm_rollup_rows_total` | `kind` | 롤업이 읽은 행(`source`), 쓴 행(`rollup`), 보존 기간이 지나 삭제한 행(`deleted`)의 수입니다. |
+| `molesignal_apm_lag_seconds` | `stage` | `projection`은 프로젝션이 마지막으로 수신한 스팬의 경과 시간입니다. `rollup`은 지연 도착 데이터를 허용하는 유예 시간(`[apm].late_grace_secs`)입니다. |
+| `molesignal_apm_health` | `component` | `projector`, `repository`, `rollup` 중 해당 구성 요소가 정상이면 `1`, 상태가 저하되면 `0`입니다. |
+| `molesignal_apm_api_duration_seconds` | `endpoint` | APM API 요청의 응답 시간입니다. `overview`, `services` 등 엔드포인트별로 표시합니다. |
+
+다음 조건에서 알림을 설정합니다.
+
+- `molesignal_apm_queue{resource="depth"}`가 `capacity`의 80%를 계속 초과하는 경우
+- `molesignal_apm_facts_total`에서 `result`가 `queue_full`, `cardinality_rejected` 또는
+  `flush_failed`인 값이 증가하는 경우. 이때 데이터가 누락되며 [데이터 품질 알림](/ko/apm#데이터-품질-알림-확인)에서
+  이를 부분 데이터로 표시합니다.
+- `molesignal_apm_lag_seconds{stage="projection"}`이 1분 버킷 두 개에 해당하는 120초를 계속 초과하는 경우
+- `molesignal_apm_health`가 `0`인 경우
+- `molesignal_apm_api_duration_seconds{endpoint="overview"}`의 P95가 0.5초를 계속 초과하는 경우
+
+APM 상태가 저하되더라도 `/api/v1/healthz` 또는 `/api/v1/readyz` 검사는 실패하지 않습니다. `GET /api/v1/apm/health`는
+단일 조직의 프로젝션 상태를 표시합니다. [APM API](/ko/api/apm)를 참조합니다.
+
+<Card title="구성" icon="sliders" href="/ko/configuration">
+  텔레메트리, 트레이싱, 익스포터, 프로파일링 설정을 모두 확인합니다.
+</Card>

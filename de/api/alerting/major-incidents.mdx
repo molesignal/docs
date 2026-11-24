@@ -1,0 +1,187 @@
+---
+title: "Schwerwiegende Incidents"
+description: "Stufen Sie einen Incident als schwerwiegend ein und benennen Sie Verantwortliche für Einsatzleitung, Kommunikation und Protokollführung. Richten Sie einen War Room und ein Meeting ein, verteilen Sie die Aufgaben anhand einer Checkliste und veröffentlichen Sie Updates in einem zentralen Feed."
+"en_link": "/en-US/api/alerting/major-incidents"
+"zh-Hans_link": "/zh-Hans/api/alerting/major-incidents"
+"zh-Hant_link": "/zh-Hant/api/alerting/major-incidents"
+"ja_link": "/ja/api/alerting/major-incidents"
+"ko_link": "/ko/api/alerting/major-incidents"
+"es_link": "/es/api/alerting/major-incidents"
+"fr_link": "/fr/api/alerting/major-incidents"
+"pt-BR_link": "/pt-BR/api/alerting/major-incidents"
+---
+
+Ein Incident mit weitreichenden Auswirkungen, an dem mehrere Personen arbeiten, lässt sich als schwerwiegend einstufen. Dafür gibt es drei Rollen, optional
+einen War Room (einen Feishu- oder Slack-Chat) und ein Meeting sowie eine Aufgabenliste. Statusupdates erscheinen im War Room und
+benachrichtigen die Beteiligten. Die Organisation kann auch eine Regel festlegen, die passende neue Incidents automatisch als schwerwiegend einstuft,
+sobald sie auftreten. Die Bedienung über die Oberfläche beschreibt [Schwerwiegende Incidents und Postmortems](/de/alerting/major-incidents).
+
+| Methode und Pfad | Funktion | Berechtigung |
+|---|---|---|
+| `GET /api/v1/alerts/incidents/{id}/response` | Gibt die Maßnahmen für den schwerwiegenden Incident und die zugehörigen Aufgaben zurück. | `alerts.incidents.read` für den Incident |
+| `POST /api/v1/alerts/incidents/{id}/declare` | Stuft den Incident als schwerwiegend ein. | `alerts.incidents.escalate` für den Incident |
+| `PUT /api/v1/alerts/incidents/{id}/roles` | Weist eine Rolle zu oder hebt die Zuweisung auf. | `alerts.incidents.update` für den Incident |
+| `POST /api/v1/alerts/incidents/{id}/tasks` | Fügt eine Aufgabe hinzu. | `alerts.incidents.update` für den Incident |
+| `PUT /api/v1/alerts/incidents/{id}/tasks/{taskId}` | Ändert den Titel, die zuständige Person oder den Erledigungsstatus einer Aufgabe. | `alerts.incidents.update` für den Incident |
+| `DELETE /api/v1/alerts/incidents/{id}/tasks/{taskId}` | Löscht eine Aufgabe. | `alerts.incidents.update` für den Incident |
+| `POST /api/v1/alerts/incidents/{id}/status-updates` | Veröffentlicht ein Statusupdate. | `alerts.incidents.update` für den Incident |
+| `GET /api/v1/alerts/response/settings` | Gibt die Organisationseinstellungen für schwerwiegende Incidents zurück. | `alerts.response.read` |
+| `PUT /api/v1/alerts/response/settings` | Speichert die Organisationseinstellungen für schwerwiegende Incidents. | `alerts.response.manage` |
+
+MoleSignal protokolliert die Einstufung, die Rollenzuweisung, das Öffnen des War Rooms, das Hinzufügen und Abschließen von Aufgaben sowie das Veröffentlichen von Statusupdates
+in der [Zeitleiste](/de/api/alerting/incident-timeline) des Incidents. Die Einstufung und das Speichern der
+Einstellungen protokolliert MoleSignal zusätzlich im Audit-Log.
+
+## Als schwerwiegend einstufen
+
+```http
+POST /api/v1/alerts/incidents/{id}/declare
+```
+
+| Feld | Typ | Erforderlich | Anmerkungen |
+|---|---|---|---|
+| `commanderId` | string | Nein | Die Einsatzleitung. Ohne Angabe übernimmt die Person diese Rolle, die den Incident als schwerwiegend einstuft. |
+
+Der Endpunkt gibt einen bereits als schwerwiegend eingestuften Incident unverändert zurück. Gelöste Incidents lassen sich nicht als schwerwiegend einstufen. Die Einstufung
+folgt den Organisationseinstellungen:
+
+1. MoleSignal übernimmt die Checkliste aus den Einstellungen als Aufgaben.
+2. `meeting` bestimmt, wie das Meeting zustande kommt: Bei `feishu_vc` bucht eine Feishu App ein sechsstündiges Feishu-Meeting unter Leitung
+   der Einsatzleitung. `tencentMeeting` bucht ein sechsstündiges Tencent Meeting. `zoom` startet ein Sofortmeeting.
+   `googleMeet` erstellt einen Meetingraum. `fixed_url` verwendet den festgelegten Meeting-Link.
+3. Der konfigurierte Konnektor (für Feishu App, Slack App, DingTalk oder WeCom) erstellt einen Gruppenchat namens
+   `[severity] incident summary` und fügt die für den Incident zuständigen Personen, die Rolleninhaber und die Stakeholder hinzu. Dazu nutzt der Konnektor
+   die mit ihm verknüpften Identitäten. In DingTalk und WeCom gehört die Gruppe der Einsatzleitung. Der Konnektor veröffentlicht
+   eine Eröffnungsnachricht mit den Links zum Incident und zum Meeting.
+4. Ticket-Konnektoren mit `onMajorIncident` erstellen ein [Ticket](/de/api/alerting/tickets).
+
+MoleSignal versucht, den War Room, das Meeting und die Tickets zu erstellen. Fehler protokolliert MoleSignal lediglich. Die Einstufung
+bleibt bestehen.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/declare \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"commanderId": "<user-id>"}'
+```
+</RequestExample>
+
+Beim Einstufen, Abrufen und Zuweisen von Rollen gibt der jeweilige Endpunkt `{ "response": { ... }, "tasks": [ ... ] }` zurück. `response` ist
+`null`, wenn der Incident nicht als schwerwiegend eingestuft ist.
+
+<ResponseExample>
+```json 200
+{
+  "response": {
+    "incidentId": "<incident-id>",
+    "orgId": "<organization-id>",
+    "declaredAt": 1790000000000000,
+    "declaredBy": "<user-id>",
+    "roles": { "commander": "<user-id>" },
+    "warRoom": {
+      "platform": "lark_app",
+      "connectorId": "<connector-id>",
+      "chatId": "oc_5ad11d72b830411d72b836c20",
+      "url": "https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=<token>"
+    },
+    "meetingUrl": "https://vc.feishu.cn/j/123456789",
+    "updatedAt": 1790000000000000
+  },
+  "tasks": [
+    {
+      "id": "3KJ9a1C7vXe2Rf8MbN4qLw0TzHd",
+      "orgId": "<organization-id>",
+      "incidentId": "<incident-id>",
+      "title": "Open a status page incident",
+      "assigneeId": null,
+      "done": false,
+      "doneBy": null,
+      "doneAt": null,
+      "position": 0,
+      "createdBy": "<user-id>",
+      "createdAt": 1790000000000000
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Feld | Anmerkungen |
+|---|---|
+| `declaredBy` | Gibt an, wer den Incident als schwerwiegend eingestuft hat. `null` bei Einstufung durch eine Organisationsregel. |
+| `roles` | Ordnet `commander` (Einsatzleitung), `communications` (Kommunikationsleitung) und `scribe` (Protokollführung) Benutzer-IDs zu. Nicht zugewiesene Rollen fehlen. |
+| `warRoom` | Der War Room mit `platform` (`lark_app`, `slackApp`, `dingtalk_app` oder `wecom_app`), Konnektor, Chat-ID und Beitrittslink. Gruppen in DingTalk und WeCom haben keinen Beitrittslink, daher ist `url` leer. Ohne War Room ist der Wert `null`. |
+| `meetingUrl` | Der Meeting-Link. Ohne Meeting ist der Wert `null`. |
+
+## Rollen und Aufgaben
+
+Weisen Sie eine Rolle mit `{ "role": "scribe", "userId": "<user-id>" }` zu. Mit `null` für `userId` heben Sie die Zuweisung auf.
+Stufen Sie den Incident zuerst als schwerwiegend ein.
+
+Fügen Sie eine Aufgabe mit `{ "title": "…", "assigneeId": "<user-id>" }` hinzu. Der Titel muss 1 bis 200 Zeichen lang sein.
+Pro Incident sind höchstens 50 Aufgaben möglich. Senden Sie bei Änderungen nur die Felder, die sich ändern: `title`, `assigneeId` (mit `null`
+heben Sie die Zuweisung auf) und `done`. Beim Abschließen einer Aufgabe erfasst MoleSignal `doneBy` und `doneAt`. Beim Hinzufügen und Ändern gibt der jeweilige Endpunkt
+die Aufgabe zurück, beim Löschen `{ "deleted": true }`.
+
+## Statusupdate veröffentlichen
+
+```http
+POST /api/v1/alerts/incidents/{id}/status-updates
+```
+
+| Feld | Typ | Anmerkungen |
+|---|---|---|
+| `impact` | string | Die Auswirkungen. |
+| `current` | string | Der aktuelle Stand. |
+| `next` | string | Die nächsten Schritte. |
+
+Füllen Sie mindestens eines der Felder aus. Pro Feld sind höchstens 2000 Zeichen zulässig. Stufen Sie den Incident vorher als
+schwerwiegend ein. MoleSignal erfasst das Statusupdate in der Zeitleiste, veröffentlicht es im War Room und übergibt es als Ereignis
+`incident.status_update` an die Benachrichtigungs-Engine. Das Ereignis richtet sich an die für den Incident zuständigen Personen, die Rolleninhaber und die
+in den Einstellungen hinterlegten Stakeholder. Die Benachrichtigungs-Engine nutzt dafür die integrierte Richtlinie
+[Update zu einem schwerwiegenden Incident: Stakeholder benachrichtigen](/de/notification-channels#integrierte-richtlinien). Das
+Ereignisattribut `status_update` enthält `impact`, `current`, `next` und `author` für die Person, die das Update verfasst hat. Der Endpunkt gibt
+`{ "sent": true }` zurück.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/status-updates \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"impact": "EU checkout failing for 30% of users", "current": "Rolling back v2026.10.28", "next": "Confirm the error rate drops"}'
+```
+</RequestExample>
+
+## Organisationseinstellungen
+
+```http
+PUT /api/v1/alerts/response/settings
+```
+
+| Feld | Typ | Anmerkungen |
+|---|---|---|
+| `warRoomConnectorId` | string | Der Benachrichtigungskonnektor, der War Rooms erstellt. Der Konnektor muss Gruppenchats unterstützen: `lark_app`, `slackApp`, `dingtalk_app` oder `wecom_app`. Bei `null` erstellt MoleSignal keine War Rooms. |
+| `meeting` | string | `none` (Standard, kein Meeting), `feishu_vc`, `tencentMeeting`, `zoom`, `googleMeet` oder `fixed_url`. |
+| `meetingUrl` | string | Der Meeting-Link für `fixed_url`. Er beginnt mit `https://`. |
+| `meetingConnectorId` | string | Für `feishu_vc`: der Feishu-App-Konnektor, der die Meetings bucht. Bei `null` verwendet MoleSignal den War-Room-Konnektor, der dann eine Feishu App sein muss. |
+| `tencentMeeting` | object | Pflichtangaben für `tencentMeeting`: `appId`, `sdkId` (falls vorhanden) und `secretId` der selbst entwickelten App sowie `userid` des Erstellers. |
+| `zoom` | object | Pflichtangaben für `zoom`: `accountId` und `clientId` der Server-to-Server-OAuth-App sowie `host` (eine E-Mail-Adresse oder Benutzer-ID). |
+| `googleMeet` | object | Pflichtangabe für `googleMeet`: `organizer` (eine E-Mail-Adresse), für den das Dienstkonto Meetings erstellt. |
+| `secrets` | object | Nur schreibbar: neu eingegebene Meeting-Secrets unter den Schlüsseln `tencentMeeting.secretKey`, `zoom.clientSecret` oder `googleMeet.credentials` (der Text des JSON-Schlüssels des Dienstkontos). Ein leerer Eintrag lässt den bisherigen Wert unverändert. MoleSignal behält nur das Secret für die ausgewählte Meeting-Option. |
+| `checklist` | array | Einträge, die MoleSignal bei der Einstufung als Aufgaben hinzufügt. Höchstens 30 Einträge mit jeweils bis zu 200 Zeichen. |
+| `stakeholderIds` | array | Stakeholder, die MoleSignal bei Statusupdates benachrichtigt und zu War Rooms hinzufügt. |
+| `auto` | object | Automatische Einstufung: `{ "enabled": true, "minSeverity": "critical", "conditions": [ ... ] }`. Erreicht oder überschreitet ein neuer Incident `minSeverity` und erfüllen seine Labels `conditions`, stuft MoleSignal den Incident sofort als schwerwiegend ein. `declaredBy` ist dann `null`. Verwenden Sie für `conditions` dieselbe Syntax wie in [Routing-Regeln](/de/api/alerting/create-routing-rule). |
+
+Senden Sie das vollständige Einstellungsobjekt im Request-Body. Der Endpunkt gibt die gespeicherten Einstellungen zurück. Vor dem ersten Speichern liefert ein Abruf
+die Standardwerte. MoleSignal verschlüsselt Secrets beim Speichern mit dem Root-Schlüssel. Beim Abruf gibt der Endpunkt nur `secretsSet` mit den
+Schlüsseln der hinterlegten Secrets und das schreibgeschützte Feld `war_room_types` mit den Konnektortypen zurück, die
+War Rooms erstellen können.
+
+**Fehler**
+
+| Status | Grund |
+|---|---|
+| `400` | Der Incident ist gelöst oder noch nicht als schwerwiegend eingestuft, ein Feld verletzt eine Begrenzung oder der Konnektor ist keine Feishu App oder Slack App dieser Organisation. |
+| `403` | Eine Berechtigung fehlt oder der Incident liegt außerhalb des Zugriffsbereichs. |
+| `404` | Der Incident oder die Aufgabe existiert nicht. |

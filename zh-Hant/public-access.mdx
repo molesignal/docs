@@ -1,0 +1,82 @@
+---
+title: "公開網路存取"
+description: "將 MoleSignal 部署在內部網路時，只對公開網路開放外部回呼與公開頁面。本頁說明需要開放的路徑、兩種入口設定方式，以及安全強化檢查清單。"
+"en_link": "/en-US/public-access"
+"zh-Hans_link": "/zh-Hans/public-access"
+"ja_link": "/ja/public-access"
+"ko_link": "/ko/public-access"
+"de_link": "/de/public-access"
+"es_link": "/es/public-access"
+"fr_link": "/fr/public-access"
+"pt-BR_link": "/pt-BR/public-access"
+---
+
+MoleSignal 通常部署在內網，員工透過公司網路或 VPN 存取。少數功能需要讓外部系統或公網訪客直接存取，例如 Datadog、PagerDuty 傳送的告警、Microsoft Teams 的訊息回呼，以及訪客開啟的狀態頁。MoleSignal 本身不區分請求來自內網還是公網，而是由網路入口區分：內網入口照常轉送所有請求，公網入口只轉送[下表](#需要從公網存取的路徑)用到的路徑，其他路徑一律傳回 404。
+
+對公網開放的每條路徑都有各自的驗證方式：告警來源的 Token、推送 Token、分享連結，或平台簽發的權杖。網路層的限制是第二道防線，讓公網上的掃描和憑證填充攻擊無法觸及登入與管理 API。
+
+## 需要從公網存取的路徑
+
+只開放實際用到的功能，表中各列互不相依。
+
+| 功能 | 路徑 | 方法 | 呼叫端 | 驗證方式 |
+|---|---|---|---|---|
+| [外部告警](/zh-Hant/alerting/sources) | `/api/v1/intake/alerts` | `POST` | Datadog、PagerDuty、阿里雲雲監控、騰訊雲可觀測平台、Amazon SNS，以及公網上的 Alertmanager、Grafana、Zabbix 和郵件系統 | 將告警來源的 Token 放在請求標頭或 `?token=` 中 |
+| [心跳打卡](/zh-Hant/alerting/rules#心跳規則) | 以 `/api/v1/intake/heartbeats/` 開頭 | `GET`、`POST` | 公網上的排程工作、備份指令碼 | 網址中的打卡 Token |
+| [Jira 的工單 Webhook](/zh-Hant/alerting/tickets#狀態同步) | `/api/v1/public/tickets/jira/<连接器 ID>` | `POST` | Jira Cloud | 以連接器的 Webhook 密鑰簽署的 `X-Hub-Signature` |
+| [值班行事曆訂閱](/zh-Hant/alerting/on-call#訂閱行事曆) | `/api/v1/public/calendar/<Token>.ics` | `GET` | Google 日曆、Outlook 等線上行事曆服務 | 網址中的訂閱 Token，每次讀取時重新檢查訂閱者的權限 |
+| [Teams 中的 Mole Agent](/zh-Hant/im#teams-的安全措施) | 以 `/api/v1/public/im/teams/` 開頭 | `POST` | Microsoft Bot Framework | Bot Framework 簽發的權杖 |
+| [回覆簡訊與電話按鍵](/zh-Hant/notification-channels#簡訊回覆與電話按鍵) | `/api/v1/public/notify/<连接器 ID>/replies`、`/api/v1/public/notify/<连接器 ID>/keypress` | `POST` | Twilio、Amazon SNS、阿里雲、騰訊雲和華為雲的簡訊與語音服務，以及自行架設的簡訊閘道（華為雲的網址末尾還有一段回呼 Token） | Twilio 或 SNS 的簽章，或網址中的回呼 Token |
+| [企業微信 App 的按鈕](/zh-Hant/im#企業微信-app-的按鈕) | `/api/v1/public/notify/<连接器 ID>/wecom` | `GET`、`POST` | 企業微信 | 使用連接器的接收訊息 Token 驗證訊息簽章，再用 EncodingAESKey 解密內容 |
+| [Mattermost 機器人的按鈕](/zh-Hant/im#mattermost-機器人的按鈕) | `/api/v1/public/notify/<连接器 ID>/mattermost` | `POST` | 公網上的 Mattermost 伺服器 | `?token=` 中的連接器回呼 Token |
+| [一次性處理連結](/zh-Hant/notification-channels#一次性處理連結) | 以 `/notify/actions/`、`/api/v1/public/notify/actions/` 開頭的路徑，以及[網頁檔案](#網頁檔案) | `GET`、`POST` | 在公司網路外開啟通知連結的使用者（例如透過手機開啟） | 連結中的一次性 Token |
+| [透過 API 觸發自動化](/zh-Hant/automations) | `/api/v1/public/automations/<自动化 ID>/trigger` | `POST` | CI 管線等外部系統 | 自動化本身的 Token |
+| [推送來源](/zh-Hant/connectors) | `/api/v1/_kinesis_firehose`、`/api/v1/_cloudflare`、`/api/v1/_heroku` | `POST` | Amazon Data Firehose、Cloudflare Logpush、Heroku 日誌 Drain | 連接器的推送 Token |
+| [使用者體驗](/zh-Hant/rum) | `/api/v1/rum/events`、`/api/v1/rum/replay` | `POST`、`OPTIONS` | 公網使用者的瀏覽器和 App | 應用程式的 Client Token |
+| [狀態頁](/zh-Hant/status-pages) | `/status/`、`/api/v1/public/status-pages/` 和[網頁檔案](#網頁檔案) | `GET`、`POST` | 狀態頁的訪客和訂閱者 | 公開狀態頁不需登入，私人狀態頁須透過存取連結開啟 |
+| [資源分享](/zh-Hant/resource-sharing) | `/s/`、`/shared`、`/api/v1/public/share` 和[網頁檔案](#網頁檔案) | `GET`、`POST` | 取得分享連結的使用者 | 以分享連結換取的短期工作階段 |
+| [合成監控的 Probe Agent](/zh-Hant/synthetics#地點與-probe-agent) | `/api/v1/synthetics/artifacts/` | `PUT` | 從外部地點上傳螢幕擷取畫面等產出檔案的 Probe Agent | 工作的租約 Token |
+
+MoleSignal 驗證租約 Token、檔案大小和內容雜湊值後，才將 Probe Agent 上傳的檔案寫入物件儲存。Probe Agent 無法取得物件儲存的憑證，物件儲存也不必對公網開放。Probe Agent 還要連線至 `5084`（註冊）和 `5085`（控制串流）兩個 gRPC 連接埠。這兩個連接埠由 MoleSignal 自行終止 TLS，只能在第 4 層（TCP）直接轉送，不能交由 HTTP 代理處理。若外部地點的 Probe Agent 從公網連線，請分別將這兩個連接埠對外映射，並將 `probe.register_endpoint` 和 `probe.control_endpoint` 設為對外位址，請參閱[設定](/zh-Hant/configuration)。
+
+### 網頁檔案
+
+狀態頁、分享頁和一次性處理連結的確認頁都是網頁。公網入口也要允許存取這些頁面的靜態檔案：以 `/assets/` 開頭的檔案，以及 `/favicon.ico`、`/favicon.svg`、`/favicon-dark.ico`、`/favicon-dark.svg`。只允許存取 `/status/`、`/shared`、`/notify/actions/` 這些頁面路徑和靜態檔案時，公網入口仍會對登入頁和其他頁面傳回 404。
+
+### 狀態頁的自訂網域
+
+為狀態頁綁定自訂網域後，請讓該網域也指向公網入口。這個網域的頁面位於根路徑下：`/`、`/history`、`/uptime`，以及以 `/incidents/` 開頭的路徑。資料來自以 `/api/v1/public/status-pages/` 開頭的 API。此網域只允許存取這些路徑和網頁檔案。可在公網入口管理憑證，或交由 MoleSignal 自動簽發，請參閱[自訂網域與 TLS](/zh-Hant/status-pages#自訂網域與-tls)。
+
+## 兩種入口設定方式
+
+### 內網與公網解析至不同入口
+
+建議採用此方式。內網 DNS 將 `molesignal.example.com` 解析至內網入口，公網 DNS 將同一個網域解析至公網入口。內網入口轉送所有路徑，公網入口只轉送上表所列的路徑。將 `http.external_url` 設為此網域，讓頁面顯示的接收位址、提供給傳送端的回呼位址，以及即時通訊和郵件中的連結都能在內網和公網使用。員工從內網存取時不受影響。
+
+### 同一個入口依來源位址區分
+
+只有一個入口時，上表所列的路徑對所有來源開放，其他路徑只允許公司網路和 VPN 的網段存取。此方式要求入口能取得實際的用戶端位址。如果入口前方還有負載平衡器，請使用 PROXY 協定或 `X-Forwarded-For` 傳遞原始位址。
+
+## 安全強化清單
+
+- **只使用 HTTPS。** 公網入口只監聽 443，並使用公開 CA 簽發的憑證。Teams 只會傳送至 HTTPS 網址。
+- **依 API 設定請求主體大小上限。** 外部告警 4 MiB，心跳打卡 64 KiB，Jira 的工單 Webhook 1 MiB，使用者體驗事件 5 MiB、工作階段重播 8 MiB，Probe Agent 的產出檔案 10 MiB，原生 JSON 資料接收 16 MiB，其他資料接收 API 2 MiB。超過上限時，MoleSignal 會傳回 `413`。入口的上限不得低於這些值。
+- **在公網入口限制請求速率。** 依來源位址限制每秒請求數。`standalone` 節點不會限制資料接收速率，請參閱[速率與大小限制](/zh-Hant/security#速率與大小限制)。
+- **存取日誌不記錄查詢字串。** 阿里雲雲監控只能將 Token 放在網址的 `token` 參數中，因此公網入口的存取日誌只記錄路徑。心跳打卡、值班行事曆訂閱、一次性處理連結和華為雲回呼的 Token 位於路徑中。這幾類路徑只記錄前綴，[設定範例](#設定範例)使用 `map` 替換 Token。MoleSignal 本身的追蹤只記錄路由，不記錄查詢字串。
+- **讓 MoleSignal 取得實際位址。** 在 `_sys` 組織的 **設定 → 用戶端 IP 識別** 中選取轉送鏈，並將公網入口的位址列為受信任的代理，請參閱[用戶端 IP 識別](/zh-Hant/settings/platform#用戶端-ip-識別)。使用者體驗的地理位置資訊和[登入速率限制](/zh-Hant/settings/platform#登入速率限制)都仰賴這項設定。若未設定，系統會將所有使用者視為來自入口位址。若該位址是私人 IP，系統不會計數；若是公網 IP，使用者的登入嘗試會合併計算，可能導致彼此遭到鎖定。
+- **選用：依來源位址縮小存取範圍。** 若傳送端有公布對外連線位址，可只允許這些位址存取。Datadog 在各站點的 `ip-ranges.<站点域名>` 中的 `webhooks` 一節公布位址，PagerDuty 分為美國和歐洲區域，阿里雲雲監控在告警回呼文件中列出位址，Teams 則使用 Azure 服務標籤 `AzureBotService`。這些位址會變動，請隨之更新。Token 仍是主要防線。
+- **上線前驗證。** 從公網請求 `/` 和 `/api/v1/auth/signin` 時，應傳回 `404`。未帶 Token 送出 `POST /api/v1/intake/alerts` 時，應傳回 `401`，表示請求已抵達 MoleSignal。從內網開啟 `/` 時，應顯示登入頁。
+
+## 設定範例
+
+<CardGroup cols={3}>
+  <Card title="nginx" icon="server" href="/zh-Hant/public-access/nginx">
+    設定兩個 server：內網入口轉送所有請求，公網入口只轉送回呼和公開頁面的請求。
+  </Card>
+  <Card title="Kubernetes Ingress" icon="network-wired" href="/zh-Hant/public-access/ingress">
+    使用兩個 ingress-nginx 控制器，公網控制器只列出要開放的路徑。
+  </Card>
+  <Card title="Gateway API" icon="route" href="/zh-Hant/public-access/gateway-api">
+    使用兩個 Gateway，公網 Gateway 的 HTTPRoute 依路徑和方法比對。
+  </Card>
+</CardGroup>

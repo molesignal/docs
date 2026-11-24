@@ -1,0 +1,79 @@
+---
+title: "Envoyer des alertes"
+description: "Depuis un système externe, déclenchez des alertes, accusez-en réception ou résolvez-les."
+"en_link": "/en-US/api/alerting/send-alerts"
+"zh-Hans_link": "/zh-Hans/api/alerting/send-alerts"
+"zh-Hant_link": "/zh-Hant/api/alerting/send-alerts"
+"ja_link": "/ja/api/alerting/send-alerts"
+"ko_link": "/ko/api/alerting/send-alerts"
+"de_link": "/de/api/alerting/send-alerts"
+"es_link": "/es/api/alerting/send-alerts"
+"pt-BR_link": "/pt-BR/api/alerting/send-alerts"
+---
+
+```http
+POST /api/v1/intake/alerts
+```
+
+Un système externe appelle cette adresse avec le jeton d’une [source d’alertes](/fr/alerting/sources) : dans l’en-tête `Authorization: Bearer <token>` ou, si le système ne peut pas définir d’en-têtes, dans l’adresse avec `?token=<token>`. Toutes les sources partagent cette adresse. Le jeton identifie la source de l’alerte, et le type de source détermine le format du corps de la requête. La section [Configurer l’émetteur](/fr/alerting/sources#configurer-l’expéditeur) décrit le format de chaque émetteur (une source de type e-mail lit un message brut avec `Content-Type: message/rfc822`). Cette page décrit le corps des requêtes pour le type **API**. Le corps ne peut pas dépasser 4 MiB.
+
+Le corps contient un objet d’alerte ou un tableau de 100 objets au maximum. L’API rejette les champs inconnus.
+
+| Champ | Type | Description |
+|---|---|---|
+| `action` | chaîne | `trigger` (par défaut), `acknowledge` ou `resolve`. |
+| `dedupKey` | chaîne | Clé de déduplication au sein de la source, limitée à 255 caractères. Une clé correspond à un seul incident actif à la fois. Obligatoire pour `acknowledge` et `resolve`. Pour un `trigger` sans clé, l’API calcule une clé à partir de `summary` et de `labels`, puis la renvoie dans la réponse. |
+| `summary` | chaîne | Titre de l’incident, obligatoire pour `trigger`, limité à 1024 caractères. |
+| `severity` | chaîne | `critical`, `error`, `warning` ou `info`. En l’absence de valeur, la gravité par défaut de la source s’applique. |
+| `priority` | chaîne | Priorité de l’incident, de `P1` à `P9` (ou de `1` à `9`). Si la valeur dépasse les niveaux configurés pour l’organisation, l’API applique la priorité la plus basse. En l’absence de valeur, l’incident n’a pas de priorité. |
+| `urgency` | chaîne | Urgence de l’incident, indiquée par la clé d’un niveau de l’organisation, par exemple `high` ou `low`. L’API ignore les clés inconnues. En l’absence de valeur, la politique d’escalade de la source détermine l’urgence. Une alerte sans `severity` a une urgence `high`. |
+| `labels` | objet | Jusqu’à 64 étiquettes. Une clé ne peut ni commencer par `alert.` ou `__molesignal`, ni être égale à `external.kind`. |
+| `annotations` | objet | Annotations, limitées à 64 en comptant les liens. |
+| `links` | tableau | Jusqu’à 10 liens `{"name": "…", "url": "https://…"}`. L’API ajoute chaque lien aux annotations avec `name` comme clé, ou `link` si `name` est absent. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/alerts \
+  -H "authorization: Bearer $SOURCE_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"dedupKey": "disk-full/web-1", "summary": "Disk almost full on web-1", "severity": "critical", "labels": {"host.name": "web-1"}, "links": [{"name": "Runbook", "url": "https://wiki.example.com/disk"}]}'
+```
+</RequestExample>
+
+La réponse indique le résultat de chaque alerte dans l’ordre. Si l’API lit le corps mais ne trouve aucune alerte à traiter, par exemple lors d’un événement de test PagerDuty, `message` indique pourquoi l’API n’a entrepris aucune action.
+
+<ResponseExample>
+```json 200
+{
+  "alerts": [
+    {
+      "dedupKey": "disk-full/web-1",
+      "outcome": "opened",
+      "incidentId": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+      "reason": null
+    }
+  ],
+  "message": null
+}
+```
+</ResponseExample>
+
+| `outcome` | Signification |
+|---|---|
+| `opened` | L’API a ouvert un nouvel incident. |
+| `updated` | La gravité de l’incident actif ou les alertes de son groupe de notification ont changé. |
+| `unchanged` | L’incident actif était déjà dans cet état ou avait déjà fait l’objet d’un accusé de réception. |
+| `acknowledged` | L’API a enregistré l’accusé de réception de l’incident. |
+| `resolved` | L’API a résolu l’incident, même si un accusé de réception avait déjà été enregistré. |
+| `ignored` | Rien n’a changé. `reason` indique pourquoi, par exemple en l’absence d’incident actif ou si le message est antérieur au dernier message reçu. |
+
+**Erreurs**
+
+| Statut | Cause |
+|---|---|
+| `400` | L’API ne peut pas lire le corps. `message` indique pourquoi. |
+| `401` | Le jeton est manquant ou incorrect, ou la source n’existe pas. |
+| `403` | L’organisation est désactivée. |
+| `409` | La source est désactivée. |
+| `413` | Le corps dépasse 4 MiB. |
+| `503` | Le cluster qui reçoit les alertes de la source est inaccessible ou l’API n’a pas pu traiter la requête intégralement. Réessayez : une nouvelle tentative n’ouvre pas deux fois le même incident. |

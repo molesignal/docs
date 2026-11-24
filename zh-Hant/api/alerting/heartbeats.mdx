@@ -1,0 +1,85 @@
+---
+title: "心跳簽到"
+description: "讓排程工作向心跳規則的簽到網址報到，並可查看最近一次簽到或重設簽到網址。"
+"en_link": "/en-US/api/alerting/heartbeats"
+"zh-Hans_link": "/zh-Hans/api/alerting/heartbeats"
+"ja_link": "/ja/api/alerting/heartbeats"
+"ko_link": "/ko/api/alerting/heartbeats"
+"de_link": "/de/api/alerting/heartbeats"
+"es_link": "/es/api/alerting/heartbeats"
+"fr_link": "/fr/api/alerting/heartbeats"
+"pt-BR_link": "/pt-BR/api/alerting/heartbeats"
+---
+
+[心跳規則](/zh-Hant/api/alerting/create-rule#心跳規則)會等待每次執行完畢的作業回報；超過週期加上寬限時間仍未回報，或回報失敗時，規則就會觸發。
+
+| 方法與路徑 | 用途 | 權限 |
+|---|---|---|
+| `GET`、`POST /api/v1/intake/heartbeats/{token}` | 回報，無須登入。 | 網址中的 Token |
+| `GET /api/v1/alerts/rules/{id}/heartbeat` | 查詢上次回報時間與下次回報的截止時間。 | 該規則的 `alerts.rules.read` |
+| `POST /api/v1/alerts/rules/{id}/heartbeat-token` | 重設回報網址。 | 該規則的 `alerts.rules.manage` |
+
+## 回報
+
+```http
+GET /api/v1/intake/heartbeats/{token}
+POST /api/v1/intake/heartbeats/{token}
+```
+
+首次儲存心跳規則時，系統會提供回報網址，請參閱[建立規則](/zh-Hant/api/alerting/create-rule#心跳規則)。作業成功時，向該網址傳送請求；失敗時加上 `?status=fail`，規則會立即觸發，不必等到週期結束。系統會將 `POST` 請求主體開頭的內容（最多 1000 字）記為本次回報的訊息，並顯示在事件的 `heartbeat_message` 註解中；請求主體上限為 64 KiB，超過時會傳回 `413`。收到回報後，規則會立即判定一次：回報失敗時就觸發；回報成功時，尚未結束的事件會依恢復條件恢復。
+
+<RequestExample>
+```bash cURL
+# 备份成功
+curl -fsS https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN
+
+# 备份失败，带上最后几行输出
+tail -n 20 backup.log | curl -fsS -X POST --data-binary @- \
+  "https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN?status=fail"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "ok": true, "status": "fail" }
+```
+</ResponseExample>
+
+`status` 只有 `fail` 算失敗，其他值或未提供都算成功。Token 不正確、規則已刪除或回報網址已重設時，會傳回 `404`。
+
+## 查看回報狀態
+
+```http
+GET /api/v1/alerts/rules/{id}/heartbeat
+```
+
+<ResponseExample>
+```json 200
+{
+  "lastCheckinAt": 1790000000000000,
+  "lastStatus": "ok",
+  "lastMessage": "",
+  "dueAt": 1790003900000000,
+  "alarming": false,
+  "issuedAt": 1789900000000000
+}
+```
+</ResponseExample>
+
+| 欄位 | 說明 |
+|---|---|---|
+| `lastCheckinAt` | 上次回報的時間，以 Unix 微秒表示；尚未回報時為 `null`。 |
+| `lastStatus`、`lastMessage` | 上次回報的 `ok` 或 `fail` 狀態，以及附帶的訊息。 |
+| `dueAt` | 下次回報的截止時間：上次回報時間（尚未回報時，以網址發出的時間為準）加上週期與寬限時間。 |
+| `alarming` | 目前是否應觸發警示：上次回報失敗，或已超過 `dueAt`。 |
+| `issuedAt` | 目前網址發出或重設的時間。 |
+
+規則不是心跳規則，或尚未取得回報網址時，會傳回 `404`。
+
+## 重設回報網址
+
+```http
+POST /api/v1/alerts/rules/{id}/heartbeat-token
+```
+
+重設後會改用新網址，舊網址立即失效，回報紀錄仍會保留。系統會傳回 `{ "path": "...", "url": "..." }`，只在此時提供一次回報網址；未設定外部網址時，`url` 為 `null`。系統會將重設操作記錄在稽核日誌中。規則不是心跳規則時，會傳回 `400`。

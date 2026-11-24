@@ -1,0 +1,156 @@
+---
+title: "Busca de logs"
+description: "Liste os registros de um fluxo de logs página por página, conte-os ao longo do tempo e descreva os valores de um campo."
+"en_link": "/en-US/api/web/logs"
+"zh-Hans_link": "/zh-Hans/api/web/logs"
+"zh-Hant_link": "/zh-Hant/api/web/logs"
+"ja_link": "/ja/api/web/logs"
+"ko_link": "/ko/api/web/logs"
+"de_link": "/de/api/web/logs"
+"es_link": "/es/api/web/logs"
+"fr_link": "/fr/api/web/logs"
+---
+
+Essas chamadas leem um único fluxo de logs da organização, da mesma forma que a página **Logs**. Se o fluxo não existir, a chamada retorna um resultado vazio. Todas as chamadas exigem `logs.read` ou, no escopo do sistema, `sys.telemetry.read`.
+
+Cada chamada aceita `POST` com um corpo JSON ou `GET` com os mesmos campos na string de consulta: `filters` e `freeText` como texto de uma lista JSON e `where` como texto de um objeto JSON. Se a consulta for longa demais para a URL, envie-a como `POST`.
+
+## Quais registros correspondem à chamada
+
+A chamada seleciona os registros do fluxo que estão no intervalo e atendem a todos estes critérios:
+
+| Campo | Tipo | Observações |
+|---|---|---|
+| `filters` | lista | Todos os filtros devem ser atendidos. O limite é de 32, incluindo os filtros de `where`. |
+| `freeText` | lista | Palavras ou frases a buscar no campo `message`, cada uma com até 512 bytes. Uma palavra em minúsculas, formada por letras e dígitos e com até 40 bytes, corresponde independentemente do uso de maiúsculas ou minúsculas. Outros textos correspondem exatamente como foram escritos. O limite é de 8, incluindo os textos de `where`. |
+| `where` | objeto | Árvore de condições para expressar alternativas: um filtro, `{"text": "..."}`, `{"and": [...]}` ou `{"or": [...]}`. |
+| `expression` | string | Consulta por campos no formato usado pela página **Logs**. Substitui `filters`, `freeText` e `where`: envie a expressão ou esses campos. |
+
+Um filtro é um objeto com `field`, `op`, `value` e `quoted`. Use o nome do campo conforme definido no fluxo.
+
+| Operador | Campos | Correspondência |
+|---|---|---|
+| `=`, `!=` | Qualquer campo escalar | O valor indicado ou qualquer outro valor, respectivamente. Se o valor informado estiver vazio, o operador verifica se o campo tem algum valor: `=` seleciona os registros sem valor no campo. |
+| `>`, `>=`, `<`, `<=` | Números e carimbos de data e hora | Registros que atendem à comparação. |
+| `contains` | Texto | O valor em qualquer posição no campo. |
+| `match` | Qualquer campo | O valor como trecho do campo, sem distinguir maiúsculas de minúsculas. Um valor vazio não corresponde a nenhum registro. |
+| `match_text` | Texto com índice de texto completo | Busca de texto completo com palavras, frases e curingas. Se o campo não tiver um índice de texto completo, a chamada retorna `400`. |
+
+`eq`, `ne` e `like` são aliases de `=`, `!=` e `contains`, respectivamente. `quoted` é `true` quando o valor está entre aspas: uma palavra, nunca um número. Para consultar um campo JSON, use SQL, pois esses filtros não aceitam campos desse tipo.
+
+`expression` aceita texto no formato da página **Logs**: comparações, `MATCH(field, 'text')` e `MATCH_TEXT(field, 'words')`, palavras para buscar, frases entre aspas, `AND` e `OR` sem distinção entre maiúsculas e minúsculas, e parênteses. `AND` tem precedência sobre `OR`. O servidor converte o texto nos campos `filters`, `freeText` e `where` que a página envia e aplica as validações acima. O texto aceita até 8 KiB e até 32 níveis de parênteses aninhados. Se o servidor não conseguir interpretar uma parte, como um parêntese sem fechamento ou uma comparação sem valor, retorna `400` e identifica a parte inválida.
+
+```bash
+curl -G "http://localhost:5080/api/v1/web/logs" \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'stream=app' \
+  --data-urlencode "expression=level = 'error' AND (service.name = 'checkout' OR timeout)"
+```
+
+## Listar registros
+
+```http
+POST /api/v1/web/logs
+GET  /api/v1/web/logs
+```
+
+Retorna os registros correspondentes, dos mais recentes aos mais antigos, com paginação por cursor.
+
+| Campo | Tipo | Observações |
+|---|---|---|
+| `stream` | string | Obrigatório. O fluxo de logs. |
+| `from`, `to` | inteiro | Intervalo em microssegundos. Por padrão, cobre as últimas 24 horas até o momento atual. `to` deve ser maior que `from`. |
+| `filters`, `freeText`, `where`, `expression` | | Critérios de seleção dos registros. |
+| `limit` | inteiro | Tamanho da página. O padrão é `20`. O valor é ajustado para ficar entre 1 e 5000. |
+| `cursor` | string | O `nextCursor` ou `previousCursor` de uma página anterior. O cursor mantém o intervalo e os critérios de seleção da primeira página. |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/web/logs \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"stream":"app","expression":"level = '\''error'\''","limit":2}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "items": [
+    { "_timestamp": 1790000000000000, "level": "error", "message": "db pool exhausted", "trace_id": "0af7651916cd43dd8448eb211c80319c" }
+  ],
+  "nextCursor": "eyJ2IjoxLC...",
+  "previousCursor": null,
+  "hasMore": true
+}
+```
+</ResponseExample>
+
+Cada item contém os campos de um registro. `_timestamp` está em microssegundos. Se uma solicitação com `cursor` usar outro fluxo, intervalo, `limit` ou critérios de seleção diferentes, a chamada retorna `400`.
+
+## Contar registros ao longo do tempo
+
+```http
+POST /api/v1/web/logs/histogram
+GET  /api/v1/web/logs/histogram
+```
+
+Conta os registros correspondentes em intervalos de tempo.
+
+| Campo | Tipo | Observações |
+|---|---|---|
+| `stream` | string | Obrigatório. |
+| `from`, `to` | inteiro | Obrigatórios. Intervalo em microssegundos. |
+| `filters`, `freeText`, `where`, `expression` | | Critérios de seleção dos registros. |
+| `bucketTime` | inteiro | Duração de cada intervalo em microssegundos. No mínimo `1000`. |
+| `originTime` | inteiro | Início do primeiro intervalo. Não pode ser posterior a `from`. |
+
+Uma solicitação abrange no máximo 512 intervalos de `originTime` a `to`.
+
+```json
+{
+  "bucketTime": 60000000,
+  "originTime": 1790000100000000,
+  "buckets": [{ "startTime": 1790000100000000, "total": 120, "errors": 4 }],
+  "split": true
+}
+```
+
+`buckets` lista os intervalos que contêm pelo menos um registro, do mais antigo ao mais recente. `errors` conta os registros com nível `ERROR` com base no campo `level` ou `body_level`. `split` é `false` quando o fluxo não contém nenhum dos dois campos ou quando as permissões de leitura ocultam o nível. Nesses casos, `errors` é `0`. Quando a contagem não está disponível, a chamada retorna `200` com `buckets` vazio e `unavailable` definido como `time_budget`, `busy` ou `scan_limit`, assim como na [contagem de traces](/pt-BR/api/web/trace#contar-rastreamentos-ao-longo-do-tempo).
+
+## Descrever um campo
+
+```http
+POST /api/v1/web/logs/field-stats
+GET  /api/v1/web/logs/field-stats
+```
+
+Descreve os valores de um campo nos registros correspondentes.
+
+| Campo | Tipo | Observações |
+|---|---|---|
+| `stream` | string | Obrigatório. |
+| `from`, `to` | inteiro | Intervalo em microssegundos. |
+| `filters`, `freeText`, `where`, `expression` | | Critérios de seleção dos registros. |
+| `field` | string | Obrigatório. Nome do campo conforme definido no fluxo. |
+
+```json
+{
+  "kind": "text",
+  "total": 1840,
+  "present": 1840,
+  "distinct": 3,
+  "distinctExact": true,
+  "top": [{ "value": "info", "count": 1500 }, { "value": "warn", "count": 300 }, { "value": "error", "count": 40 }],
+  "topSkipped": false
+}
+```
+
+`kind` é `number`, `time`, `text` ou `bool`. `total` conta os registros correspondentes e `present` conta os que têm um valor no campo. `top` lista os valores em ordem decrescente de frequência. `topSkipped` é `true` quando quase todos os valores são distintos e a lista não inclui nenhum deles. `range` retorna o menor e o maior valor como texto. Para campos numéricos, a resposta também inclui `spread` e `bars`. `trend` conta as ocorrências dos valores mais frequentes ao longo do intervalo e não aparece quando nenhum valor se destaca pela frequência.
+
+## Erros
+
+| Status | Causa |
+|---|---|
+| `400` | Um parâmetro é inválido: falta `stream`; `to` não é maior que `from`; um filtro indica um campo desconhecido ou usa um operador incompatível com o tipo do campo; as listas ou a árvore excedem seus limites; a solicitação combina `expression` com `filters`, `freeText` ou `where`, ou o servidor não consegue interpretar parte da expressão; o cursor não corresponde à consulta; ou falta um parâmetro do histograma ou ele abrange mais de 512 intervalos. |
+| `403` | O token não tem a permissão `logs.read`. |

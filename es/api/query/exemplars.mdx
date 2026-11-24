@@ -1,0 +1,86 @@
+---
+title: "Consultar ejemplares"
+description: "Lee los ejemplares almacenados con las muestras de escritura remota de Prometheus en el formato de respuesta de la API HTTP de Prometheus."
+"en_link": "/en-US/api/query/exemplars"
+"zh-Hans_link": "/zh-Hans/api/query/exemplars"
+"zh-Hant_link": "/zh-Hant/api/query/exemplars"
+"ja_link": "/ja/api/query/exemplars"
+"ko_link": "/ko/api/query/exemplars"
+"de_link": "/de/api/query/exemplars"
+"fr_link": "/fr/api/query/exemplars"
+"pt-BR_link": "/pt-BR/api/query/exemplars"
+---
+
+```http
+GET  /api/v1/prometheus/api/v1/query_exemplars
+POST /api/v1/prometheus/api/v1/query_exemplars
+```
+
+Devuelve los ejemplares de las series que selecciona una expresión PromQL, con la misma estructura de respuesta que el endpoint `query_exemplars` de la API HTTP de Prometheus. La página **Métricas** obtiene sus ejemplares de este endpoint. La llamada requiere `metrics.read` o `sys.telemetry.read` en el ámbito del sistema.
+
+Los ejemplares provienen de la [escritura remota de Prometheus](/es/intake#prometheus-remote_write), que los conserva junto a las muestras. El sistema almacena las métricas de OTLP sin sus ejemplares.
+
+`GET` recibe los parámetros en la cadena de consulta y `POST` los recibe como datos de formulario (`application/x-www-form-urlencoded`):
+
+| Parámetro | Obligatorio | Notas |
+|---|---|---|
+| `query` | Sí | Una expresión PromQL. Cada selector debe indicar el nombre de su métrica. |
+| `start` | Sí | Segundos desde la época Unix, con fracciones opcionales, o una fecha y hora en formato RFC 3339. |
+| `end` | Sí | Admite los mismos formatos. No puede ser anterior a `start`. |
+
+Solo cuentan los selectores de la expresión: cada uno elige las series de su métrica que cumplen sus condiciones de coincidencia de etiquetas. Las funciones, los operadores y las duraciones de los intervalos no cambian la respuesta. Si el sistema recibe un ejemplar dos veces, por ejemplo, al reintentar una escritura remota, solo lo devuelve una vez. La respuesta se limita a 10 000 ejemplares e incluye una advertencia al alcanzar el límite. Al igual que una consulta, la solicitud espera un cupo en el [control de admisión](/es/configuration#control-de-admisión). El sistema nunca almacena la respuesta en caché.
+
+El [enmascaramiento de campos](/es/settings/data-security#enmascaramiento-de-campos) se aplica a las etiquetas de las series y de los ejemplares. Si una regla enmascara `value` o `_timestamp`, la solicitud falla porque la estructura de Prometheus no admite valores enmascarados.
+
+<RequestExample>
+```bash cURL
+curl -G http://localhost:5080/api/v1/prometheus/api/v1/query_exemplars \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'query=histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{service="checkout"}[5m]))' \
+  --data-urlencode "start=$(( $(date +%s) - 3600 ))" \
+  --data-urlencode "end=$(date +%s)"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "status": "success",
+  "data": [
+    {
+      "seriesLabels": {
+        "__name__": "http_request_duration_seconds_bucket",
+        "le": "0.5",
+        "service": "checkout"
+      },
+      "exemplars": [
+        {
+          "labels": { "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7" },
+          "value": 0.43,
+          "timestamp": 1790000000.123
+        }
+      ]
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Campo | Notas |
+|---|---|
+| `data[].seriesLabels` | Las etiquetas de la serie, con el nombre de la métrica en `__name__`. |
+| `data[].exemplars[]` | Los ejemplares de la serie dentro del intervalo, del más antiguo al más reciente. |
+| `labels` | Las etiquetas del ejemplar, como `trace_id` y `span_id`. |
+| `value` | El valor observado por el ejemplar. |
+| `timestamp` | Segundos desde la época Unix, con fracciones. |
+| `warnings` | Solo aparece cuando la respuesta alcanza el límite de 10 000 ejemplares. |
+
+**Errores**
+
+| Estado | Causa |
+|---|---|
+| `400` | `query` está vacío o no es una expresión PromQL válida, un selector no indica ninguna métrica, una marca de tiempo no usa ninguno de los formatos admitidos o `end` es anterior a `start`. |
+| `403` | El token no tiene el permiso `metrics.read` o una regla de enmascaramiento se aplica a `value` o `_timestamp`. |
+| `429` | El [control de admisión](/es/configuration#control-de-admisión) rechazó la solicitud. |
+
+Estos errores usan el [cuerpo de error](/es/api-reference#respuestas-y-errores) de los demás endpoints, no el de Prometheus.

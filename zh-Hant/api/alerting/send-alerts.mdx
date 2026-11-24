@@ -1,0 +1,79 @@
+---
+title: "接收外部告警"
+description: "接收外部系統送來的告警：觸發、確認、復原。"
+"en_link": "/en-US/api/alerting/send-alerts"
+"zh-Hans_link": "/zh-Hans/api/alerting/send-alerts"
+"ja_link": "/ja/api/alerting/send-alerts"
+"ko_link": "/ko/api/alerting/send-alerts"
+"de_link": "/de/api/alerting/send-alerts"
+"es_link": "/es/api/alerting/send-alerts"
+"fr_link": "/fr/api/alerting/send-alerts"
+"pt-BR_link": "/pt-BR/api/alerting/send-alerts"
+---
+
+```http
+POST /api/v1/intake/alerts
+```
+
+外部系統使用[告警來源](/zh-Hant/alerting/sources)的 Token 呼叫：在請求標頭中設定 `Authorization: Bearer <token>`；若無法設定請求標頭，則在網址加上 `?token=<token>`。所有來源共用這個網址。Token 用來識別來源，來源類型決定以哪種格式解析請求本文。各來源的格式請參閱[設定傳送端](/zh-Hant/alerting/sources#設定傳送端)（電子郵件來源會讀取 `Content-Type: message/rfc822` 的原始郵件）。這裡說明 **API** 類型的請求本文。請求本文大小上限為 4 MiB。
+
+請求本文可以是單一告警物件，也可以是最多包含 100 個告警物件的陣列。若包含無法識別的欄位，系統會拒絕請求。
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `action` | string | `trigger`（預設）、`acknowledge` 或 `resolve`。 |
+| `dedupKey` | string | 來源內的去重鍵，最多 255 個字元；同一個鍵同時只能有一個活動事件。`acknowledge` 和 `resolve` 必填。若 `trigger` 未提供此欄位，系統會根據 `summary` 和 `labels` 算出去重鍵，並在回應中傳回。 |
+| `summary` | string | 事件標題，`trigger` 必填，最多 1024 個字元。 |
+| `severity` | string | `critical`、`error`、`warning` 或 `info`；若未提供，則使用來源的預設嚴重程度。 |
+| `priority` | string | 事件的優先順序，接受 `P1` 到 `P9`（也接受 `1` 到 `9`）。若超出組織設定的級數，則使用最低一級；若未提供，則不設定。 |
+| `urgency` | string | 事件的緊急程度，填入組織所設定的等級鍵，例如 `high`、`low`。若組織未設定該鍵，則忽略。若未提供此欄位，則依來源的升級策略決定；未提供 `severity` 的告警則使用 `high`。 |
+| `labels` | object | 標籤，最多 64 個。鍵不能以 `alert.` 或 `__molesignal` 開頭，也不能是 `external.kind`。 |
+| `annotations` | object | 註解，與連結合計最多 64 個。 |
+| `links` | array | 最多 10 個 `{"name": "…", "url": "https://…"}`，依 `name` 寫入註解；若未提供 `name`，則使用 `link`。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/intake/alerts \
+  -H "authorization: Bearer $SOURCE_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"dedupKey": "disk-full/web-1", "summary": "web-1 磁盘使用率 95%", "severity": "critical", "labels": {"host.name": "web-1"}, "links": [{"name": "Runbook", "url": "https://wiki.example.com/disk"}]}'
+```
+</RequestExample>
+
+回應會依序列出每筆告警的處理結果。如果系統成功解析請求，但沒有需要處理的告警（例如 PagerDuty 的測試事件），`message` 會說明原因。
+
+<ResponseExample>
+```json 200
+{
+  "alerts": [
+    {
+      "dedupKey": "disk-full/web-1",
+      "outcome": "opened",
+      "incidentId": "3KEDNEyqouYJeBDTLTMTBui7XHW",
+      "reason": null
+    }
+  ],
+  "message": null
+}
+```
+</ResponseExample>
+
+| `outcome` | 含義 |
+|---|---|
+| `opened` | 已開啟新事件。 |
+| `updated` | 已更新活動事件的嚴重程度，或通知群組中的告警。 |
+| `unchanged` | 活動事件沒有變更，或已有使用者確認。 |
+| `acknowledged` | 已確認事件。 |
+| `resolved` | 已解決事件，包括已確認的事件。 |
+| `ignored` | 未進行任何變更。請查看 `reason` 瞭解原因，例如沒有活動事件，或這則訊息比上一則更早。 |
+
+**錯誤**
+
+| 狀態碼 | 原因 |
+|---|---|
+| `400` | 無法解析請求本文。請查看 `message` 瞭解原因。 |
+| `401` | 未提供 Token、Token 不正確，或來源不存在。 |
+| `403` | 組織已停用。 |
+| `409` | 來源已停用。 |
+| `413` | 請求本文超過 4 MiB。 |
+| `503` | 無法連線到來源的接收叢集，或這次未能完成處理。重試即可，不會重複開啟事件。 |

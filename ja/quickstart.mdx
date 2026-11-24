@@ -1,0 +1,204 @@
+---
+title: "クイックスタート"
+description: "Docker Compose で MoleSignal のローカルサンドボックスを起動し、ログイベントを送信して Web UI で確認します。"
+"en_link": "/en-US/quickstart"
+"zh-Hans_link": "/zh-Hans/quickstart"
+"zh-Hant_link": "/zh-Hant/quickstart"
+"ko_link": "/ko/quickstart"
+"de_link": "/de/quickstart"
+"es_link": "/es/quickstart"
+"fr_link": "/fr/quickstart"
+"pt-BR_link": "/pt-BR/quickstart"
+---
+
+このガイドでは、ローカルの MoleSignal サンドボックスを起動し、ログイベントを1件送信して、Web UI とクエリ API でそのイベントを検索します。サンドボックスは評価専用です。
+
+## 前提条件
+
+- **Docker** と **Docker Compose** v2。
+- 約 2 GB の空きメモリ。
+- ローカルで未使用のポート: `5080`（Web UI と API）、`5082`、`5432`（PostgreSQL）、`9000` と `9001`（RustFS）。
+
+## サンドボックスを起動する
+
+<Steps>
+  <Step title="リポジトリをクローンしてスタックを起動する">
+    ```bash
+    git clone https://github.com/molesignal/molesignal
+    cd molesignal
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
+    ```
+
+    初回起動時はイメージをダウンロードまたはビルドするため、数分かかることがあります。スタックは、メタデータ用の PostgreSQL 17、S3 互換オブジェクトストレージの RustFS、すべてのロールを実行して Web UI を提供する単一の MoleSignal プロセスで構成されます。
+
+    サーバーの準備ができていることを確認します。
+
+    ```bash
+    curl http://localhost:5080/api/v1/healthz
+    ```
+
+    サーバーが正常なら `{"status":"ok"}` が返ります。
+  </Step>
+
+  <Step title="Web UI にサインインする">
+    [http://localhost:5080](http://localhost:5080) を開き、次の認証情報でサインインします。
+
+    - **メールアドレス:** `admin@example.com`
+    - **パスワード:** `admin`
+
+    <Warning>
+      サンドボックスの設定では、初回起動時にのみこのルートアカウントを作成します。ローカルでの評価以外に使用する前に、このアカウントを置き換えてください。[本番環境のチェックリスト](/ja/deployment/production-checklist)を参照してください。
+    </Warning>
+
+    RustFS コンソールは [http://localhost:9001](http://localhost:9001) で開き、`rustfsadmin` / `rustfsadmin` でサインインできます。このサンドボックス用の認証情報は安全ではありません。
+  </Step>
+
+  <Step title="アクセストークンを取得する">
+    API でサインインすると、Web UI が使用するセッション Cookie が設定され、`curl` がそれを `ms-cookies.txt` に保存します。API は Bearer トークンとして API トークンを受け付けます。セッションを一度使って有効期間が7日間の個人用 API トークンを発行し、組織 ID を控えます。このトークンでは発行元のアカウントと同じ操作を実行できます。
+
+    ```bash
+    RESP=$(curl -s -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+      -H 'content-type: application/json' \
+      -d '{"email":"admin@example.com","password":"admin"}')
+
+    export MS_ORG=$(echo "$RESP" | jq -r .login.orgId)
+
+    export MS_TOKEN=$(curl -s -b ms-cookies.txt -X POST http://localhost:5080/api/v1/me/api-tokens \
+      -H 'content-type: application/json' \
+      -d '{"name":"quickstart","expiresInDays":7}' | jq -r .token)
+    ```
+
+    `jq` がない場合は、サインインのレスポンスから `orgId` を、最後のレスポンスから `token` をコピーし、手動でエクスポートします。
+
+    <Note>
+      デフォルトでは、セッション Cookie は24時間で期限切れになります。API トークンは、有効期限が切れるか、**アカウント設定 → API トークン**で失効させるまで使用できます。[API トークン](/ja/identity/tokens)を参照してください。
+    </Note>
+  </Step>
+
+  <Step title="ログイベントを送信する">
+    ネイティブの HTTP JSON 取り込みは、レコードの配列を受け付けます。`_timestamp` には、Unix エポックからの経過時間をマイクロ秒単位で指定します。最初の書き込み時に `app` ストリームを作成します。
+
+    ```bash
+    curl -X POST http://localhost:5080/api/v1/intake/logs/app \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+    ```
+
+    レスポンスには、受け付けたレコード数が含まれます。
+
+    ```json
+    {"accepted":1,"rejected":0,"errors":[]}
+    ```
+  </Step>
+
+  <Step title="Web UI でイベントを検索する">
+    1. **ログ**を開きます。
+    2. ストリームセレクターで `app` ストリームを選択します。
+    3. 時間範囲は**過去1時間**のままにし、**実行**を選択します。
+
+    結果テーブルにイベントが表示されます。元のフィールドを確認するには、該当する行を選択します。
+  </Step>
+
+  <Step title="API でイベントを検索する">
+    クエリ API で同じ検索を実行します。`timeRange` には、開始と終了を必ずマイクロ秒単位で指定してください。範囲が広すぎると、クエリプランナーはクエリを非同期検索ジョブに切り替えます。
+
+    ```bash
+    NOW=$(date +%s)000000
+
+    curl -X POST http://localhost:5080/api/v1/query \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+           \"statement\":\"SELECT level, msg, trace_id FROM app WHERE trace_id = 'abc123'\",
+           \"timeRange\":{\"start\":$((NOW - 3600000000)),\"end\":$((NOW + 60000000))},
+           \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+    ```
+
+    レスポンスには `columns`、`rows`、`scannedRows`、`tookMs` が含まれます。
+
+    ```json
+    {"columns":["level","msg","trace_id"],"rows":[["error","db pool exhausted","abc123"]],"scannedRows":1,"tookMs":120}
+    ```
+  </Step>
+</Steps>
+
+## サンプルデータを読み込む
+
+データのないワークスペースでは、ページに何も表示されません。複数のシグナルを横断して調査するには、`trace_id` の値で関連付けた少量のデモデータ（ログ、メトリクス、トレース）を読み込みます。
+
+```bash
+curl -X POST http://localhost:5080/api/v1/onboarding/sample-data \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+
+このリクエストは `sample_app_logs`、`sample_app_metrics`、`sample_app_traces` の各ストリームを作成します。独自のストリームがまだないワークスペースでは、Web UI でも同じ操作ができます。**ホーム**のページ上部にあるセットアップ手順のボタンを選択し、**サンプルデータを読み込む**の横にある**読み込む**を選択します。上の手順で作成した `app` は独自のストリームにあたるため、手順を実施済みの場合はリクエストを使用します。リスト内のすべての手順が完了すると、ボタンは表示されなくなります。
+
+レスポンスには、各ストリームに書き込んだ行数と、サンプルダッシュボードおよび保存済みビューの ID が含まれます。
+
+```json
+{
+  "loaded": true,
+  "totalRows": 196,
+  "streams": [
+    { "stream": "sample_app_traces", "rows": 24 },
+    { "stream": "sample_app_logs", "rows": 24 },
+    { "stream": "sample_app_metrics", "rows": 148 }
+  ],
+  "dashboardId": "<dashboard id>",
+  "savedViewIds": ["<saved view id>", "<saved view id>", "<saved view id>", "<saved view id>"]
+}
+```
+
+`GET /api/v1/onboarding/sample-data` は、3つのストリーム、ダッシュボード、4つの保存済みビューがすべて存在する場合にのみ `{"loaded":true}` を返します。サンプルデータが現在の表示時間範囲内にあるかどうかは示しません。読み込み時に作成されるもの、再読み込み時の動作、必要な権限については、[ホームのクイックスタート](/ja/home#クイックスタート)を参照してください。
+
+## OpenTelemetry データを送信する
+
+OTLP over HTTP は、どの OpenTelemetry SDK や Collector でも使用できます。エクスポーターの送信先にはベースパス `/api` を指定します。エクスポーターが `/v1/logs`、`/v1/metrics`、`/v1/traces` を追加します。
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer $MS_TOKEN"
+export OTEL_SERVICE_NAME=checkout
+```
+
+`stream-name` ヘッダーで別のストリームを指定しない限り、テレメトリーはシグナルタイプごとの `default` ストリームに取り込まれます。Collector、Vector、Fluent Bit、Prometheus、SDK の設定については、[データソース](/ja/intake)と[インテグレーションガイド](/ja/intake/integrations)を参照してください。
+
+## サンドボックスを停止する
+
+```bash
+# Stop the containers and keep the data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down
+
+# Stop the containers and delete all sandbox data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down -v
+```
+
+## トラブルシューティング
+
+| 症状 | 原因と対処方法 |
+|---|---|
+| `healthz` が `"status":"degraded"` とともに `503` を返す | オブジェクトストレージのプローブなど、サブシステムの一部が正常に動作していません。`reason` フィールドを確認し、`rustfs` コンテナを調べてください。 |
+| サインインで `401` が返る | ルートアカウントは初回起動時にのみ作成されます。以前の起動時に作成したデータベースボリュームには、そのときのパスワードが残っています。`down -v` を実行してサンドボックスをリセットしてください。 |
+| クエリが `jobId` とともに `202` を返す | 時間範囲が広すぎるため（デフォルト設定では約 13.9 時間以上）、クエリプランナーが非同期検索ジョブを開始しました。範囲を狭めるか、`Prefer: respond-sync` を送信するか、`GET /api/v1/query/jobs/{id}` をポーリングしてください。[クエリ](/ja/query#時間範囲と非同期ジョブ)を参照してください。 |
+| クエリが `422 missing field orgId` または `400 query.stream hint is required` を返す | `orgId` と `stream` オブジェクトの両方を送信してください。 |
+| ポートがすでに使用されている | ポートを使用しているプロセスを停止するか、`deploy/docker/docker-compose.yaml` で公開ポートを変更してください。 |
+| ホストから `4317` の OTLP gRPC に接続できない | サンドボックスの Compose ファイルでは `4317` を公開していません。`molesignal` サービスにポートマッピング `4317:4317` を追加してください。 |
+
+## 次のステップ
+
+<CardGroup cols={2}>
+  <Card title="実データを接続する" icon="inbox" href="/ja/intake">
+    データソースページ、取り込みトークン、対応プロトコルを使用します。
+  </Card>
+  <Card title="インテグレーションガイド" icon="plug" href="/ja/intake/integrations">
+    OpenTelemetry Collector、Vector、Fluent Bit、Filebeat、Prometheus を設定します。
+  </Card>
+  <Card title="基本概念" icon="book" href="/ja/concepts">
+    シグナル、ストリーム、ワークスペース、権限について学びます。
+  </Card>
+  <Card title="本番環境にデプロイする" icon="server" href="/ja/deployment">
+    サンドボックスから本番環境へのデプロイに移行します。
+  </Card>
+</CardGroup>

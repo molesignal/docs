@@ -1,0 +1,329 @@
+---
+title: "外部アラート"
+description: "Alertmanager、Grafana、Datadog、PagerDuty、Zabbix、クラウド監視サービス、メール、独自システムからアラートを受信します。受信したアラートからインシデントを作成し、エスカレーションと通知を行います。"
+"en_link": "/en-US/alerting/sources"
+"zh-Hans_link": "/zh-Hans/alerting/sources"
+"zh-Hant_link": "/zh-Hant/alerting/sources"
+"ko_link": "/ko/alerting/sources"
+"de_link": "/de/alerting/sources"
+"es_link": "/es/alerting/sources"
+"fr_link": "/fr/alerting/sources"
+"pt-BR_link": "/pt-BR/alerting/sources"
+---
+
+アラートソースは、別のシステムから送信されたアラートを[インシデント](/ja/alerting/incidents)に変換します。ルールから作成されたインシデントと同様に、[エスカレーションポリシー](/ja/alerting/on-call#エスカレーションポリシー)に従って担当者を呼び出し、[通知ポリシー](/ja/notification-channels)に従って通知を送信します。ソースが復旧を報告すると、インシデントを解決します。**アラート → ソース**を開きます。閲覧には `alerts.sources.read` が必要です。ソースの作成、編集、削除、およびトークンのローテーションには `alerts.sources.manage` が必要です。
+
+## ソースの種類
+
+ソースの種類によって、リクエストボディをどの送信元の形式で読み取るかが決まります。
+
+| 種類 | 送信元 | インシデントを1件作成する単位 |
+|---|---|---|
+| **API** | MoleSignal API を呼び出すスクリプト、CI、社内システム | 重複排除キー |
+| **Alertmanager** | Prometheus Alertmanager の Webhook レシーバー | 通知グループ |
+| **Grafana** | Grafana Alerting の Webhook コンタクトポイント | 通知グループ |
+| **Datadog** | Datadog Webhooks インテグレーション | モニター（マルチアラートモニターの場合はグループごと） |
+| **PagerDuty** | PagerDuty V3 の Webhook サブスクリプション | PagerDuty インシデント |
+| **Alibaba Cloud CloudMonitor** | しきい値アラームのコールバックとイベントサブスクリプションのプッシュチャネル | アラームルールの対象オブジェクト、またはシステムイベント |
+| **Tencent Cloud Observability Platform** | 通知テンプレートの API コールバック | ポリシーの対象オブジェクトごとのメトリクスまたはイベント（レベル別のポリシーではレベルごと） |
+| **Amazon CloudWatch** | SNS トピックに送信され、そのトピックの HTTPS サブスクリプションを経由するアラーム | アラーム |
+| **Zabbix** | Zabbix の Webhook メディアタイプ | 障害 |
+| **メールアドレス** | IMAP メールボックス、または運用中のメールシステムから受け取る未加工のメール | 件名が同じ一連のメール |
+
+Thanos、Cortex、Mimir の Alertmanager など、Alertmanager の Webhook 形式に対応するシステムでは、種類に **Alertmanager** を指定します。
+
+## ソースを作成する
+
+1. **アラート → ソース**を開き、**新規アラートソース**をクリックします。
+2. **種類**を選択し、**名前**を入力します。
+3. **エスカレーションポリシー**を選択します。デフォルトは、ルールワークベンチと同じく**ルーティングに従う（デフォルト）**です。[アラートルーティング](/ja/alerting/routing)は、ルーティングルール、サービスの担当チーム、チームラベルに基づいて、チームとエスカレーションポリシーを選択します。該当するポリシーがない場合は、`default` という名前の[デフォルトポリシー](/ja/alerting/on-call#デフォルトポリシー)を使用します。ポリシーを明示的に選択すると、インシデントにはそのポリシーを適用し、ルーティングではチームのみを選択します。**エスカレーションなし（通知ポリシーのみ）**を選択しても、インシデントの作成と通知は行いますが、エスカレーションポリシーによる呼び出しは行いません。
+4. **デフォルトの重大度**を選択します。アラートに重大度が設定されていない場合に使用します。
+5. 必要に応じて、`team=payments` などの**追加ラベル**を設定します。ソースが作成するすべてのインシデントに追加します。同じキーのラベルがアラートにもある場合は、アラート側の値を優先します。
+6. **作成**をクリックします。ソースのページが開き、ダイアログにトークンと、そのトークンを入力済みの設定内容が表示されます。Alibaba Cloud CloudMonitor では受信アドレスだけが必要なため、ダイアログにはトークンを含むアドレスが表示されます。
+
+<Warning>
+  トークンは、ソースの作成時またはトークンのローテーション時にのみ表示されます。ダイアログを閉じると、`mspat-` で始まるプレフィックスだけを確認できます。トークンを紛失した場合は、**トークンをローテーション**をクリックして新しいトークンを発行してください。古いトークンはすぐに無効になります。
+</Warning>
+
+## 受信アドレスとトークン
+
+すべてのソースが同じ受信アドレスを使用します。トークンでアラートのソースを識別します。
+
+```text
+https://<molesignal-host>/api/v1/intake/alerts
+```
+
+トークンは `mspat-<36>` で、API トークンと同じ形式です。ただし、このトークンはアラートの受信専用で、API トークンはアラートの受信には使用できません。送信元はトークンをヘッダーに設定します。
+
+```text
+Authorization: Bearer <token>
+```
+
+ヘッダーを設定できない送信元（Alibaba Cloud CloudMonitor、Tencent Cloud Observability Platform、SNS 経由の Amazon CloudWatch）は、アドレスにトークンを含めます：`https://<molesignal-host>/api/v1/intake/alerts?token=<token>`。
+
+送信元からこのアドレスにアクセスできる必要があります。MoleSignal の手前にファイアウォールがある場合は、送信元のサイトまたはリージョンの送信元 IP アドレスを許可してください。Datadog は `ip-ranges` の `webhooks` セクションにサイトごとの範囲を記載しています。PagerDuty は米国と EU のサービスリージョンの範囲を公開しています。Alibaba Cloud CloudMonitor はアラームコールバックのドキュメントにプッシュ送信元の範囲を記載しています。MoleSignal を内部ネットワークで実行している場合は、このアドレスだけをインターネットに公開する方法について、[パブリックアクセス](/ja/public-access)を参照してください。
+
+## 送信元を設定する
+
+ソースのページの**受信**には、受信アドレスとトークン、および種類ごとの設定手順が 3 ステップで表示されます。`<TOKEN>` をソースのトークンに置き換えます。ソースが最初のリクエストを受信すると、3 つのステップすべてにチェックが付きます。
+
+### API
+
+```bash
+curl -X POST https://<molesignal-host>/api/v1/intake/alerts \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"dedupKey": "disk-full/web-1", "summary": "Disk almost full on web-1", "severity": "critical", "labels": {"host.name": "web-1"}}'
+```
+
+`action` には `trigger`（デフォルト）、`acknowledge`、`resolve` のいずれかを指定します。同じアラートを確認済みまたは解決済みにするには、同じ `dedupKey` を使用します。[アラートの送信](/ja/api/alerting/send-alerts)では、すべてのフィールドについて説明しています。
+
+### Alertmanager
+
+`alertmanager.yml` にレシーバーを追加し、アラートをそのレシーバーにルーティングします。
+
+```yaml
+route:
+  receiver: molesignal
+receivers:
+  - name: molesignal
+    webhook_configs:
+      - url: https://<molesignal-host>/api/v1/intake/alerts
+        send_resolved: true
+        http_config:
+          authorization:
+            credentials: <token>
+```
+
+復旧通知が送信されるように、`send_resolved` は `true` のままにします。同じ Alertmanager クラスターの全レプリカには、同じ `--web.external-url` を指定します。外部 URL は重複排除キーの一部です。そのため、複数リージョンの Alertmanager が同じルーティングを使用していても、同名のグループは 1 件のインシデントに統合されません。
+
+### Grafana
+
+1. Grafana で**アラート → コンタクトポイント**を開き、**コンタクトポイントを追加**をクリックします。
+2. **インテグレーション**を**Webhook**に設定し、**URL**に受信アドレスを入力します。
+3. **Webhook のオプション設定**で、**認証ヘッダーのスキーム**を `Bearer` に設定し、**認証ヘッダーの認証情報**にトークンを入力します。
+4. **解決済みメッセージを無効にする**はオフのまま保存し、通知ポリシーでそのコンタクトポイントを使用します。
+
+ファイルでプロビジョニングする場合は、次のように設定します。
+
+```yaml
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: molesignal
+    receivers:
+      - uid: molesignal
+        type: webhook
+        settings:
+          url: https://<molesignal-host>/api/v1/intake/alerts
+          httpMethod: POST
+          authorization_scheme: Bearer
+          authorization_credentials: <token>
+```
+
+### Datadog
+
+1. Datadog で**インテグレーション → Webhooks**を開き、`molesignal` などの名前で Webhook を追加します。
+2. **URL**に受信アドレスを入力し、**カスタムヘッダー**を `{"Authorization": "Bearer <token>"}` に設定します。**フォームとしてエンコード**はオフのままにします。
+3. **ペイロード**に以下のテンプレートを設定します。フィールド名は MoleSignal のもので、値は Datadog の変数です。このテンプレートを使用しないリクエストは拒否されます。
+
+```json
+{
+  "alert_id": "$ALERT_ID",
+  "alert_cycle_key": "$ALERT_CYCLE_KEY",
+  "transition": "$ALERT_TRANSITION",
+  "alert_type": "$ALERT_TYPE",
+  "priority": "$ALERT_PRIORITY",
+  "title": "$ALERT_TITLE",
+  "event_title": "$EVENT_TITLE",
+  "message": "$TEXT_ONLY_MSG",
+  "scope": "$ALERT_SCOPE",
+  "tags": "$TAGS",
+  "hostname": "$HOSTNAME",
+  "link": "$LINK",
+  "snapshot": "$SNAPSHOT",
+  "query": "$ALERT_QUERY",
+  "org_id": "$ORG_ID",
+  "last_updated": "$LAST_UPDATED"
+}
+```
+
+4. モニターの通知メッセージに `@webhook-molesignal` を記載します。
+
+すべての Datadog サイト（`datadoghq.com`、`datadoghq.eu`、`us3`、`us5`、`ap1` など）から 1 つのソースに送信できます。MoleSignal は `$LINK` のドメインからサイトを特定し、組織 ID とともに重複排除キーに含めます。
+
+### PagerDuty
+
+1. PagerDuty で**インテグレーション → Generic Webhooks (v3)** を開き、**New Webhook** をクリックします。
+2. **Webhook URL** に受信アドレスを入力し、**Scope Type**（アカウント、サービス、またはチーム）を選択します。
+3. **Event Subscription** で、`incident.triggered`、`incident.acknowledged`、`incident.resolved`、`incident.reopened`、`incident.priority_updated` を選択します。
+4. カスタムヘッダー `Authorization` を追加し、値を `Bearer <token>` に設定します。
+
+米国と EU のサービスリージョンのアカウントから 1 つのソースに送信できます。MoleSignal はアカウントのドメイン（`<subdomain>.pagerduty.com` または `<subdomain>.eu.pagerduty.com`）を重複排除キーに含め、ラベル `pagerduty.region` に記録します。
+
+### Alibaba Cloud CloudMonitor
+
+受信アドレスにトークンを追加します。
+
+```text
+https://<molesignal-host>/api/v1/intake/alerts?token=<token>
+```
+
+- **しきい値アラーム**: アラームルールの**アラームコールバック**にこのアドレスを入力します。CloudMonitor はフォームエンコードしたコールバックを POST で送信します。MoleSignal は JSON も読み取れます。
+- **システムイベント**: **Event Center → Event Subscription → Push channels** で、ターゲットタイプを **Webhook**、リクエストメソッドを **POST**、データ形式を **JSON** に設定してチャネルを作成します。このアドレスを入力し、サブスクリプションポリシーでそのチャネルを使用します。
+
+CloudMonitor はシステムイベントのコールバックへの応答を 5 秒間待ち、失敗すると 3 回再試行します。MoleSignal はリクエストを[受信クラスター](#複数のクラスター)に転送する際に最大 3 秒待ちます。タイムアウトすると `503` を返し、CloudMonitor に再試行を促します。中国サイトと国際サイトの全リージョンで、送信形式は同じです。MoleSignal はリージョンをラベル `aliyun.region` に記録し、アカウントの `userId` を重複排除キーに含めます。
+
+### Tencent Cloud Observability Platform
+
+Tencent Cloud Observability Platform（旧 Cloud Monitor）で、**Alarm Management → Notification Templates** からテンプレートを編集または作成します。**API callback** に受信アドレスを入力し、テンプレートをアラームポリシーに関連付けます。Tencent Cloud のコールバックにはヘッダーを設定できないため、アドレスにトークンを含めます。コールバックには署名がなく、アドレスでソースを識別するため、アドレスは認証情報として管理してください。メトリクスアラームとイベントアラームの両方に対応し、発生時と復旧時の両方で通知が送信されます。
+
+- **重複排除**: アカウント、アラームポリシー、メトリクス名またはイベント名、対象がすべて同じ場合、1 件のアラートとして扱います。レベル付きのポリシーでは、Tencent Cloud と同様にレベルごとにインシデントが 1 件発生し、それぞれ個別に復旧します。
+- **重大度**: `alarmLevel` の Serious（`Serious`）はクリティカル、Severe（`Warn`）はエラー、Reminder（`Remind`）は情報に対応します。レベルのないポリシーには、ソースのデフォルトの重大度を適用します。
+- **ステートレスイベント**（`alarmStatus` が `5`）はインシデントを発生させますが、復旧通知は届かないため、手動で解決します。
+- コールバックの**時刻**にはタイムゾーンが含まれないため、北京時間として扱います。
+
+### Amazon CloudWatch
+
+CloudWatch アラームは外部アドレスを直接呼び出さず、SNS を経由します。
+
+1. アラームの通知設定で、**アラーム状態**（`ALARM`）への移行と **OK** への復帰の両方を、同じ SNS トピックに送信します。`OK` の通知がないと、インシデントは自動で解決されません。データがない場合にもアラートを出すには、**データ不足**（`INSUFFICIENT_DATA`）も送信します。
+2. トピックに HTTPS サブスクリプションを追加し、トークンを含む受信アドレスをエンドポイントに指定します。
+
+   ```bash
+   aws sns subscribe \
+     --topic-arn <ARN of the topic> \
+     --protocol https \
+     --notification-endpoint 'https://<molesignal-host>/api/v1/intake/alerts?token=<token>'
+   ```
+
+3. サブスクリプションの確認は自動で行われます。MoleSignal は確認メッセージの署名を検証してから、メッセージ内の `SubscribeURL` にアクセスします。
+
+MoleSignal はすべての SNS メッセージの署名を検証するため、**Raw メッセージ配信**はオフのままにします。オンにするとメッセージは拒否され、その理由がソースのページの「最近の受信」に表示されます。署名証明書は `sns.<region>.amazonaws.com` から取得するため、リクエストを受信するノードはそのアドレスにアクセスできる必要があります。
+
+CloudWatch アラームには重大度がないため、インシデントにはソースのデフォルトの重大度を適用します。複合アラームも含め、アラームの ARN を重複排除キーとして使用します。アラームの説明と状態変更の理由はアノテーションに、リージョン、アカウント、名前空間、メトリクス、ディメンションはラベルに記録します。そのため、`aws.region` などのラベルをルーティングに使用できます。
+
+### Zabbix
+
+Zabbix 6.0 以降に対応します。Zabbix 固有のリクエスト形式はなく、メディアタイプのスクリプトがリクエストを送信します。ソースのページとソースの作成ダイアログには、アドレスとトークンが入力済みのメディアタイプが表示されます。
+
+1. メディアタイプを YAML として保存し、**アラート → メディアタイプ → インポート**からインポートします。`token` パラメーターを確認します。
+2. グローバルマクロ `{$ZABBIX.URL}` に Zabbix フロントエンドのアドレスを設定します。このアドレスを重複排除キーに含めることで、複数の Zabbix サーバーから 1 つのソースに送信でき、インシデントから Zabbix に戻るリンクも利用できます。このマクロを設定しなくても動作します。
+3. このメディアをユーザーに割り当てます。スクリプトは**宛先**を使用しないため、任意の値を設定できます。
+4. トリガーアクションを追加し、**実行内容**、**復旧時の実行内容**、**更新時の実行内容**の通知先をすべてそのユーザーに設定します。復旧時の実行内容を設定しないと、インシデントは自動で解決されません。
+
+メディアタイプの**テスト**ボタンでは、実際の値を指定する必要があります。マクロが展開されず、たとえば `{EVENT.ID}` がそのまま届くと、MoleSignal は `400` を返し、ドキュメントにあるメディアタイプを使用するよう案内します。
+
+### メール
+
+メールを受信する方法は 2 つあります。どちらも同じ方法でメールをアラートに変換します。
+
+**メールボックスの読み取り**（推奨）: MoleSignal は IMAP メールボックスを定期的に読み取ります。必要なのは外向きの接続とメールボックスだけです。公開アドレス、MX レコード、ポート 25、証明書が不要なため、セルフホスト環境では最も簡単な方法です。監視システムのアラートメールをそのメールボックスに送信するか、メールルールで転送します。
+
+ソースのページの**メールボックスの読み取り**で、**IMAP サーバー**、**ポート**、**暗号化**、**ユーザー名**、**パスワード**、**フォルダー**（デフォルトは `INBOX`）、**読み取り間隔**（15～3600 秒、デフォルトは 60 秒）を設定します。**接続をテスト**をクリックし、続いて**メールボックスを保存**をクリックします。
+
+- **読み取り専用**: `EXAMINE` と `BODY.PEEK[]` を使用するため、メールを既読にしたり削除したりしません。読み取り専用のアカウントで利用できます。
+- **過去のメールは読み取らない**: 初回接続時に読み取り位置を記録し、それ以降に届くメールだけを読み取ります。ホスト、アカウント、フォルダーを変更した場合や、サーバーがメールボックスを再構築した場合（`UIDVALIDITY` が変わった場合）は、その時点以降に届くメールを読み取ります。ソースが無効な間はメールを読み取らず、位置も保持しません。再び有効にした時点以降に届くメールを読み取ります。
+- **送信元リストは必須**: メールアドレスを知っていれば、誰でもメールを送信できます。ソース設定の**許可する送信元**に、メールアドレスを指定します。ドメイン全体を許可するには `@example.com`、すべての送信元を許可するには `*` を指定します。リストとの照合に使用する `From` は偽装できるため、メールプロバイダーの迷惑メールフィルターと DMARC は有効にしておきます。許可していない送信元からのメールは**拒否済み**として記録し、アラートを発生させません。
+- **認証**: パスワード、またはメールプロバイダーが発行するアプリパスワードを使用します。Microsoft 365 はパスワード認証に対応しなくなったため、**OAuth 2.0** を選択し、トークンのアドレス `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token`、クライアント ID、クライアントシークレット、スコープ `https://outlook.office365.com/.default` を入力します。アプリケーションには `IMAP.AccessAsApp` 権限と、このメールボックスへのアクセス権が必要です。
+- **暗号化なし**は、信頼できるネットワークでのみ使用してください。パスワードが平文で送信されます。
+- 読み取りに失敗すると、ソースのページに理由が表示され、次の周期で再試行します。複数のアラートノードがある場合、各メールボックスはそのうち 1 つのノードが読み取ります。フェデレーション構成では、ソースの受信クラスターでメールボックスを設定します。設定は同期されないため、パスワードはそのクラスターにのみ保持されます。
+
+**メールの原文を POST**: メールシステム（Postfix の `pipe`、SES、Mailgun の raw MIME など）をすでに運用している場合は、メッセージの原文を受信アドレスに POST します。
+
+```bash
+curl -X POST 'https://<molesignal-host>/api/v1/intake/alerts' \
+  -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: message/rfc822' \
+  --data-binary @alert.eml
+```
+
+メールシステムから受信アドレスにアクセスできる必要があります。トークンでリクエストの送信元を識別できるため、ここでは送信元リストは任意です。設定した場合は、そのリストが適用されます。
+
+MoleSignal には SMTP レシーバーが組み込まれていません。SMTP で受信するには、ポート 25 の開放、MX レコード、TLS 証明書、独自の迷惑メールフィルターが必要であり、ほとんどのセルフホスト環境ではこれらを用意できないためです。
+
+**メールの処理方法**は、ソース設定の**メールの受信方法**で設定します。
+
+| 設定 | 説明 |
+|---|---|
+| **復旧と判定する件名** | 正規表現を指定します。空欄の場合は組み込みの正規表現を使用し、`resolved`、`recovered`、`recovery`、`cleared`、`恢复`、`已解决`、または件名の先頭の `OK` を復旧と判定します。それ以外のメールはアラートを発生させます。 |
+| **件名から抽出する重複排除キー** | `host=(\S+)` のような正規表現を指定します。最初のキャプチャグループの値を使用します。空欄または一致しない場合は、`Re:` と `Fwd:`、状態を示す語（`PROBLEM`、`RECOVERY`、`告警`、`恢复` など）、重大度、日時、パーセンテージを取り除いた件名を使用し、大文字と小文字は区別しません。そのため、「CRITICAL: disk full on web-1 (91%)」と「RECOVERY: disk full on web-1 (40%)」は同じアラートとして扱いますが、`web-1` と `web-2` は別のアラートとして扱います。送信元のドメインもキーに含めます。 |
+| **アラートの対象外とする件名** | 正規表現を指定します。一致したメールはアラートの対象から除外し、「最近の受信」に表示します。 |
+
+重大度は件名の語句から判定します（`critical`、`fatal`、`disaster`、`P1` はクリティカル、`error`、`P2` はエラー、`warning`、`P3` は警告、`info`、`notice`、`P4`、`P5` は情報）。該当する語句がなければ、ソースのデフォルトの重大度を使用します。`High CPU` の High や `Low disk` の Low は判定に使用しません。本文はアノテーション `message` に記録します（HTML メールはテキストに変換し、最大 4096 文字）。送信元はラベル `email.from` とアノテーション `from` に記録し、時刻は `Date` ヘッダーから取得します。自動返信（`Auto-Submitted: auto-replied`）や配信不能通知（`multipart/report`）はアラートの対象外です。GBK、GB2312 などの文字セットに対応します。4 MiB を超えるメールは本文を読み取らず、**拒否済み**として記録します。
+
+## アラートがインシデントになる仕組み
+
+| 種類 | 重複排除キー | トリガー | 解決 | 重大度 |
+|---|---|---|---|---|
+| **API** | `dedupKey` | `trigger` | `resolve` | `severity` |
+| **Alertmanager** | 外部 URL と `groupKey` | グループの `status` が `firing` | グループの `status` が `resolved`：グループ内のすべてのアラートが復旧 | グループ内の発報中のアラートのうち最も高い `severity` ラベル |
+| **Grafana** | 外部 URL、組織、`groupKey` | Alertmanager と同じ | Alertmanager と同じ | Alertmanager と同じ |
+| **Datadog** | サイト、組織、モニター ID、スコープ | `Recovered` 以外への状態遷移 | `Recovered` | `$ALERT_PRIORITY`。指定がない場合、Warn と No Data は warning になり、それ以外は `$ALERT_TYPE` に従います |
+| **PagerDuty** | アカウントドメインと PagerDuty インシデント ID | `incident.triggered`、`incident.reopened`。`incident.priority_updated` は重大度を変更します | `incident.resolved` | 優先度 P1～P5。指定がない場合、緊急度が high なら error、low なら warning になります |
+| **Alibaba Cloud CloudMonitor** | アカウント、ルール ID、`dimensions`。システムイベントの場合はアカウントと `dedupId` | `ALERT`、`INSUFFICIENT_DATA`。システムイベントの場合は `TRIGGERED` | `OK`。システムイベントの場合は `RESOLVED` | `triggerLevel`。システムイベントの場合は `severity` |
+| **Tencent Cloud Observability Platform** | アカウント、ポリシー、メトリクス名またはイベント名、レベル、オブジェクト | `alarmStatus` が `1` または `5` | `alarmStatus` が `0` | `alarmLevel` |
+| **Amazon CloudWatch** | `AlarmArn` | `NewStateValue` が `ALARM` または `INSUFFICIENT_DATA` | `NewStateValue` が `OK` | 指定なし：ソースのデフォルトの重大度を使用します |
+| **Zabbix** | `{$ZABBIX.URL}` のホストと `{EVENT.ID}` | `{EVENT.VALUE}` が 1。更新操作でもトリガーし、重大度は更新内容に従います | `{EVENT.VALUE}` が 0、または更新操作で問題がクローズされた場合 | `{EVENT.NSEVERITY}`：Disaster は critical、High は error、Average と Warning は warning、Information は info になります |
+| **メールアドレス** | 送信元のドメインと件名から抽出した部分 | 復旧を示す件名以外のメール | 件名が復旧を示すメール | 件名に含まれる語句 |
+
+優先度と緊急度は個別に判定します。API の `priority` と `urgency`、Datadog の `$ALERT_PRIORITY`、PagerDuty の優先度と緊急度を、インシデントの対応する項目に反映します。緊急度の指定がない場合は、ソースのエスカレーションポリシーに従います。重大度の指定がないアラートは緊急度が高になります。[緊急度](/ja/alerting/on-call#緊急度)を参照してください。
+
+重大度の指定がないアラートには、ソースの**デフォルトの重大度**を適用します。送信元にかかわらず、重大度を表す語句の大文字と小文字は区別しません。`critical`、`crit`、`fatal`、`page`、`P1` は critical、`error`、`major`、`high`、`P2` は error、`warning`、`warn`、`minor`、`medium`、`P3` は warning、`info`、`low`、`P4`、`P5` は info として扱います。それ以外の語句には、デフォルトの重大度を適用します。
+
+- **新規作成**：同一ソースで、重複排除キーごとにアクティブなインシデントは最大 1 件です。インシデントには、`alert.source=external` と `external.kind=<kind>`、アラート自体のラベル（Alertmanager と Grafana の場合はグループの `commonLabels`）、ソースの追加ラベルを付与します。`service.name` または `service` ラベルを影響を受けるサービスとして、`host.name`、`host`、`hostname` のいずれかのラベルをホストとして登録します。
+- **タイトル**：API は `summary` を使用します。Alertmanager と Grafana は `summary` アノテーションを使用し、指定がなければ `alertname` を使用します。Datadog は `$ALERT_TITLE`、PagerDuty はインシデントのタイトル、Alibaba Cloud CloudMonitor は「アラーム名 · インスタンス名」を使用します。
+- **リンク**：送信元への URL を `alertmanager_url`、`generator_url`、`dashboard_url`、`datadog_url`、`pagerduty_url` などのアノテーションに保存し、インシデントページにリンクとして表示します。API の `links` は、`name` をキーとしてアノテーションに保存します。
+- **グループ内のアラート**：Alertmanager または Grafana から作成したインシデントには、グループ内のアラートをステータスとともに最大 100 件保持し、通知を受けるたびに更新します。インシデントページの**外部アラート**には、各アラートとその識別に使うラベルを表示します。
+- **重大度の変更**：未確認のインシデントの重大度は、[アラートパイプライン](/ja/pipelines/alert-events#重大度の変更)が判定したアラートの重大度に従います。重大度が上がると、エスカレーションを最初のステップからやり直します。手動で設定した重大度は維持します。
+- **確認**：API の `acknowledge`、PagerDuty の `incident.acknowledged`、Zabbix で問題を確認済みにする更新操作は、インシデントを確認済みにし、それ以降のエスカレーションステップと電話通知を停止します。確認者としてユーザーは記録しません。
+- **解決**：ソースが復旧を報告すると、確認済みのものも含め、インシデントを解決済みにします。解決者としてユーザーは記録せず、タイムラインには復旧として表示します。
+- **遅れて届いたメッセージ**：重複排除キーごとに、最後に処理した送信元の時刻を保持し、それより古いメッセージを無視します。遅れて届いたトリガーで解決済みのインシデントが再作成されたり、遅れて届いた復旧通知で新しいインシデントが解決されたりすることはありません。API のメッセージには時刻が含まれないため、受信順に処理します。
+- **手動で先に解決した場合**：ソースが引き続きアラートを報告している場合は、ルールの場合と同様に、次回の再送時に新しいインシデントを作成します。
+- **データなし**：CloudMonitor の `INSUFFICIENT_DATA` または Datadog の No Data によって作成したインシデントには `alert.condition=no_data` を付与し、通知タイトルの先頭に `NO DATA` を付けます。
+- **無効化と削除**：無効にしたソースはアラートを拒否します（`409`）。未解決のインシデントはそのまま残ります。ソースを削除すると、そのトークンは即座に無効になり、未解決のインシデントを解決済みにします。
+
+[サイレンスポリシー](/ja/alerting/silences)、[セマンティックグループ](/ja/alerting/silences#セマンティックグループ)、[通知ポリシー](/ja/notification-channels)は、ほかのインシデントと同様に外部インシデントにも適用できます。`external.kind`、ソースの追加ラベル、またはアラート自体のラベルを条件に指定してください。
+
+## 最近の受信リクエスト
+
+ソースのページ上部に、ソースの状態を**初回リクエスト待ち**、**受信中**、**直近のリクエストを拒否**、**過去7日間にリクエストなし**、**無効**のいずれかで表示します。その横には、過去 24 時間のリクエストとアラート、およびそのソースで作成した未解決のインシデントを表示します。
+
+リクエストを受信すると、ソースのページの**最近の受信リクエスト**に一覧を表示します。一覧には、受信時刻、処理結果（**処理済み**、**拒否済み**、**転送済み**）、HTTP ステータス、アラート数、アラートの処理結果（**新規作成**、**更新日時**、**変更なし**、**確認済み**、**解決済み**、**無視**）が含まれます。行をクリックすると、各アラートのタイトル、重大度、アクション、結果、インシデントを確認できます。拒否したリクエストでは、拒否理由とリクエストボディの先頭部分（最大 16 KiB）も表示します。ソースごとに直近 500 件のリクエストを最大 7 日間保持します。
+
+## 複数のクラスター
+
+[クラスター間フェデレーション](/ja/settings/data-plane#クラスターフェデレーション)を有効にすると、次のように動作します。
+
+- ほかのアラート設定と同様に、ソースとそのトークンをクラスター間で同期します。同じトークンをすべてのクラスターの受信アドレスで使用できます。
+- ソースのインシデントは、そのソースの**受信クラスター**でのみ作成します。ソースの設定で変更しない限り、ソースを作成したクラスターが受信クラスターになります。別のクラスターがソースのアラートを受信すると、gRPC で受信クラスターに転送し、受信クラスターからの応答を送信元に返します。そのため、どのクラスターのアドレスで受信しても、1 件の外部アラートに対応するインシデントは 1 件です。
+- 受信クラスターに接続できない場合は `503` を返し、送信元が再試行します。受信クラスターのリージョンで障害が続く場合は、ソースの設定で**受信クラスター**を稼働中のクラスターに変更してください。
+- **最近の受信リクエスト**は、リクエストを処理したクラスターに記録します。別のクラスターでソースのページを開くと、その旨を表示します。
+
+## 制限
+
+| 項目 | 上限 |
+|---|---|
+| リクエストボディ、メール1通 | 最大4 MiBです。 |
+| メールボックスの読み取り | 1回につき最大50通を読み取ります。残りは次回に読み取ります。 |
+| APIリクエスト1件 | アラートは最大100件です。`dedupKey` は最大255文字、`summary` は最大1024文字です。 |
+| アラート1件 | ラベルとアノテーションはそれぞれ最大64個です。上限を超えると、APIはリクエストを拒否します。他の種類のソースでは、上限を超えたラベルとアノテーションを破棄し、長すぎるタイトルとアノテーションを切り詰めます。 |
+| グループ内のアラート | 最大100件を保持します。 |
+| ソースの追加ラベル | 最大32個です。キーに `alert.` で始まる名前や `external.kind` は使用できません。 |
+| 最近受信したリクエスト | ソースごとに直近500件を最大7日間保持します。 |
+
+トークンでソースを識別するため、GrafanaのHMAC署名とPagerDutyの署名は検証しません。MoleSignalでインシデントを確認または解決しても、その状態は送信元に反映されません。
+
+## アラートソースAPI
+
+| 操作 | エンドポイント |
+|---|---|
+| アラートを送信 | [`POST /api/v1/intake/alerts`](/ja/api/alerting/send-alerts) |
+| ソースの一覧を取得 | [`GET /api/v1/alerts/sources`](/ja/api/alerting/list-sources) |
+| ソースを作成 | [`POST /api/v1/alerts/sources`](/ja/api/alerting/create-source) |
+| ソースを更新 | [`PUT /api/v1/alerts/sources/{id}`](/ja/api/alerting/update-source) |
+| ソースを削除 | [`DELETE /api/v1/alerts/sources/{id}`](/ja/api/alerting/delete-source) |
+| トークンをローテーション | [`POST /api/v1/alerts/sources/{id}/token`](/ja/api/alerting/rotate-source-token) |
+| 最近受信したリクエスト | [`GET /api/v1/alerts/sources/{id}/requests`](/ja/api/alerting/list-source-requests) |
+| メールソースのメールボックス | [`/api/v1/alerts/sources/{id}/mailbox`](/ja/api/alerting/source-mailbox) |
+| 外部インシデントのソース | [`GET /api/v1/alerts/incidents/{id}/source`](/ja/api/alerting/incident-source) |

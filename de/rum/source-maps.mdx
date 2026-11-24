@@ -1,0 +1,225 @@
+---
+title: "RUM-Source-Maps und -Symbole"
+sidebarTitle: "Source Maps und Symbole"
+description: "Laden Sie Source Maps für Browser, Flutter-Symbole, Android-Mappings und native Symbole oder Apple-dSYM-Dateien hoch, um RUM-Stacktraces in ihrer ursprünglichen Form wiederherzustellen."
+"en_link": "/en-US/rum/source-maps"
+"zh-Hans_link": "/zh-Hans/rum/source-maps"
+"zh-Hant_link": "/zh-Hant/rum/source-maps"
+"ja_link": "/ja/rum/source-maps"
+"ko_link": "/ko/rum/source-maps"
+"es_link": "/es/rum/source-maps"
+"fr_link": "/fr/rum/source-maps"
+"pt-BR_link": "/pt-BR/rum/source-maps"
+---
+
+MoleSignal verwendet Debug-Artefakte, um Stack-Frames aus minifiziertem JavaScript, obfuskiertem Dart- oder Android-Code und
+nativem Android- oder iOS-Code wiederherzustellen. Verwalten Sie alle Artefakttypen über
+`/api/v1/debug-artifacts`.
+
+## Artefakttyp auswählen
+
+| Laufzeitumgebung | `kind` | `platform` | Datei |
+|---|---|---|---|
+| JavaScript im Browser | `javascript_sourcemap` | `web` | Externe `.map`-Datei |
+| Flutter Web | `javascript_sourcemap` | `flutter` | `main.dart.js.map` oder eine andere generierte `.map`-Datei |
+| Flutter AOT für Android oder iOS | `flutter_symbols` | `android` oder `ios` | `.symbols`-Datei aus Flutter `--split-debug-info` |
+| Android R8 | `android_mapping` | `android` | `mapping.txt` des Releases |
+| Android NDK | `android_native_symbols` | `android` | ELF-Shared-Object mit intakten Symbolen |
+| Nativ für Apple | `apple_dsym` | `ios` | DWARF-Binärdatei im passenden `.dSYM`-Bundle |
+
+Der Upload unterstützt unkomprimierte und gzip-komprimierte Dateien. Das Upload-Limit beträgt 50 MiB. Ein gzip-Artefakt darf
+nach dem Entpacken höchstens 256 MiB groß sein.
+
+## Build-Kennung abgleichen
+
+MoleSignal wählt anhand der Build-Kennung des RUM-Fehlers ein Artefakt aus:
+
+| Upload-Feld | Passender RUM-Wert | Regel |
+|---|---|---|
+| `applicationId` | `application.id`, die Anwendung des Client-Tokens | Muss exakt übereinstimmen |
+| `service` | `service` des Events | Muss exakt übereinstimmen; Groß- und Kleinschreibung beachten |
+| `release` | `version` des Events | Muss exakt übereinstimmen; Groß- und Kleinschreibung beachten |
+| `kind` | `artifact_kind` des Frames. Ein Frame ohne `artifact_kind`, aber mit `file` und `line`, gilt als JavaScript-Frame | Wählen Sie einen unterstützten Typ aus der Tabelle oben |
+| `platform` | `os.name` des Events oder `source`, falls `os.name` fehlt | Verwenden Sie wie oben aufgeführt `web`, `flutter`, `android` oder `ios` |
+| `architecture` | `device.architecture` des Events | Geben Sie für mobile und native Artefakte die Architektur an, etwa `arm64` oder `x86_64` |
+| `debugId` | `debug_id` des Frames, ersatzweise `build_id` des Events | Verwenden Sie dieselbe Flutter-Build-ID, ELF-Build-ID oder Mach-O-UUID |
+| Dateiname | Laufzeitmodul oder Bundle | Source Maps für Browser müssen dem Schema `<deployed bundle basename>.map` entsprechen |
+
+MoleSignal normalisiert gängige ABI-Aliasse. So werden `arm64-v8a` und `aarch64` zu `arm64` und
+`amd64` und `x64` zu `x86_64`. Beim Vergleich hexadezimaler Debug-IDs und UUIDs ignoriert MoleSignal Groß- und Kleinschreibung, geschweifte Klammern,
+Bindestriche und ein vorangestelltes `0x`.
+
+<Warning>
+  Verwalten Sie `applicationId`, `service`, `release`, `architecture` und `debugId` in derselben Build-Pipeline,
+  die das Artefakt erzeugt. Bei einer veralteten oder mehrdeutigen Build-Kennung bleibt das Event unverändert, aber
+  die Symbolisierung ergibt `missing` oder `partial`.
+</Warning>
+
+### Beispiel für Browser
+
+Legen Sie `service` und `version` bei jedem Build auf stabile Werte fest:
+
+```ts
+import { init } from '@molesignal/browser-rum';
+
+init({
+  applicationId: 'checkout-web',
+  clientToken: 'mspat-your-client-token',
+  site: 'https://molesignal.example.com',
+  service: 'web-frontend',
+  version: '2026.08.04.1',
+});
+```
+
+Laden Sie die Source Map mit derselben Build-Kennung und dem exakten Namen des bereitgestellten Bundles hoch:
+
+| Upload-Feld | SDK-Feld | Beispiel |
+|---|---|---|
+| Anwendungs-ID | `applicationId` | `checkout-web` |
+| Service | `service` | `web-frontend` |
+| Release | `version` | `2026.08.04.1` |
+| Datei | Generierte `.map`-Datei | `app.8f312.js.map` |
+
+Laden Sie `app.8f312.js.map` hoch, wenn die Frame-URL des bereitgestellten Bundles auf `/assets/app.8f312.js` endet. Laden Sie auch
+die Source Maps aller nachgeladenen Chunks hoch, nicht nur die des Hauptbundles.
+
+## Über die Benutzeroberfläche hochladen
+
+<Steps>
+  <Step title="Build mit aktivierten Source Maps erstellen">
+    Generieren Sie beim Produktionsbuild externe Source Maps. Stellen Sie diese nicht öffentlich bereit,
+    wenn die Sicherheitsrichtlinie vertraulichen Quellcode vorschreibt.
+  </Step>
+  <Step title="Upload-Seite öffnen">
+    Gehen Sie zu **RUM → RUM-Einstellungen → Source Maps und Symbole** und klicken Sie auf **Debug-Artefakt hochladen**.
+  </Step>
+  <Step title="Build-Kennung eingeben">
+    Wählen Sie den Artefakttyp und die Plattform aus. Geben Sie Anwendung, Service und Release exakt an.
+    Ergänzen Sie bei mobilen Artefakten die Architektur und die Debug-ID. Wählen Sie dann die generierte Datei aus.
+  </Step>
+  <Step title="Symbolisierung prüfen">
+    Senden Sie einen Fehler aus dem Release. Öffnen Sie **RUM → Explorer**, wählen Sie **Fehler** aus und öffnen Sie den Fehler. Prüfen Sie, ob der
+    Stack die ursprünglichen Stellen im Quellcode anzeigt.
+  </Step>
+</Steps>
+
+## Release-Artefakte vorbereiten
+
+<Tabs>
+  <Tab title="Web">
+    Generieren Sie externe Source Maps aus genau dem Browser-Bundle, das bereitgestellt wird. Halten Sie die `.map`-Dateien vertraulich,
+    wenn der Quellcode nicht offengelegt werden darf.
+
+    Erstellen Sie den Flutter-Web-Build mit aktivierten Source Maps:
+
+    ```bash
+    flutter build web \
+      --release \
+      --source-maps \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=javascript \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Laden Sie `main.dart.js.map` mit `kind=javascript_sourcemap`, `platform=flutter` und
+    `architecture=javascript` hoch.
+  </Tab>
+  <Tab title="Flutter Android">
+    Generieren Sie für jede Produktions-ABI eine Flutter-Symboldatei:
+
+    ```bash
+    flutter build apk \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/android-arm64 \
+      --target-platform=android-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Laden Sie `app.android-arm64.symbols` mit `kind=flutter_symbols`, `platform=android`,
+    `architecture=arm64` und `debugId=${BUILD_ID}` hoch.
+  </Tab>
+  <Tab title="Flutter iOS">
+    Generieren Sie die Flutter-AOT-Symbole aus dem IPA-Build des Releases:
+
+    ```bash
+    flutter build ipa \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/ios-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    Laden Sie `app.ios-arm64.symbols` mit `kind=flutter_symbols`, `platform=ios`,
+    `architecture=arm64` und `debugId=${BUILD_ID}` hoch.
+  </Tab>
+  <Tab title="Natives Android">
+    Bewahren Sie `app/build/outputs/mapping/release/mapping.txt` für jedes R8-Release auf. Laden Sie die Datei mit
+    `kind=android_mapping` und `platform=android` hoch.
+
+    Bewahren Sie für jede NDK-ABI eine ELF-Datei (`.so`) mit intakten Symbolen auf. Extrahieren Sie ihre Build-ID mit der Toolchain
+    der Plattform. Laden Sie die Datei dann mit `kind=android_native_symbols`, `platform=android`, der kanonischen
+    Architektur und derselben Build-ID hoch, die der Stack-Frame des Absturzes enthält.
+  </Tab>
+  <Tab title="Natives iOS">
+    Lesen Sie die UUID aus dem archivierten dSYM aus und komprimieren Sie bei Bedarf die DWARF-Binärdatei:
+
+    ```bash
+    dwarfdump --uuid Checkout.app.dSYM
+    gzip -k Checkout.app.dSYM/Contents/Resources/DWARF/Checkout
+    ```
+
+    Laden Sie die DWARF-Datei oder `.gz` mit `kind=apple_dsym`, `platform=ios`, der passenden
+    Architektur und der normalisierten Mach-O-UUID als `debugId` hoch.
+  </Tab>
+</Tabs>
+
+## Aus der CI hochladen
+
+Verwenden Sie ein Verwaltungstoken mit `debug_artifacts.manage`. Betten Sie dieses Token nie in eine Browser- oder mobile
+Anwendung ein. Verwenden Sie das öffentliche Client-Token nie zur Verwaltung von Artefakten.
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${MOLESIGNAL_TOKEN}" \
+  -F "applicationId=${APPLICATION_ID}" \
+  -F "service=${SERVICE}" \
+  -F "release=${RELEASE_VERSION}" \
+  -F "kind=${ARTIFACT_KIND}" \
+  -F "platform=${PLATFORM}" \
+  -F "architecture=${ARCHITECTURE}" \
+  -F "debugId=${DEBUG_ID}" \
+  -F "file=@${ARTIFACT_PATH}" \
+  "${MOLESIGNAL_SITE}/api/v1/debug-artifacts"
+```
+
+Lassen Sie `architecture` oder `debugId` nur bei einem dafür vorgesehenen Fallback-Artefakt leer. Eine exakte Build-Kennung
+verhindert bei mobilen Builds mehrdeutige Zuordnungen.
+
+Listen Sie Artefakte mit `GET /api/v1/debug-artifacts` auf. Filtern Sie nach `applicationId`, `service`, `kind` oder
+`platform`. Löschen Sie ein einzelnes Artefakt mit `DELETE /api/v1/debug-artifacts/{id}`. Zum Auflisten ist
+`debug_artifacts.read` erforderlich, zum Hochladen und Löschen `debug_artifacts.manage`.
+
+## Release-Checkliste
+
+- Bewahren Sie die Artefakte zu genau der bereitgestellten Binärdatei oder dem bereitgestellten Bundle auf.
+- Legen Sie im SDK eine unveränderliche Version fest, bevor es Fehler erfassen kann.
+- Stimmen Sie Anwendung, Service, Release, Architektur und Debug-ID auf den Build ab.
+- Laden Sie die Source Maps aller Web-Chunks und die Artefakte für alle ausgelieferten mobilen Architekturen hoch.
+- Bewahren Sie das Verwaltungstoken ausschließlich in der Release-Pipeline auf.
+- Lösen Sie nach der Bereitstellung gezielt einen Fehler aus und prüfen Sie, ob die `original_*`-Felder der Frames wiederhergestellt wurden.
+- Laden Sie die Artefakte vor der Auslieferung des Releases hoch. Die wiederhergestellten Frames bestimmen, zu welchem [Issue](/de/rum/errors#wie-aus-fehlern-probleme-werden) ein Fehler
+  gehört. Geht ein Fehler vor seiner Source Map ein, landet er in einem anderen Issue als derselbe Fehler nach dem Upload.
+
+<CardGroup cols={2}>
+  <Card title="RUM-SDK für Browser" icon="code" href="/de/rum/browser-sdk">
+    Konfigurieren Sie Anwendung, Service und Release-Kennung für den Browser.
+  </Card>
+  <Card title="RUM-SDK für Flutter-Apps" icon="mobile" href="/de/rum/flutter-sdk">
+    Konfigurieren Sie die Flutter-Build-Kennung und die Fehlererfassung.
+  </Card>
+</CardGroup>

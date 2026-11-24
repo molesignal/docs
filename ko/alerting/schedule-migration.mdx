@@ -1,0 +1,224 @@
+---
+title: "Opsgenie 또는 PagerDuty 일정 이전"
+description: "Opsgenie 또는 PagerDuty의 REST API에서 온콜 일정을 가져옵니다. 저장하기 전에 원본 시스템에 표시되는 일정과 비교하고, 이전되는 항목과 이전되지 않는 항목을 확인합니다."
+"en_link": "/en-US/alerting/schedule-migration"
+"zh-Hans_link": "/zh-Hans/alerting/schedule-migration"
+"zh-Hant_link": "/zh-Hant/alerting/schedule-migration"
+"ja_link": "/ja/alerting/schedule-migration"
+"de_link": "/de/alerting/schedule-migration"
+"es_link": "/es/alerting/schedule-migration"
+"fr_link": "/fr/alerting/schedule-migration"
+"pt-BR_link": "/pt-BR/alerting/schedule-migration"
+---
+
+**일정 가져오기…**는 Opsgenie와 PagerDuty REST API가 반환하는 형식 그대로 일정을 읽습니다. 따라서 이전하는 팀은 교대 근무를 수동으로 다시 구성할 필요가 없습니다. 스크립트는 원본 서비스의 API 키를 사용해 일정을 파일로 가져옵니다. 이후 [번들](/ko/alerting/on-call#가져오기-및-내보내기)과 같은 방식으로 파일을 가져옵니다. 먼저 테스트를 실행한 다음 한 번에 저장합니다. MoleSignal은 키를 저장하거나 원본 서비스에 요청을 보내지 않습니다. 일정을 가져오려면 `schedules.create` 권한이 필요합니다.
+
+가져오기 여부는 한 가지 기준으로 결정합니다. 지금부터 어느 시점이든 온콜 담당자가 동일해야 합니다. MoleSignal 일정으로 표현할 수 없고 담당자가 달라지는 항목이 있으면 가져오기를 중단합니다. 지금부터 담당자 배정에 영향을 주지 않는 항목은 제외하고 결과에 표시합니다.
+
+## 단계
+
+<Steps>
+  <Step title="멤버 추가">
+    모든 교대 근무 참여자를 원본 서비스와 동일한 이메일 주소로 워크스페이스에 추가합니다. 자세한 내용은 [멤버](/ko/identity/members)를 참조합니다. 멤버를 매칭할 때 이메일 주소의 대소문자를 구분하지 않습니다.
+  </Step>
+  <Step title="일정 파일 내려받기">
+    `curl`과 `jq`가 설치된 머신에서 [Opsgenie](#opsgenie) 또는 [PagerDuty](#pagerduty)용 스크립트를 실행합니다. 스크립트는 파일 하나를 생성합니다.
+  </Step>
+  <Step title="가져오기 테스트">
+    **알림 → 온콜 일정**을 열고 **가져오기/내보내기 → 일정 가져오기…**를 선택합니다. **파일 선택**으로 파일을 지정한 다음 **테스트 실행**을 선택합니다. 목록에서 각 일정의 처리 결과를 미리 확인할 수 있습니다. 자세한 내용은 [결과 확인](#결과-확인)을 참조합니다.
+  </Step>
+  <Step title="가져오기 오류 해결">
+    원본 일정을 수정하고 파일을 다시 내려받거나 파일을 직접 편집합니다. 일정에 오류가 하나라도 있으면 아무것도 저장하지 않습니다.
+  </Step>
+  <Step title="가져오기">
+    **가져오기**를 선택한 다음 가져온 일정을 열어 온콜 담당자를 확인합니다. 해당 일정에 따라 온콜 담당자에게 알림을 보내려면 [에스컬레이션 정책](/ko/alerting/on-call#에스컬레이션-정책)에 일정을 지정합니다.
+  </Step>
+</Steps>
+
+## Opsgenie
+
+일정 읽기 권한이 있는 API 키를 설정한 다음 스크립트를 실행합니다. EU 계정은 `api.eu.opsgenie.com`을 사용합니다.
+
+```bash
+export OPSGENIE_API_KEY=<api key>
+```
+
+```bash
+API=https://api.opsgenie.com   # EU accounts: https://api.eu.opsgenie.com
+DAYS=200
+
+get() { curl -fsS -H "Authorization: GenieKey $OPSGENIE_API_KEY" "$API$1"; }
+
+get /v2/schedules | jq -r '.data[].id' | while read -r id; do
+  get "/v2/schedules/$id"
+  get "/v2/schedules/$id/timeline?expand=base&interval=$DAYS&intervalUnit=days"
+done | jq -s '{
+  data: map(.data | select(has("rotations"))),
+  timelines: map(.data | select(has("baseTimeline"))
+    | {_parent, startDate, endDate, baseTimeline}
+    | .baseTimeline.rotations[].periods |= map({startDate, endDate, type, recipient}))
+}' > opsgenie-schedules.json
+```
+
+파일의 `data`에는 `GET /v2/schedules/{id}`가 반환한 각 일정이, `timelines`에는 `GET /v2/schedules/{id}/timeline`이 반환한 각 일정의 타임라인이 들어 있습니다. `DAYS`는 타임라인에 앞으로 며칠을 포함할지 지정합니다.
+
+| Opsgenie | MoleSignal |
+|---|---|
+| 이름, 설명, 시간대, 활성화 상태 | 그대로 가져옵니다. |
+| 소유 팀 | 이름이 같은 팀이 있으면 해당 팀을 지정합니다. 없으면 일정에 팀을 지정하지 않고 결과에 이 사실을 표시합니다. |
+| 교대 근무의 `type`과 `length` | 길이가 1이면 유형에 따라 **매일** 또는 **매주**를 사용합니다. 그 외에는 사용자 지정 주기를 사용합니다. 예를 들어 `hourly`의 길이가 6이면 6시간 주기를 사용합니다. |
+| `startDate`, `endDate` | 교대 근무의 시작일과 종료일입니다. 이미 종료된 교대 근무는 제외합니다. |
+| `timeRestriction` | 일정의 시간대를 기준으로 한 주간 시간 범위입니다. 여러 날에 걸친 범위도 포함합니다. |
+| 서로 겹치지 않는 여러 교대 근무 | 업무 시간과 업무 외 시간에 각각 하나를 두는 것처럼 여러 교대 근무를 구성합니다. |
+| 사용자 참여자 | 이메일 주소인 `username`으로 멤버를 매칭하고 기존 순서를 유지합니다. |
+
+교대 근무가 진행 중일 때 다음 항목이 있으면 가져오기를 중단합니다.
+
+| Opsgenie | 이유 |
+|---|---|
+| 참여자로 지정된 팀 또는 에스컬레이션 | MoleSignal에서는 개인만 교대 근무에 참여할 수 있습니다. |
+| **No-One** 참여자 | MoleSignal에서는 교대 근무에 담당자가 없는 차례를 둘 수 없습니다. |
+| 서로 겹치는 교대 근무 | Opsgenie에서는 시간이 겹치는 모든 교대 근무의 담당자가 동시에 온콜을 맡지만, MoleSignal에서는 일정마다 한 번에 한 명만 온콜을 맡습니다. 파일에서 교대 근무를 이름이 서로 다른 별도 일정으로 나눈 다음 에스컬레이션 정책의 한 단계에 두 일정을 모두 지정합니다. |
+
+재정의, 전달 규칙, 에스컬레이션, 라우팅은 가져오지 않습니다.
+
+## PagerDuty
+
+스케줄과 사용자를 조회할 수 있는 API 키를 설정한 다음 스크립트를 실행합니다. EU 계정은 `api.eu.pagerduty.com`을 사용합니다.
+
+```bash
+export PAGERDUTY_API_KEY=<api key>
+```
+
+```bash
+API=https://api.pagerduty.com   # EU accounts: https://api.eu.pagerduty.com
+DAYS=200
+since=$(jq -rn 'now | todate')
+until=$(jq -rn "now + $DAYS * 86400 | todate")
+
+get() {
+  curl -fsSg -H "Authorization: Token token=$PAGERDUTY_API_KEY" \
+    -H 'Accept: application/vnd.pagerduty+json;version=2' "$API$1"
+}
+pages() {
+  offset=0
+  while page=$(get "$1?limit=100&offset=$offset"); do
+    printf '%s\n' "$page"
+    [ "$(printf '%s' "$page" | jq .more)" = true ] || break
+    offset=$((offset + 100))
+  done
+}
+shift_based=$(pages /v3/schedules)
+
+{
+  pages /users
+  printf '%s\n' "$shift_based"
+  printf '%s\n' "$shift_based" | jq -r '.schedules[].id' | while read -r id; do
+    get "/v3/schedules/$id?since=$since&until=$until&include[]=final_schedule"
+  done
+  pages /schedules | jq -r '.schedules[].id' | while read -r id; do
+    get "/schedules/$id?since=$since&until=$until&include[]=final_schedule&include[]=overrides_subschedule"
+  done
+} | jq -s --arg since "$since" --arg until "$until" '{
+  since: $since,
+  until: $until,
+  users: (map(.users // []) | add // [] | map({id, email})),
+  shift_based_schedules: (map(.schedules // []) | add // [] | map({id, type, summary})),
+  schedules: map(.schedule // empty
+    | del(.users, .escalation_policies)
+    | if .type == "schedule_v3" then
+        .final_schedule.computed_shift_assignments[]? |= {start_time, end_time, member, source: {type: .source.type}}
+      else
+        del(.schedule_layers[].rendered_schedule_entries)
+        | .final_schedule.rendered_schedule_entries |= map({start, end, user: (.user | select(.) | {id})})
+        | .overrides_subschedule.rendered_schedule_entries |= map({start, end})
+      end)
+}' > pagerduty-schedules.json
+```
+
+파일은 `GET /schedules/{id}`와 `GET /v3/schedules/{id}`에서 가져온 각 스케줄을 `schedules`에, `GET /v3/schedules`에서 가져온 목록을 `shift_based_schedules`에 저장합니다. 스케줄에는 담당자 이름만 있고 이메일은 없으므로, `GET /users`에서 가져온 이메일은 `users`에 저장합니다. `since`와 `until`은 PagerDuty가 스케줄을 산출하는 기간을 지정하고, `DAYS`는 며칠 앞까지 산출할지 지정합니다.
+
+`time_zone`을 지정하지 않고 스케줄을 하나씩 가져옵니다. `GET /schedules`는 스케줄의 시간대가 아닌 호출자의 시간대로 제한 시간대를 표시합니다. 가져오기 기능은 다른 시간대로 산출한 스케줄을 감지하면 가져오기를 거부합니다.
+
+### 레이어 기반 스케줄
+
+| PagerDuty | MoleSignal |
+|---|---|
+| 이름, 설명, 시간대 | 그대로 유지합니다. 일시 중지된 스케줄을 업데이트해도 일시 중지 상태를 유지합니다. |
+| 팀 | MoleSignal에 같은 이름의 팀이 있는 첫 번째 팀을 연결하고, 나머지 팀의 이름은 결과에 표시합니다. |
+| 레이어 | 우선순위를 유지한 채 로테이션으로 가져옵니다. 가장 나중 레이어가 우선하여 담당자를 정하고, 해당 레이어의 제한 시간대 밖에서는 하위 레이어가 담당자를 정합니다. |
+| `rotation_turn_length_seconds` | 정확히 24시간이면 **매일**, 정확히 7일이면 **매주**로 설정합니다. 그 외에는 사용자 지정 주기를 적용합니다. |
+| `rotation_virtual_start` | 로테이션 시작 시각입니다. 인계 시각과 담당 순서를 결정합니다. |
+| `start` | 레이어가 적용되기 시작하는 시각입니다. 이미 지난 시각이면 추가로 조정하지 않습니다. 미래 시각이면 로테이션 시작을 해당 시각으로 옮기고, 그 시각에 근무할 담당자를 첫 순서에 배치합니다. |
+| `end` | 로테이션 종료 시각입니다. 이미 종료된 레이어와 편집된 레이어의 이전 버전은 제외합니다. |
+| `restrictions` | `daily_restriction`과 `weekly_restriction` 모두 스케줄의 시간대를 기준으로 주간 시간 범위로 변환합니다. |
+| `users` | `users`의 이메일로 멤버를 매칭하고 기존 순서를 유지합니다. |
+
+### 교대 근무 기반 스케줄
+
+PagerDuty V3 API에서 반환하는 스케줄은 이벤트로 구성됩니다. 이벤트에는 우선순위가 없습니다. 이벤트가 겹치면 겹치는 모든 이벤트의 담당자가 동시에 온콜 근무를 합니다.
+
+| PagerDuty | MoleSignal |
+|---|---|
+| 이름, 설명, 팀 | 레이어 기반 스케줄과 동일하게 처리합니다. |
+| 이벤트의 시간대 | 이벤트의 현지 시각에 인계가 이루어지도록 이벤트의 시간대를 스케줄의 시간대로 사용합니다. 스케줄 자체의 `time_zone`이 다르면 결과에 표시합니다. |
+| 각 이벤트 | 이벤트 이름으로 로테이션을 하나씩 생성합니다. 업무 시간과 업무 외 시간처럼 서로 겹치지 않는 이벤트는 순서에 상관없이 배치할 수 있습니다. |
+| `start_time`, `end_time`, `recurrence` | 다음 표에 따라 첫 근무 구간과 반복 방식을 설정합니다. |
+| `shifts_per_member` | 담당자 한 명의 근무 차례 길이입니다. `start_time`부터 반복되는 근무 구간을 세며, `BYDAY`에 지정한 요일마다 한 번으로 계산합니다. |
+| `effective_since` | 이벤트가 적용되기 시작하는 시각입니다. 이미 지난 시각이면 추가로 조정하지 않으며 담당 순서에도 영향을 주지 않습니다. 미래 시각이면 로테이션 시작을 해당 시각으로 옮기고, 그 시각에 근무할 담당자를 첫 순서에 배치합니다. |
+| `effective_until` | 로테이션 종료 시각입니다. 이미 종료된 이벤트는 제외합니다. |
+| `members` | `users`의 이메일로 멤버를 매칭하고 기존 순서를 유지합니다. |
+
+| `recurrence` | 첫 근무 구간 | MoleSignal |
+|---|---|---|
+| `RRULE:FREQ=WEEKLY` | 7일 | 항상 활성 상태입니다. `shifts_per_member`가 1이면 **매주**, 그 외에는 사용자 지정 주기를 적용합니다. |
+| `RRULE:FREQ=DAILY` | 24시간 | 항상 활성 상태입니다. `shifts_per_member`가 1이면 **매일**, 7이면 **매주**, 그 외에는 사용자 지정 주기를 적용합니다. |
+| `INTERVAL`을 지정한 `FREQ=WEEKLY`, `FREQ=DAILY` 또는 `FREQ=HOURLY` | 반복 간격과 동일 | 항상 활성 상태이며 사용자 지정 주기를 적용합니다. 예를 들어 `RRULE:FREQ=HOURLY;INTERVAL=12`는 12시간 주기를 적용합니다. |
+| `RRULE:FREQ=DAILY` | 하루 중 일부 | 매일 해당하는 주간 시간 범위를 설정합니다. |
+| `RRULE:FREQ=WEEKLY` 또는 `BYDAY`에 요일 하나를 지정한 규칙 | 일주일 중 일부 | 주간 시간 범위 하나를 설정합니다. 이 범위는 여러 날에 걸칠 수 있습니다. |
+| `RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` | 하루 중 일부 | 해당 요일에 주간 시간 범위를 설정합니다. `shifts_per_member`가 5이면 담당자당 1주, 10이면 2주입니다. |
+
+진행 중인 이벤트에 다음 조건이 있으면 가져오기를 중단합니다.
+
+| PagerDuty | 이유 |
+|---|---|
+| 멤버가 여러 명인 `every_member_assignment_strategy` | 모든 멤버가 동시에 온콜 근무를 하지만, MoleSignal에서는 스케줄당 한 번에 한 명만 근무할 수 있습니다. 파일에서 담당자마다 이름이 다른 스케줄을 만들고, 에스컬레이션 정책의 한 단계에 해당 스케줄을 모두 지정합니다. |
+| 다른 멤버와 함께 지정된 `empty_member` | MoleSignal 로테이션에서는 근무 차례를 비워 둘 수 없습니다. |
+| 서로 겹치는 이벤트 | 여러 담당자가 동시에 온콜 근무를 합니다. Opsgenie와 마찬가지로 이벤트를 별도 스케줄로 나눕니다. |
+| `EXDATE` 또는 `RDATE` | MoleSignal 로테이션에서는 특정 회차만 제외하거나 추가할 수 없습니다. PagerDuty는 이런 회차를 `shifts_per_member`에 포함하는지 문서에 명시하지 않습니다. |
+| `FREQ=MONTHLY`, `COUNT`, `UNTIL` 또는 근무 구간이 반복 간격보다 짧은 `INTERVAL` 등 그 밖의 규칙 | 담당 순서나 근무 시간대가 매주 같은 요일과 시각에 반복되지 않습니다. |
+| 멤버가 여러 명이고 `shifts_per_member`가 요일 수의 배수가 아닌 `BYDAY` | 인계 간격이 일정하지 않습니다. 금요일 근무 다음에는 월요일 근무가 이어집니다. |
+| 아직 시작하지 않은 사용자 지정 근무 | MoleSignal 로테이션에서는 일회성 근무를 설정할 수 없습니다. 해당 근무가 끝난 뒤에 가져오거나, 파일의 `final_schedule`에서 해당 근무를 제거하고 가져온 뒤 오버라이드를 추가합니다. |
+| 시간대가 서로 다른 이벤트 | MoleSignal에서는 스케줄 하나에 시간대 하나만 사용할 수 있습니다. |
+
+스크립트가 세부 정보를 가져오지 못한 경우처럼 파일의 `shift_based_schedules`에 이름만 있는 교대 근무 기반 스케줄은 가져오기에서 제외하고 결과에 이름을 표시합니다. 해당 스케줄을 가져오려면 스크립트를 다시 실행합니다. 파일의 나머지 항목은 그대로 가져옵니다.
+
+오버라이드, 에스컬레이션 정책, 서비스는 가져오지 않습니다.
+
+## 결과 확인
+
+| 표시 | 의미 |
+|---|---|
+| **생성**, **업데이트**, **변경 없음** | 번들과 마찬가지로 이름으로 매칭합니다. **업데이트**는 변경할 필드를 표시합니다. |
+| **건너뛰기** | 파일에 이름만 있는 PagerDuty 교대 근무 기반 스케줄이나 **새 규칙만 생성하고 같은 이름의 기존 규칙은 유지**를 선택했을 때 이름이 일치하는 기존 스케줄은 건너뜁니다. |
+| **오류** | 파일 전체의 가져오기를 중단합니다. 사유를 한 줄씩 표시하고, 매칭되는 멤버가 없는 이메일을 모두 나열합니다. |
+
+각 스케줄 아래의 나머지 줄에는 제외한 항목과 원본과의 비교 결과를 표시합니다.
+
+### 원본과 비교
+
+파일에는 원본 서비스가 직접 산출한 스케줄인 PagerDuty의 `final_schedule`과 Opsgenie의 타임라인이 들어 있습니다. 시험 실행에서는 해당 기간 중 현재 시점 이후의 온콜 담당자를 계산하고 원본과 비교합니다. 차이가 있으면 해당 시각과 양쪽 담당자를 오류로 표시하고 아무것도 저장하지 않습니다.
+
+- 오버라이드는 가져오지 않으므로 오버라이드가 적용되는 기간은 비교하지 않습니다.
+- 교대 근무 기반 스케줄의 `final_schedule`에서 여러 담당자가 동시에 온콜 근무를 하면, 이벤트가 겹치지 않더라도 가져오기를 중단합니다.
+- Opsgenie에서 비활성화한 스케줄은 일시 중지 상태로 가져오고 비교하지 않습니다.
+- 일광 절약 시간제를 사용하는 시간대에서 비교 기간에 시계 전환 시점이 포함되지 않으면 결과에 표시합니다. MoleSignal에서는 인계가 같은 현지 시각에 이루어집니다. 다음 전환 시점 전후를 비교하려면 `DAYS`를 늘립니다.
+- 파일에 산출된 스케줄이 없으면 비교하지 않았다고 결과에 표시하고 가져오기를 계속합니다. 원본과 다른 스케줄을 의도적으로 가져오려면 파일에서 `final_schedule` 또는 `timelines`를 제거합니다.
+
+### 제한
+
+파일은 최대 4 MiB이며 스케줄을 최대 500개까지 포함할 수 있습니다. 스케줄 하나에는 실행 중인 로테이션을 최대 60개까지 포함할 수 있습니다. 파일이 너무 크면 `DAYS`를 줄입니다.
+
+## 다시 가져오기
+
+스케줄은 이름으로 매칭합니다. 가져오기를 다시 실행하면 원본에서 변경된 스케줄의 로테이션만 업데이트하고 나머지는 그대로 둡니다. MoleSignal에서 만든 오버라이드와 근무 교환은 유지합니다. 팀이나 **근무 교환에 승인 필요**처럼 파일에 없는 설정도 유지합니다.

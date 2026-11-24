@@ -1,0 +1,86 @@
+---
+title: "Consultar exemplares"
+description: "Consulte os exemplares armazenados com as amostras de remote write do Prometheus. O resultado segue o formato de resposta da API HTTP do Prometheus."
+"en_link": "/en-US/api/query/exemplars"
+"zh-Hans_link": "/zh-Hans/api/query/exemplars"
+"zh-Hant_link": "/zh-Hant/api/query/exemplars"
+"ja_link": "/ja/api/query/exemplars"
+"ko_link": "/ko/api/query/exemplars"
+"de_link": "/de/api/query/exemplars"
+"es_link": "/es/api/query/exemplars"
+"fr_link": "/fr/api/query/exemplars"
+---
+
+```http
+GET  /api/v1/prometheus/api/v1/query_exemplars
+POST /api/v1/prometheus/api/v1/query_exemplars
+```
+
+Retorna os exemplares das séries que uma expressão PromQL seleciona, no formato de resposta do endpoint `query_exemplars` da API HTTP do Prometheus. A página **Métricas** obtém os exemplares desse endpoint. A chamada exige `metrics.read` ou, no escopo do sistema, `sys.telemetry.read`.
+
+Os exemplares vêm da [escrita remota do Prometheus](/pt-BR/intake#prometheus-remote_write), que os mantém junto às amostras. O MoleSignal armazena as métricas OTLP sem os exemplares.
+
+`GET` recebe os parâmetros na string de consulta, e `POST` os recebe como dados de formulário (`application/x-www-form-urlencoded`):
+
+| Parâmetro | Obrigatório | Observações |
+|---|---|---|
+| `query` | Sim | Uma expressão PromQL. Cada seletor da expressão deve especificar o nome da métrica. |
+| `start` | Sim | Segundos desde a época Unix, com frações permitidas, ou uma data e hora no formato RFC 3339. |
+| `end` | Sim | Aceita os mesmos formatos. Não pode ser anterior a `start`. |
+
+Apenas os seletores da expressão determinam o resultado: cada seletor escolhe as séries da métrica que atendem aos critérios de correspondência de rótulos. Funções, operadores e durações dos intervalos não alteram a resposta. Se uma nova tentativa de escrita remota, por exemplo, enviar o mesmo exemplar duas vezes, o endpoint retorna apenas uma cópia. A resposta inclui no máximo 10.000 exemplares e traz um aviso ao atingir esse limite. Assim como uma consulta, a solicitação aguarda uma vaga no [controle de admissão](/pt-BR/configuration#controle-de-admissão). O MoleSignal nunca armazena a resposta em cache.
+
+O [mascaramento de campos](/pt-BR/settings/data-security#mascaramento-de-campos) se aplica aos rótulos das séries e dos exemplares. Uma regra de mascaramento para `value` ou `_timestamp` faz a solicitação falhar, pois o formato do Prometheus não aceita valores mascarados.
+
+<RequestExample>
+```bash cURL
+curl -G http://localhost:5080/api/v1/prometheus/api/v1/query_exemplars \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'query=histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{service="checkout"}[5m]))' \
+  --data-urlencode "start=$(( $(date +%s) - 3600 ))" \
+  --data-urlencode "end=$(date +%s)"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "status": "success",
+  "data": [
+    {
+      "seriesLabels": {
+        "__name__": "http_request_duration_seconds_bucket",
+        "le": "0.5",
+        "service": "checkout"
+      },
+      "exemplars": [
+        {
+          "labels": { "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7" },
+          "value": 0.43,
+          "timestamp": 1790000000.123
+        }
+      ]
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Campo | Observações |
+|---|---|
+| `data[].seriesLabels` | Os rótulos da série, com o nome da métrica no rótulo `__name__`. |
+| `data[].exemplars[]` | Os exemplares da série no intervalo, do mais antigo ao mais recente. |
+| `labels` | Os rótulos do exemplar, como `trace_id` e `span_id`. |
+| `value` | O valor que o exemplar registrou. |
+| `timestamp` | Segundos desde a época Unix, com frações. |
+| `warnings` | Aparece apenas quando a resposta atinge o limite de 10.000 exemplares. |
+
+**Erros**
+
+| Status | Causa |
+|---|---|
+| `400` | `query` está vazio ou não é uma expressão PromQL válida, um seletor não especifica o nome de uma métrica, uma data e hora não segue nenhum dos formatos aceitos ou `end` é anterior a `start`. |
+| `403` | O token não tem `metrics.read` ou uma regra de mascaramento se aplica a `value` ou `_timestamp`. |
+| `429` | O [controle de admissão](/pt-BR/configuration#controle-de-admissão) rejeitou a solicitação. |
+
+Esses erros usam o [corpo da resposta de erro](/pt-BR/api-reference#respostas-e-erros) dos outros endpoints, não o do Prometheus.

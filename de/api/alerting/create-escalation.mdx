@@ -1,0 +1,124 @@
+---
+title: "Eskalationsrichtlinie erstellen"
+description: "Legen Sie fest, in welcher Reihenfolge die Benachrichtigungsschritte bei Incidents ausgeführt werden."
+"en_link": "/en-US/api/alerting/create-escalation"
+"zh-Hans_link": "/zh-Hans/api/alerting/create-escalation"
+"zh-Hant_link": "/zh-Hant/api/alerting/create-escalation"
+"ja_link": "/ja/api/alerting/create-escalation"
+"ko_link": "/ko/api/alerting/create-escalation"
+"es_link": "/es/api/alerting/create-escalation"
+"fr_link": "/fr/api/alerting/create-escalation"
+"pt-BR_link": "/pt-BR/api/alerting/create-escalation"
+---
+
+```http
+POST /api/v1/alerts/escalations
+```
+
+Erstellt eine Eskalationsrichtlinie. Eine Richtlinie legt die Reihenfolge der Schritte fest. Jeder Schritt benachrichtigt seine Ziele und wartet auf eine Bestätigung. Der Aufruf erfordert `alerts.escalations.manage`.
+
+## So funktioniert die Eskalation
+
+1. Die Rolle `alert` prüft aktive Incidents im Intervall `[alert].dispatch_interval_secs`, standardmäßig alle 10 Sekunden. Nur Incidents mit dem Status `open` eskalieren weiter. Die Bestätigung eines Incidents stoppt die Eskalation.
+2. Ein Schritt mit `minSeverity` gilt nur für Incidents mit diesem oder einem höheren Schweregrad. Die Eskalation überspringt alle Schritte, die nicht zutreffen.
+3. Jedes Ziel des aktuellen Schritts erhält ein Benachrichtigungsereignis. Die [Benachrichtigungskanäle](/de/notification-channels) legen fest, wie die Nachricht zugestellt wird. Als `assignees` des Incidents gelten dann die direkt im Schritt angegebenen Benutzer: die `user`-Ziele und der jeweils diensthabende Benutzer jedes `schedule`-Ziels. Richtet sich ein Schritt nur an Teams, bleiben die bisherigen Zuweisungen bestehen.
+4. Läuft `ackTimeoutSecs` ohne Bestätigung ab, beginnt der nächste zutreffende Schritt.
+5. Nach Ablauf der Wartezeit im letzten zutreffenden Schritt beginnt eine Richtlinie mit `repeat` auf `true` wieder beim ersten Schritt, bis `maxLoops` Durchläufe abgeschlossen sind.
+6. Wenn `ackRetriggerSecs` festgelegt ist und ein Incident mit dem Status `acknowledged` nach dieser Zeit seit seiner Bestätigung noch nicht behoben ist, wechselt er zurück zu `open`. Die Eskalation benachrichtigt die zugewiesenen Benutzer erneut oder, falls keine zugewiesen sind, die Ziele des aktuellen Schritts. Dabei setzt sie `escalation.reason` auf `ack_timeout`. Die Wartezeit auf eine Bestätigung beginnt im aktuellen Schritt von vorn und die Eskalation läuft wie gewohnt weiter. Für zurückgestellte Incidents gilt diese Frist nicht.
+
+Eine Regel wählt eine Richtlinie über `escalationPolicyId` aus. Ohne diese Angabe verwendet die Regel den Alias `default` für die Richtlinie der Organisation mit dem Namen `default`. Beim Namensvergleich spielt die Groß- und Kleinschreibung keine Rolle. Zu Beginn der Eskalation speichert der Incident die tatsächliche ID der Richtlinie. Eine spätere Umbenennung weist einem offenen Incident daher keine andere Richtlinie zu. Gibt es in der Organisation keine Richtlinie namens `default`, eskalieren die Incidents einer solchen Regel nie. Das ausgelöste Ereignis erreicht aber weiterhin die Benachrichtigungsrichtlinien. Erstellen Sie eine Richtlinie namens `default` oder geben Sie in der Regel eine Richtlinien-ID an.
+
+**Anfragetext**
+
+| Feld | Typ | Erforderlich | Hinweise |
+|---|---|---|---|
+| `name` | string | Ja | Darf nicht leer sein. |
+| `steps` | array | Nein | Standardmäßig leer. Eine Richtlinie ohne Schritte sendet keine Benachrichtigungen. |
+| `repeat` | boolean | Nein | Standardwert: `false`. Legt fest, ob nach dem letzten Schritt ein neuer Durchlauf beginnt. |
+| `maxLoops` | integer | Nein | Standardwert: `1`. Gesamtzahl der Durchläufe, wenn `repeat` auf `true` steht. Ein Wert unter 1 wird auf 1 gesetzt. |
+| `ackRetriggerSecs` | integer | Nein | Zeitspanne von 300 bis 86400 Sekunden, nach der ein bestätigter, aber noch nicht behobener Incident eine weitere Benachrichtigung auslöst. Standardwert: `null` (keine erneute Benachrichtigung). |
+| `urgencyRule` | object | Nein | Legt die Dringlichkeit eines Incidents fest, für den noch keine angegeben ist. Standardwert: `{"mode": "by_severity"}`. Damit gilt die Stufe, die die Organisation dem jeweiligen Schweregrad zuordnet (standardmäßig hoch für „Kritisch“ und „Fehler“, niedrig für „Warnung“ und „Info“). Weitere Optionen: `{"mode": "always", "urgency": "high"}` oder `{"mode": "support_hours", "hours": {"timezone": "Asia/Shanghai", "ranges": [{"weekdayMask": 62, "start": "09:00", "end": "18:00"}], "calendar": {"calendarId": "<id>", "holidays": "exclude"}}, "inside": "high", "outside": "low", "raiseAtStart": true}`. `inside` gilt innerhalb der Supportzeiten und `outside` außerhalb. Die Standardwerte sind `high` bzw. `low`. Mit `raiseAtStart` steigt die Dringlichkeit unbestätigter Incidents zu Beginn der Supportzeiten auf `inside`, sofern sie darunter liegt. Die Benachrichtigungen beginnen dann erneut beim ersten Schritt. Als Dringlichkeit dient der Schlüssel einer der [Stufen](/de/alerting/on-call#dringlichkeits-und-prioritätsstufen) der Organisation. Bit 0 von `weekdayMask` steht für Sonntag. `calendar` ist optional. Für `holidays` sind `exclude` und `only` zulässig (siehe [Feiertagskalender](/de/alerting/on-call#feiertagskalender)). Siehe [Dringlichkeit](/de/alerting/on-call#dringlichkeit). |
+| `escalateLowUrgency` | boolean | Nein | Standardwert: `false`. Bei Incidents einer Stufe, die keine weitere Eskalation vorsieht, benachrichtigt die Richtlinie nur die Ziele des ersten Schritts, ohne weitere Schritte oder Wiederholungen. Mit `true` eskalieren diese Incidents gemäß dieser Richtlinie wie gewohnt. |
+
+Ein Schritt hat folgende Felder:
+
+| Feld | Typ | Erforderlich | Hinweise |
+|---|---|---|---|
+| `targets` | array | Ja | Alle Empfänger dieses Schritts erhalten die Benachrichtigung gleichzeitig. |
+| `ackTimeoutSecs` | integer | Nein | Wartezeit in Sekunden für eine Bestätigung, bevor der nächste Schritt beginnt. Ohne diese Angabe übernimmt der Schritt `[alert].default_ack_timeout_secs` (standardmäßig 300) und speichert den Wert. |
+| `minSeverity` | string | Nein | `info`, `warning`, `error` oder `critical`. Der Schritt gilt für Incidents mit diesem oder einem höheren Schweregrad. Lassen Sie das Feld weg, damit der Schritt für alle Incidents gilt. |
+
+Ein Ziel bestimmt seine Empfänger anhand von `kind`:
+
+| `kind` | Zusätzliches Feld | Empfänger |
+|---|---|---|
+| `user` | `userId` | Ein Benutzer. |
+| `team` | `teamId` | Die Mitglieder eines Teams. |
+| `schedule` | `scheduleId` | Der diensthabende Benutzer in einem Bereitschaftsplan. |
+
+Der Aufruf prüft nicht, ob der referenzierte Benutzer, das Team oder der Bereitschaftsplan existiert.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/escalations \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "Primary operations",
+    "steps": [
+      { "targets": [{ "kind": "user", "userId": "<user-id>" }],
+        "ackTimeoutSecs": 300 },
+      { "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+        "ackTimeoutSecs": 900,
+        "minSeverity": "critical" }
+    ],
+    "repeat": true,
+    "maxLoops": 2,
+    "ackRetriggerSecs": 3600
+  }'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "id": "3KED3sy8RBNYIdLayGZN0bp2IIY",
+  "orgId": "<organization-id>",
+  "name": "Primary operations",
+  "steps": [
+    {
+      "targets": [{ "kind": "user", "userId": "<user-id>" }],
+      "ackTimeoutSecs": 300,
+      "minSeverity": null
+    },
+    {
+      "targets": [{ "kind": "team", "teamId": "<team-id>" }],
+      "ackTimeoutSecs": 900,
+      "minSeverity": "critical"
+    }
+  ],
+  "repeat": true,
+  "maxLoops": 2,
+  "ackRetriggerSecs": 3600
+}
+```
+</ResponseExample>
+
+**Fehler**
+
+| Status | Ursache |
+|---|---|
+| `400` | `name` ist leer oder `ackRetriggerSecs` liegt außerhalb des Bereichs von 300 bis 86400. |
+| `403` | Dem Token fehlt `alerts.escalations.manage`. |
+| `422` | Ein Feld fehlt oder ist ungültig. Beispiele: ein anderer Wert als `user`, `team` oder `schedule` für `kind` eines Ziels oder ein unbekannter Wert für `minSeverity`. Die Antwort enthält unformatierten Text. |
+
+## Weitere Endpunkte für Eskalationsrichtlinien
+
+| Vorgang | Endpunkt | Berechtigung |
+|---|---|---|
+| Auflisten | `GET /api/v1/alerts/escalations` | `alerts.escalations.read` |
+| Abrufen | `GET /api/v1/alerts/escalations/{id}` | `alerts.escalations.read` |
+| Ersetzen | `PUT /api/v1/alerts/escalations/{id}` | `alerts.escalations.manage` |
+| Löschen | `DELETE /api/v1/alerts/escalations/{id}` | `alerts.escalations.delete` |
+
+`PUT` verwendet denselben Anfragetext wie der Aufruf zum Erstellen und ersetzt die Richtlinie. `DELETE` gibt `deleted` als unformatierten Text zurück, bei einer unbekannten ID jedoch `404`. Beim Löschen prüft der Aufruf nicht, welche Regeln auf die Richtlinie verweisen. Incidents dieser Regeln eskalieren nicht mehr.

@@ -1,0 +1,152 @@
+---
+title: "API 入門"
+description: "基礎 URL、身分驗證、權限、請求慣例、分頁、串流回應與錯誤處理。"
+"en_link": "/en-US/api-reference"
+"zh-Hans_link": "/zh-Hans/api-reference"
+"ja_link": "/ja/api-reference"
+"ko_link": "/ko/api-reference"
+"de_link": "/de/api-reference"
+"es_link": "/es/api-reference"
+"fr_link": "/fr/api-reference"
+"pt-BR_link": "/pt-BR/api-reference"
+---
+
+MoleSignal 提供有版本的 HTTP API。產品端點使用 `/api/v1`。健康探查、Prometheus 指標、公開共用連結和少數相容通訊協定也會使用其他路徑。
+
+## 基礎 URL
+
+本機執行個體：
+
+```text
+http://localhost:5080/api/v1
+```
+
+正式環境請將主機替換為部署的對外位址，也就是 `[http].external_url` 的值。
+
+## 身分驗證
+
+受保護的端點會接受 `Authorization` 要求標頭中的 Bearer 權杖：
+
+```http
+Authorization: Bearer <token>
+```
+
+| 權杖 | 取得方式 | 有效期限 |
+|---|---|---|
+| API 權杖 | **個人設定 → API 權杖**，或[簽發 API 權杖](/zh-Hant/api/auth/issue-token)。格式為 `mspat-<36>`。 | 直到撤銷或達到選定的到期時間。 |
+| 預設擷取權杖 | `GET /api/v1/me/api-tokens/default`，僅限 `logs.write`、`metrics.write`、`traces.write`、`profiles.write` 和 `apm.deploy`。 | 不會過期。 |
+| RUM 用戶端權杖 | `GET /api/v1/auth/tokens/rum?applicationId=<id>`，僅限 `rum.write`。 | 不會過期。 |
+
+指令碼和收集器請使用 API 權杖。擷取權杖的詳細資訊請參閱[資料來源](/zh-Hant/intake#資料接收-token)。
+
+Web 介面透過 `POST /api/v1/auth/signin` 登入。此端點會設定工作階段 Cookie，不會傳回權杖。`Authorization` 要求標頭不接受工作階段權杖，請參閱[登入](/zh-Hant/api/auth/login)。
+
+身分驗證會產生 IAM 內容，其中包含主體、目前的組織或平台範圍，以及實際生效的權限。系統一律從這個內容判定要求所屬的組織，無法在要求主體中選擇其他組織。
+
+## 公開與自行驗證的路由
+
+少數路由不接受組織的 Bearer 權杖，改為驗證範圍較窄的憑證或原則：
+
+- 登入、註冊原則與密碼重設；
+- `GET /api/v1/healthz` 與頂層的 `/metrics`；
+- 公開資源共用的交換與共用工作階段要求；
+- 簽名檔案下載與公開大頭貼；
+- 驗證推送權杖的推送型連接器端點。
+
+公開路由仍有存取限制。對應的處理邏輯會檢查註冊原則、共用權杖、下載權杖、簽章或連接器憑證。
+
+## 授權
+
+端點可能要求符合下列一項或多項條件：
+
+- 組織權限，例如 `streams.query`；
+- 平台權限，例如 `sys.telemetry.read`；
+- 資源擁有權、與資源的關係，或跨組織授權。
+
+`GET /api/v1/iam/capabilities` 會傳回目前主體實際生效的權限。請勿根據角色名稱或可見的選單項目推斷存取權限。
+
+## 要求
+
+- 大多數要求主體採用 JSON，並使用 `Content-Type: application/json`。
+- 相容型擷取端點使用各自通訊協定的承載資料，例如 Protobuf、NDJSON 或 gzip 壓縮的要求主體。
+- 擷取端點會拒絕超過 2 MiB 的要求主體，並傳回 `413`；原生 JSON 擷取的上限為 16 MiB。
+- 時間以自 Unix 紀元起算的微秒整數表示。時間點依發生的事件命名（`createdAt`、`expiresAt`），單用一個詞說不清楚時加上 `Time`（`startTime`）；持續時間以 `Time` 結尾（`p95Time`），名稱本身已表示持續時間時則不加（`duration`）。原生遙測記錄使用 `_timestamp`，同樣以微秒計。
+- 請對路徑中的 id 和資料串流名稱進行 URL 編碼。
+
+## 回應與錯誤
+
+除非端點傳回串流或檔案，否則成功回應一律採用 JSON。錯誤回應包含狀態碼，以及帶有機器可讀的 `error` 代碼和 `message` 的 JSON 回應主體：
+
+```json
+{
+  "error": "unauthorized",
+  "message": "unauthorized: missing Authorization Bearer token"
+}
+```
+
+`validation_failed` 錯誤也會附上 `issues` 陣列，每個無效欄位各有一個項目。
+
+| 狀態碼 | `error` | 意義 |
+|---|---|---|
+| `400` | `invalid_argument`、`validation_failed` | 要求或其中某個參數無效。 |
+| `401` | `unauthorized` | 權杖缺失、格式錯誤、無效或已過期。 |
+| `403` | `forbidden` | 缺少權限、關係或範圍。 |
+| `404` | `not_found` | 資源不存在，或在授權範圍內不可見。 |
+| `409` | `conflict` | 狀態或唯一性衝突。 |
+| `413` | `payload_too_large` | 要求主體超出限制。 |
+| `429` | `resource_exhausted` | 已觸發速率限制。若有 `Retry-After` 回應標頭，請依其指定的時間重試。 |
+| `499` | `cancelled` | 要求已取消。 |
+| `503` | `unavailable` | 相依項目無法使用。 |
+| `500` | `internal` | 內部故障。回應主體中的 message 為 `internal error`，詳細資訊只會保留在伺服器端記錄中。 |
+
+如果無法剖析要求主體，要求會在抵達端點前失敗。這時會傳回純文字，而非 JSON：
+
+| 狀態碼 | 意義 |
+|---|---|
+| `400` | 要求主體不是有效的 JSON。 |
+| `415` | 要求缺少 `Content-Type: application/json`。 |
+| `422` | 欄位缺失或型別錯誤，文字會指出欄位名稱。 |
+
+每個回應都包含 `X-Request-Id` 與 `X-Trace-Id` 回應標頭。回報伺服器端故障時，請同時提供這兩個值。
+
+## 分頁
+
+可能傳回大量資料列的端點接受 `limit` 與 `cursor`，這類回應會包含 `items` 與 `nextCursor`。將 `nextCursor` 當作 `cursor` 傳回，即可讀取下一頁；如果 `nextCursor` 為空，就停止讀取。其他清單端點會傳回完整清單，詳情請參閱各端點頁面。
+
+## 查詢與耗時較長的工作
+
+這組查詢端點可傳回一般 JSON 或以串流形式傳回 NDJSON，並將耗時較長的查詢當成非同步搜尋工作執行。規模過大的查詢會傳回 `202`，並附上 `jobId` 與 `monitor` 路徑。呼叫串流端點時，請處理只收到部分資料的情況，並在不再需要結果時取消要求。請參閱[查詢](/zh-Hant/query)。
+
+產生的報告、Profile 資料區塊和匯出檔案等大型產出，會透過範圍受限的下載權杖以檔案形式交付，而不會放在 JSON 回應主體中。
+
+## 瀏覽 API
+
+<CardGroup cols={3}>
+  <Card title="API 目錄" icon="list" href="/zh-Hant/api/catalog">
+    查看各類路由、用途及保護這些路由的權限。
+  </Card>
+  <Card title="身分驗證" icon="key" href="/zh-Hant/api/auth/login">
+    登入並管理 API 權杖。
+  </Card>
+  <Card title="資料擷取" icon="inbox" href="/zh-Hant/api/intake/native-json">
+    傳送原生 JSON 格式與相容通訊協定的遙測資料。
+  </Card>
+  <Card title="查詢" icon="magnifying-glass" href="/zh-Hant/api/query/execute">
+    執行 SQL 查詢、PromQL 相容查詢、串流查詢及已儲存的查詢。
+  </Card>
+  <Card title="APM" icon="gauge-high" href="/zh-Hant/api/apm">
+    讀取服務、交易、相依性與錯誤指標。
+  </Card>
+  <Card title="資料串流" icon="database" href="/zh-Hant/api/streams/list">
+    建立、檢視並設定資料串流。
+  </Card>
+  <Card title="警示" icon="bell" href="/zh-Hant/api/alerting/list-rules">
+    管理規則、事件、管道與升級。
+  </Card>
+  <Card title="關聯與 Web" icon="diagram-project" href="/zh-Hant/api/web/correlation">
+    搜尋、拓撲、追蹤與跨訊號導覽。
+  </Card>
+  <Card title="平台與管理" icon="shield-halved" href="/zh-Hant/api/admin/audit">
+    稽核記錄、加密金鑰與健康檢查。
+  </Card>
+</CardGroup>

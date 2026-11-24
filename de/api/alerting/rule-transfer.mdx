@@ -1,0 +1,100 @@
+---
+title: "Regeln importieren und exportieren"
+description: "Exportieren Sie Alert-Regeln als Paket, in dem ihre Referenzen aufgeführt sind, oder importieren Sie ein solches Paket oder eine Prometheus-Datei mit Alert-Regeln."
+"en_link": "/en-US/api/alerting/rule-transfer"
+"zh-Hans_link": "/zh-Hans/api/alerting/rule-transfer"
+"zh-Hant_link": "/zh-Hant/api/alerting/rule-transfer"
+"ja_link": "/ja/api/alerting/rule-transfer"
+"ko_link": "/ko/api/alerting/rule-transfer"
+"es_link": "/es/api/alerting/rule-transfer"
+"fr_link": "/fr/api/alerting/rule-transfer"
+"pt-BR_link": "/pt-BR/api/alerting/rule-transfer"
+---
+
+```http
+GET  /api/v1/alerts/rules/export
+POST /api/v1/alerts/rules/import
+```
+
+## Export
+
+Erfordert `alerts.rules.read`. Der Abfrageparameter `ids` akzeptiert kommagetrennte Regel-IDs. Ein leerer Wert exportiert alle
+Regeln. Die Antwort enthält ein Paket:
+
+```json
+{
+  "format": "molesignal.alert-rules/v1",
+  "exportedAt": "2026-10-28T08:00:00Z",
+  "rules": [
+    {
+      "name": "High error rate",
+      "description": "",
+      "enabled": true,
+      "kind": "scheduled",
+      "query": {"language": "promql", "statement": "sum(rate(http_requests_total{code=~\"5..\"}[5m]))", "periodSecs": 60, "stream": {"name": "http_requests_total", "streamType": "metrics"}},
+      "trigger": {"operator": "gt", "threshold": 5, "forPeriods": 2, "silenceSecs": 300},
+      "thresholds": [],
+      "severity": "error",
+      "escalationPolicy": "Payments on-call",
+      "labels": {"service": "checkout"},
+      "annotations": {}
+    }
+  ]
+}
+```
+
+Eine Regel behält ihre vollständige Definition, aber keine ID, Organisation, keinen Auswertungsstatus und keine Zeitangaben.
+`escalationPolicy` enthält den Namen der Eskalationsrichtlinie und fehlt bei der Standardrichtlinie.
+`query.composite.rules` enthält bei einer zusammengesetzten Regel die Namen ihrer untergeordneten Regeln. Die Check-in-Adresse einer Heartbeat-Regel
+fehlt im Paket.
+
+## Import
+
+Erfordert `alerts.rules.manage`.
+
+| Feld | Typ | Erforderlich | Beschreibung |
+|---|---|---|---|
+| `content` | string | Ja | Ein Paket (JSON oder YAML, mit `format`) oder eine Prometheus-Alert-Regeldatei (`groups` auf oberster Ebene oder `spec.groups` einer `PrometheusRule`); maximal 4 MiB und 500 Regeln. |
+| `dryRun` | boolean | Nein | Standardmäßig `true`: prüft den Import, ohne zu schreiben. `false` schreibt die Änderungen. |
+| `createOnly` | boolean | Nein | Bei `true` bleiben vorhandene Regeln mit demselben Namen unverändert. |
+
+Der Import gleicht jede Regel anhand ihres Namens ab. Bei einem neuen Namen legt er die Regel an. Gibt es genau eine vorhandene Regel mit diesem Namen, vergleicht er die Felder einzeln. Bei
+mehreren vorhandenen Regeln mit demselben Namen oder einem doppelten Namen in der Datei schlägt der Import fehl. Der Import prüft jede Regel wie beim Speichern. Besteht eine Regel die Prüfung nicht,
+schreibt der Import nichts. Andernfalls schreibt er alle Änderungen in einer Transaktion, sendet für jede Regel ein Föderationsänderungsereignis
+und protokolliert ein Audit-Ereignis `alert_rules.imported`. Unter
+[Import und Export](/de/alerting/rules#import-und-export) steht, wie der Import eine Prometheus-Regel in eine
+MoleSignal-Regel umwandelt.
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/rules/import \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d "$(jq -n --rawfile content rules.yaml '{content: $content, dryRun: true}')"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "format": "prometheus",
+  "items": [
+    {"name": "HighErrorRate", "action": "create", "ruleId": "3KF1..."},
+    {"name": "DiskFull", "action": "update", "changes": ["query", "trigger"], "ruleId": "3KC9..."},
+    {"name": "TargetDown", "action": "error", "error": "no escalation policy is named `ops`"}
+  ],
+  "notes": ["recording rule `job:errors:rate5m` in group `api` is not imported"],
+  "applied": false
+}
+```
+</ResponseExample>
+
+`action` lautet `create`, `update`, `unchanged`, `skip` (bei einer vorhandenen Regel mit `createOnly`) oder `error`.
+`applied` gibt an, ob der Import etwas geschrieben hat.
+
+**Fehler**
+
+| Status | Grund |
+|---|---|
+| `400` | Der Inhalt ist weder ein Paket noch eine Prometheus-Regeldatei, gibt ein anderes Format an, ist zu groß oder enthält zu viele Regeln. |
+| `403` | Dem Token fehlt die Berechtigung. |

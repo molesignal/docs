@@ -1,0 +1,117 @@
+---
+title: "Checkliste für den Produktivbetrieb"
+description: "Diese Einstellungen sollten Sie ändern und diese Prüfungen durchführen, bevor MoleSignal echte Daten speichert. Die Checkliste deckt Geheimnisse, Speicher, Netzwerk, Dauerhaftigkeit der Daten und Betrieb ab."
+"en_link": "/en-US/deployment/production-checklist"
+"zh-Hans_link": "/zh-Hans/deployment/production-checklist"
+"zh-Hant_link": "/zh-Hant/deployment/production-checklist"
+"ja_link": "/ja/deployment/production-checklist"
+"ko_link": "/ko/deployment/production-checklist"
+"es_link": "/es/deployment/production-checklist"
+"fr_link": "/fr/deployment/production-checklist"
+"pt-BR_link": "/pt-BR/deployment/production-checklist"
+---
+
+Die Compose-Sandbox und die Beispieldatei `conf/config.toml` sind auf einen schnellen Einstieg ausgelegt. Arbeiten Sie diese Seite durch, bevor eine Bereitstellung echte Daten enthält.
+
+## Sandbox-Standardwerte ersetzen
+
+| Element | Sandbox-Standardwert | Produktion |
+|---|---|---|
+| Root-Konto | `admin@example.com` mit dem Passwort `admin` | Legen Sie vor dem ersten Start in `[auth]` eine eindeutige E-Mail-Adresse und ein starkes Passwort fest. |
+| `MS_CIPHER_KEY` | Nicht gesetzt (ein Entwicklungsschlüssel aus lauter Nullen) oder ein fest hinterlegter Entwicklungsschlüssel in der Compose-Datei | Ein zufälliger 32-Byte-Schlüssel in einem Secret Manager. |
+| PostgreSQL-Zugangsdaten | `molesignal` / `molesignal` | Eine eigene Datenbank und ein eigener Benutzer mit einem generierten Passwort. |
+| Objektspeicher-Zugangsdaten | `rustfsadmin` / `rustfsadmin` | Ein eigener Zugriffsschlüssel, der nur für den Bucket gilt. |
+| Objektspeicher-Backend | RustFS in einem Container-Volume | `s3`, `azure` oder `gcs` mit dauerhaftem Speicher. |
+| `[http].external_url` | Leer | Die öffentliche HTTPS-Adresse. |
+| TLS | Aus | Ein Proxy mit TLS-Terminierung oder `[http.tls]`. |
+| Image-Tag | `latest` | Ein festgelegter Versions-Tag wie `26.1.0.0`. |
+
+## Checkliste
+
+<Steps>
+  <Step title="PostgreSQL und Objektspeicher bereitstellen">
+    Verwenden Sie PostgreSQL 17 mit automatisierten Backups. Erstellen Sie eine eigene Datenbank und einen eigenen Benutzer für MoleSignal.
+
+    Stellen Sie sicher, dass das Produkt aus `[meta_database].max_connections` und der Anzahl der Knoten unter dem PostgreSQL-Grenzwert `max_connections` bleibt.
+
+    Erstellen Sie einen privaten Bucket in derselben Region wie die Knoten. Fügen Sie keine Lebenszyklusregeln hinzu, die Objekte nach Ablauf einer Frist löschen. MoleSignal wendet die Aufbewahrungsregeln an und löscht die Objekte selbst.
+  </Step>
+  <Step title="Verschlüsselungsschlüssel generieren und speichern">
+    `MS_CIPHER_KEY` ist der Hauptschlüssel für die Secrets, die MoleSignal in PostgreSQL speichert: API-Tokens, Freigabelinks, Tokens für Remote-Cluster, Zugangsdaten für Benachrichtigungs- und Pipeline-Konnektoren, Anbieterschlüssel für Mole Agent, Secrets für das synthetische Monitoring und Schlüssel für Organisationsfelder. Generieren Sie den Schlüssel einmalig:
+
+    ```bash
+    openssl rand -base64 32
+    ```
+
+    Speichern Sie den Wert in einem Secret Manager und stellen Sie allen Knoten denselben Wert bereit. Sichern Sie den Schlüssel getrennt von der Datenbank. Wenn Sie die Datenbank ohne den Schlüssel wiederherstellen, bleiben diese Secrets unlesbar.
+
+    <Warning>
+      Ersetzen Sie den Schlüssel nie im laufenden Betrieb. Mit dem alten Schlüssel verschlüsselte Daten werden dadurch unlesbar. Stoppen Sie für den Schlüsselwechsel alle Schreibvorgänge, exportieren Sie den neuen Wert als `MS_CIPHER_KEY` und führen Sie den Offline-Befehl mit dem alten Schlüssel aus:
+
+      ```bash
+      molesignal --config /etc/molesignal/config.toml rewrap-kek --old-key "<old key, base64>"
+      ```
+
+      Der Befehl verschlüsselt alle betroffenen Spalten neu und gibt die Anzahl der Zeilen pro Tabelle aus. Prüfen Sie die Zahlen, bevor Sie den alten Schlüssel außer Betrieb nehmen.
+    </Warning>
+
+    Wenn eine Bereitstellung ohne `MS_CIPHER_KEY` gestartet ist, hat sie einen Entwicklungsschlüssel aus lauter Nullen verwendet. Übergeben Sie `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=` als `--old-key`, um bei einer solchen Bereitstellung auf einen echten Schlüssel umzusteigen.
+  </Step>
+  <Step title="Root-Konto absichern">
+    Beim ersten Start mit einer leeren Datenbank erstellt MoleSignal das Root-Konto anhand von `[auth].root_email` und `[auth].root_password`. Legen Sie beide Werte vor diesem ersten Start fest. Spätere Änderungen an `root_password` ändern das Passwort des bestehenden Kontos nicht.
+
+    Das Zurücksetzen des Passworts und **Kontoeinstellungen → Sicherheit und Anmeldung → Passwort ändern** funktionieren per E-Mail. Beide Funktionen benötigen `[notify.smtp]` und `[http].external_url`. Ohne diese Einstellungen versendet MoleSignal keine E-Mails. Konfigurieren Sie beides, bevor Sie sich auf diese Funktionen verlassen.
+
+    Bei jedem Start weist MoleSignal dem Konto mit `root_email` die Plattformadministratorrechte zu. Stellen Sie sicher, dass `root_email` auf ein bestehendes Benutzerkonto verweist.
+  </Step>
+  <Step title="Secrets nicht im Repository speichern">
+    Übergeben Sie den Datenbank-DSN, die Objektspeicherschlüssel und `MS_CIPHER_KEY` über Umgebungsvariablen oder einen Secret Manager. Verwenden Sie `MS_META_DATABASE_DSN`, `MS_OBJECT_STORE_ACCESS_KEY` und `MS_OBJECT_STORE_SECRET_KEY`. Lassen Sie die zugehörigen Konfigurationsschlüssel in `config.toml` leer.
+
+    Legen Sie das JWT-Signatur-Secret bei Bedarf mit `MS_AUTH_JWT_SECRET_OVERRIDE` fest. Andernfalls generiert MoleSignal beim ersten Start ein Secret in PostgreSQL. Wechseln Sie es mit `POST /api/v1/auth/jwt/rotate`. Der Aufruf erfordert die Berechtigung `sys.signing_keys.rotate`. Tokens, die mit dem abgelösten Secret signiert wurden, bleiben 24 Stunden gültig.
+  </Step>
+  <Step title="Die richtigen Ports freigeben">
+    | Port | Erreichbarkeit |
+    |---|---|
+    | `5080` | Öffentlich, mit TLS. |
+    | `4317` | Nur hinter einem Proxy mit TLS-Terminierung öffentlich. |
+    | `5082` | Nur im privaten Netzwerk. Über diesen Port kommunizieren Knoten ohne Authentifizierung miteinander. |
+    | `5083` | Optional, mit TLS, wenn SQL-Clients eine Verbindung herstellen. |
+    | `5084`, `5085` | Nur wenn Probe Agents außerhalb des Knotens laufen. |
+
+    Setzen Sie `[http].external_url` auf die öffentliche Adresse. Onboarding-Snippets, E-Mails zum Zurücksetzen von Passwörtern, Statusseiten-Domains und [Passkeys](/de/identity/mfa#voraussetzungen-für-die-instanz) verwenden diese Adresse.
+  </Step>
+  <Step title="TLS terminieren und Proxy konfigurieren">
+    Terminieren Sie TLS an einem Reverse-Proxy oder aktivieren Sie `[http.tls]` für automatische ACME-Zertifikate.
+
+    Setzen Sie am Proxy die maximale Größe für Anfragebodys auf mindestens 16 MiB, da die native JSON-Datenaufnahme Anfragebodys bis zu dieser Größe akzeptiert. Deaktivieren Sie für `/api/v1/query/stream` die Antwortpufferung und erlauben Sie lange Lesevorgänge. Die nginx-Referenzkonfiguration des Projekts verwendet für diesen Pfad einen Timeout von 600 Sekunden.
+
+    Beschränken Sie `/metrics` auf interne Aufrufe. Geben Sie die Aufnahmepfade `/api/v1/_bulk`, `/api/v1/_kinesis_firehose`, `/api/v1/_cloudflare` und `/api/v1/_heroku` nur frei, wenn ein Sender sie benötigt.
+  </Step>
+  <Step title="Knotenausfälle einplanen">
+    Das Write-Ahead Log (WAL) liegt im Objektspeicher. Da ein Knoten einen Schreibvorgang erst nach dem Speichern des zugehörigen WAL-Objekts bestätigt, benötigen Knoten kein persistentes Volume. Fällt ein Knoten aus, übernimmt ein anderer Knoten für die Datenaufnahme dessen WAL nach `[wal].lease_secs` (standardmäßig 15 Sekunden) plus bis zu `[wal].takeover_interval_secs`. Bis dahin lassen sich die Datensätze nicht abfragen, die der ausgefallene Knoten bereits bestätigt, aber noch nicht aus dem Puffer geschrieben hat. Startet ein einzelner Knoten neu, übernimmt er sein eigenes bisheriges WAL. Jeder Schreibvorgang wartet auf das Schreiben eines Objekts. Die Latenz des Objektspeichers erhöht deshalb die Latenz jedes Schreibvorgangs. Siehe [Dauerhaftigkeit und Übernahme](/de/architecture#dauerhaftigkeit-und-übernahme).
+
+    Geben Sie dem Prozess beim Herunterfahren Zeit, laufende Vorgänge abzuschließen. Setzen Sie die Frist für das Beenden im Orchestrator auf einen höheren Wert als `[node].drain_timeout_secs` (standardmäßig 30 Sekunden).
+  </Step>
+  <Step title="Datenaufbewahrung festlegen">
+    Die Standardaufbewahrungsdauer beträgt 30 Tage. Die Einstellung befindet sich unter **Einstellungen → Datenaufbewahrung** in der Organisation `_sys`. MoleSignal löscht ältere Daten aus allen Streams ohne eigene Aufbewahrungsdauer. Erhöhen Sie den Wert oder legen Sie die Aufbewahrungsdauer pro Stream fest, bevor sich Daten ansammeln. Siehe [Streams](/de/streams).
+  </Step>
+  <Step title="Kapazität für die Rollen alert und compactor planen">
+    Für die Rollen `alert` und `compactor` können mehrere Instanzen laufen und sich die Arbeit teilen. Die `alert`-Knoten teilen die Arbeit nach Regel, Bericht, Pipeline und Konnektor auf. Ein primärer Knoten führt die Jobs aus, die nur einmal laufen dürfen. Die `compactor`-Knoten teilen die Arbeit nach Stream und Organisation auf. Legen Sie auf jedem Knoten eine eindeutige `[node].id` fest und halten Sie die Systemuhren synchron. Ein `standalone`-Knoten umfasst bereits beide Rollen. Verwenden Sie `standalone`, sofern Sie die Rollen nicht trennen müssen. Lesen Sie vor einer Trennung [Rollenbasierte Bereitstellung](/de/deployment/role-based).
+  </Step>
+  <Step title="Bereitstellung überwachen">
+    Rufen Sie `/metrics` mit Prometheus ab. Prüfen Sie `GET /api/v1/healthz`. Der Endpunkt ist öffentlich und gibt `503` zurück, wenn der Objektspeicher nicht erreichbar ist. Das Container-Image führt diese Prüfung bereits als `HEALTHCHECK` aus.
+
+    Lassen Sie `[telemetry.self_collect]` aktiviert, damit der Dienst seine eigenen Metriken, Traces und Profile erfasst. Erstellen Sie Alert-Regeln für diese Metriken. Siehe [Self-Observability](/de/self-observability).
+  </Step>
+  <Step title="Backups und Upgrades planen">
+    Sichern Sie PostgreSQL, den Objektspeicher und den Verschlüsselungsschlüssel wie unter [Backup und Wiederherstellung](/de/backup-restore) beschrieben. Testen Sie die Wiederherstellung, bevor Sie sich darauf verlassen. Lesen Sie vor dem ersten Versionswechsel [Upgrade](/de/upgrade).
+  </Step>
+</Steps>
+
+## Vor dem Go-live prüfen
+
+- `GET /api/v1/healthz` gibt über die öffentliche Adresse `200` zurück.
+- Das Start-Log enthält `object_store_credentials_source`, aber nicht `MS_CIPHER_KEY missing`.
+- Ein mit einem Dienstkonto-Token gesendeter Testdatensatz erscheint im Abfrageergebnis.
+- Die Anmeldung mit den Standardzugangsdaten `admin@example.com` und dem Passwort `admin` schlägt fehl.
+- Die Wiederherstellung des neuesten PostgreSQL-Backups in einer temporären Datenbank gelingt.

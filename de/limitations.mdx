@@ -1,0 +1,60 @@
+---
+title: "Bekannte Einschränkungen"
+description: "Erfahren Sie, wo sich die aktuelle Version im Betrieb anders als erwartet verhält und wie Sie diese Einschränkungen umgehen können."
+"en_link": "/en-US/limitations"
+"zh-Hans_link": "/zh-Hans/limitations"
+"zh-Hant_link": "/zh-Hant/limitations"
+"ja_link": "/ja/limitations"
+"ko_link": "/ko/limitations"
+"es_link": "/es/limitations"
+"fr_link": "/fr/limitations"
+"pt-BR_link": "/pt-BR/limitations"
+---
+
+MoleSignal hat Version 1.0 noch nicht erreicht. Diese Seite listet Einschränkungen für Planung und Betrieb auf.
+
+## Bereitstellung
+
+- **Verzögerung bei der Übernahme.** Das Write-Ahead-Log liegt im Objektspeicher. Fällt ein Aufnahmeknoten aus, gehen daher keine bestätigten Datensätze verloren. Noch nicht aus dem Puffer geschriebene Datensätze lassen sich jedoch erst abfragen, wenn ein anderer Aufnahmeknoten sie nach Ablauf von `[wal].lease_secs` (standardmäßig 15 Sekunden) übernimmt. Siehe [Dauerhaftigkeit und Übernahme](/de/architecture#dauerhaftigkeit-und-übernahme).
+- **Aufgaben auf einem einzelnen Knoten.** Der primäre `alert`-Knoten übernimmt den clusterübergreifenden Ereignisversand und Gossip, die Neuberechnung des Service-Graphen, die APM-Aggregation, die Pflege von Statusseiten, die Automatisierung des synthetischen Monitorings, die Analyse langsamer Abfragen und die Ursachenanalyse bei Vorfällen. Diese Aufgaben skalieren nicht mit der Anzahl der `alert`-Knoten. Sie laufen auf einem anderen Knoten weiter, sobald der primäre Knoten nicht mehr zum Cluster gehört. Siehe [Rollenbasierte Bereitstellung](/de/deployment/role-based#aufgabenverteilung-zwischen-alert-knoten).
+- **Nur PostgreSQL.** MoleSignal unterstützt nur PostgreSQL als Metadatenbank.
+- **Konfigurationsänderungen erfordern einen Neustart.** Ein laufender Prozess übernimmt keine Änderungen an der Konfigurationsdatei. Siehe [Konfiguration](/de/configuration).
+- **Migrationen nur vorwärts.** Ein älterer Build kann eine Datenbank nicht öffnen, die ein neuerer Build migriert hat. Builds vor Version 1.0 können das Basisschema ändern. Siehe [Upgrade](/de/upgrade).
+
+## Datenaufnahme
+
+- **Anfragegröße.** MoleSignal lehnt Anfragen mit einem Body von mehr als 2 MiB mit `413` ab. Bei der nativen JSON-Aufnahme liegt das Limit bei 16 MiB.
+- **Komprimierung bei OTLP über HTTP.** MoleSignal lehnt komprimierte Anfrage-Bodys mit `400` ab. Deaktivieren Sie die Komprimierung im Sender.
+- **Histogramm-Buckets.** Für OTLP-Histogramme speichert MoleSignal `count`, `sum`, `min` und `max`. Bucket-Grenzen, Zählwerte pro Bucket und Quantile aus Summary-Metriken speichert MoleSignal nicht.
+- **Doppelte Spans.** MoleSignal verwirft erneut gesendete Spans mit derselben `trace_id` und derselben `span_id`.
+- **Loki-Push.** Der Endpunkt verarbeitet nur Anfragen im JSON-Format. Sender wie Promtail und Grafana Alloy, die mit Snappy komprimiertes Protobuf verwenden, können keine Daten an diesen Endpunkt senden.
+- **Prometheus remote_write.** MoleSignal überspringt native Histogramme und Metrik-Metadaten.
+- **OTLP gRPC ohne TLS.** Der Empfänger terminiert TLS nicht. Schalten Sie für Datenverkehr, der ein vertrauenswürdiges Netzwerk verlässt, einen Proxy mit TLS-Terminierung vor den Empfänger.
+- **Anfragelimits.** Nur die Rolle `router` begrenzt Anfragen. Das Limit gilt für die Anfragen der authentifizierten Organisation. Jede Router-Replik zählt separat.
+- **Plattform-Streams.** Nur MoleSignal schreibt in `_molesignal`, `_synthetic_results`, `_audit`, `_agent_model_traces` und `_agent_score_traces`. Diese Streams akzeptieren keine Daten über die öffentliche Aufnahme. Siehe [Plattform-Streams](/de/streams#plattform-streams).
+
+## Abfragen
+
+- **Abfragen über lange Zeiträume laufen asynchron.** Erreicht die geschätzte Zeilenzahl einer Abfrage den Schwellenwert `[querier].auto_async_threshold_rows`, gibt MoleSignal `202` mit einem nachverfolgbaren Job zurück. Mit den Standardeinstellungen entspricht das einem Zeitraum von etwa 13,9 Stunden. Senden Sie `Prefer: respond-sync`, um die Abfrage direkt innerhalb der Anfrage auszuführen. Siehe [Abfragen](/de/query#zeitbereiche-und-asynchrone-jobs).
+- **PromQL-Teilmenge.** Die Abfrage-Engine unterstützt eine Teilmenge von PromQL. Siehe [PromQL-Unterstützungsmatrix](/de/query/promql-subset).
+- **Zeilen pro Abfrage.** MoleSignal lehnt Abfragen, die mehr als `[querier].max_scan_rows` Zeilen lesen würden (standardmäßig 100 Millionen), mit `400` ab. Schränken Sie den Zeitraum ein oder fügen Sie Filter hinzu. Für PromQL gilt das Limit pro Selektor.
+- **Datenaktualität in einem Cluster mit getrennten Rollen.** Abfragen lesen die Dateien, die im Katalog stehen. Puffert ein Aufnahmeknoten einen Datensatz noch, erscheint er daher erst nach dem nächsten Schreiben des Puffers, spätestens nach `[intake].flush_interval_secs`. Ein `standalone`-Knoten liest auch seinen eigenen Puffer. Alarmregeln verschieben ihr Zeitfenster um die Auswertungsverzögerung unter **Einstellungen → Auswertung von Alarmregeln** nach hinten (standardmäßig 60 Sekunden). Siehe [Auswertungsverzögerung](/de/alerting/rules#auswertungsverzögerung).
+
+## Alarmierung
+
+- **Echtzeitregeln halten Zählwerte im Arbeitsspeicher.** Eine `real_time`-Regel zählt auf jedem Knoten, der Schreibvorgänge annimmt. Der für die Regel zuständige Alarmknoten summiert die Zählwerte jede Sekunde. Dadurch öffnet sich ein Vorfall spätestens eine Sekunde nach dem Schreiben der Datensätze. Bei einem Neustart verliert ein Knoten nur seinen eigenen Zählwert. Kann der Alarmknoten einen Zählwert nicht abrufen, bleibt dieser Knoten für die betreffende Sekunde unberücksichtigt. Die Knoten lesen die Zählwerte der jeweils anderen Knoten mit dem Cluster-Bearer-Token. MoleSignal summiert keine Zählwerte über föderierte Cluster hinweg. Die Anweisung ist auf `SELECT count(*) FROM <stream> [WHERE <condition>]` beschränkt. Siehe [Echtzeitregeln](/de/alerting/rules#echtzeitregeln).
+
+## Sicherheit und Identität
+
+- **Internes gRPC nutzt keine Authentifizierung.** Über Port `5082` kommunizieren die Knoten ohne Authentifizierung. Betreiben Sie diesen Port nur in einem privaten Netzwerk.
+- **Ein Passkey ist an einen Domainnamen gebunden.** Für einen Passkey muss `[http].external_url` eine HTTPS-URL mit Domainnamen sein. Unter einem anderen Hostnamen funktioniert der Passkey in der Konsole nicht.
+- **Das Zurücksetzen von Passwörtern erfordert E-Mail.** MoleSignal sendet zum Zurücksetzen eines Passworts einen Link per E-Mail. Konfigurieren Sie dafür `[notify.smtp]` und `[http].external_url`.
+- **Selbstregistrierung ohne Freigabe erfordert E-Mail.** Bei der Registrierung prüft MoleSignal zuerst die E-Mail-Adresse. Ohne `[notify.smtp]` und `[http].external_url` erfordert jedes neue Konto eine administrative Freigabe.
+- **Anmeldelimits gelten pro IP-Adresse.** Die [Erkennung der Client-IP](/de/settings/platform#client-ip-erkennung) muss die richtige Adresse ermitteln. Hinter einem nicht konfigurierten öffentlichen Proxy oder CDN teilen sich alle Benutzerkonten dieselbe Adresse und können sich gegenseitig von der Anmeldung ausschließen. Private Adressen zählen standardmäßig nicht. Bei einer internen Bereitstellung oder hinter einem nicht konfigurierten privaten Proxy greift daher nur das Kontolimit.
+- **Das Kontolimit sperrt das Konto nicht.** Damit sich ein Konto nicht von außen sperren lässt, bleiben selbst bei gedrosselter Anmeldung rund 1400 Rateversuche pro Tag möglich. Bei einem Konto mit Mehrfaktor-Authentifizierung reicht selbst ein richtig geratenes Passwort nicht für die Anmeldung. Solange Dritte die verfügbaren Anmeldeversuche ausschöpfen, kann die Anmeldung von einer bisher ungenutzten Adresse weiter verzögert bleiben. Verwenden Sie einen Passkey oder Single Sign-on oder setzen Sie das Passwort zurück.
+- **Sperrrichtlinien eines LDAP-Verzeichnisses.** Die Sperrrichtlinie des Verzeichnisses kann zuerst greifen. Dadurch können Dritte weiterhin ein Verzeichniskonto sperren. Legen Sie die [Anmeldelimits](/de/settings/platform#anmeldelimits) niedriger fest als im Verzeichnis.
+- **Sitzungen.** Über die Kontoeinstellungen lässt sich nur die Sitzung des aktuellen Browsers verwalten.
+
+## Berichte
+
+- **Das Rendern von PDF und PNG** erfordert Headless Chrome. Das Release-Container-Image enthält Chromium. Installieren Sie bei einer Installation aus einer Binärdatei zusätzlich Chrome. Die Weboberfläche muss unter `[scheduled_reports.renderer].base_url` erreichbar sein.

@@ -1,0 +1,225 @@
+---
+title: "RUM 소스 맵 및 심볼"
+sidebarTitle: "소스 맵 및 심볼"
+description: "RUM 스택 트레이스를 복원하기 위해 브라우저 소스 맵, Flutter 심볼, Android 매핑 파일 및 네이티브 심볼, 또는 Apple dSYM 파일을 업로드합니다."
+"en_link": "/en-US/rum/source-maps"
+"zh-Hans_link": "/zh-Hans/rum/source-maps"
+"zh-Hant_link": "/zh-Hant/rum/source-maps"
+"ja_link": "/ja/rum/source-maps"
+"de_link": "/de/rum/source-maps"
+"es_link": "/es/rum/source-maps"
+"fr_link": "/fr/rum/source-maps"
+"pt-BR_link": "/pt-BR/rum/source-maps"
+---
+
+MoleSignal은 디버그 아티팩트를 사용해 최소화된 JavaScript, 난독화된 Dart 또는 Android, 그리고
+네이티브 Android 또는 iOS의 스택 프레임을 복원합니다. 모든 아티팩트 유형은 다음 API로
+관리합니다: `/api/v1/debug-artifacts`.
+
+## 아티팩트 유형 선택
+
+| 런타임 | `kind` | `platform` | 파일 |
+|---|---|---|---|
+| 브라우저 JavaScript | `javascript_sourcemap` | `web` | 외부 `.map` 파일 |
+| Flutter Web | `javascript_sourcemap` | `flutter` | `main.dart.js.map` 또는 그 외 생성된 `.map` 파일 |
+| Flutter Android 또는 iOS AOT | `flutter_symbols` | `android` 또는 `ios` | Flutter `--split-debug-info` 옵션으로 생성한 `.symbols` 파일 |
+| Android R8 | `android_mapping` | `android` | 릴리스 `mapping.txt` |
+| Android NDK | `android_native_symbols` | `android` | 심볼을 제거하지 않은 ELF 공유 객체 |
+| Apple 네이티브 | `apple_dsym` | `ios` | 일치하는 `.dSYM` 번들에 포함된 DWARF 바이너리 |
+
+원본 파일과 gzip 압축 파일을 모두 지원합니다. 업로드 한도는 50 MiB입니다. gzip 아티팩트는
+압축 해제 후 최대 256 MiB까지 허용합니다.
+
+## 빌드 식별 정보 일치시키기
+
+MoleSignal은 RUM 오류의 빌드 식별 정보를 기준으로 아티팩트를 선택합니다.
+
+| 업로드 필드 | 대응하는 RUM 값 | 규칙 |
+|---|---|---|
+| `applicationId` | 클라이언트 토큰이 속한 애플리케이션의 `application.id` | 정확히 일치해야 합니다 |
+| `service` | 이벤트의 `service` | 대소문자까지 정확히 일치해야 합니다 |
+| `release` | 이벤트의 `version` | 대소문자까지 정확히 일치해야 합니다 |
+| `kind` | 프레임의 `artifact_kind`. 이 필드가 없고 `file`과 `line`이 있는 프레임은 JavaScript 프레임입니다 | 지원 아티팩트 표에서 선택합니다 |
+| `platform` | 이벤트의 `os.name`. `os.name`이 없으면 이벤트의 `source` | 위 표에 따라 `web`, `flutter`, `android`, `ios` 중 하나를 사용합니다 |
+| `architecture` | 이벤트의 `device.architecture` | 모바일 및 네이티브 아티팩트에는 `arm64` 또는 `x86_64`와 같은 값을 설정합니다 |
+| `debugId` | 프레임의 `debug_id`를 우선 사용하고, 없으면 이벤트의 `build_id` 사용 | 동일한 Flutter 빌드 ID, ELF 빌드 ID 또는 Mach-O UUID를 사용합니다 |
+| 파일 이름 | 런타임 모듈 또는 번들 | 브라우저 소스 맵의 파일 이름은 `<deployed bundle basename>.map` 형식을 사용해야 합니다 |
+
+일반적인 ABI 별칭은 정규화합니다. 예를 들어 `arm64-v8a`와 `aarch64`는 `arm64`로,
+`amd64`와 `x64`는 `x86_64`로 변환합니다. 16진수 디버그 ID와 UUID를 비교할 때는 대소문자를 구분하지 않으며
+중괄호, 하이픈, 맨 앞의 `0x`를 무시합니다.
+
+<Warning>
+  아티팩트를 생성하는 빌드 파이프라인에서 `applicationId`, `service`, `release`, `architecture`, `debugId`를 함께
+  관리합니다. 식별 정보가 오래되었거나 모호하면 이벤트는 그대로 유지되지만
+  심볼리케이션 결과는 `missing` 또는 `partial`이 됩니다.
+</Warning>
+
+### 브라우저 예시
+
+빌드할 때마다 `service`와 `version`에 변경되지 않는 값을 설정합니다.
+
+```ts
+import { init } from '@molesignal/browser-rum';
+
+init({
+  applicationId: 'checkout-web',
+  clientToken: 'mspat-your-client-token',
+  site: 'https://molesignal.example.com',
+  service: 'web-frontend',
+  version: '2026.08.04.1',
+});
+```
+
+같은 빌드 식별 정보와 실제 배포된 번들 이름을 정확히 사용해 소스 맵을 업로드합니다.
+
+| 업로드 필드 | SDK 필드 | 예시 |
+|---|---|---|
+| 애플리케이션 ID | `applicationId` | `checkout-web` |
+| 서비스 | `service` | `web-frontend` |
+| 릴리스 | `version` | `2026.08.04.1` |
+| 파일 | 생성된 `.map` 파일 | `app.8f312.js.map` |
+
+배포된 프레임의 URL이 `/assets/app.8f312.js`로 끝나면 `app.8f312.js.map`을 업로드합니다. 기본 번들의 소스 맵뿐 아니라
+지연 로드되는 모든 청크의 소스 맵도 업로드합니다.
+
+## UI에서 업로드
+
+<Steps>
+  <Step title="소스 맵을 활성화한 상태로 빌드">
+    프로덕션 빌드에서 외부 소스 맵을 생성합니다. 보안 정책상 소스 코드를 비공개로 유지해야 한다면
+    공개 배포에 소스 맵을 포함하지 않습니다.
+  </Step>
+  <Step title="업로드 페이지 열기">
+    **RUM → RUM 설정 → 소스 맵 및 심볼**로 이동한 다음 **디버그 아티팩트 업로드**를 클릭합니다.
+  </Step>
+  <Step title="빌드 식별 정보 입력">
+    아티팩트 유형과 플랫폼을 선택합니다. 애플리케이션, 서비스, 릴리스 값을 정확히 입력합니다.
+    모바일 아티팩트의 경우 아키텍처와 디버그 ID를 추가한 다음 생성된 파일을 선택합니다.
+  </Step>
+  <Step title="심볼리케이션 확인">
+    해당 릴리스에서 오류를 전송합니다. **RUM → 탐색기**를 열고 **오류**를 선택한 다음, 전송한 오류를 열어
+    스택에 원본 소스 위치가 표시되는지 확인합니다.
+  </Step>
+</Steps>
+
+## 릴리스 아티팩트 준비
+
+<Tabs>
+  <Tab title="웹">
+    실제로 배포한 브라우저 번들에서 외부 소스 맵을 생성합니다. 소스 코드 공개가 허용되지 않으면
+    `.map` 파일을 비공개로 유지합니다.
+
+    소스 맵을 활성화한 상태로 Flutter Web을 빌드합니다.
+
+    ```bash
+    flutter build web \
+      --release \
+      --source-maps \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=javascript \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    `main.dart.js.map`을 업로드할 때 `kind=javascript_sourcemap`, `platform=flutter`,
+    `architecture=javascript`를 지정합니다.
+  </Tab>
+  <Tab title="Flutter Android">
+    프로덕션 ABI마다 Flutter 심볼 파일을 하나씩 생성합니다.
+
+    ```bash
+    flutter build apk \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/android-arm64 \
+      --target-platform=android-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    `app.android-arm64.symbols`를 업로드할 때 `kind=flutter_symbols`, `platform=android`,
+    `architecture=arm64`, `debugId=${BUILD_ID}`를 지정합니다.
+  </Tab>
+  <Tab title="Flutter iOS">
+    릴리스 IPA 빌드에서 Flutter AOT 심볼을 생성합니다.
+
+    ```bash
+    flutter build ipa \
+      --release \
+      --obfuscate \
+      --split-debug-info=build/molesignal-symbols/ios-arm64 \
+      --dart-define=MOLESIGNAL_VERSION="${RELEASE_VERSION}" \
+      --dart-define=MOLESIGNAL_ARCHITECTURE=arm64 \
+      --dart-define=MOLESIGNAL_DEBUG_ID="${BUILD_ID}"
+    ```
+
+    `app.ios-arm64.symbols`를 업로드할 때 `kind=flutter_symbols`, `platform=ios`,
+    `architecture=arm64`, `debugId=${BUILD_ID}`를 지정합니다.
+  </Tab>
+  <Tab title="Android 네이티브">
+    모든 R8 릴리스에서 `app/build/outputs/mapping/release/mapping.txt`를 보관합니다. 파일을 업로드할 때
+    `kind=android_mapping`과 `platform=android`를 지정합니다.
+
+    모든 NDK ABI에 대해 심볼을 제거하지 않은 ELF `.so` 파일을 보관합니다. 플랫폼 도구를 사용해
+    빌드 ID를 추출합니다. 파일을 업로드할 때는 `kind=android_native_symbols`, `platform=android`, 표준 아키텍처 값,
+    크래시 프레임이 전송한 빌드 ID와 동일한 값을 지정합니다.
+  </Tab>
+  <Tab title="iOS 네이티브">
+    아카이브된 dSYM에서 UUID를 읽고 필요에 따라 DWARF 바이너리를 압축합니다.
+
+    ```bash
+    dwarfdump --uuid Checkout.app.dSYM
+    gzip -k Checkout.app.dSYM/Contents/Resources/DWARF/Checkout
+    ```
+
+    DWARF 파일 또는 `.gz` 파일을 업로드할 때 `kind=apple_dsym`, `platform=ios`, 일치하는
+    아키텍처를 지정하고, `debugId`에는 정규화된 Mach-O UUID를 지정합니다.
+  </Tab>
+</Tabs>
+
+## CI에서 업로드
+
+`debug_artifacts.manage` 권한이 있는 관리 토큰을 사용합니다. 이 토큰을 브라우저 또는 모바일
+애플리케이션에 삽입하지 않습니다. 아티팩트 관리에 공개 클라이언트 토큰을 사용하지 않습니다.
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${MOLESIGNAL_TOKEN}" \
+  -F "applicationId=${APPLICATION_ID}" \
+  -F "service=${SERVICE}" \
+  -F "release=${RELEASE_VERSION}" \
+  -F "kind=${ARTIFACT_KIND}" \
+  -F "platform=${PLATFORM}" \
+  -F "architecture=${ARCHITECTURE}" \
+  -F "debugId=${DEBUG_ID}" \
+  -F "file=@${ARTIFACT_PATH}" \
+  "${MOLESIGNAL_SITE}/api/v1/debug-artifacts"
+```
+
+대체 아티팩트로 사용할 때만 `architecture` 또는 `debugId`를 비워 둡니다. 모바일 빌드의
+식별 정보를 정확히 지정하면 일치 여부가 모호해지는 것을 방지할 수 있습니다.
+
+`GET /api/v1/debug-artifacts`로 아티팩트 목록을 조회합니다. `applicationId`, `service`, `kind` 또는
+`platform`으로 필터링합니다. `DELETE /api/v1/debug-artifacts/{id}`로 아티팩트 하나를 삭제합니다. 목록을 조회하려면
+`debug_artifacts.read` 권한이 필요하며, 업로드하거나 삭제하려면 `debug_artifacts.manage` 권한이 필요합니다.
+
+## 릴리스 체크리스트
+
+- 실제로 배포한 바이너리 또는 번들의 아티팩트를 보관합니다.
+- 오류가 기록되기 전에 SDK에 변경되지 않는 버전 값을 설정합니다.
+- 애플리케이션, 서비스, 릴리스, 아키텍처, 디버그 ID를 빌드와 일치시킵니다.
+- 모든 웹 청크의 소스 맵과 배포한 모든 모바일 아키텍처의 아티팩트를 업로드합니다.
+- 관리 토큰은 릴리스 파이프라인에만 보관합니다.
+- 배포 후 테스트 오류를 하나 발생시키고 프레임의 `original_*` 필드가 복원되었는지 확인합니다.
+- 릴리스를 사용자에게 배포하기 전에 아티팩트를 업로드합니다. 복원된 프레임에 따라 오류가 속할 [이슈](/ko/rum/errors#오류를-이슈로-그룹화하는-방식)가
+  결정됩니다. 따라서 동일한 오류라도 소스 맵 업로드 전에 수신한 오류와 업로드 후에 수신한 오류는 서로 다른 이슈로 분류됩니다.
+
+<CardGroup cols={2}>
+  <Card title="브라우저 RUM SDK" icon="code" href="/ko/rum/browser-sdk">
+    브라우저 애플리케이션, 서비스, 릴리스의 식별 정보를 설정합니다.
+  </Card>
+  <Card title="Flutter 앱 RUM SDK" icon="mobile" href="/ko/rum/flutter-sdk">
+    Flutter 빌드의 식별 정보와 오류 수집을 설정합니다.
+  </Card>
+</CardGroup>

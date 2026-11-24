@@ -1,0 +1,86 @@
+---
+title: "Interroger les exemplaires"
+description: "Récupérez les exemplaires conservés avec les échantillons Prometheus remote write, au format de réponse de l’API HTTP de Prometheus."
+"en_link": "/en-US/api/query/exemplars"
+"zh-Hans_link": "/zh-Hans/api/query/exemplars"
+"zh-Hant_link": "/zh-Hant/api/query/exemplars"
+"ja_link": "/ja/api/query/exemplars"
+"ko_link": "/ko/api/query/exemplars"
+"de_link": "/de/api/query/exemplars"
+"es_link": "/es/api/query/exemplars"
+"pt-BR_link": "/pt-BR/api/query/exemplars"
+---
+
+```http
+GET  /api/v1/prometheus/api/v1/query_exemplars
+POST /api/v1/prometheus/api/v1/query_exemplars
+```
+
+Renvoie les exemplaires des séries sélectionnées par une expression PromQL, au format de réponse du point de terminaison `query_exemplars` de l’API HTTP de Prometheus. La page **Métriques** utilise cette réponse pour afficher ses exemplaires. L’appel nécessite `metrics.read`, ou `sys.telemetry.read` dans la portée système.
+
+Les exemplaires proviennent de [Prometheus remote write](/fr/intake#prometheus-remote_write), qui les conserve avec les échantillons. Le stockage des métriques OTLP exclut leurs exemplaires.
+
+`GET` accepte les paramètres dans la chaîne de requête et `POST` les accepte sous forme de formulaire (`application/x-www-form-urlencoded`) :
+
+| Paramètre | Obligatoire | Remarques |
+|---|---|---|
+| `query` | Oui | Une expression PromQL. Chaque sélecteur doit indiquer le nom de sa métrique. |
+| `start` | Oui | Un nombre de secondes depuis l’époque Unix, avec une partie fractionnaire facultative, ou un horodatage au format RFC 3339. |
+| `end` | Oui | Mêmes formats. Valeur supérieure ou égale à `start`. |
+
+Seuls les sélecteurs de l’expression comptent : chacun sélectionne les séries de sa métrique dont les étiquettes correspondent à ses critères. Les fonctions, les opérateurs et les durées des plages ne changent pas le résultat. La réponse ne contient qu’une seule occurrence d’un exemplaire envoyé deux fois, par exemple lors d’une nouvelle tentative d’écriture à distance. La réponse se limite à 10 000 exemplaires et contient un avertissement si elle atteint cette limite. Comme pour une requête de données, l’appel attend qu’une place se libère dans le [contrôle d’admission](/fr/configuration#contrôle-d’admission). Le service ne met jamais la réponse en cache.
+
+Le [masquage des champs](/fr/settings/data-security#masquage-des-champs) s’applique aux étiquettes des séries et des exemplaires. Une règle de masquage sur `value` ou `_timestamp` fait échouer la requête, car le format de réponse de Prometheus ne permet pas de représenter une valeur masquée.
+
+<RequestExample>
+```bash cURL
+curl -G http://localhost:5080/api/v1/prometheus/api/v1/query_exemplars \
+  -H "authorization: Bearer $MS_TOKEN" \
+  --data-urlencode 'query=histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{service="checkout"}[5m]))' \
+  --data-urlencode "start=$(( $(date +%s) - 3600 ))" \
+  --data-urlencode "end=$(date +%s)"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "status": "success",
+  "data": [
+    {
+      "seriesLabels": {
+        "__name__": "http_request_duration_seconds_bucket",
+        "le": "0.5",
+        "service": "checkout"
+      },
+      "exemplars": [
+        {
+          "labels": { "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7" },
+          "value": 0.43,
+          "timestamp": 1790000000.123
+        }
+      ]
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Champ | Remarques |
+|---|---|
+| `data[].seriesLabels` | Les étiquettes de la série, dont `__name__` indique le nom de la métrique. |
+| `data[].exemplars[]` | Les exemplaires de la série dans la plage, du plus ancien au plus récent. |
+| `labels` | Les étiquettes de l’exemplaire, comme `trace_id` et `span_id`. |
+| `value` | La valeur observée pour l’exemplaire. |
+| `timestamp` | Le nombre de secondes depuis l’époque Unix, avec une partie fractionnaire. |
+| `warnings` | Présent uniquement si la réponse a atteint la limite de 10 000 exemplaires. |
+
+**Erreurs**
+
+| Statut | Cause |
+|---|---|
+| `400` | `query` est vide ou ne contient pas d’expression PromQL valide, un sélecteur ne nomme aucune métrique, un horodatage ne respecte aucun des deux formats ou `end` précède `start`. |
+| `403` | Le jeton ne dispose pas de `metrics.read` ou une règle de masquage s’applique à `value` ou à `_timestamp`. |
+| `429` | Le [contrôle d’admission](/fr/configuration#contrôle-d’admission) a rejeté la requête. |
+
+Ces erreurs utilisent le [corps de réponse d’erreur](/fr/api-reference#réponses-et-erreurs) des autres points de terminaison, et non celui de Prometheus.

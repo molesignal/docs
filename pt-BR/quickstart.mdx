@@ -1,0 +1,204 @@
+---
+title: "Guia rápido"
+description: "Execute um ambiente de testes local do MoleSignal com Docker Compose, envie um evento de log e encontre-o na interface web."
+"en_link": "/en-US/quickstart"
+"zh-Hans_link": "/zh-Hans/quickstart"
+"zh-Hant_link": "/zh-Hant/quickstart"
+"ja_link": "/ja/quickstart"
+"ko_link": "/ko/quickstart"
+"de_link": "/de/quickstart"
+"es_link": "/es/quickstart"
+"fr_link": "/fr/quickstart"
+---
+
+Este guia mostra como iniciar um ambiente de testes local do MoleSignal, enviar um evento de log e encontrá-lo na interface web e pela API de consulta. Use o ambiente apenas para avaliação.
+
+## Pré-requisitos
+
+- **Docker** com **Docker Compose** v2.
+- Cerca de 2 GB de memória livre.
+- Portas locais livres: `5080` (interface web e API), `5082`, `5432` (PostgreSQL), `9000` e `9001` (RustFS).
+
+## Inicie o ambiente de testes
+
+<Steps>
+  <Step title="Clone o repositório e inicie a pilha">
+    ```bash
+    git clone https://github.com/molesignal/molesignal
+    cd molesignal
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up
+    ```
+
+    Na primeira inicialização, o Docker baixa ou compila as imagens. Isso pode levar vários minutos. A pilha inclui o PostgreSQL 17 para metadados, o RustFS como armazenamento de objetos compatível com S3 e um único processo do MoleSignal que executa todas as funções e disponibiliza a interface web.
+
+    Verifique se o servidor está pronto:
+
+    ```bash
+    curl http://localhost:5080/api/v1/healthz
+    ```
+
+    Um servidor saudável retorna `{"status":"ok"}`.
+  </Step>
+
+  <Step title="Entre na interface web">
+    Abra [http://localhost:5080](http://localhost:5080) e entre com:
+
+    - **E-mail:** `admin@example.com`
+    - **Senha:** `admin`
+
+    <Warning>
+      A configuração do ambiente de testes cria essa conta raiz apenas na primeira inicialização. Substitua a conta antes de usar o ambiente para qualquer finalidade além da avaliação local. Consulte a [Lista de verificação para produção](/pt-BR/deployment/production-checklist).
+    </Warning>
+
+    Acesse o console do RustFS em [http://localhost:9001](http://localhost:9001) com `rustfsadmin` / `rustfsadmin`. Essas credenciais do ambiente de testes não são seguras.
+  </Step>
+
+  <Step title="Obtenha um token de acesso">
+    Ao entrar pela API, o servidor define os cookies de sessão que a interface web usa, e o `curl` os salva em `ms-cookies.txt`. A API aceita um token de API como token bearer. Use a sessão uma vez para emitir um token de API pessoal, válido por 7 dias, e anote o ID da organização. O token tem as mesmas permissões da conta que o emitiu.
+
+    ```bash
+    RESP=$(curl -s -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+      -H 'content-type: application/json' \
+      -d '{"email":"admin@example.com","password":"admin"}')
+
+    export MS_ORG=$(echo "$RESP" | jq -r .login.orgId)
+
+    export MS_TOKEN=$(curl -s -b ms-cookies.txt -X POST http://localhost:5080/api/v1/me/api-tokens \
+      -H 'content-type: application/json' \
+      -d '{"name":"quickstart","expiresInDays":7}' | jq -r .token)
+    ```
+
+    Sem `jq`, copie `orgId` da resposta de login e `token` da última resposta e exporte os valores manualmente.
+
+    <Note>
+      Por padrão, os cookies de sessão expiram após 24 horas. O token de API continua funcionando até expirar ou até que seja revogado em **Configurações da conta → Tokens de API**. Consulte [Tokens de API](/pt-BR/identity/tokens).
+    </Note>
+  </Step>
+
+  <Step title="Envie um evento de log">
+    A ingestão nativa de JSON via HTTP aceita um array de registros. O campo `_timestamp` contém o número de microssegundos desde a época Unix. O MoleSignal cria o fluxo `app` na primeira gravação.
+
+    ```bash
+    curl -X POST http://localhost:5080/api/v1/intake/logs/app \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "[{\"_timestamp\":$(date +%s)000000,\"level\":\"error\",\"msg\":\"db pool exhausted\",\"trace_id\":\"abc123\"}]"
+    ```
+
+    A resposta indica os registros aceitos:
+
+    ```json
+    {"accepted":1,"rejected":0,"errors":[]}
+    ```
+  </Step>
+
+  <Step title="Encontre o evento na interface web">
+    1. Abra **Logs**.
+    2. Selecione o fluxo `app` no seletor de fluxos.
+    3. Mantenha o intervalo de tempo em **Última hora** e selecione **Executar**.
+
+    A tabela de resultados mostra o evento. Selecione a linha para inspecionar os campos originais.
+  </Step>
+
+  <Step title="Consulte o evento pela API">
+    Execute a mesma busca pela API de consulta. Sempre envie um `timeRange` com limites definidos em microssegundos. Se o intervalo for muito amplo, o planejador transforma a consulta em uma tarefa de busca assíncrona.
+
+    ```bash
+    NOW=$(date +%s)000000
+
+    curl -X POST http://localhost:5080/api/v1/query \
+      -H "authorization: Bearer $MS_TOKEN" \
+      -H 'content-type: application/json' \
+      -d "{\"orgId\":\"$MS_ORG\",\"language\":\"sql\",
+           \"statement\":\"SELECT level, msg, trace_id FROM app WHERE trace_id = 'abc123'\",
+           \"timeRange\":{\"start\":$((NOW - 3600000000)),\"end\":$((NOW + 60000000))},
+           \"stream\":{\"name\":\"app\",\"streamType\":\"logs\"}}"
+    ```
+
+    A resposta contém `columns`, `rows`, `scannedRows` e `tookMs`:
+
+    ```json
+    {"columns":["level","msg","trace_id"],"rows":[["error","db pool exhausted","abc123"]],"scannedRows":1,"tookMs":120}
+    ```
+  </Step>
+</Steps>
+
+## Carregar dados de exemplo
+
+Um espaço de trabalho sem dados exibe páginas vazias. Carregue um pequeno conjunto de dados de demonstração correlacionados (logs, métricas e traces que compartilham valores de `trace_id`) para experimentar a investigação entre sinais:
+
+```bash
+curl -X POST http://localhost:5080/api/v1/onboarding/sample-data \
+  -H "authorization: Bearer $MS_TOKEN"
+```
+
+A solicitação cria os fluxos `sample_app_logs`, `sample_app_metrics` e `sample_app_traces`. Se o espaço de trabalho ainda não tiver um fluxo próprio, faça o mesmo pela interface web: em **Início**, selecione o botão de etapas de configuração no topo da página e, em seguida, selecione **Carregar** ao lado de **Carregar dados de exemplo**. O fluxo `app` criado nas etapas anteriores é um fluxo próprio, então use a solicitação após concluir essas etapas. O botão desaparece quando todas as etapas da lista estão concluídas.
+
+A resposta informa quantas linhas foram gravadas em cada fluxo e fornece os IDs do dashboard de exemplo e das visualizações salvas:
+
+```json
+{
+  "loaded": true,
+  "totalRows": 196,
+  "streams": [
+    { "stream": "sample_app_traces", "rows": 24 },
+    { "stream": "sample_app_logs", "rows": 24 },
+    { "stream": "sample_app_metrics", "rows": 148 }
+  ],
+  "dashboardId": "<dashboard id>",
+  "savedViewIds": ["<saved view id>", "<saved view id>", "<saved view id>", "<saved view id>"]
+}
+```
+
+`GET /api/v1/onboarding/sample-data` retorna `{"loaded":true}` apenas quando os três fluxos, o dashboard e as quatro visualizações salvas existem. A resposta não indica se os dados de exemplo ainda estão no intervalo de tempo exibido. Para saber o que o carregamento cria, o que acontece ao carregar novamente e quais permissões são necessárias, consulte [Início rápido na página Início](/pt-BR/home#início-rápido).
+
+## Envie dados do OpenTelemetry
+
+OTLP via HTTP funciona com qualquer SDK ou Collector do OpenTelemetry. Aponte o exportador para o caminho base `/api`. O exportador acrescenta `/v1/logs`, `/v1/metrics` e `/v1/traces`:
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5080/api
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer $MS_TOKEN"
+export OTEL_SERVICE_NAME=checkout
+```
+
+O MoleSignal encaminha a telemetria ao fluxo `default` de cada tipo de sinal, a menos que o cabeçalho `stream-name` indique outro fluxo. Consulte [Fonte de dados](/pt-BR/intake) e [Guias de integração](/pt-BR/intake/integrations) para configurar o Collector, o Vector, o Fluent Bit, o Prometheus e os SDKs.
+
+## Pare o ambiente de testes
+
+```bash
+# Stop the containers and keep the data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down
+
+# Stop the containers and delete all sandbox data
+docker compose -f deploy/docker/docker-compose.yaml --profile standalone down -v
+```
+
+## Solução de problemas
+
+| Sintoma | Causa e solução |
+|---|---|
+| `healthz` retorna `503` com `"status":"degraded"` | Um subsistema apresenta falha, como na verificação do armazenamento de objetos. Leia o campo `reason` e verifique o contêiner `rustfs`. |
+| O login retorna `401` | O MoleSignal cria a conta raiz apenas na primeira inicialização. Um volume de banco de dados de uma execução anterior mantém a senha antiga. Execute `down -v` para redefinir o ambiente de testes. |
+| A consulta retorna `202` com um `jobId` | O intervalo de tempo é amplo demais (cerca de 13,9 horas ou mais com as configurações padrão), então o planejador iniciou uma tarefa de busca assíncrona. Reduza o intervalo, envie `Prefer: respond-sync` ou consulte `GET /api/v1/query/jobs/{id}` periodicamente. Consulte [Consulta](/pt-BR/query#intervalos-de-tempo-e-tarefas-assíncronas). |
+| A consulta retorna `422 missing field orgId` ou `400 query.stream hint is required` | Envie `orgId` e o objeto `stream`. |
+| Uma porta já está em uso | Pare o outro processo ou altere as portas publicadas em `deploy/docker/docker-compose.yaml`. |
+| O host não consegue acessar OTLP gRPC na porta `4317` | O arquivo Compose do ambiente de testes não publica a porta `4317`. Adicione o mapeamento de porta `4317:4317` ao serviço `molesignal`. |
+
+## Próximas etapas
+
+<CardGroup cols={2}>
+  <Card title="Conecte dados reais" icon="inbox" href="/pt-BR/intake">
+    Use a página Fonte de dados, os tokens de ingestão e os protocolos compatíveis.
+  </Card>
+  <Card title="Guias de integração" icon="plug" href="/pt-BR/intake/integrations">
+    Configure o OpenTelemetry Collector, o Vector, o Fluent Bit, o Filebeat e o Prometheus.
+  </Card>
+  <Card title="Conceitos básicos" icon="book" href="/pt-BR/concepts">
+    Conheça os sinais, os fluxos, os espaços de trabalho e as permissões.
+  </Card>
+  <Card title="Implante em produção" icon="server" href="/pt-BR/deployment">
+    Passe do ambiente de testes para uma implantação em produção.
+  </Card>
+</CardGroup>

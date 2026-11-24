@@ -1,0 +1,158 @@
+---
+title: "CI y gestión de versiones"
+description: "Con la CLI de MoleSignal, informa a APM de los despliegues, carga mapas de código fuente para RUM y símbolos de aplicaciones móviles, valida una versión con comprobaciones sintéticas y comparaciones entre versiones, y envía la salida de las tareas de CI a un flujo."
+"en_link": "/en-US/cli/ci"
+"zh-Hans_link": "/zh-Hans/cli/ci"
+"zh-Hant_link": "/zh-Hant/cli/ci"
+"ja_link": "/ja/cli/ci"
+"ko_link": "/ko/cli/ci"
+"de_link": "/de/cli/ci"
+"fr_link": "/fr/cli/ci"
+"pt-BR_link": "/pt-BR/cli/ci"
+---
+
+Los comandos de esta página llaman a la API de MoleSignal y requieren un token de API: configura `MOLESIGNAL_URL` y
+`MOLESIGNAL_TOKEN` en el pipeline o pasa `--url` y `--token`. Crea el token en
+**Identidad y acceso → Tokens de API** con un rol que incluya el permiso que indica cada comando.
+
+## Registra un despliegue
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production
+```
+
+El despliegue aparece en la línea de tiempo del servicio en APM, donde puedes comparar su versión con la
+anterior. En CI, la CLI obtiene el commit, el repositorio, la solicitud de incorporación de cambios, el autor y el enlace a la ejecución
+del entorno de GitHub Actions, GitLab CI/CD, Jenkins, CircleCI, Buildkite,
+Bitbucket Pipelines o Azure Pipelines. Fuera de CI, obtiene el commit y el repositorio de git.
+El rol del token requiere `apm.deploy`.
+
+Si pasas un comando después de `--`, la CLI lo ejecuta primero, registra el despliegue como exitoso o fallido según
+el resultado del comando y termina con el mismo código de salida:
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production -- ./scripts/deploy.sh
+```
+
+| Opción | Significado |
+|---|---|
+| `--service <name>` | El nombre del servicio tal como aparece en `service.name` en sus spans. Obligatorio. |
+| `--version <version>` | La versión desplegada, según `service.version`. Obligatoria para un despliegue. |
+| `--env <environment>` | El entorno, según `deployment.environment.name`. |
+| `--namespace <namespace>` | El valor de `service.namespace` del servicio. |
+| `--kind <kind>` | `deployment` (predeterminado), `configuration` o `feature_flag`. |
+| `--status <status>` | `succeeded` (predeterminado), `failed` o `rolled_back` a `--version`. |
+| `--commit`, `--repository`, `--pull-request`, `--author`, `--ci-url` | Valores que sustituyen a los que proporciona CI o git. |
+| `--description <text>` | Aparece al pasar el cursor sobre el despliegue. |
+| `--time <time>` | Fecha y hora del despliegue, en lugar de las actuales. |
+| `--dry-run` | Imprime lo que registraría sin registrar nada. |
+
+Los campos son los mismos que en [Registra despliegues desde CI](/es/apm/deployments#reporta-despliegues-desde-ci).
+
+## Carga mapas de código fuente
+
+```bash
+molesignal source-maps upload dist/assets --application checkout-web --service web-frontend --release "$VERSION"
+```
+
+La CLI carga cada archivo `.map` que encuentra en las carpetas con su nombre original: el nombre del paquete
+desplegado seguido de `.map`. Comprime los archivos con gzip durante la carga, de cuatro en cuatro. Usa `--concurrency` para cambiar
+ese límite. Si dos mapas tienen el mismo nombre, uno sobrescribiría al otro, así que el comando los rechaza.
+`--application`, `--service` y `--release` deben coincidir con los valores que indica el SDK de RUM en
+`applicationId`, `service` y `version`. Para Flutter Web, agrega `--platform flutter` y el
+`--debug-id` con el que compilaste la aplicación. El rol del token requiere `debug_artifacts.manage`.
+
+`--dry-run` enumera los mapas que cargaría. `molesignal source-maps list` enumera los mapas cargados
+y `molesignal source-maps delete <id>` elimina uno.
+
+## Carga símbolos móviles y nativos
+
+```bash
+molesignal symbols upload build/molesignal-symbols --application checkout-app --service checkout --release 2.4.0 --debug-id "$BUILD_ID"
+```
+
+La CLI procesa cada archivo según su tipo:
+
+| Archivo | Cómo se carga |
+|---|---|
+| `app.android-arm64.symbols` de `--split-debug-info` | Símbolos de Flutter. La CLI obtiene la plataforma y la arquitectura del nombre. `--debug-id` es el valor de `MOLESIGNAL_DEBUG_ID` con el que compilaste la aplicación. |
+| `mapping.txt` | Un archivo de asignación de R8 de Android. |
+| Una biblioteca ELF como `libapp.so` | Símbolos nativos de Android. La CLI lee la arquitectura y el ID de compilación del archivo. |
+| Un `.dSYM` de Apple | Una carga por cada arquitectura del binario, con el UUID correspondiente que la CLI lee del archivo. |
+
+`--debug-id`, `--platform` y `--arch` sustituyen los valores del archivo. Para un dSYM, `--arch` selecciona una sola
+arquitectura. `--dry-run` enumera todos los archivos con los ID que obtiene de cada uno. Usa `molesignal symbols list`
+y `molesignal symbols delete <id>` para enumerar y eliminar cargas. El rol del token requiere
+`debug_artifacts.manage`. [Mapas de código fuente y símbolos de RUM](/es/rum/source-maps) explica cómo se identifican los marcos
+de la pila.
+
+## Verifica una versión
+
+`molesignal synthetics run <check> --wait --yes` ejecuta una comprobación sintética en cada ubicación configurada
+y termina con el código `1` si falla alguna ejecución. `molesignal services compare <service> <baseline> <candidate>
+--fail-on-regression` termina con el código `1` si la versión candidata presenta una regresión. Consulta
+[Incidentes y cambios](/es/cli/changes#ejecuta-comprobaciones-sintéticas) y
+[Métricas, trazas y servicios](/es/cli/observe#comparar-dos-versiones).
+
+## Envía líneas a un flujo de logs
+
+`molesignal send` envía cada línea de la entrada estándar a un flujo de logs: si la línea es un objeto JSON, usa sus campos como
+campos del log; si no, usa la línea como `message`. El comando envía los logs por lotes a medida que llegan, así que puede seguir
+un archivo:
+
+```bash
+tail -f /var/log/app.log | molesignal send app_logs --field service=billing
+```
+
+`--field name=value` agrega un campo a cada log, `--raw` envía cada línea como un mensaje y
+`--batch` fija el máximo de logs por solicitud (`500` de forma predeterminada). Si el servidor está ocupado, el
+comando reintenta la solicitud. Si MoleSignal rechaza algún log, el comando termina con el código `1`. El rol del token requiere `logs.write`, al igual que
+un token de ingesta.
+
+## Conserva la salida de una tarea
+
+`molesignal run` ejecuta un comando, muestra su salida como de costumbre y envía cada línea a un flujo de logs.
+Después, envía un log adicional con el código de salida y la duración. Termina con el mismo código que el comando:
+
+```bash
+molesignal run jobs --name nightly-backup -- ./backup.sh --full
+```
+
+Cada log incluye los campos `message`, `output` (`stdout` o `stderr`), `command`, `run_id` y
+`host`. El último agrega `exit_code`, `duration_ms` y `level`. `--quiet` oculta la salida en la
+terminal y `--field` agrega un campo.
+
+## GitHub Actions
+
+Guarda la URL y el token como secretos del repositorio y agrega los pasos a la tarea de despliegue.
+`if: always()` registra el despliegue aunque falle:
+
+```yaml
+- name: Upload source maps
+  run: npx -y @molesignal/cli source-maps upload dist/assets --application checkout-web --service web-frontend --release "${{ github.sha }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+
+- name: Report the deployment
+  if: always()
+  run: npx -y @molesignal/cli deploy --service checkout --version "${{ github.sha }}" --env production --status "${{ job.status == 'success' && 'succeeded' || 'failed' }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+```
+
+## GitLab CI/CD
+
+Agrega `MOLESIGNAL_URL` y `MOLESIGNAL_TOKEN` como variables enmascaradas de CI/CD y ejecuta el comando de despliegue
+mediante la CLI:
+
+```yaml
+deploy:
+  stage: deploy
+  environment: production
+  script:
+    - npx -y @molesignal/cli deploy --service checkout --version "$CI_COMMIT_SHORT_SHA" -- ./scripts/deploy.sh
+```
+
+La CLI obtiene el entorno de `environment` y el commit, la solicitud de fusión y el enlace a la tarea de GitLab.

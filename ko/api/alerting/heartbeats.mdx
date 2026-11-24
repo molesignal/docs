@@ -1,0 +1,95 @@
+---
+title: "하트비트 체크인"
+description: "하트비트 규칙의 주소로 예약 작업의 체크인을 보내고, 마지막 체크인을 조회하거나 주소를 재설정합니다."
+"en_link": "/en-US/api/alerting/heartbeats"
+"zh-Hans_link": "/zh-Hans/api/alerting/heartbeats"
+"zh-Hant_link": "/zh-Hant/api/alerting/heartbeats"
+"ja_link": "/ja/api/alerting/heartbeats"
+"de_link": "/de/api/alerting/heartbeats"
+"es_link": "/es/api/alerting/heartbeats"
+"fr_link": "/fr/api/alerting/heartbeats"
+"pt-BR_link": "/pt-BR/api/alerting/heartbeats"
+---
+
+[하트비트 규칙](/ko/api/alerting/create-rule#하트비트-규칙)은 작업이 실행될 때마다
+체크인할 때까지 기다립니다. 실행 주기와 유예 시간을 합한 시간 내에 체크인이 없거나 체크인이
+실패를 보고하면 알림을 발생시킵니다.
+
+| 메서드 및 경로 | 동작 | 권한 |
+|---|---|---|
+| `GET`, `POST /api/v1/intake/heartbeats/{token}` | 로그인 없이 체크인합니다. | 주소에 포함된 토큰 |
+| `GET /api/v1/alerts/rules/{id}/heartbeat` | 마지막 체크인과 다음 체크인 기한을 조회합니다. | 해당 규칙의 `alerts.rules.read` |
+| `POST /api/v1/alerts/rules/{id}/heartbeat-token` | 체크인 주소를 재설정합니다. | 해당 규칙의 `alerts.rules.manage` |
+
+## 체크인하기
+
+```http
+GET /api/v1/intake/heartbeats/{token}
+POST /api/v1/intake/heartbeats/{token}
+```
+
+하트비트 규칙을 처음 저장하면 체크인 주소가 발급됩니다.
+[규칙 만들기](/ko/api/alerting/create-rule#하트비트-규칙)를 참조합니다. 작업이 성공하면 해당 주소로 요청을 보냅니다.
+작업이 실패하면 `?status=fail`을 추가합니다. 그러면 규칙이 실행 주기가 끝날 때까지 기다리지 않고 즉시 알림을 발생시킵니다.
+`POST` 본문의 처음 최대 1000자를 체크인 메시지로 저장하고 인시던트 주석
+`heartbeat_message`에 표시합니다. 본문이 64 KiB를 초과하면 `413`을 반환합니다. 체크인이 들어오면 규칙이 해당 회차를 즉시 평가합니다.
+실패하면 알림을 발생시키고, 성공하면 복구 조건에 따라 진행 중인 인시던트를 복구할 수 있습니다.
+
+<RequestExample>
+```bash cURL
+# The backup succeeded
+curl -fsS https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN
+
+# The backup failed: send its last lines of output
+tail -n 20 backup.log | curl -fsS -X POST --data-binary @- \
+  "https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN?status=fail"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "ok": true, "status": "fail" }
+```
+</ResponseExample>
+
+`status=fail`만 실패로 처리합니다. 다른 값을 지정하거나 생략하면 성공으로 처리합니다. 토큰이 잘못되었거나,
+규칙이 삭제되었거나, 재설정 전 주소를 사용하면 `404`를 반환합니다.
+
+## 체크인 상태 조회하기
+
+```http
+GET /api/v1/alerts/rules/{id}/heartbeat
+```
+
+<ResponseExample>
+```json 200
+{
+  "lastCheckinAt": 1790000000000000,
+  "lastStatus": "ok",
+  "lastMessage": "",
+  "dueAt": 1790003900000000,
+  "alarming": false,
+  "issuedAt": 1789900000000000
+}
+```
+</ResponseExample>
+
+| 필드 | 설명 |
+|---|---|
+| `lastCheckinAt` | 마지막 체크인 시각입니다. Unix 마이크로초 단위이며, 첫 체크인 전에는 `null`입니다. |
+| `lastStatus`, `lastMessage` | 마지막 체크인에서 보고한 상태(`ok` 또는 `fail`)와 메시지입니다. |
+| `dueAt` | 다음 체크인 기한입니다. 마지막 체크인 시각(체크인이 없으면 주소 발급 시각)에 실행 주기와 유예 시간을 더한 값입니다. |
+| `alarming` | 규칙이 지금 알림을 발생시켜야 하는지 나타냅니다. 마지막 체크인이 실패를 보고했거나 `dueAt`이 지났으면 알림을 발생시킵니다. |
+| `issuedAt` | 현재 주소를 발급하거나 재설정한 시각입니다. |
+
+하트비트 규칙이 아니거나 아직 주소가 없으면 `404`를 반환합니다.
+
+## 체크인 주소 재설정하기
+
+```http
+POST /api/v1/alerts/rules/{id}/heartbeat-token
+```
+
+새 주소를 발급합니다. 이전 주소는 즉시 무효화되며 체크인 기록은 유지합니다.
+새 주소는 이번에만 `{ "path": "...", "url": "..." }` 형식으로 반환합니다. 외부 주소를
+설정하지 않았으면 `url`은 `null`입니다. 재설정 내역은 감사 로그에 기록합니다. 하트비트 규칙이 아니면 `400`을 반환합니다.

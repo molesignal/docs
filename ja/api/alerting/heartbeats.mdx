@@ -1,0 +1,85 @@
+---
+title: "ハートビートのチェックイン"
+description: "スケジュールジョブからハートビートルールの URL にチェックインを送信し、直近のチェックインの取得や URL のリセットを行います。"
+"en_link": "/en-US/api/alerting/heartbeats"
+"zh-Hans_link": "/zh-Hans/api/alerting/heartbeats"
+"zh-Hant_link": "/zh-Hant/api/alerting/heartbeats"
+"ko_link": "/ko/api/alerting/heartbeats"
+"de_link": "/de/api/alerting/heartbeats"
+"es_link": "/es/api/alerting/heartbeats"
+"fr_link": "/fr/api/alerting/heartbeats"
+"pt-BR_link": "/pt-BR/api/alerting/heartbeats"
+---
+
+[ハートビートルール](/ja/api/alerting/create-rule#ハートビートルール)は、ジョブが実行されるたびにチェックインを待ちます。期間に猶予期間を加えた時間内にチェックインがない場合や、チェックインで失敗が報告された場合に発報します。
+
+| メソッドとパス | 動作 | 権限 |
+|---|---|---|
+| `GET`、`POST /api/v1/intake/heartbeats/{token}` | サインインせずにチェックインします。 | アドレスに含まれるトークン |
+| `GET /api/v1/alerts/rules/{id}/heartbeat` | 最後のチェックインと次回のチェックイン期限を取得します。 | 対象ルールの `alerts.rules.read` |
+| `POST /api/v1/alerts/rules/{id}/heartbeat-token` | チェックインアドレスをリセットします。 | 対象ルールの `alerts.rules.manage` |
+
+## チェックインする
+
+```http
+GET /api/v1/intake/heartbeats/{token}
+POST /api/v1/intake/heartbeats/{token}
+```
+
+ハートビートルールを初めて保存すると、チェックインアドレスが発行されます。詳細は [ルールを作成する](/ja/api/alerting/create-rule#ハートビートルール)を参照してください。ジョブが成功したら、このアドレスにリクエストを送信してください。失敗した場合は `?status=fail` を付けて送信してください。ルールは期間の満了を待たずに発報します。 `POST` の本文の先頭から最大1000文字をチェックインメッセージとして保存し、インシデントのアノテーション `heartbeat_message` に表示します。本文が64 KiBを超える場合は `413` を返します。チェックインを受け取ると、ルールはその回の結果をすぐに判定します。失敗なら発報し、成功なら復旧条件を満たした時点で未解決のインシデントを解決します。
+
+<RequestExample>
+```bash cURL
+# The backup succeeded
+curl -fsS https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN
+
+# The backup failed: send its last lines of output
+tail -n 20 backup.log | curl -fsS -X POST --data-binary @- \
+  "https://molesignal.example.com/api/v1/intake/heartbeats/$HEARTBEAT_TOKEN?status=fail"
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{ "ok": true, "status": "fail" }
+```
+</ResponseExample>
+
+`status=fail` の場合のみ失敗として扱います。それ以外の値や、値の指定がない場合は成功として扱います。トークンが無効な場合、ルールが削除されている場合、またはリセット前のアドレスを使用した場合は `404` を返します。
+
+## チェックインの状態を取得する
+
+```http
+GET /api/v1/alerts/rules/{id}/heartbeat
+```
+
+<ResponseExample>
+```json 200
+{
+  "lastCheckinAt": 1790000000000000,
+  "lastStatus": "ok",
+  "lastMessage": "",
+  "dueAt": 1790003900000000,
+  "alarming": false,
+  "issuedAt": 1789900000000000
+}
+```
+</ResponseExample>
+
+| フィールド | 説明 |
+|---|---|
+| `lastCheckinAt` | 最後のチェックイン時刻をUnix時刻（マイクロ秒単位）で示します。初回チェックイン前は `null` です。 |
+| `lastStatus`、`lastMessage` | 最後のチェックインで報告された結果（`ok` または `fail`）とメッセージです。 |
+| `dueAt` | 次回のチェックイン期限です。最後のチェックイン時刻（初回チェックイン前はアドレスの発行時刻）に、期間と猶予期間を加えた時刻です。 |
+| `alarming` | ルールが現時点で発報すべきかどうかを示します。最後のチェックインで失敗が報告された場合、または `dueAt` を過ぎた場合に発報します。 |
+| `issuedAt` | 現在のアドレスを発行またはリセットした時刻です。 |
+
+対象がハートビートルールではない場合、またはアドレスがまだ発行されていない場合は `404` を返します。
+
+## チェックインアドレスをリセットする
+
+```http
+POST /api/v1/alerts/rules/{id}/heartbeat-token
+```
+
+新しいアドレスを発行します。古いアドレスはすぐに無効になりますが、チェックイン履歴は保持します。 `{ "path": "...", "url": "..." }` を返します。新しいアドレスを返すのはこのときだけです。外部アドレスを設定していない場合、`url` は `null` です。リセットは監査ログに記録します。対象がハートビートルールではない場合は `400` を返します。

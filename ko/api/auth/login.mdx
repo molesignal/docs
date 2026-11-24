@@ -1,0 +1,144 @@
+---
+title: "로그인 API"
+sidebarTitle: "로그인"
+description: "이메일과 비밀번호로 브라우저 세션을 시작합니다."
+"en_link": "/en-US/api/auth/login"
+"zh-Hans_link": "/zh-Hans/api/auth/login"
+"zh-Hant_link": "/zh-Hant/api/auth/login"
+"ja_link": "/ja/api/auth/login"
+"de_link": "/de/api/auth/login"
+"es_link": "/es/api/auth/login"
+"fr_link": "/fr/api/auth/login"
+"pt-BR_link": "/pt-BR/api/auth/login"
+---
+
+```http
+POST /api/v1/auth/signin
+```
+
+웹 UI 세션을 시작합니다. 이 경로는 **인증이 필요하지 않습니다**. 응답은 세션 쿠키를 설정하고 `login`에 로그인한 사용자의 정보를 반환합니다. 응답 본문에는 토큰이 없습니다. 다단계 인증을 사용하는 계정은 [두 번째 단계](#두-번째-단계)를 참조합니다.
+
+**본문**
+
+| 필드 | 유형 | 필수 | 참고 |
+|---|---|---|---|
+| `email` | 문자열 | 예 | |
+| `password` | 문자열 | 예 | |
+| `remember` | 불리언 | 아니요 | 브라우저를 닫아도 세션을 유지합니다. 기본값은 `false`입니다. |
+
+<RequestExample>
+```bash cURL
+curl -c ms-cookies.txt -X POST http://localhost:5080/api/v1/auth/signin \
+  -H 'content-type: application/json' \
+  -d '{"email":"admin@example.com","password":"admin"}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "login": {
+    "userId": "<user-id>",
+    "email": "admin@example.com",
+    "displayName": "root",
+    "orgId": "<organization-id>",
+    "orgName": "default",
+    "displayRole": "Owner",
+    "roles": [
+      {
+        "id": "<role-id>",
+        "key": "owner",
+        "name": "Owner",
+        "builtin": true
+      }
+    ],
+    "scope": "organization"
+  }
+}
+```
+</ResponseExample>
+
+로그인 시 사용자가 속한 조직 중 로그인을 허용하는 첫 번째 조직을 선택합니다. 프로그램에서는 대신 `Authorization` 헤더에 API 토큰을 넣어 전송합니다. 이 헤더는 세션 토큰을 허용하지 않습니다. [API 토큰 발급](/ko/api/auth/issue-token)을 참조합니다.
+
+## 로그인 시도 제한 초과
+
+비밀번호 입력 실패 횟수가 한도를 초과하면 `429`를 반환합니다. 응답에는 대기 시간을 초 단위로 나타내는 `Retry-After` 헤더와 `signin_limited` 코드가 포함되며, 계정이 존재하는지와 관계없이 동일한 메시지를 반환합니다. 이때 비밀번호를 확인하지 않습니다. 비밀번호가 틀리거나 계정이 존재하지 않으면 `401`을 반환합니다. 비밀번호가 맞더라도 계정이 비활성 상태이거나 승인 대기 중이면 사유와 함께 `403`을 반환합니다. [로그인 제한](/ko/settings/platform#로그인-제한)을 참조합니다.
+
+```json
+{
+  "error": "resource_exhausted",
+  "code": "signin_limited",
+  "message": "too many failed password attempts; try again in 14 minutes"
+}
+```
+
+## 두 번째 단계
+
+[다단계 인증](/ko/identity/mfa)을 사용하는 계정은 비밀번호만으로 쿠키를 설정하지 않습니다. 응답은 `login` 대신 `mfa`를 반환하고, 로그인을 완료하는 데 사용할 수 있는 인증 수단을 안내합니다.
+
+```json
+{
+  "mfa": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp", "recovery_code"],
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| 엔드포인트 | 용도 |
+|---|---|
+| `POST /api/v1/auth/signin/verify` | 로그인을 완료합니다. `challenge`와 함께 `method`가 `totp` 또는 `recovery_code`이면 `code`를, `method`가 `passkey`이면 `ceremony`와 `credential`을 받습니다. 세션 쿠키와 함께 `{"login": …}`을 반환합니다. 복구 코드를 사용하면 `recoveryCodesLeft`도 반환합니다. |
+| `POST /api/v1/auth/signin/verify/passkey` | `challenge`를 받아 패스키 검증에 필요한 `ceremony`와 `options`를 반환합니다. `options`는 `navigator.credentials.get()`에 전달합니다. `ceremony`는 인증 결과와 함께 다시 보내며 한 번만 사용할 수 있습니다. |
+
+## 로그인 중 두 번째 인증 수단 등록
+
+조직에서 [다단계 인증을 요구하는데](/ko/identity/sso#로그인-요구-사항) 계정에 두 번째 인증 수단이 아직 없으면, 응답은 `login` 대신 `enroll`을 반환합니다.
+
+```json
+{
+  "enroll": {
+    "challenge": "<challenge>",
+    "methods": ["passkey", "totp"],
+    "organizationName": "default",
+    "expiresAt": 1790000000000000
+  }
+}
+```
+
+| 엔드포인트 | 용도 |
+|---|---|
+| `POST /api/v1/auth/signin/enroll/totp` | `challenge`를 받아 `setup`, `secret`, `otpauthUrl`, `qrSvg`, `expiresAt`을 반환합니다. |
+| `POST /api/v1/auth/signin/enroll/totp/confirm` | `challenge`, `setup`, `code`를 받습니다. 세션 쿠키와 함께 `{"login": …, "recoveryCodes": […]}`를 반환합니다. |
+| `POST /api/v1/auth/signin/enroll/passkey/options` | `challenge`를 받아 `navigator.credentials.create()`에 사용할 `ceremony`와 `options`를 반환합니다. |
+| `POST /api/v1/auth/signin/enroll/passkey` | `challenge`, `ceremony`, `credential`을 받으며, 선택적으로 `name`도 받습니다. 세션 쿠키와 함께 `{"login": …, "recoveryCodes": […]}`를 반환합니다. |
+
+[싱글 사인온만 허용하는](/ko/identity/sso#로그인-요구-사항) 조직에서는 비밀번호로 로그인하면 `403`을 반환합니다. 계정이 여러 조직에 속해 있으면 로그인을 허용하는 첫 번째 조직을 선택합니다.
+
+## 패스키 로그인
+
+[패스키](/ko/identity/mfa#비밀번호-없이-패스키로-로그인)를 사용하면 비밀번호나 두 번째 인증 단계 없이 로그인할 수 있습니다.
+
+| 엔드포인트 | 용도 |
+|---|---|
+| `POST /api/v1/auth/signin/passkey/options` | `ceremony`와 `options`를 반환합니다. 인스턴스의 `[http].external_url`을 패스키의 [신뢰 당사자](/ko/identity/mfa#인스턴스-요구-사항)로 사용할 수 없으면 `400`을 반환합니다. |
+| `POST /api/v1/auth/signin/passkey` | `ceremony`와 `credential`을 받으며, 선택적으로 `remember`도 받습니다. 세션 쿠키와 함께 `{"login": …}`을 반환합니다. |
+
+## 세션 쿠키
+
+| 쿠키 | 경로 | 내용 | 유효 기간 |
+|---|---|---|---|
+| `accessToken` | `/api` | 모든 API 요청에 포함되는 액세스 토큰입니다. | 15분이며, `POST /api/v1/auth/refresh`로 갱신합니다. |
+| `refreshToken` | `/api/v1/auth` | 액세스 토큰을 갱신할 때만 사용하는 갱신 토큰입니다. | 로그인 후 `[auth].session_ttl_secs`가 지나 세션이 끝날 때까지입니다. 기본값은 24시간입니다. |
+
+두 쿠키 모두 `HttpOnly`와 `SameSite=Strict`를 적용하며, 브라우저가 HTTPS로 MoleSignal에 접속하면 `Secure`도 적용합니다. `remember`를 사용하지 않으면 브라우저를 닫을 때 두 쿠키를 삭제합니다. 두 토큰 모두 서명된 JWT입니다. 서버는 토큰을 저장하지 않고 각 토큰의 서명, 용도, 만료 시점을 확인합니다. 사용자를 비활성화하거나 삭제하면 다음 요청에서 세션이 종료됩니다.
+
+## 세션 엔드포인트
+
+| 엔드포인트 | 용도 |
+|---|---|
+| `POST /api/v1/auth/refresh` | 갱신 토큰을 사용해 새 액세스 토큰을 발급하고, 새 `accessToken` 쿠키와 함께 `204`를 반환합니다. 세션 종료 시점은 그대로 유지합니다. 세션이 만료되었거나 사용자가 비활성 상태이거나 쿠키가 없으면 `401`을 반환하고 두 쿠키를 모두 삭제합니다. |
+| `GET /api/v1/auth/session` | 현재 세션의 사용자 정보를 로그인 응답의 `login`과 동일한 형식으로 반환합니다. |
+| `POST /api/v1/auth/signout` | 두 쿠키를 모두 삭제하고 `204`를 반환합니다. |
+
+세션 쿠키를 사용해 데이터를 변경하는 요청은 MoleSignal 페이지에서 보내야 합니다. 브라우저 요청의 `Sec-Fetch-Site` 값이 `same-origin`이 아니면 `403`을 반환합니다.

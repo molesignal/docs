@@ -1,0 +1,125 @@
+---
+title: "Informes post mortem de incidentes"
+description: "Redacta un informe post mortem interno con texto en Markdown, un estado, una persona responsable y revisores. Agrega acciones de seguimiento con responsables y fechas límite; cada acción puede convertirse en un ticket."
+"en_link": "/en-US/api/alerting/postmortems"
+"zh-Hans_link": "/zh-Hans/api/alerting/postmortems"
+"zh-Hant_link": "/zh-Hant/api/alerting/postmortems"
+"ja_link": "/ja/api/alerting/postmortems"
+"ko_link": "/ko/api/alerting/postmortems"
+"de_link": "/de/api/alerting/postmortems"
+"fr_link": "/fr/api/alerting/postmortems"
+"pt-BR_link": "/pt-BR/api/alerting/postmortems"
+---
+
+Cada incidente tiene como máximo un análisis post mortem interno, redactado en Markdown. Se guarda por separado de los
+[análisis post mortem de la página de estado](/es/status-pages#análisis-post-mortem); las páginas de estado pueden copiar su resumen. Consulta
+cómo lo usan en [Incidentes graves y análisis post mortem](/es/alerting/major-incidents#análisis-post-mortem).
+
+| Método y ruta | Qué hace | Permiso |
+|---|---|---|
+| `GET /api/v1/alerts/postmortems` | Devuelve los análisis post mortem de la organización, del más reciente al más antiguo, con la cantidad de acciones de seguimiento de cada uno. | `postmortems.read` |
+| `GET /api/v1/alerts/incidents/{id}/postmortem` | Devuelve el análisis post mortem del incidente y sus acciones de seguimiento. | `alerts.incidents.read` para el incidente y `postmortems.read` |
+| `POST /api/v1/alerts/incidents/{id}/postmortem` | Inicia un análisis post mortem para el incidente. | `alerts.incidents.read` para el incidente y `postmortems.manage` |
+| `PUT /api/v1/alerts/postmortems/{id}` | Modifica el título, el cuerpo, el estado, el responsable y los revisores de un análisis post mortem. | `postmortems.manage` |
+| `POST /api/v1/alerts/postmortems/{id}/actions` | Agrega una acción de seguimiento. | `postmortems.manage` |
+| `PUT /api/v1/alerts/postmortems/{id}/actions/{actionId}` | Modifica una acción de seguimiento. | `postmortems.manage` |
+| `DELETE /api/v1/alerts/postmortems/{id}/actions/{actionId}` | Elimina una acción de seguimiento. | `postmortems.manage` |
+| `POST /api/v1/alerts/postmortems/{id}/actions/{actionId}/ticket` | Crea un ticket para una acción de seguimiento. | `postmortems.manage` |
+
+## Inicia y modifica un análisis post mortem
+
+```http
+POST /api/v1/alerts/incidents/{id}/postmortem
+```
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `title` | cadena | Sí | De 1 a 200 caracteres. |
+| `body` | cadena | No | Cuerpo en Markdown, de hasta 100000 caracteres. |
+
+Si el incidente ya tiene un análisis post mortem, la API devuelve `409`. Las páginas primero preparan un borrador del cuerpo a partir de una plantilla
+(resumen, impacto, cronología, causa raíz, qué salió bien, qué salió mal y acciones de seguimiento) y luego llaman a este endpoint.
+El registro de auditoría guarda la creación. Para modificar un análisis, envía solo los campos que quieras cambiar: `title`, `body`,
+`status`, `ownerId` (usa `null` para quitar al responsable) y `reviewerIds`.
+
+<RequestExample>
+```bash cURL
+curl -X PUT http://localhost:5080/api/v1/alerts/postmortems/$POSTMORTEM_ID \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"status": "in_review", "reviewerIds": ["<user-id>"]}'
+```
+</RequestExample>
+
+Las operaciones de consulta, creación y modificación devuelven `{ "postmortem": { ... }, "actions": [ ... ] }`. El valor de `postmortem` es
+`null` si el incidente no tiene un análisis post mortem.
+
+<ResponseExample>
+```json 200
+{
+  "postmortem": {
+    "id": "3KJbX2p8Lr0Ws4Nf6Qa1Hd9TcVe",
+    "orgId": "<organization-id>",
+    "incidentId": "<incident-id>",
+    "title": "Checkout errors after the payments deploy",
+    "status": "in_review",
+    "body": "# Checkout errors after the payments deploy\n\n## Summary\n…",
+    "ownerId": "<user-id>",
+    "reviewerIds": ["<user-id>"],
+    "createdBy": "<user-id>",
+    "createdAt": 1790000000000000,
+    "updatedAt": 1790003600000000,
+    "publishedAt": null
+  },
+  "actions": [
+    {
+      "id": "3KJbZ7m1Qe5Rt9Va2Xc8Lw0NdHf",
+      "orgId": "<organization-id>",
+      "postmortemId": "3KJbX2p8Lr0Ws4Nf6Qa1Hd9TcVe",
+      "incidentId": "<incident-id>",
+      "title": "Alert on payments pool saturation",
+      "ownerId": "<user-id>",
+      "dueAt": 1790600000000000,
+      "status": "open",
+      "ticketId": "<ticket-id>",
+      "ticketKey": "OPS-57",
+      "ticketUrl": "https://example.atlassian.net/browse/OPS-57",
+      "createdAt": 1790003600000000,
+      "updatedAt": 1790003600000000
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Campo | Notas |
+|---|---|
+| `status` | `draft`, `in_review` o `published`. El primer cambio a `published` registra `publishedAt`. |
+
+Cada fila de la lista incluye los campos del análisis post mortem, el resumen del incidente (`incidentSummary`), la cantidad de acciones
+de seguimiento abiertas (`openActions`) y la cantidad de acciones que siguen abiertas después de su fecha de vencimiento (`overdueActions`).
+
+## Acciones de seguimiento
+
+Para agregar una acción, envía `{ "title": "…", "ownerId": "<user-id>", "dueAt": 1790600000000000 }`, con un título de 1
+a 300 caracteres y `dueAt` en microsegundos desde la época Unix. El máximo es de 50 acciones por análisis post mortem. Para modificar una acción, envía solo los
+campos que quieras cambiar: `title`, `ownerId` y `dueAt` (usa `null` para borrar cualquiera de estos dos últimos valores) y `status` (`open` o `done`).
+Las operaciones de creación y modificación devuelven la acción de seguimiento. La eliminación devuelve `{ "deleted": true }`.
+
+```http
+POST /api/v1/alerts/postmortems/{id}/actions/{actionId}/ticket
+```
+
+Envía `{ "connectorId": "<connector-id>" }` en el cuerpo. La API crea un ticket para la acción de seguimiento con ese
+[conector de tickets](/es/api/alerting/tickets) y devuelve la acción de seguimiento con `ticketKey` y
+`ticketUrl`. Si la acción ya tiene un ticket, la API la devuelve sin cambios. El ticket no recibe comentarios ni
+cambios de estado del incidente. Completar el ticket no resuelve el incidente.
+
+**Errores**
+
+| Estado | Motivo |
+|---|---|
+| `400` | Un campo no respeta sus límites o el conector de tickets está deshabilitado. |
+| `403` | Falta un permiso o el incidente no está dentro del alcance de acceso. |
+| `404` | No existe el incidente, el análisis post mortem, la acción de seguimiento o el conector de tickets. |
+| `409` | El incidente ya tiene un análisis post mortem. |

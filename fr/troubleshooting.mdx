@@ -1,0 +1,85 @@
+---
+title: "Dépannage"
+description: "Identifiez les causes et les solutions pour les échecs de démarrage courants, les requêtes rejetées, les données manquantes et les requêtes lentes ou asynchrones."
+"en_link": "/en-US/troubleshooting"
+"zh-Hans_link": "/zh-Hans/troubleshooting"
+"zh-Hant_link": "/zh-Hant/troubleshooting"
+"ja_link": "/ja/troubleshooting"
+"ko_link": "/ko/troubleshooting"
+"de_link": "/de/troubleshooting"
+"es_link": "/es/troubleshooting"
+"pt-BR_link": "/pt-BR/troubleshooting"
+---
+
+Consultez d’abord le journal du processus. Il indique la cause d’un échec au démarrage. Si une requête est rejetée, le corps de la réponse d’erreur HTTP contient un message. Le niveau de journalisation dépend de `[telemetry].log_level` ou de `RUST_LOG`.
+
+## Démarrage
+
+| Symptôme | Cause | Solution |
+|---|---|---|
+| `... password authentication failed for user` | Le nom d’utilisateur ou le mot de passe du DSN est incorrect. | Corrigez `[meta_database].dsn`. |
+| `... pool timed out while waiting for an open connection` | Le nœud ne peut pas joindre PostgreSQL. | Vérifiez l’hôte, le port, le pare-feu et les exigences relatives à `sslmode`. |
+| `startup_ping put: ... SignatureDoesNotMatch` | Le stockage d’objets rejette les identifiants. | Vérifiez `access_key` et `secret_key`. Définissez-les avec `MS_OBJECT_STORE_ACCESS_KEY` et `MS_OBJECT_STORE_SECRET_KEY`. |
+| `startup_ping put: ... NoSuchBucket` | Le compartiment n’existe pas. | Créez le compartiment ou corrigez `[object_store].bucket`. |
+| Lignes `Encountered transport error` répétées, puis arrêt du processus | Le point de terminaison est inaccessible ou le client ne reçoit aucun identifiant. | Vérifiez `endpoint`, le DNS et le réseau. Fournissez les identifiants via `access_key` et `secret_key`. |
+| `unknown field: found ...` | Une clé d’une section stricte est mal orthographiée ou non prise en charge. | Supprimez ou corrigez la clé. Consultez [Configuration](/fr/configuration#ordre-de-chargement-de-la-configuration). |
+| `MS_SELF_TELEMETRY_CLUSTER_TOKEN must be set when split-role self intake is enabled` | Dans un déploiement à rôles séparés, un nœud sans le rôle `intake` démarre sans le jeton partagé alors que la capture des traces ou l’autocollecte est active. | Définissez le même jeton sur tous les nœuds. Désactiver uniquement `[telemetry.self_collect]` ne suffit pas, car la capture des traces est active par défaut. |
+| `open Probe CA key` | `MS_CIPHER_KEY` diffère de la clé qui a servi à chiffrer la base de données. | Restaurez la clé d’origine. Consultez [Liste de contrôle pour la mise en production](/fr/deployment/production-checklist). |
+| `migration ... was previously applied but is missing in the resolved migrations` ou `... has been modified` | Le binaire et la base de données proviennent de versions incompatibles. | Exécutez la version correspondante ou restaurez une sauvegarde. Consultez [Mise à niveau](/fr/upgrade). |
+| `address already in use` | Un autre processus utilise un port configuré. | Changez le port. |
+| `profiling.port and ... are both ...` | Le service pprof écoute sur le même port qu’un autre service. | Attribuez à `[profiling].port` un port qu’aucun autre service n’utilise. |
+| Un paramètre défini par une variable d’environnement reste sans effet | Le nom de la variable contient un point, deux traits de soulignement consécutifs ou une faute de frappe. | Séparez les éléments du chemin par un seul trait de soulignement, comme dans `MS_META_DATABASE_DSN`. |
+
+## Connexion
+
+| Symptôme | Cause | Solution |
+|---|---|---|
+| La connexion avec `admin@example.com` et `admin` échoue | La base de données contenait déjà des comptes, donc le compte racine n’a pas été recréé, ou `root_email` et `root_password` étaient vides. | Connectez-vous avec un compte existant. Pour créer le compte racine, définissez les deux valeurs et démarrez MoleSignal avec une base de données vide. |
+| L’e-mail de réinitialisation du mot de passe n’arrive jamais | SMTP ou `http.external_url` n’est pas configuré. MoleSignal accepte la demande sans envoyer d’e-mail. | Définissez `[notify.smtp].host` et `[http].external_url`. |
+| Un script se connecte, envoie `Authorization: Bearer` et reçoit une réponse `401` | La connexion crée des cookies de session pour l’interface web et ne renvoie aucun jeton. L’en-tête accepte uniquement les jetons d’API. | Créez un jeton d’API pour le script. Consultez [Jetons d’API](/fr/identity/tokens). |
+| L’interface web demande de se reconnecter chaque jour | Une session expire après la durée définie par `[auth].session_ttl_secs` (24 heures). | Augmentez la valeur de `[auth].session_ttl_secs`. |
+
+## Envoi de données
+
+| Symptôme | Cause | Solution |
+|---|---|---|
+| `401` | Le jeton est absent ou non valide, ou l’en-tête contient un jeton de session. | Envoyez `Authorization: Bearer <token>` avec un jeton d’ingestion par défaut ou un jeton de compte de service. |
+| `403` | Le jeton ne dispose pas de l’autorisation d’écriture pour ce signal, par exemple `logs.write`. C’est le cas si un client envoie un jeton client RUM à un chemin d’ingestion. | Utilisez un jeton doté de l’autorisation d’écriture pour ce signal. |
+| `413` | Le corps de la requête dépasse la limite du point de terminaison : 16 MiB pour l’ingestion JSON native, 2 MiB pour les autres. | Envoyez des lots plus petits. Relevez la limite du proxy au moins au niveau de celle du point de terminaison. |
+| Réponse `400` d’un point de terminaison OTLP sur HTTP | L’émetteur a compressé le corps de la requête. | Définissez `compression: none` dans l’exportateur d’OpenTelemetry Collector. |
+| Réponse `404` d’un point de terminaison OTLP sur HTTP | Le point de terminaison de l’exportateur ne contient pas le chemin de base `/api` et envoie donc les requêtes à `/v1/logs`. | Utilisez `http://host:5080/api` comme point de terminaison OTLP. |
+| `429` avec `Retry-After` | Le débit de l’organisation atteint la limite imposée par le rôle `router`. | Réduisez le débit d’envoi ou relevez la limite dans `[router.rate_limit]`. |
+| L’ingestion JSON native signale des enregistrements `rejected` | La valeur d’un champ ne correspond pas au schéma du flux, par exemple `type mismatch on field level: expected Utf8, got Number`. La réponse indique le motif pour chaque index. | Envoyez une valeur du type déjà utilisé pour ce champ dans le flux. |
+| `400` avec `event #1 must be a JSON object` | Le tableau contient un élément qui n’est pas un objet JSON. MoleSignal rejette la requête entière. | Envoyez un tableau d’objets. |
+| Promtail ou Grafana Alloy ne parvient pas à envoyer les données | Le point de terminaison Loki décode uniquement le JSON, alors que ces émetteurs envoient des données protobuf compressées avec Snappy. | Envoyez les données via OpenTelemetry Collector, Vector ou Fluent Bit. |
+| Les requêtes ne retrouvent pas les enregistrements acceptés | La requête utilise un autre nom ou type de flux, ou une plage temporelle qui exclut les enregistrements. | Vérifiez le nom du flux et le type de signal. Consultez la section suivante pour les horodatages. |
+
+## Données manquantes ou incohérentes
+
+- **Horodatages.** `_timestamp` compte les microsecondes depuis l’époque Unix. Une valeur en secondes, en millisecondes ou en nanosecondes place les événements dans la mauvaise année ou loin dans le futur. Les requêtes sur une période récente ne les renvoient pas. Omettez `_timestamp` pour utiliser l’heure de réception par le serveur.
+- **Plage temporelle.** Une requête qui couvre une longue période s’exécute sous forme de tâche asynchrone. Définissez des bornes pour `timeRange` dans les requêtes interactives. Consultez [Requêtes](/fr/query#plages-temporelles-et-tâches-asynchrones).
+- **Conservation.** MoleSignal supprime les données qui dépassent la durée de conservation du flux. Si le flux n’a pas de durée propre, MoleSignal applique la valeur par défaut de la plateforme dans **Paramètres → Conservation des données**.
+- **Type de flux.** Le nom et le type identifient le flux. Un flux nommé `default` peut exister à la fois pour les logs, les métriques et les traces.
+
+## Requêtes
+
+| Symptôme | Cause | Solution |
+|---|---|---|
+| La réponse est `202` avec un `jobId` et un chemin `monitor` | Le nombre estimé de lignes atteint le seuil `[querier].auto_async_threshold_rows].` La requête s’exécute alors sous forme de tâche de recherche asynchrone. Avec les valeurs par défaut, cela correspond à une plage d’environ 13,9 heures ou plus. | Interrogez le chemin `monitor` jusqu’à la fin de la tâche, puis récupérez ses résultats via `/results`. Vous pouvez aussi réduire la plage temporelle ou envoyer `Prefer: respond-sync`. Consultez [Requêtes](/fr/query#plages-temporelles-et-tâches-asynchrones). |
+| Le client Flight SQL ne parvient pas à se connecter | MoleSignal désactive `[flight_sql]` par défaut. | Définissez `enabled = true`, exposez le port `5083` et authentifiez-vous avec un jeton d’API. |
+
+## Exploitation
+
+| Symptôme | Cause | Solution |
+|---|---|---|
+| `GET /api/v1/healthz` renvoie `503` | Le stockage d’objets est inaccessible. Le corps de la réponse contient un champ `reason`. | Rétablissez la connexion au stockage d’objets. |
+| La taille du répertoire WAL augmente | Les vidages de tampon échouent, généralement parce que le stockage d’objets est inaccessible. | Rétablissez le stockage d’objets. Le service d’ingestion vide ensuite les tampons accumulés. |
+| Le service d’ingestion renvoie `429` avec `intake buffer memory limit exceeded` | La mémoire occupée par les tampons du processus dépasse `[intake].max_buffer_memory_size`, généralement parce que les vidages échouent à répétition. | Identifiez la cause dans les lignes de journal `intake flush failed`, puis rétablissez le stockage d’objets ou la base de données. Les lignes impossibles à publier ne sont plus prises en compte dans le calcul de la limite (voir les deux lignes suivantes). L’ingestion JSON native inclut `Retry-After` dans cette réponse ; réessayez après le délai indiqué. |
+| Le journal affiche `dataset no longer exists; buffered rows discarded` | Un flux a été supprimé, ou supprimé puis recréé, alors que certaines de ses lignes étaient encore en mémoire tampon. Faute de destination, le service d’ingestion écarte ces lignes et libère la mémoire qu’elles occupent. Le compteur `intake_flush_errors_total` comptabilise chaque rejet sous l’étape `stream_gone` ou `dataset_gone`. | Aucune correction nécessaire. Renvoyez les données si nécessaire. |
+| Les écritures renvoient `503` avec `fenced by a newer writer epoch` | Un autre processus publie le même jeu de données avec le même `[node].id`. Le processus exclu ne peut plus publier ses données. Il écarte les lignes en mémoire et refuse les écritures dans ce jeu de données. Son WAL reste sur le disque. Le compteur `intake_flush_errors_total` comptabilise l’exclusion sous l’étape `writer_fenced`. | Attribuez un `[node].id` unique à chaque processus, puis redémarrez le processus exclu. Consultez [Déploiement par rôle](/fr/deployment/role-based). |
+| La génération des rapports PDF ou PNG planifiés échoue | Chrome est absent ou l’adresse `[scheduled_reports.renderer].base_url` ne permet pas d’accéder à l’interface Web. | Utilisez l’image de la version publiée, qui inclut Chromium, et définissez `base_url` sur une adresse de l’interface Web accessible depuis le nœud. |
+| Les extraits de code de prise en main affichent un hôte incorrect | `http.external_url` est vide alors que le service se trouve derrière un proxy. | Définissez `[http].external_url` sur l’adresse publique, puis redémarrez le service. |
+| Les requêtes renvoient `503` avec `no querier node is available` | Aucun nœud doté du rôle `querier` n’a émis de signal de présence récent. | Démarrez un nœud `querier` et vérifiez que son adresse `advertise_addr` est accessible depuis le routeur. Consultez [Déploiement par rôle](/fr/deployment/role-based#appartenance-au-cluster). |
+| Les écritures via le routeur renvoient `503` avec `no intake node is available` | Aucun nœud doté du rôle `intake` n’a émis de signal de présence récent. | Démarrez un nœud `intake` et vérifiez son adresse `advertise_addr`. Consultez [Déploiement par rôle](/fr/deployment/role-based#appartenance-au-cluster). |
+| Les requêtes renvoient `503` avec `no metadata database connection` | Le nœud a attendu 10 secondes sans obtenir de connexion à PostgreSQL : PostgreSQL est surchargé ou inaccessible, ou toutes les connexions autorisées par `[meta_database].max_connections` sont utilisées. | Relancez la requête. Si le problème persiste, vérifiez d’abord la charge et l’accessibilité de PostgreSQL. Si PostgreSQL est peu sollicité, augmentez `[meta_database].max_connections` en fonction de la charge, sans dépasser la valeur de `max_connections` dans PostgreSQL. |
+| Le port OTLP gRPC est inaccessible depuis l’hôte | Le fichier Compose ne publie pas le port `4317`. | Ajoutez le mappage `4317:4317`. |

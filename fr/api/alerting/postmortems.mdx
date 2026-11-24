@@ -1,0 +1,125 @@
+---
+title: "Post-mortems d’incident"
+description: "Rédigez un post-mortem interne avec un contenu en Markdown, un statut, un responsable et des relecteurs. Ajoutez des actions de suivi, chacune avec un responsable et une échéance, et convertissez-les en tickets si nécessaire."
+"en_link": "/en-US/api/alerting/postmortems"
+"zh-Hans_link": "/zh-Hans/api/alerting/postmortems"
+"zh-Hant_link": "/zh-Hant/api/alerting/postmortems"
+"ja_link": "/ja/api/alerting/postmortems"
+"ko_link": "/ko/api/alerting/postmortems"
+"de_link": "/de/api/alerting/postmortems"
+"es_link": "/es/api/alerting/postmortems"
+"pt-BR_link": "/pt-BR/api/alerting/postmortems"
+---
+
+Un incident comporte au plus un post-mortem interne, rédigé en Markdown. Ce document reste distinct des
+[post-mortems de la page de statut](/fr/status-pages#analyses-post-incident) ; les pages peuvent en reprendre le résumé.
+Pour savoir comment les pages l’utilisent, consultez [Incidents majeurs et post-mortems](/fr/alerting/major-incidents#bilans-d’incident).
+
+| Méthode et chemin | Description | Autorisation |
+|---|---|---|
+| `GET /api/v1/alerts/postmortems` | Liste les post-mortems de l’organisation, du plus récent au plus ancien, avec le nombre d’actions de suivi pour chacun. | `postmortems.read` |
+| `GET /api/v1/alerts/incidents/{id}/postmortem` | Renvoie le post-mortem de l’incident et ses actions de suivi. | `alerts.incidents.read` sur l’incident et `postmortems.read` |
+| `POST /api/v1/alerts/incidents/{id}/postmortem` | Crée un post-mortem pour l’incident. | `alerts.incidents.read` sur l’incident et `postmortems.manage` |
+| `PUT /api/v1/alerts/postmortems/{id}` | Modifie le titre, le contenu, le statut, le responsable et les relecteurs d’un post-mortem. | `postmortems.manage` |
+| `POST /api/v1/alerts/postmortems/{id}/actions` | Ajoute une action de suivi. | `postmortems.manage` |
+| `PUT /api/v1/alerts/postmortems/{id}/actions/{actionId}` | Modifie une action de suivi. | `postmortems.manage` |
+| `DELETE /api/v1/alerts/postmortems/{id}/actions/{actionId}` | Supprime une action de suivi. | `postmortems.manage` |
+| `POST /api/v1/alerts/postmortems/{id}/actions/{actionId}/ticket` | Crée un ticket pour une action de suivi. | `postmortems.manage` |
+
+## Créer et modifier un post-mortem
+
+```http
+POST /api/v1/alerts/incidents/{id}/postmortem
+```
+
+| Champ | Type | Obligatoire | Remarques |
+|---|---|---|---|
+| `title` | string | Oui | De 1 à 200 caractères. |
+| `body` | string | Non | Contenu Markdown, jusqu’à 100 000 caractères. |
+
+L’API renvoie `409` si l’incident a déjà un post-mortem. Les pages préparent d’abord le contenu à partir d’un modèle
+(résumé, impact, chronologie, cause racine, points positifs, points négatifs, actions de suivi), puis appellent cette API.
+Le journal d’audit consigne la création. Pour une modification, envoyez uniquement les champs à modifier : `title`, `body`,
+`status`, `ownerId` (`null` efface la valeur) et `reviewerIds`.
+
+<RequestExample>
+```bash cURL
+curl -X PUT http://localhost:5080/api/v1/alerts/postmortems/$POSTMORTEM_ID \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"status": "in_review", "reviewerIds": ["<user-id>"]}'
+```
+</RequestExample>
+
+La lecture, la création et la modification renvoient `{ "postmortem": { ... }, "actions": [ ... ] }`. Le champ `postmortem` vaut
+`null` si l’incident n’a pas de post-mortem.
+
+<ResponseExample>
+```json 200
+{
+  "postmortem": {
+    "id": "3KJbX2p8Lr0Ws4Nf6Qa1Hd9TcVe",
+    "orgId": "<organization-id>",
+    "incidentId": "<incident-id>",
+    "title": "Checkout errors after the payments deploy",
+    "status": "in_review",
+    "body": "# Checkout errors after the payments deploy\n\n## Summary\n…",
+    "ownerId": "<user-id>",
+    "reviewerIds": ["<user-id>"],
+    "createdBy": "<user-id>",
+    "createdAt": 1790000000000000,
+    "updatedAt": 1790003600000000,
+    "publishedAt": null
+  },
+  "actions": [
+    {
+      "id": "3KJbZ7m1Qe5Rt9Va2Xc8Lw0NdHf",
+      "orgId": "<organization-id>",
+      "postmortemId": "3KJbX2p8Lr0Ws4Nf6Qa1Hd9TcVe",
+      "incidentId": "<incident-id>",
+      "title": "Alert on payments pool saturation",
+      "ownerId": "<user-id>",
+      "dueAt": 1790600000000000,
+      "status": "open",
+      "ticketId": "<ticket-id>",
+      "ticketKey": "OPS-57",
+      "ticketUrl": "https://example.atlassian.net/browse/OPS-57",
+      "createdAt": 1790003600000000,
+      "updatedAt": 1790003600000000
+    }
+  ]
+}
+```
+</ResponseExample>
+
+| Champ | Remarques |
+|---|---|
+| `status` | `draft`, `in_review` ou `published`. Le premier passage à `published` renseigne `publishedAt`. |
+
+Chaque ligne de la liste contient les champs du post-mortem, le résumé de l’incident (`incidentSummary`), le nombre
+d’actions de suivi encore ouvertes (`openActions`) et le nombre de celles dont l’échéance est dépassée (`overdueActions`).
+
+## Actions de suivi
+
+Pour ajouter une action, envoyez `{ "title": "…", "ownerId": "<user-id>", "dueAt": 1790600000000000 }`. Le titre doit compter de 1
+à 300 caractères. Ajoutez au plus 50 actions par post-mortem et indiquez `dueAt` en microsecondes depuis l’époque Unix. Pour modifier une action, envoyez uniquement les
+champs à modifier : `title`, `ownerId` et `dueAt` (`null` efface la valeur de l’un ou l’autre de ces deux derniers champs), et `status` (`open` ou `done`).
+L’ajout et la modification renvoient l’action de suivi. La suppression renvoie `{ "deleted": true }`.
+
+```http
+POST /api/v1/alerts/postmortems/{id}/actions/{actionId}/ticket
+```
+
+Envoyez `{ "connectorId": "<connector-id>" }` dans le corps de la requête. L’API crée un ticket pour l’action de suivi à l’aide de ce
+[connecteur de tickets](/fr/api/alerting/tickets) et renvoie l’action avec `ticketKey` et
+`ticketUrl`. Si l’action a déjà un ticket, l’API la renvoie sans la modifier. Le ticket ne reprend ni les commentaires ni
+les changements de statut de l’incident. La clôture du ticket ne résout pas l’incident.
+
+**Erreurs**
+
+| Statut | Motif |
+|---|---|
+| `400` | Un champ ne respecte pas ses limites ou le connecteur de tickets est désactivé. |
+| `403` | Il manque une autorisation ou l’incident n’est pas accessible. |
+| `404` | L’incident, le post-mortem, l’action de suivi ou le connecteur de tickets n’existe pas. |
+| `409` | L’incident a déjà un post-mortem. |

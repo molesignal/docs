@@ -1,0 +1,224 @@
+---
+title: "Opsgenie または PagerDuty からのスケジュール移行"
+description: "Opsgenie または PagerDuty の REST API からオンコールスケジュールを取得し、書き込む前に移行元の表示と比較します。移行される項目と移行されない項目を確認できます。"
+"en_link": "/en-US/alerting/schedule-migration"
+"zh-Hans_link": "/zh-Hans/alerting/schedule-migration"
+"zh-Hant_link": "/zh-Hant/alerting/schedule-migration"
+"ko_link": "/ko/alerting/schedule-migration"
+"de_link": "/de/alerting/schedule-migration"
+"es_link": "/es/alerting/schedule-migration"
+"fr_link": "/fr/alerting/schedule-migration"
+"pt-BR_link": "/pt-BR/alerting/schedule-migration"
+---
+
+**スケジュールをインポート…**は、Opsgenie と PagerDuty の REST API が返す形式のままスケジュールを読み込みます。移行時にローテーションを手作業で作り直す必要はありません。スクリプトは移行元の API キーを使ってスケジュールを取得し、ファイルに保存します。その後は[バンドル](/ja/alerting/on-call#インポートとエクスポート)と同じ手順で、まずテストを実行し、次にまとめて書き込みます。MoleSignal はキーを保持せず、移行元の API にもアクセスしません。インポートには `schedules.create` 権限が必要です。
+
+インポートの基準は、今後どの時点でもオンコール担当者が変わらないことです。MoleSignal のスケジュールで再現できず、今後の担当者が変わってしまう設定がある場合は、インポートを中止します。今後の担当者に影響しない設定は除外し、結果に明記します。
+
+## 手順
+
+<Steps>
+  <Step title="メンバーを追加する">
+    ローテーションの全担当者を、移行元と同じメールアドレスでワークスペースに追加します。[メンバー](/ja/identity/members)を参照してください。メンバーはメールアドレスで照合し、大文字と小文字は区別しません。
+  </Step>
+  <Step title="スケジュールを取得する">
+    `curl` と `jq` が使えるマシンで、[Opsgenie](#opsgenie) または [PagerDuty](#pagerduty) のスクリプトを実行します。スクリプトはファイルを 1 つ出力します。
+  </Step>
+  <Step title="インポートをテストする">
+    **アラート → オンコールスケジュール**を開き、**インポート／エクスポート → スケジュールをインポート…**を選択します。次に、**ファイルを選択**でファイルを指定し、**テストを実行**を選択します。各スケジュールの処理予定が一覧に表示されます。[結果を確認する](#結果を確認する)を参照してください。
+  </Step>
+  <Step title="インポートを妨げる問題を修正する">
+    移行元で修正して再取得するか、ファイルを編集します。エラーがあるスケジュールが 1 件でも残っている間は、何も書き込みません。
+  </Step>
+  <Step title="インポート">
+    **インポート**を選択し、インポートしたスケジュールを開いてオンコール担当者を確認します。このスケジュールに従って担当者を呼び出すには、[エスカレーションポリシー](/ja/alerting/on-call#エスカレーションポリシー)でこのスケジュールを指定します。
+  </Step>
+</Steps>
+
+## Opsgenie
+
+スケジュールの読み取り権限を持つ API キーを設定し、スクリプトを実行します。EU のアカウントでは `api.eu.opsgenie.com` を使用します。
+
+```bash
+export OPSGENIE_API_KEY=<api key>
+```
+
+```bash
+API=https://api.opsgenie.com   # EU accounts: https://api.eu.opsgenie.com
+DAYS=200
+
+get() { curl -fsS -H "Authorization: GenieKey $OPSGENIE_API_KEY" "$API$1"; }
+
+get /v2/schedules | jq -r '.data[].id' | while read -r id; do
+  get "/v2/schedules/$id"
+  get "/v2/schedules/$id/timeline?expand=base&interval=$DAYS&intervalUnit=days"
+done | jq -s '{
+  data: map(.data | select(has("rotations"))),
+  timelines: map(.data | select(has("baseTimeline"))
+    | {_parent, startDate, endDate, baseTimeline}
+    | .baseTimeline.rotations[].periods |= map({startDate, endDate, type, recipient}))
+}' > opsgenie-schedules.json
+```
+
+ファイルの `data` には `GET /v2/schedules/{id}` で取得した各スケジュールが入り、`timelines` には `GET /v2/schedules/{id}/timeline` で取得した各スケジュールのタイムラインが入ります。`DAYS` で、何日先までのタイムラインを取得するかを指定します。
+
+| Opsgenie | MoleSignal |
+|---|---|
+| 名前、説明、タイムゾーン、有効状態 | そのまま引き継ぎます。 |
+| 所有チーム | 同名のチームがあれば割り当てます。なければチームを割り当てず、その旨を結果に表示します。 |
+| ローテーションの `type` と `length` | `length` が 1 の場合は、`type` に応じて**毎日**または**毎週**になります。それ以外はカスタム間隔になります。たとえば、`hourly` で `length` が 6 の場合は 6 時間です。 |
+| `startDate`、`endDate` | ローテーションの開始日時と終了日時です。すでに終了したローテーションは除外します。 |
+| `timeRestriction` | スケジュールのタイムゾーンに従う、週ごとの時間帯です。複数日にまたがる時間帯にも対応します。 |
+| 重複しない複数のローテーション | 営業時間内と営業時間外にそれぞれ設定する場合など、複数のローテーションとして引き継ぎます。 |
+| ユーザーとして登録された参加者 | `username` に入っているメールアドレスでメンバーを照合し、元の順序を維持します。 |
+
+実行中のローテーションに以下のいずれかが該当すると、インポートを中止します。
+
+| Opsgenie | 理由 |
+|---|---|
+| 参加者にチームまたはエスカレーションを指定 | MoleSignal のローテーションでは、個人のみを参加者に指定できます。 |
+| 参加者に **No-One** を指定 | MoleSignal のローテーションでは、担当者のいない当番枠を設定できません。 |
+| 重複するローテーション | Opsgenie では重複するすべてのローテーションの担当者が同時にオンコールになりますが、MoleSignal では 1 つのスケジュールで同時にオンコールになれるのは 1 人だけです。ファイル内でローテーションを異なる名前のスケジュールに分け、エスカレーションポリシーの同じステップで両方のスケジュールを指定します。 |
+
+オーバーライド、転送ルール、エスカレーション、ルーティングはインポートしません。
+
+## PagerDuty
+
+スケジュールとユーザーを読み取れる API キーを設定し、スクリプトを実行します。EU のアカウントでは `api.eu.pagerduty.com` を使用します。
+
+```bash
+export PAGERDUTY_API_KEY=<api key>
+```
+
+```bash
+API=https://api.pagerduty.com   # EU accounts: https://api.eu.pagerduty.com
+DAYS=200
+since=$(jq -rn 'now | todate')
+until=$(jq -rn "now + $DAYS * 86400 | todate")
+
+get() {
+  curl -fsSg -H "Authorization: Token token=$PAGERDUTY_API_KEY" \
+    -H 'Accept: application/vnd.pagerduty+json;version=2' "$API$1"
+}
+pages() {
+  offset=0
+  while page=$(get "$1?limit=100&offset=$offset"); do
+    printf '%s\n' "$page"
+    [ "$(printf '%s' "$page" | jq .more)" = true ] || break
+    offset=$((offset + 100))
+  done
+}
+shift_based=$(pages /v3/schedules)
+
+{
+  pages /users
+  printf '%s\n' "$shift_based"
+  printf '%s\n' "$shift_based" | jq -r '.schedules[].id' | while read -r id; do
+    get "/v3/schedules/$id?since=$since&until=$until&include[]=final_schedule"
+  done
+  pages /schedules | jq -r '.schedules[].id' | while read -r id; do
+    get "/schedules/$id?since=$since&until=$until&include[]=final_schedule&include[]=overrides_subschedule"
+  done
+} | jq -s --arg since "$since" --arg until "$until" '{
+  since: $since,
+  until: $until,
+  users: (map(.users // []) | add // [] | map({id, email})),
+  shift_based_schedules: (map(.schedules // []) | add // [] | map({id, type, summary})),
+  schedules: map(.schedule // empty
+    | del(.users, .escalation_policies)
+    | if .type == "schedule_v3" then
+        .final_schedule.computed_shift_assignments[]? |= {start_time, end_time, member, source: {type: .source.type}}
+      else
+        del(.schedule_layers[].rendered_schedule_entries)
+        | .final_schedule.rendered_schedule_entries |= map({start, end, user: (.user | select(.) | {id})})
+        | .overrides_subschedule.rendered_schedule_entries |= map({start, end})
+      end)
+}' > pagerduty-schedules.json
+```
+
+ファイルには、`GET /schedules/{id}` と `GET /v3/schedules/{id}` で取得した各スケジュールを `schedules` に、`GET /v3/schedules` で取得した一覧を `shift_based_schedules` に格納します。スケジュールには担当者のメールアドレスが含まれないため、`GET /users` で取得したメールアドレスを `users` に格納します。`since` と `until` は PagerDuty が担当を展開する期間を指定し、`DAYS` は何日先まで展開するかを指定します。
+
+`time_zone` を指定せずに、スケジュールを 1 件ずつ取得してください。`GET /schedules` は、スケジュール自体ではなく呼び出し元のタイムゾーンで制限を展開します。インポート時に、別のタイムゾーンで展開されたスケジュールを検出すると、インポートを中止します。
+
+### レイヤーベースのスケジュール
+
+| PagerDuty | MoleSignal |
+|---|---|
+| 名前、説明、タイムゾーン | そのまま引き継ぎます。一時停止中のスケジュールを更新しても、一時停止のままです。 |
+| チーム | MoleSignal に同名のチームがある最初のチームを割り当てます。残りのチーム名は結果に表示します。 |
+| レイヤー | 同じ優先順位でローテーションに変換します。最新のレイヤーを先頭に置いて担当者を決め、そのレイヤーの制限時間帯外では下位のレイヤーが担当します。 |
+| `rotation_turn_length_seconds` | ちょうど 24 時間なら **毎日**、ちょうど 7 日間なら **毎週** になります。それ以外はカスタム期間になります。 |
+| `rotation_virtual_start` | ローテーションの開始時刻です。この時刻を基準に、引き継ぎ時刻と担当者が決まります。 |
+| `start` | レイヤーが有効になる時刻です。すでに過ぎている場合は、追加の処理は不要です。未来の時刻なら、ローテーションをその時刻から開始し、その時点の担当者を先頭にします。 |
+| `end` | ローテーションの終了時刻です。終了済みのレイヤーや、編集前のバージョンはインポートしません。 |
+| `restrictions` | `daily_restriction` と `weekly_restriction` のどちらも、スケジュールのタイムゾーンで週ごとに繰り返す時間帯に変換します。 |
+| `users` | `users` のメールアドレスでメンバーを照合し、元の順序で登録します。 |
+
+### シフトベースのスケジュール
+
+PagerDuty の V3 API が返すスケジュールは、イベントで構成されます。イベントに優先順位はありません。イベントが重なると、すべてのイベントの担当者が同時にオンコールになります。
+
+| PagerDuty | MoleSignal |
+|---|---|
+| 名前、説明、チーム | レイヤーベースのスケジュールと同じです。 |
+| イベントのタイムゾーン | 引き継ぎをイベントの現地時刻に合わせるため、イベントのタイムゾーンをスケジュールのタイムゾーンに設定します。元のスケジュールの `time_zone` と異なる場合は、その旨を結果に表示します。 |
+| 各イベント | イベントと同じ名前のローテーションを 1 つ作成します。営業時間内と営業時間外のように重ならないイベントは、どの順序でも構いません。 |
+| `start_time`、`end_time`、`recurrence` | 最初のシフトと繰り返しパターンを、次の表のとおりに設定します。 |
+| `shifts_per_member` | 1 人あたりの担当期間を決めます。`start_time` から繰り返し回数を数え、`BYDAY` で指定した各曜日を 1 回と数えます。 |
+| `effective_since` | イベントが有効になる時刻です。すでに過ぎている場合は追加の処理は不要で、担当者の決定にも影響しません。未来の時刻なら、ローテーションをその時刻から開始し、その時点の担当者を先頭にします。 |
+| `effective_until` | ローテーションの終了時刻です。終了済みのイベントはインポートしません。 |
+| `members` | `users` のメールアドレスでメンバーを照合し、元の順序で登録します。 |
+
+| `recurrence` | 最初のシフト | MoleSignal |
+|---|---|---|
+| `RRULE:FREQ=WEEKLY` | 7 日間 | 常に有効です。`shifts_per_member` が 1 なら **毎週**、それ以外はカスタム期間になります。 |
+| `RRULE:FREQ=DAILY` | 24 時間 | 常に有効です。`shifts_per_member` が 1 なら **毎日**、7 なら **毎週**、それ以外はカスタム期間になります。 |
+| `INTERVAL` を指定した `FREQ=WEEKLY`、`FREQ=DAILY`、または `FREQ=HOURLY` | 繰り返し間隔と同じ長さ | 常に有効です。`RRULE:FREQ=HOURLY;INTERVAL=12` なら 12 時間など、カスタム期間になります。 |
+| `RRULE:FREQ=DAILY` | 1 日の一部 | 毎日、指定の時間帯を週ごとに繰り返します。 |
+| `RRULE:FREQ=WEEKLY`、または `BYDAY` で 1 曜日を指定 | 1 週間の一部 | 1 つの時間帯を週ごとに繰り返します。時間帯は複数日にまたがることができます。 |
+| `RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR` | 1 日の一部 | 指定した曜日の時間帯を週ごとに繰り返します。`shifts_per_member` が 5 なら 1 人あたり 1 週間、10 なら 2 週間です。 |
+
+有効なイベントが次のいずれかに該当すると、インポートを中止します。
+
+| PagerDuty | 理由 |
+|---|---|
+| 複数メンバーを指定した `every_member_assignment_strategy` | 全員が同時にオンコールになりますが、MoleSignal のスケジュールでは同時に担当できるのは 1 人だけです。ファイル内で担当者ごとに別名のスケジュールを作成し、エスカレーションポリシーの同じステップにすべてのスケジュールを指定してください。 |
+| 他のメンバーと一緒に指定した `empty_member` | MoleSignal のローテーションでは、担当者のいない順番を設定できません。 |
+| 重複するイベント | 各イベントの担当者が同時にオンコールになります。Opsgenie の場合と同様に、別々のスケジュールに分けてください。 |
+| `EXDATE` または `RDATE` | MoleSignal のローテーションでは、特定の回だけ除外したり追加したりできません。また、PagerDuty のドキュメントには、それらの回を `shifts_per_member` に含めるかどうかの記載がありません。 |
+| その他のルール（`FREQ=MONTHLY`、`COUNT`、`UNTIL`、シフトが繰り返し間隔より短い場合の `INTERVAL` など） | 担当の切り替わりやオンコールの時間帯が、毎週同じ曜日・時刻に繰り返されません。 |
+| 複数のメンバーがいて、`shifts_per_member` が `BYDAY` で指定した曜日数の倍数でない場合 | 金曜日の次のシフトが月曜日になるため、引き継ぎの間隔が一定になりません。 |
+| まだ終了していない将来のカスタムシフト | MoleSignal のローテーションでは単発のシフトを設定できません。シフトの終了後にインポートするか、ファイルの `final_schedule` からそのシフトを削除し、インポート後にオーバーライドを追加してください。 |
+| タイムゾーンが異なるイベント | MoleSignal では、1 つのスケジュールに設定できるタイムゾーンは 1 つだけです。 |
+
+スクリプトで取得できなかった場合など、ファイルの `shift_based_schedules` に名前しか記載されていないシフトベースのスケジュールはスキップし、結果に名前を表示します。そのスケジュールを取り込むには、スクリプトをもう一度実行してください。ファイルの残りの内容はインポートします。
+
+オーバーライド、エスカレーションポリシー、サービスはインポートしません。
+
+## 結果を確認する
+
+| 表示 | 意味 |
+|---|---|
+| **作成**、**更新**、**変更なし** | バンドルと同様に、名前で照合します。**更新** には、変更するフィールドを表示します。 |
+| **スキップ** | ファイルに名前しか記載されていない PagerDuty のシフトベースのスケジュール、または **新規ルールのみ作成（同名の既存ルールは変更しない）** を選択した場合の既存スケジュールは、インポートしません。 |
+| **エラー** | ファイル全体のインポートを中止します。理由を 1 行ずつ表示し、対応するメンバーが見つからないメールアドレスをすべて一覧表示します。 |
+
+各スケジュールの残りの行には、インポートしなかった内容と、インポート元との比較結果を表示します。
+
+### インポート元との比較
+
+ファイルには、インポート元が展開したスケジュール（PagerDuty の `final_schedule` または Opsgenie のタイムライン）が含まれます。試行時には、その期間のうち現在時刻以降のオンコール担当者を計算し、インポート元の担当者と比較します。差異があると、該当する時刻と双方の担当者をエラーに表示し、何も書き込みません。
+
+- オーバーライドはインポートしないため、適用期間は比較しません。
+- シフトベースのスケジュールの `final_schedule` で複数の担当者が同時にオンコールになっている場合、イベントが重なっていなくてもインポートを中止します。
+- Opsgenie で無効になっているスケジュールは、一時停止の状態でインポートし、比較は行いません。
+- 夏時間を採用しているタイムゾーンで、比較期間が時刻の切り替えまで届かない場合は、その旨を結果に表示します。MoleSignal では引き継ぎの現地時刻を維持します。次の切り替えをまたいで比較するには、`DAYS` を増やしてください。
+- ファイルに展開済みのスケジュールが含まれていない場合は、比較しなかったことを結果に表示し、インポートを続行します。意図的にインポート元と異なるスケジュールを取り込むには、ファイルから `final_schedule` または `timelines` を削除してください。
+
+### 上限
+
+ファイルの上限は 4 MiB、スケジュールは 500 件までです。1 つのスケジュールにつき、稼働中のローテーションは 60 件までです。ファイルが大きすぎる場合は、`DAYS` を減らしてください。
+
+## 再インポートする
+
+スケジュールは名前で照合します。再インポートすると、インポート元で変更されたスケジュールのローテーションを更新し、それ以外は変更しません。MoleSignal で設定したオーバーライドや担当交代に加え、チームや **担当交代に承認が必要** など、ファイルに含まれない設定も維持します。

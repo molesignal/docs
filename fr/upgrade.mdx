@@ -1,0 +1,105 @@
+---
+title: "Mise à niveau"
+description: "Découvrez comment mettre à niveau un déploiement MoleSignal : sauvegardes, migrations de schéma, procédures selon le type de déploiement et retour à la version précédente."
+"en_link": "/en-US/upgrade"
+"zh-Hans_link": "/zh-Hans/upgrade"
+"zh-Hant_link": "/zh-Hant/upgrade"
+"ja_link": "/ja/upgrade"
+"ko_link": "/ko/upgrade"
+"de_link": "/de/upgrade"
+"es_link": "/es/upgrade"
+"pt-BR_link": "/pt-BR/upgrade"
+---
+
+MoleSignal n’a pas encore atteint la version 1.0. Les notes de version de la page [Historique des modifications](/fr/changelog) répertorient les changements de chaque version. Lisez-les avant la mise à niveau et effectuez une sauvegarde avant chaque mise à niveau.
+
+## Avant la mise à niveau
+
+1. Lisez les notes de version de toutes les versions depuis la version actuelle jusqu’à la version cible.
+2. Sauvegardez PostgreSQL et le stockage objet. Consultez [Sauvegarde et restauration](/fr/backup-restore).
+3. Notez la version en cours d’exécution. `molesignal --version` l’affiche, et `GET /api/v1/version` renvoie la version, le commit, l’identifiant de build, le canal de publication et l’édition. La requête nécessite un jeton d’accès de type Bearer.
+4. Si le déploiement est critique, testez la mise à niveau sur une copie restaurée de la base de données.
+
+## Application des modifications du schéma
+
+Le binaire intègre les migrations de la base de données et les applique à PostgreSQL à chaque démarrage, avant de traiter le trafic. Si une migration échoue, le processus s’arrête. Un verrou dans PostgreSQL garantit que les migrations s’exécutent l’une après l’autre, même si plusieurs nœuds démarrent en même temps. La table `_molesignal_schema_meta` répertorie les versions appliquées.
+
+Les migrations ne s’appliquent que dans le sens des mises à niveau :
+
+- Un binaire plus ancien que la base de données refuse de démarrer et affiche `migration <version> was previously applied but is missing in the resolved migrations`.
+- Un binaire qui contient une version modifiée d’une migration déjà appliquée refuse de démarrer et affiche `migration <version> was previously applied but has been modified`. Le schéma de base peut changer d’un build de préversion à l’autre. Une base de données créée avec un build ne s’ouvre donc pas forcément avec un autre.
+
+Pour revenir à une version antérieure, restaurez la base de données et les objets à partir d’une sauvegarde effectuée avant la mise à niveau.
+
+## Procédures
+
+<Tabs>
+  <Tab title="Docker Compose">
+    Modifiez le tag de l’image `image` dans le fichier Compose, puis récupérez l’image et recréez le conteneur :
+
+    ```bash
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone pull
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up -d
+    ```
+
+    Conservez les volumes nommés. Ils contiennent les données de PostgreSQL et celles de RustFS, dont le journal WAL.
+  </Tab>
+  <Tab title="Binaire et systemd">
+    Arrêtez le service, remplacez le binaire et la base de données GeoIP, puis redémarrez le service :
+
+    ```bash
+    sudo systemctl stop molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo install -Dm644 mmdb/dbip-city-lite.mmdb \
+      /usr/share/molesignal/mmdb/dbip-city-lite.mmdb
+    sudo systemctl start molesignal
+    sudo journalctl -u molesignal -n 50
+    ```
+
+    Les anciennes versions installaient `/usr/share/molesignal/mmdb/GeoLite2-City.mmdb`. Supprimez ce fichier. Si `[mmdb].db_path` dans `/etc/molesignal/config.toml` le référence encore, faites pointer ce paramètre vers `dbip-city-lite.mmdb`.
+
+    Comparez le fichier `conf/config.toml` de la nouvelle version au fichier installé. En l’absence de nouveaux paramètres dans le fichier installé, MoleSignal utilise leurs valeurs par défaut intégrées. Une modification des valeurs par défaut peut toutefois avoir un impact.
+  </Tab>
+  <Tab title="Helm">
+    Lisez l’[historique des modifications du chart](https://github.com/molesignal/molesignal-helm/blob/main/CHANGELOG.md), puis effectuez la mise à niveau avec le même fichier de valeurs :
+
+    ```bash
+    helm repo update
+    helm upgrade molesignal molesignal/molesignal --namespace molesignal --values values.yaml
+    ```
+
+    Sans `image.tag`, le chart utilise le tag d’image `latest`. Pour passer à une version précise de MoleSignal, définissez `image.tag` dans le fichier de valeurs.
+
+    Les secrets générés restent inchangés d’une version à l’autre. Par défaut, les pods `standalone` et `intake` disposent de 60 secondes pour s’arrêter : maintenez `terminationGracePeriodSeconds` au-dessus de `[node].drain_timeout_secs`.
+
+    En mode `distributed`, `helm upgrade` remplace simultanément les pods de toutes les charges de travail, sans respecter l’ordre indiqué dans [Clusters à rôles séparés](#clusters-à-rôles-séparés).
+  </Tab>
+  <Tab title="Manifestes Kubernetes">
+    Modifiez le tag de l’image dans les manifestes, puis appliquez-les :
+
+    ```bash
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    kubectl -n molesignal rollout status deployment/intake
+    ```
+
+    Définissez `terminationGracePeriodSeconds` sur une valeur supérieure à `[node].drain_timeout_secs` pour laisser aux pods le temps d’écrire les données en attente avant de s’arrêter.
+  </Tab>
+</Tabs>
+
+Lorsqu’un processus reçoit `SIGTERM` ou `SIGINT`, il attend jusqu’à `[node].drain_timeout_secs` que les données en attente soient écrites, puis s’arrête. Les enregistrements qu’il n’a pas pu écrire restent dans le journal WAL du stockage objet. Un autre nœud d’ingestion les publie, ou le même nœud s’en charge après son redémarrage.
+
+## Clusters à rôles séparés
+
+Un cluster à rôles séparés utilise un schéma commun. Un nœud qui exécute une version antérieure continue d’utiliser le nouveau schéma jusqu’à son redémarrage, sans garantie de compatibilité entre les versions. Mettez à niveau tous les nœuds au cours d’une même fenêtre de maintenance :
+
+1. Arrêtez les nœuds `router`, puis les nœuds `intake` et `querier`, et enfin les nœuds `compactor` et `alert`.
+2. Démarrez un nœud avec la nouvelle version et attendez que `GET /api/v1/healthz` renvoie `200`. Ce nœud applique les migrations.
+3. Démarrez les nœuds restants.
+
+## Vérification de la mise à niveau
+
+- Le journal ne contient aucune erreur de migration et `GET /api/v1/healthz` renvoie `200`.
+- `GET /api/v1/version` renvoie la nouvelle version.
+- Une requête sur les données récentes renvoie des lignes et de nouveaux enregistrements arrivent.
+- Dans `/metrics`, la valeur de `storage_reconciler_issues_total` n’augmente pas.

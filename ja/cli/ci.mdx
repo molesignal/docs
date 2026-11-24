@@ -1,0 +1,128 @@
+---
+title: "CI とリリース"
+description: "CI から MoleSignal CLI を使って、デプロイを APM に報告し、RUM のソースマップとモバイルアプリのシンボルをアップロードします。シンセティックチェックとバージョン比較でリリースを検証し、ジョブの出力をストリームに送信することもできます。"
+"en_link": "/en-US/cli/ci"
+"zh-Hans_link": "/zh-Hans/cli/ci"
+"zh-Hant_link": "/zh-Hant/cli/ci"
+"ko_link": "/ko/cli/ci"
+"de_link": "/de/cli/ci"
+"es_link": "/es/cli/ci"
+"fr_link": "/fr/cli/ci"
+"pt-BR_link": "/pt-BR/cli/ci"
+---
+
+このページのコマンドは、API トークンを使って MoleSignal の API を呼び出します。パイプラインで `MOLESIGNAL_URL` と `MOLESIGNAL_TOKEN` を設定するか、`--url` と `--token` を渡してください。トークンは **ID とアクセス → API トークン**で、各コマンドに記載の権限を持つロールを使って作成してください。
+
+## デプロイを報告する
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production
+```
+
+デプロイは APM のサービスのタイムラインに表示され、APM はデプロイしたバージョンと直前のバージョンを比較します。CI では、コミット、リポジトリ、プルリクエスト、作成者、実行へのリンクを GitHub Actions、GitLab CI/CD、Jenkins、CircleCI、Buildkite、 Bitbucket Pipelines、Azure Pipelines の実行環境から取得します。CI 以外では、コミットとリポジトリを git から取得します。トークンのロールには `apm.deploy` 権限が必要です。
+
+`--` の後にコマンドを指定すると、CLI はそのコマンドを先に実行し、実行結果に応じてデプロイの成功または失敗を記録し、同じ終了コードで終了します。
+
+```bash
+molesignal deploy --service checkout --version 2.4.0 --env production -- ./scripts/deploy.sh
+```
+
+| オプション | 説明 |
+|---|---|
+| `--service <name>` | スパンの `service.name` に設定されているサービス名です。必須です。 |
+| `--version <version>` | `service.version` に対応するデプロイ済みのバージョンです。デプロイには必須です。 |
+| `--env <environment>` | `deployment.environment.name` に対応する環境です。 |
+| `--namespace <namespace>` | サービスの `service.namespace` です。 |
+| `--kind <kind>` | `deployment`（デフォルト）、`configuration`、`feature_flag` のいずれかです。 |
+| `--status <status>` | `succeeded`（デフォルト）、`failed`、または `--version` へのロールバックを示す `rolled_back` です。 |
+| `--commit`, `--repository`, `--pull-request`, `--author`, `--ci-url` | CI または git から取得する値を上書きします。 |
+| `--description <text>` | デプロイにポインターを合わせると表示されます。 |
+| `--time <time>` | 現在の時刻の代わりに、デプロイが行われた時刻を指定します。 |
+| `--dry-run` | 記録予定の内容を表示し、実際には記録しません。 |
+
+フィールドは[CI からデプロイを報告する](/ja/apm/deployments#ci-からデプロイを報告する)に記載されているものと同じです。
+
+## ソースマップをアップロードする
+
+```bash
+molesignal source-maps upload dist/assets --application checkout-web --service web-frontend --release "$VERSION"
+```
+
+指定したフォルダー配下のすべての `.map` ファイルを、元のファイル名でアップロードします。ファイル名は、デプロイ済みのバンドル名の末尾に `.map` を付けたものにしてください。ファイルは gzip で圧縮しながら、4 件ずつ並行してアップロードします。並行数は `--concurrency` で変更できます。同名のソースマップは互いに上書きするため、コマンドは同名ファイルのアップロードを拒否します。 `--application`、`--service`、`--release` は、RUM SDK が報告する `applicationId`、`service`、`version` とそれぞれ一致させてください。Flutter Web の場合は `--platform flutter` を追加し、アプリのビルドに使用した `--debug-id` を指定してください。トークンのロールには `debug_artifacts.manage` 権限が必要です。
+
+`--dry-run` はアップロード予定のファイルを一覧表示します。`molesignal source-maps list` はアップロード済みのソースマップを一覧表示し、 `molesignal source-maps delete <id>` は指定したソースマップを削除します。
+
+## モバイルおよびネイティブのシンボルをアップロードする
+
+```bash
+molesignal symbols upload build/molesignal-symbols --application checkout-app --service checkout --release 2.4.0 --debug-id "$BUILD_ID"
+```
+
+ファイルは種類に応じて次のように処理します。
+
+| ファイル | アップロード時の扱い |
+|---|---|
+| `--split-debug-info` で生成した `app.android-arm64.symbols` | Flutter シンボルとして扱い、ファイル名からプラットフォームとアーキテクチャを取得します。`--debug-id` には、アプリのビルドに使用した `MOLESIGNAL_DEBUG_ID` を指定します。 |
+| `mapping.txt` | Android R8 のマッピングとして扱います。 |
+| `libapp.so` などの ELF ライブラリ | Android ネイティブシンボルとして扱い、ファイルからアーキテクチャとビルド ID を読み取ります。 |
+| Apple の `.dSYM` | バイナリのアーキテクチャごとにアップロードし、それぞれの UUID をファイルから読み取ります。 |
+
+`--debug-id`、`--platform`、`--arch` は、ファイルから取得した値を上書きします。dSYM の場合、`--arch` で対象を 1 つのアーキテクチャに絞ります。`--dry-run` は、すべてのファイルを読み取った ID とともに一覧表示します。`molesignal symbols list` と `molesignal symbols delete <id>` は、それぞれアップロード済みのシンボルの一覧表示と削除を行います。トークンのロールには `debug_artifacts.manage` 権限が必要です。フレームの照合方法については、[RUM のソースマップとシンボル](/ja/rum/source-maps)を参照してください。
+
+## リリースを確認する
+
+`molesignal synthetics run <check> --wait --yes` は設定されたすべてのロケーションで合成チェックを実行し、いずれかの実行が失敗すると終了コード `1` で終了します。`molesignal services compare <service> <baseline> <candidate>
+--fail-on-regression` は候補バージョンにリグレッションがあると終了コード `1` で終了します。 [インシデントと変更](/ja/cli/changes#シンセティックチェックを実行する)と [メトリクス、トレース、サービス](/ja/cli/observe#2-つのバージョンを比較する)を参照してください。
+
+## ストリームに行を送信する
+
+`molesignal send` は標準入力の各行をログストリームに送信します。JSON オブジェクトの行はその各項目をフィールドとして送り、それ以外の行は `message` として送ります。入力が届くたびにログをバッチで送信するため、ファイルへの追記を追跡できます。
+
+```bash
+tail -f /var/log/app.log | molesignal send app_logs --field service=billing
+```
+
+`--field name=value` はすべてのログにフィールドを追加し、`--raw` はすべての行をメッセージとして送信します。 `--batch` はリクエストあたりの最大ログ件数を設定します。デフォルトは `500` です。サーバーがビジー状態の場合は再試行します。 MoleSignal がログを拒否すると、コマンドは終了コード `1` で終了します。取り込みトークンと同様に、トークンのロールには `logs.write` 権限が必要です。
+
+## ジョブの出力を保存する
+
+`molesignal run` はコマンドを実行し、出力を通常どおり表示しながら、各行をログストリームに送信します。最後に終了ステータスと実行時間を含むログを 1 件追加し、実行したコマンドと同じ終了コードで終了します。
+
+```bash
+molesignal run jobs --name nightly-backup -- ./backup.sh --full
+```
+
+各ログには `message`、`output`（`stdout` または `stderr`）、`command`、`run_id`、 `host` フィールドが含まれます。最後のログには `exit_code`、`duration_ms`、`level` も含まれます。`--quiet` は画面への出力を非表示にし、 `--field` はフィールドを追加します。
+
+## GitHub Actions
+
+アドレスとトークンをリポジトリシークレットとして保存し、デプロイジョブにステップを追加してください。 `if: always()` を指定すると、デプロイが失敗した場合も報告します。
+
+```yaml
+- name: Upload source maps
+  run: npx -y @molesignal/cli source-maps upload dist/assets --application checkout-web --service web-frontend --release "${{ github.sha }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+
+- name: Report the deployment
+  if: always()
+  run: npx -y @molesignal/cli deploy --service checkout --version "${{ github.sha }}" --env production --status "${{ job.status == 'success' && 'succeeded' || 'failed' }}"
+  env:
+    MOLESIGNAL_URL: ${{ secrets.MOLESIGNAL_URL }}
+    MOLESIGNAL_TOKEN: ${{ secrets.MOLESIGNAL_TOKEN }}
+```
+
+## GitLab CI/CD
+
+`MOLESIGNAL_URL` と `MOLESIGNAL_TOKEN` をマスクされた CI/CD 変数として追加し、デプロイコマンドを CLI 経由で実行してください。
+
+```yaml
+deploy:
+  stage: deploy
+  environment: production
+  script:
+    - npx -y @molesignal/cli deploy --service checkout --version "$CI_COMMIT_SHORT_SHA" -- ./scripts/deploy.sh
+```
+
+環境は `environment` から取得し、コミット、マージリクエスト、ジョブへのリンクは GitLab から取得します。

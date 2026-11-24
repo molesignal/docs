@@ -1,0 +1,117 @@
+---
+title: "Matriz de compatibilidade com PromQL"
+description: "Veja quais funções, operadores e modificadores de PromQL o mecanismo do MoleSignal oferece e quais são as limitações conhecidas."
+"en_link": "/en-US/query/promql-subset"
+"zh-Hans_link": "/zh-Hans/query/promql-subset"
+"zh-Hant_link": "/zh-Hant/query/promql-subset"
+"ja_link": "/ja/query/promql-subset"
+"ko_link": "/ko/query/promql-subset"
+"de_link": "/de/query/promql-subset"
+"es_link": "/es/query/promql-subset"
+"fr_link": "/fr/query/promql-subset"
+---
+
+MoleSignal executa consultas PromQL sobre fluxos de métricas com um avaliador integrado (`promql-parser` mais um
+avaliador Arrow/DataFusion). O sistema aceita consultas **instantâneas** e **por intervalo**: uma consulta com
+`step` percorre `[start, end]` em etapas e retorna uma matriz. Sem `step`, a consulta é instantânea em
+`end`. Esta página é a referência oficial de compatibilidade.
+
+## Supported
+
+### Range-vector functions (`metric[range]`)
+
+`rate`, `irate`, `increase`, `delta`, `idelta`, `deriv`, `predict_linear`, `resets`, `changes`,
+`holt_winters` (alias `double_exponential_smoothing`) e toda a família `*_over_time`:
+`avg_over_time` / `min_over_time` / `max_over_time` / `sum_over_time` / `count_over_time` /
+`quantile_over_time` / `stddev_over_time` / `stdvar_over_time` / `last_over_time` /
+`present_over_time` / `mad_over_time`.
+
+`rate`, `increase` e `delta` extrapolam a variação entre a primeira e a última amostra da
+janela até os limites da janela, assim como o Prometheus. Com isso, as mesmas amostras geram os mesmos valores.
+
+### Aggregations (with `by()` / `without()`)
+
+`sum`, `avg`, `min`, `max`, `count`, `stddev`, `stdvar`, `quantile`, `group`, `count_values`,
+`topk`, `bottomk`, `limitk`, `limit_ratio`.
+
+### Histograms
+
+`histogram_quantile(q, sum by(le)(rate(metric_bucket[range])))` — interpolação linear nos buckets
+clássicos `le`.
+
+`histogram_fraction(lower, upper, v)` — estima, nos buckets clássicos `le`, a fração de
+observações no intervalo `[lower, upper]` (com a mesma função de distribuição acumulada linear por partes,
+`(rank(upper) - rank(lower)) / total`).
+
+### Labels & sorting
+
+`label_replace`, `label_join`, `sort`, `sort_desc`, `sort_by_label`, `sort_by_label_desc`.
+
+### Time
+
+`time`, `timestamp`, `minute`, `hour`, `day_of_week`, `day_of_month`, `day_of_year`,
+`days_in_month`, `month`, `year` (UTC; por padrão, as funções de data usam `vector(time())`).
+
+### Type / absence
+
+`vector`, `scalar`, `absent`, `absent_over_time`.
+
+### Math / rounding / trig
+
+`abs`, `ceil`, `floor`, `round`, `exp`, `ln`, `log2`, `log10`, `sqrt`, `sgn`,
+`clamp` / `clamp_min` / `clamp_max`, `sin` / `cos` / `tan` / `asin` / `acos` / `atan` / `sinh` /
+`cosh` / `tanh` / `asinh` / `acosh` / `atanh`, `pi`, `deg`, `rad`.
+
+### Operators
+
+Operadores aritméticos `+ - * / % ^`, de comparação `== != > < >= <=` (com `bool`), de conjunto
+`and` / `or` / `unless`, correspondência de vetores com `on(...)` / `ignoring(...)` e
+`group_left` / `group_right`, e negação unária.
+
+### Modifiers & structure
+
+Seletor `@` (`start()` / `end()` / `<ts>`) e `offset` (inclusive em seletores de matriz);
+subconsultas `inner[range:step]`.
+
+## Not implemented / known differences
+
+| Recurso | Status | Observações |
+|---|---|---|
+| Funções de histogramas nativos `histogram_count` / `histogram_sum` / `histogram_avg` / `histogram_stddev` / `histogram_stdvar` | ❌ → 400 | Não se aplicam ao modelo de buckets clássicos `le`. Use `histogram_quantile` para quantis e `histogram_fraction` para a fração de observações em um intervalo |
+| Preenchimento com o operador binário `default` | ❌ → 400 | — |
+| Subconsultas em consultas por intervalo | ⚠️ | Usam avaliação instantânea como alternativa (sem percorrer etapas tanto na consulta externa quanto na interna). A avaliação em consultas instantâneas e em alertas é exata |
+| `timestamp()` | ⚠️ | Retorna o instante da avaliação em consultas instantâneas e o carimbo de data e hora do próprio ponto em consultas por intervalo |
+| Parâmetros escalares de funções (`t` em `predict_linear`, `sf`/`tf` em `holt_winters`, quantis) | ⚠️ | Aceitam apenas literais numéricos |
+
+Funções e sintaxes incompatíveis retornam o erro `promql function not yet supported: <name>`,
+que `POST /api/v1/query` (`language: "promql"`) mapeia para `400`.
+
+<Note>
+  Quando `query.language` é `promql`, a regra de alerta avalia a expressão PromQL como uma consulta instantânea no
+  fim da janela de avaliação. A regra em si é um recurso `AlertRule` do MoleSignal, que não é
+  compatível com o formato de regras do Prometheus. Consulte [Criar uma regra](/pt-BR/api/alerting/create-rule).
+</Note>
+
+## Label matching
+
+`=`, `!=`, `=~`, `!~` (expressões regulares via RE2, que difere um pouco do PCRE do Prometheus). `__name__` corresponde
+à coluna `metric_name`. Um nome entre aspas seleciona uma métrica cujo nome contém pontos, como em
+`{"http.server.duration"}`. Um seletor sem nome de métrica, como `{job="api"}` ou
+`{__name__=~"http_.*"}`, lê todas as métricas que atendem aos critérios de correspondência, e suas séries preservam `__name__`.
+
+## Metric stream layout
+
+Um fluxo de métricas armazena as métricas de uma única origem, como um servidor Prometheus, e mantém os rótulos
+em **colunas separadas**, em vez de armazená-los em um único bloco JSON:
+
+```sql
+_timestamp   Timestamp(Microsecond)  NOT NULL   -- time
+metric_name  Utf8                    NOT NULL   -- the metric, PromQL's __name__
+value        Float64                 NOT NULL   -- the measurement (Int64 etc. is accepted and cast to f64)
+<label_x>    Utf8 …                             -- every non-reserved column is a label
+```
+
+Os arquivos mantêm juntas as linhas de cada métrica, ordenadas por `metric_name` e depois por tempo. O seletor lê os
+fluxos que contêm a métrica. Nos arquivos Parquet desses fluxos cujo intervalo de tempo se sobrepõe ao da consulta, lê apenas as páginas
+que contêm a métrica. O seletor cria uma série por conjunto distinto de rótulos e aplica os critérios de correspondência (`=`, `!=`, `=~`,
+`!~`) no mecanismo de consulta. `@` e `offset` deslocam o instante da avaliação. Para métricas recebidas via OTLP, consulte [Campos de métricas OTLP](/pt-BR/query#campos-de-métricas-otlp).

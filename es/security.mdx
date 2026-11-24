@@ -1,0 +1,146 @@
+---
+title: "Seguridad y arquitectura multiinquilino"
+description: "Aislamiento entre inquilinos, autorización basada en capacidades, alcance de la plataforma, tokens, auditoría, uso compartido, secretos y cifrado de campos."
+"en_link": "/en-US/security"
+"zh-Hans_link": "/zh-Hans/security"
+"zh-Hant_link": "/zh-Hant/security"
+"ja_link": "/ja/security"
+"ko_link": "/ko/security"
+"de_link": "/de/security"
+"fr_link": "/fr/security"
+"pt-BR_link": "/pt-BR/security"
+---
+
+MoleSignal aplica controles de aislamiento y autorización en la API y en el plano de datos, por debajo de la
+capa de navegación web.
+
+## Aislamiento de organizaciones
+
+Cada flujo de una organización y cada recurso del producto tiene un `org_id` que identifica a la organización propietaria. El planificador incorpora a la consulta el
+límite de la organización autorizada antes de ejecutarla. Los controladores de recursos también cargan el recurso de destino y
+verifican a qué organización pertenece antes de leerlo o modificarlo.
+
+El acceso entre espacios de trabajo requiere un permiso explícito de IAM o un mecanismo compatible para compartir recursos. Si el recurso solicitado
+pertenece a otra organización, la búsqueda no cambia de organización de forma silenciosa.
+
+La organización `_sys` es un ámbito protegido de la plataforma. Las sesiones de las organizaciones y los tokens de API `mspat-*` no pueden
+enumerar las cuentas de administración de la plataforma ni consultar la telemetría interna de MoleSignal.
+
+## Autenticación y autorización
+
+MoleSignal acepta:
+
+- sesiones del navegador en cookies HttpOnly, que se actualizan con el nuevo ámbito al cambiar de espacio de trabajo;
+- tokens de API con el formato `mspat-<36>` en el encabezado `Authorization`;
+- tokens específicos que autentican por sí solos el acceso a rutas públicas o de integración de alcance limitado.
+
+El inicio de sesión se realiza con una contraseña o mediante un proveedor de OIDC, OAuth 2.0, SAML o LDAP configurado desde una cuenta de administración en **Identidad y acceso → Proveedores de SSO**.
+
+MoleSignal guarda el prefijo del token de API para buscarlo y aplica una función hash al secreto. Solo muestra el token completo
+al crearlo.
+
+Tras la autenticación, el servidor consulta la base de datos para resolver los permisos, los roles, las asignaciones, las relaciones entre
+recursos y la propiedad del recurso de destino. Consulta [Identidad y acceso](/es/identity).
+
+## Sesiones del navegador
+
+Al iniciar sesión, el servidor establece dos cookies: una con un token de acceso que se incluye en cada solicitud a la API y tiene una validez de 15 minutos,
+y otra con un token de actualización que lo renueva hasta que la sesión termina al cumplirse `[auth].session_ttl_secs`. Ambas tienen el atributo
+`HttpOnly`, que impide que los scripts de la página las lean, y el atributo `SameSite=Strict`. También tienen el atributo `Secure` con HTTPS. Las solicitudes
+que modifican datos con la sesión deben provenir de una página de MoleSignal. El navegador indica el origen con
+`Sec-Fetch-Site`. Las llamadas a la API desde otro origen nunca incluyen credenciales.
+
+El servidor no guarda registros de sesión: ambos tokens son JWT firmados. Cerrar sesión elimina las cookies de
+ese navegador, pero cualquier copia de un token del navegador sigue siendo válida hasta que caduque. Para cortar el acceso de inmediato,
+deshabilita la cuenta. El servidor comprueba su estado en cada solicitud y cada renovación. Rotar las claves de
+firma pone fin a todas las sesiones tras un período de gracia de 24 horas.
+
+## Claves de firma de JWT
+
+En el primer inicio, MoleSignal inicializa las claves de firma de JWT en la base de datos. El endpoint de
+metadatos nunca devuelve los bytes de las claves. Tras una rotación, MoleSignal firma los tokens nuevos con la clave nueva. Los tokens firmados con la clave retirada siguen siendo válidos durante 24 horas.
+Cada nodo adopta la clave nueva sin reiniciarse.
+
+Para listar o rotar las claves de firma, necesitas el permiso de plataforma `sys.signing_keys.rotate`:
+
+```text
+GET  /api/v1/auth/jwt/secrets
+POST /api/v1/auth/jwt/rotate
+```
+
+Usa `MS_AUTH_JWT_SECRET_OVERRIDE` solo si la política de implementación exige una clave de inicialización fija.
+
+## Auditoría
+
+Las operaciones relevantes para la seguridad y las que modifican datos del producto registran quién realizó la acción, la organización, la acción, el destino, la fecha y hora y
+los metadatos no sensibles. Para consultar los eventos de la organización en **Configuración → Auditoría**, necesitas `audit.read`. Esos mismos eventos
+son filas del flujo `_audit`. Consulta [Flujo de auditoría](/es/settings/data-security#flujo-de-auditoría).
+
+De forma predeterminada, MoleSignal conserva los registros de auditoría durante 90 días. Una vez al día, elimina los registros que superan el período de retención
+de todas las organizaciones y de la plataforma. No es posible recuperarlos. Configura el período
+en **Configuración → Retención de registros de auditoría**, dentro de la organización `_sys`. Para ello, necesitas
+`sys.settings.retention.manage`. El valor `0` conserva los registros indefinidamente. MoleSignal registra cada cambio del período en la
+auditoría de la plataforma como `audit_retention.update`.
+
+MoleSignal excluye de los datos de auditoría las credenciales, las claves de los modelos, los encabezados sensibles de webhooks y el
+material criptográfico de firma en bruto.
+
+## Uso compartido de recursos
+
+Los enlaces públicos a dashboards e informes funcionan como credenciales al portador, pero no se convierten en tokens de la
+organización. MoleSignal intercambia el enlace por una sesión de acceso compartido de corta duración con una cookie HttpOnly y limita el acceso
+a un único recurso guardado.
+
+Los paneles de los dashboards públicos solo pueden ejecutar consultas almacenadas en el servidor a través de un proxy restringido. El acceso compartido
+puede caducar, requerir una contraseña, aplicar un límite de visualizaciones o deshabilitar las descargas. También puedes revocar o
+rotar los enlaces. Consulta [Uso compartido de recursos](/es/resource-sharing).
+
+## Cifrado a nivel de campo
+
+Marca los campos como cifrados al crear un flujo. MoleSignal los cifra con AES-256-GCM antes de que
+los valores lleguen a Parquet. Una consulta sin descifrado devuelve los valores cifrados. En SQL, recupera el texto sin cifrar con
+`decrypt(field)`. Consulta [Flujos](/es/streams#campos-cifrados).
+
+MoleSignal cifra las claves de datos de la organización con la clave raíz de cifrado de `MS_CIPHER_KEY` y no devuelve el material de las claves
+después de crearlas. Para leer los metadatos de las claves, necesitas `org.cipher_keys.read`. Para crear,
+rotar o eliminar claves, necesitas `org.cipher_keys.manage`.
+
+<Warning>
+  Si pierdes `MS_CIPHER_KEY`, es posible que no puedas recuperar los campos cifrados. Guarda la clave en un gestor de secretos
+  y crea una copia de seguridad de la clave independiente de PostgreSQL y del almacenamiento de objetos.
+</Warning>
+
+## Protección de secretos y datos de telemetría
+
+- Guarda las credenciales de la base de datos, el almacenamiento de objetos, SMTP, SSO, los proveedores de modelos y los webhooks en un
+  gestor de secretos.
+- Usa referencias `env:` o `secret:` para los encabezados sensibles al exportar trazas a sistemas externos.
+- Mantén el puerto `5082` de gRPC interno en una red de confianza, ya que también admite protocolos del clúster.
+- Protege con TLS el tráfico externo de HTTP, OTLP gRPC `4317` y Flight SQL `5083`.
+- Limita el servicio de escucha de pprof a la interfaz de bucle local, a menos que protejas explícitamente el diagnóstico remoto.
+- Las trazas del backend excluyen los cuerpos de las solicitudes, los valores de SQL, las credenciales, las instrucciones para los modelos, sus respuestas y
+  los argumentos de las herramientas.
+
+## Límites de frecuencia y tamaño
+
+El rol `router` limita las solicitudes de ingesta y consulta mediante depósitos de tokens por organización y responde con
+`429` y un encabezado `Retry-After`. Los nodos `standalone` no aplican esos límites. Consulta
+[Implementación basada en roles](/es/deployment/role-based#límites-de-solicitudes). MoleSignal rechaza con `413` las solicitudes de ingesta cuyo cuerpo supera
+2 MiB, o 16 MiB en el caso de la ingesta de JSON nativo.
+
+MoleSignal cuenta los intentos fallidos de inicio de sesión con contraseña por cuenta y por dirección de origen. Al alcanzar un límite, responde con `429` y
+`Retry-After` y deja de comprobar la contraseña. Solo bloquea la dirección de origen de las solicitudes.
+Para la cuenta, solo reduce la frecuencia de los intentos, lo que impide bloquear una cuenta ajena con contraseñas incorrectas.
+Si la cuenta no existe, MoleSignal cuenta los intentos y responde de la misma manera. Consulta
+[Límites de inicio de sesión](/es/settings/platform#límites-de-inicio-de-sesión).
+
+## Refuerzo de la seguridad en producción
+
+Antes de recibir datos reales, reemplaza los valores predeterminados del entorno de pruebas: la cuenta raíz, `MS_CIPHER_KEY` y las credenciales de la base de datos
+y del almacenamiento de objetos. Consulta la
+[Lista de verificación para producción](/es/deployment/production-checklist). Si usas una red interna, expón a Internet solo las
+rutas de callback externas y las páginas públicas. Consulta [Acceso público](/es/public-access).
+
+<Card title="Autoobservabilidad" icon="heart-pulse" href="/es/self-observability">
+  Configura la telemetría protegida de `_sys`, el muestreo al final de la traza y el diagnóstico local de cada nodo.
+</Card>

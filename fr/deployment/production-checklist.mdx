@@ -1,0 +1,117 @@
+---
+title: "Liste de contrôle pour la production"
+description: "Paramètres à remplacer et vérifications à effectuer avant de stocker des données réelles dans MoleSignal : secrets, stockage, réseau, durabilité des données et exploitation."
+"en_link": "/en-US/deployment/production-checklist"
+"zh-Hans_link": "/zh-Hans/deployment/production-checklist"
+"zh-Hant_link": "/zh-Hant/deployment/production-checklist"
+"ja_link": "/ja/deployment/production-checklist"
+"ko_link": "/ko/deployment/production-checklist"
+"de_link": "/de/deployment/production-checklist"
+"es_link": "/es/deployment/production-checklist"
+"pt-BR_link": "/pt-BR/deployment/production-checklist"
+---
+
+Le bac à sable Compose et l’exemple `conf/config.toml` privilégient un démarrage rapide. Suivez les étapes de cette page avant de stocker des données réelles dans un déploiement.
+
+## Remplacer les valeurs par défaut du bac à sable
+
+| Élément | Valeur par défaut du bac à sable | Production |
+|---|---|---|
+| Compte racine | `admin@example.com` avec le mot de passe `admin` | Définissez une adresse e-mail unique et un mot de passe robuste dans `[auth]` avant le premier démarrage. |
+| `MS_CIPHER_KEY` | Non définie (clé de développement composée uniquement de zéros), ou clé de développement fixe dans le fichier Compose | Une clé aléatoire de 32 octets conservée dans un gestionnaire de secrets. |
+| Identifiants PostgreSQL | `molesignal` / `molesignal` | Une base de données et un utilisateur dédiés, avec un mot de passe généré. |
+| Identifiants du stockage objet | `rustfsadmin` / `rustfsadmin` | Une clé d’accès dédiée, limitée au compartiment. |
+| Système de stockage objet | RustFS dans un volume de conteneur | `s3`, `azure` ou `gcs` avec un stockage durable. |
+| `[http].external_url` | Vide | L’adresse HTTPS publique. |
+| TLS | Désactivé | Un proxy qui termine TLS ou `[http.tls]`. |
+| Tag d’image | `latest` | Un tag de version fixe, comme `26.1.0.0`. |
+
+## Liste de contrôle
+
+<Steps>
+  <Step title="Provisionner PostgreSQL et le stockage objet">
+    Utilisez PostgreSQL 17 avec des sauvegardes automatisées. Créez une base de données et un utilisateur dédiés à MoleSignal.
+
+    Veillez à ce que le produit de `[meta_database].max_connections` par le nombre de nœuds reste inférieur à la limite `max_connections` de PostgreSQL.
+
+    Créez un compartiment privé dans la même région que les nœuds. N’ajoutez pas de règles de cycle de vie qui font expirer les objets. MoleSignal applique la politique de conservation et supprime lui-même les objets.
+  </Step>
+  <Step title="Générer et stocker la clé de chiffrement">
+    `MS_CIPHER_KEY` est la clé racine des secrets que MoleSignal stocke dans PostgreSQL : jetons d’API, liens de partage, jetons de clusters distants, identifiants des connecteurs de notification, identifiants des connecteurs de pipeline, clés des fournisseurs de Mole Agent, secrets de la surveillance synthétique et clés des champs d’organisation. Générez cette clé une seule fois :
+
+    ```bash
+    openssl rand -base64 32
+    ```
+
+    Stockez la valeur dans un gestionnaire de secrets et fournissez la même valeur à chaque nœud. Sauvegardez-la séparément de la base de données. Si la clé manque lors d’une restauration de la base de données, ces secrets restent illisibles.
+
+    <Warning>
+      Ne remplacez jamais directement la clé. Les données chiffrées avec l’ancienne clé deviennent illisibles. Pour renouveler la clé, arrêtez toutes les écritures, exportez la nouvelle valeur dans `MS_CIPHER_KEY`, puis exécutez la commande hors ligne avec l’ancienne clé :
+
+      ```bash
+      molesignal --config /etc/molesignal/config.toml rewrap-kek --old-key "<old key, base64>"
+      ```
+
+      La commande chiffre à nouveau chaque colonne concernée et affiche le nombre de lignes par table. Vérifiez ces nombres avant de retirer l’ancienne clé.
+    </Warning>
+
+    Un déploiement démarré sans `MS_CIPHER_KEY` a utilisé une clé de développement composée uniquement de zéros. Passez `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=` à `--old-key` pour faire passer ce déploiement à une clé de production.
+  </Step>
+  <Step title="Sécuriser le compte racine">
+    Au premier démarrage avec une base de données vide, MoleSignal crée le compte racine à partir de `[auth].root_email` et de `[auth].root_password`. Définissez les deux avant ce premier démarrage. Toute modification ultérieure de `root_password` laisse le mot de passe du compte existant inchangé.
+
+    La réinitialisation du mot de passe et l’action **Paramètres du compte → Sécurité et connexion → Modifier le mot de passe** passent par e-mail. Ces deux opérations nécessitent `[notify.smtp]` et `[http].external_url`. Sans ces paramètres, MoleSignal n’envoie aucun e-mail. Configurez les deux avant d’utiliser ces fonctions.
+
+    À chaque démarrage, le compte associé à `root_email` devient administrateur de la plateforme. Veillez à ce que `root_email` désigne un compte utilisateur existant.
+  </Step>
+  <Step title="Ne pas stocker les secrets dans le dépôt">
+    Fournissez le DSN de la base de données, les clés du stockage objet et `MS_CIPHER_KEY` via des variables d’environnement ou un gestionnaire de secrets. Utilisez `MS_META_DATABASE_DSN`, `MS_OBJECT_STORE_ACCESS_KEY` et `MS_OBJECT_STORE_SECRET_KEY`. Laissez vides les clés correspondantes dans `config.toml`.
+
+    Pour fixer le secret de signature JWT, utilisez `MS_AUTH_JWT_SECRET_OVERRIDE`. Sinon, MoleSignal en génère un dans PostgreSQL au premier démarrage. Renouvelez-le avec `POST /api/v1/auth/jwt/rotate`, qui nécessite l’autorisation `sys.signing_keys.rotate`. Les jetons signés avec l’ancien secret restent valides pendant 24 heures.
+  </Step>
+  <Step title="Exposer les ports nécessaires">
+    | Port | Exposition |
+    |---|---|
+    | `5080` | Public, protégé par TLS. |
+    | `4317` | Public uniquement derrière un proxy qui termine TLS. |
+    | `5082` | Réseau privé uniquement. Ce port transporte le trafic non authentifié entre les nœuds. |
+    | `5083` | Facultatif, protégé par TLS, si des clients SQL se connectent. |
+    | `5084`, `5085` | Uniquement si des agents de sondage s’exécutent en dehors du nœud. |
+
+    Définissez `[http].external_url` sur l’adresse publique. Les extraits de configuration initiale, les e-mails de réinitialisation du mot de passe, les domaines des pages de statut et les [clés d’accès](/fr/identity/mfa#prérequis-de-l’instance) utilisent cette adresse.
+  </Step>
+  <Step title="Terminer TLS et configurer le proxy">
+    Terminez TLS sur un proxy inverse ou activez `[http.tls]` pour obtenir automatiquement des certificats ACME.
+
+    Fixez la taille maximale du corps des requêtes sur le proxy à au moins 16 MiB, car l’ingestion JSON native accepte des corps de cette taille. Pour `/api/v1/query/stream`, désactivez la mise en mémoire tampon des réponses et autorisez des délais de lecture prolongés. La configuration nginx de référence du projet utilise un délai d’expiration de 600 secondes pour ce chemin.
+
+    Limitez l’accès à `/metrics` aux clients internes. N’exposez les chemins d’ingestion `/api/v1/_bulk`, `/api/v1/_kinesis_firehose`, `/api/v1/_cloudflare` et `/api/v1/_heroku` que si une source de données en a besoin.
+  </Step>
+  <Step title="Prévoir la perte d’un nœud">
+    Le journal d’écriture anticipée (WAL) réside dans le stockage objet. MoleSignal ne confirme une écriture qu’après avoir stocké l’objet WAL correspondant. Les nœuds n’ont donc pas besoin de volume persistant. Si un nœud disparaît, un autre nœud d’ingestion reprend son WAL après `[wal].lease_secs` (15 secondes par défaut), avec un délai supplémentaire pouvant atteindre `[wal].takeover_interval_secs`. Jusque-là, les requêtes ne peuvent pas accéder aux enregistrements que ce nœud a confirmés sans les avoir vidés de son tampon. Un nœud unique qui redémarre reprend son propre WAL antérieur. Chaque écriture attend l’écriture d’un objet. La latence du stockage objet s’ajoute donc à celle de chaque écriture. Consultez [Durabilité et reprise](/fr/architecture#durabilité-et-reprise).
+
+    Laissez au processus le temps de terminer les opérations en cours à l’arrêt. Fixez le délai de grâce de l’orchestrateur avant l’arrêt forcé à une valeur supérieure à `[node].drain_timeout_secs`, qui vaut 30 secondes par défaut.
+  </Step>
+  <Step title="Définir la durée de conservation">
+    La durée de conservation par défaut est de 30 jours. Ce réglage se trouve dans **Paramètres → Conservation des données** de l’organisation `_sys`. MoleSignal supprime les données plus anciennes de chaque flux qui ne définit pas sa propre durée de conservation. Augmentez cette valeur ou définissez une durée de conservation par flux avant que les données ne s’accumulent. Consultez [Flux](/fr/streams).
+  </Step>
+  <Step title="Dimensionner les rôles d’alerte et de compactage">
+    Plusieurs instances des rôles `alert` et `compactor` peuvent se partager le travail. Les nœuds `alert` se répartissent les règles, les rapports, les pipelines et les connecteurs. Un nœud principal exécute les tâches qui ne doivent s’exécuter qu’une fois. Les nœuds `compactor` se répartissent le travail par flux et par organisation. Définissez un `[node].id` unique sur chaque nœud et maintenez les horloges synchronisées. Un nœud `standalone` inclut déjà les deux rôles. Utilisez `standalone` sauf si la séparation des rôles est nécessaire. Dans ce cas, consultez [Déploiement par rôle](/fr/deployment/role-based) avant de les séparer.
+  </Step>
+  <Step title="Surveiller le déploiement">
+    Collectez les métriques de `/metrics` avec Prometheus. Sondez `GET /api/v1/healthz`, un point de terminaison public qui renvoie `503` lorsque le stockage objet est inaccessible. L’image du conteneur exécute déjà ce contrôle via `HEALTHCHECK`.
+
+    Laissez `[telemetry.self_collect]` activé pour que le service enregistre ses propres métriques, traces et profils. Créez des règles d’alerte à partir de ces métriques. Consultez [Auto-observabilité](/fr/self-observability).
+  </Step>
+  <Step title="Planifier les sauvegardes et les mises à niveau">
+    Sauvegardez PostgreSQL, le stockage objet et la clé de chiffrement comme indiqué dans [Sauvegarde et restauration](/fr/backup-restore). Testez la procédure de restauration avant de devoir l’utiliser. Consultez [Mise à niveau](/fr/upgrade) avant le premier changement de version.
+  </Step>
+</Steps>
+
+## Vérifiez avant la mise en production
+
+- `GET /api/v1/healthz` renvoie `200` depuis l’adresse publique.
+- Le journal de démarrage indique `object_store_credentials_source` et n’affiche pas `MS_CIPHER_KEY missing`.
+- Un enregistrement de test envoyé avec un jeton de compte de service figure dans les résultats d’une requête.
+- La connexion avec les identifiants par défaut (`admin@example.com` et le mot de passe `admin`) échoue.
+- La restauration de la dernière sauvegarde PostgreSQL dans une base de données temporaire réussit.

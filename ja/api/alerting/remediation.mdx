@@ -1,0 +1,235 @@
+---
+title: "修復API"
+sidebarTitle: "修復"
+description: "HTTPとKubernetesの修復アクションを定義し、クラスターを登録して、インシデントに対してアクションを実行します。アクションは、実行ごとの承認または事前承認に基づき実行され、その結果が確認されます。"
+"en_link": "/en-US/api/alerting/remediation"
+"zh-Hans_link": "/zh-Hans/api/alerting/remediation"
+"zh-Hant_link": "/zh-Hant/api/alerting/remediation"
+"ko_link": "/ko/api/alerting/remediation"
+"de_link": "/de/api/alerting/remediation"
+"es_link": "/es/api/alerting/remediation"
+"fr_link": "/fr/api/alerting/remediation"
+"pt-BR_link": "/pt-BR/api/alerting/remediation"
+---
+
+修復アクションとは、Jenkins のロールバックジョブを呼び出す、Deployment を再起動するなど、事前に定義する復旧処置です。インシデントに対して修復アクションを実行するには、[承認](/ja/agent#承認と実行)が必要です。 L2 には 1 名、L3 には 2 名の承認者が必要で、リクエストした人は承認できません。組織で [事前承認](#事前承認)を有効にすると、同じ人数であらかじめ承認できます。承認されると直ちに実行し、実行結果と実行後の確認結果をインシデントの [タイムライン](/ja/api/alerting/incident-timeline)に記録します。画面での操作方法は [修復](/ja/alerting/remediation)を参照してください。
+
+| メソッドとパス | 処理内容 | 権限 |
+|---|---|---|
+| `GET /api/v1/alerts/remediation/actions` | 組織の修復アクションを取得します。 | `alerts.remediation.read` |
+| `POST /api/v1/alerts/remediation/actions` | 修復アクションを作成します。 | `alerts.remediation.manage` |
+| `PUT /api/v1/alerts/remediation/actions/{id}` | 修復アクションを置き換えます。 | `alerts.remediation.manage` |
+| `DELETE /api/v1/alerts/remediation/actions/{id}` | 修復アクションを削除します。 | `alerts.remediation.manage` |
+| `GET /api/v1/alerts/remediation/clusters` | 登録済みの Kubernetes クラスターを取得します。 | `alerts.remediation.read` |
+| `POST /api/v1/alerts/remediation/clusters` | クラスターを登録します。 | `alerts.remediation.manage` |
+| `PUT /api/v1/alerts/remediation/clusters/{id}` | クラスターの設定を変更します。 | `alerts.remediation.manage` |
+| `DELETE /api/v1/alerts/remediation/clusters/{id}` | クラスターを削除します。 | `alerts.remediation.manage` |
+| `POST /api/v1/alerts/remediation/clusters/{id}/test` | 接続をテストし、`{ "ok": true, "version": "v1.30.2" }` を返します。 | `alerts.remediation.manage` |
+| `GET /api/v1/alerts/incidents/{id}/remediations` | インシデントに適用できるアクションと、そのインシデントでの実行履歴を取得します。 | 対象インシデントの `alerts.incidents.read` |
+| `POST /api/v1/alerts/incidents/{id}/remediations` | インシデントに対するアクションの実行をリクエストし、承認に回します。 | 対象インシデントの `alerts.incidents.remediate` |
+| `GET /api/v1/alerts/remediation/preapproval` | 組織の事前承認の有効・無効と、事前承認を設定した各アクションの対象期間内の実行回数および現在の状態を取得します。 | `alerts.remediation.read` |
+| `PUT /api/v1/alerts/remediation/preapproval` | 組織の事前承認を有効または無効にします。リクエストボディは `{ "enabled": true }` です。 | `alerts.remediation.preapprove` |
+| `PUT /api/v1/alerts/remediation/actions/{id}/preapproval` | アクションの事前承認を設定または置き換えます。 | `alerts.remediation.preapprove` と `agent.approve` |
+| `DELETE /api/v1/alerts/remediation/actions/{id}/preapproval` | アクションの事前承認を解除します。 | `alerts.remediation.preapprove` |
+| `POST /api/v1/alerts/remediation/actions/{id}/preapproval/confirm` | 2 人目の承認者が L3 アクションの事前承認を確定します。 | `alerts.remediation.preapprove` と `agent.approve` |
+
+作成、変更、削除、実行リクエストを監査ログに記録します。事前承認の有効化・無効化や、事前承認の設定、確定、解除も記録します。
+
+## 修復アクション
+
+**リクエストボディ**
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `name` | string | はい | 1～120 文字です。 |
+| `description` | string | いいえ | アクションの説明です。 |
+| `target` | object | はい | 実行方法を指定します。`kind` は `http` または `kubernetes` です。その他のフィールドは以下を参照してください。 |
+| `parameters` | array | いいえ | 実行時に入力する項目です。最大 10 個まで指定できます。詳細は以下を参照してください。 |
+| `services` | array | いいえ | 適用対象のサービスです。`teamIds` も空の場合は、すべてのインシデントに適用します。それ以外の場合は、インシデントのサービスまたはチームが指定と一致する必要があります。 |
+| `teamIds` | array | いいえ | 適用対象のチームです。 |
+| `risk` | string | いいえ | `l2`（デフォルト、承認者 1 名）または `l3`（承認者 2 名）です。 |
+| `verifyAfterSecs` | integer | いいえ | 実行が成功してから結果を確認するまでの秒数です。0～86400 を指定できます。デフォルトの `0` では確認しません。 |
+| `verifyBy` | string | いいえ | 修復の成否を判定する条件です。`incidentResolved`（デフォルト、インシデントが解決済みまたはクローズ済み）または `rule_healthy`（インシデントを発生させたルールが正常に戻った状態）を指定します。 |
+| `enabled` | boolean | いいえ | デフォルトは `true` です。無効なアクションは実行できません。 |
+
+**`target`：HTTP リクエスト**
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `kind` | string | `http` です。 |
+| `method` | string | `GET`、`POST`（デフォルト）、`PUT`、`PATCH` のいずれかです。 |
+| `url` | string | `http://` または `https://` で始まるアドレスのテンプレートです。 |
+| `headers` | object | リクエストヘッダーです。値はテンプレートとして指定し、暗号化して保存します。 |
+| `body` | string | 最大 16384 文字の JSON ボディテンプレートです。引用符で囲まないプレースホルダーには数値を指定できます。すべてのプレースホルダーを `0` に置き換えたときに有効な JSON にならない場合は、`400` を返します。ボディは `application/json` として送信します。ボディを送信しない場合は空にしてください。 |
+| `signingSecret` | string | 署名用のシークレットです。暗号化して保存します。設定すると、[汎用 Webhook の署名](/ja/notification-channels/webhooks#ヘッダーと署名)と同じ方法で計算した `X-MoleSignal-Timestamp` と `X-MoleSignal-Sign` をリクエストに含めます。 |
+
+リクエストは、アドレスの名前解決で得た IP アドレスにのみ接続します。クラウドメタデータのアドレスへの接続は拒否し、リダイレクトには従いません。30 秒でタイムアウトし、2xx レスポンスを成功とみなします。
+
+**`target`：Kubernetes**
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `kind` | string | `kubernetes` です。 |
+| `clusterId` | string | 登録済みのクラスターです。 |
+| `operation` | string | `restart`（`kubectl rollout restart` と同じローリング再起動）、`scale`（レプリカ数の変更）、`rollback`（`kubectl rollout undo` と同様に直前のバージョンに戻す）のいずれかです。 |
+| `workloadKind` | string | `Deployment`、`StatefulSet`、`DaemonSet` のいずれかです。ロールバックできるのは Deployment のみです。DaemonSet はスケーリングできません。 |
+| `namespace`, `workloadName` | string | 名前空間とワークロード名です。どちらにもテンプレートを使用できます。 |
+| `replicas` | string | スケーリング後のレプリカ数です。`{{params.replicas}}` などのテンプレートを使用できます。 |
+
+**`parameters[]`**
+
+| フィールド | 型 | 備考 |
+|---|---|---|
+| `key` | string | テンプレートでは `{{params.<key>}}` と記述します。 |
+| `label` | string | アクションの実行時に表示する名前です。 |
+| `kind` | string | `text`（デフォルト）、`number`、`select` のいずれかです。 |
+| `options` | array | `select` の選択肢です。 |
+| `required` | boolean | デフォルトは `false` です。 |
+| `default` | string | 値を指定しなかった場合に使用する値です。 |
+
+**テンプレート変数**：`{{incident.id}}`、`{{incident.summary}}`、`{{incident.severity}}`、 `{{incident.status}}`、`{{incident.service}}`（`service` ラベル。ラベルがない場合は、影響を受けたサービスのうち最初のもの）、 `{{incident.url}}`（インシデントページ）、`{{params.<key>}}` を使用できます。アドレス内では値をパーセントエンコードし、 JSON ボディ内では JSON 文字列としてエスケープします。未定義の変数は空文字列に置き換えます。
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/remediation/actions \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "Roll back checkout",
+    "target": {
+      "kind": "http",
+      "method": "POST",
+      "url": "https://jenkins.example.com/job/rollback/buildWithParameters?service={{incident.service}}",
+      "headers": { "Authorization": "Bearer <jenkins-token>" },
+      "body": "{\"reason\": \"{{params.reason}}\", \"incident\": \"{{incident.url}}\"}"
+    },
+    "parameters": [{ "key": "reason", "label": "Why", "required": true }],
+    "services": ["checkout"],
+    "risk": "l3",
+    "verifyAfterSecs": 600,
+    "verifyBy": "incident_resolved"
+  }'
+```
+</RequestExample>
+
+保存したアクションを返します。ヘッダー値と署名用のシークレットは返しません。 `headers` の各値は空です。`secretsSet` には設定済みのシークレットを一覧で示します。例： `["header:Authorization", "signing_secret"]`。変更時にヘッダー値を空にしたり、 `signingSecret` を省略したりすると、既存の値を保持します。`signingSecret` に空文字列を指定すると、署名を無効にします。
+
+## Kubernetes クラスター
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `name` | string | はい | クラスター名です。 |
+| `apiServer` | string | はい | `https://` で始まる API サーバーのアドレスです。 |
+| `caCert` | string | いいえ | PEM 形式の CA 証明書です。空の場合は、システムが信頼するルート証明書を使用します。 |
+| `token` | string | 作成時 | ServiceAccount トークンです。暗号化して保存し、レスポンスには含めません。変更時に空にすると、既存の値を保持します。 |
+
+トークンには対象ワークロードに対する `get` と `patch` の権限が必要です。ロールバックには、ReplicaSet の一覧を取得する権限も必要です。 API サーバーのアドレスの名前解決で得た IP アドレスにのみ接続します。クラウドメタデータのアドレスへの接続は拒否し、 30 秒でタイムアウトします。アクションが参照しているクラスターは削除できません。
+
+## 事前承認
+
+組織で事前承認を有効にすると（デフォルトでは無効です）、アクションを事前承認できます。対象サービスでは、指定期間内に上限回数に達するまで、実行のたびに承認を待つ必要はありません。L2 アクションの事前承認は設定した時点で有効になります。L3 アクションでは、2 人目が `confirm` で確認した後にのみ有効になります。事前承認は承認のタイミングを早めるだけで、必要な承認者数は減りません。設定と確認はログインしたユーザーが行います。API トークンでは行えません。
+
+**リクエストボディ** (`PUT /api/v1/alerts/remediation/actions/{id}/preapproval`)
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `services` | 配列 | はい | 対象サービスを最大 20 件指定します。各サービスはアクション自体の適用範囲内にある必要があります。 |
+| `maxRuns` | 整数 | はい | 指定期間内の最大実行回数を 1～20 の範囲で指定します。 |
+| `windowSecs` | 整数 | はい | 期間の長さを 300～604800 秒の範囲で指定します。 |
+| `expiresAt` | 整数 | いいえ | 有効期限をエポックからの経過時間（マイクロ秒）で指定します。省略すると期限切れになりません。 |
+| `channels` | 配列 | いいえ | 実行後の通知先を最大 5 件指定します。通知ポリシーの通知先と同じく、`connectorId`、`targetType`、`target` を指定します。 |
+
+レスポンスは `{ "preapproval": { ... } }` です。リクエストボディの内容に `approvers`（`[{ "userId", "at" }]`）、`setBy`、`setAt` が加わります。設定したユーザーが最初の承認者になります。事前承認を置き換えると、新たに設定したユーザーだけが承認者になります。アクションの対象、パラメーター、サービス、チーム、リスクのいずれかが変わると、承認者がクリアされるため、再確認が必要です。
+
+`GET /api/v1/alerts/remediation/preapproval` は `{ "enabled": true, "actions": { "<action-id>": { "used": 1, "state": "active" } } }` を返します。`state` は `off`（組織で無効）、`expired`（期限切れ）、`awaiting_approver`（L3 アクションで 2 人目の確認待ち）、`used_up`（指定期間内の実行回数が上限に到達）、`active`（有効）のいずれかです。
+
+事前承認が適用される場合、対象サービスのインシデントでアクションをリクエストすると、事前承認を設定または確認したユーザーによる承認として記録し、すぐに実行を開始します。リクエストしたユーザーには引き続き `alerts.incidents.remediate` が必要です。リクエストしたユーザー自身の事前承認は、そのリクエストの承認数に含めません。他のユーザーによる事前承認が必要数に満たない場合は、通常どおり承認を待ちます。リクエストしたユーザーは、いずれの場合もレビュー記録には含まれません。実行回数が上限に達した場合、事前承認の期限が切れた場合、または組織で事前承認が無効な場合は、通常どおり承認フローに進みます。実行後は、成否にかかわらず `channels` に通知を送信します。
+
+## インシデントでアクションを実行する
+
+```http
+GET /api/v1/alerts/incidents/{id}/remediations
+```
+
+`{ "actions": [ ... ], "runs": [ ... ] }` を返します。このインシデントに適用できる有効なアクション（シークレットは除外）と、このインシデントでの実行を含みます。承認が却下、期限切れ、またはキャンセルになった実行は `declined` と表示します。
+
+```http
+POST /api/v1/alerts/incidents/{id}/remediations
+```
+
+| フィールド | 型 | 必須 | 備考 |
+|---|---|---|---|
+| `actionId` | 文字列 | はい | 実行するアクションを指定します。このインシデントに適用できる必要があります。 |
+| `inputs` | オブジェクト | いいえ | 各パラメーターの `key` をキーとして値を指定します。必須パラメーターは必ず指定し、数値パラメーターには数値を渡し、選択式パラメーターには選択肢に含まれる値を指定します。定義されていないパラメーターは指定できません。省略したパラメーターにはデフォルト値を使います。各値は最大 500 文字です。 |
+| `reason` | 文字列 | いいえ | 承認リクエストに記載する理由を最大 2000 文字で指定します。省略すると自動生成します。 |
+
+<RequestExample>
+```bash cURL
+curl -X POST http://localhost:5080/api/v1/alerts/incidents/$INCIDENT_ID/remediations \
+  -H "authorization: Bearer $MS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"actionId": "<action-id>", "inputs": {"reason": "pool exhausted after v2026.10.28"}}'
+```
+</RequestExample>
+
+レスポンスは `{ "run": { ... }, "approval": { ... } }` です。実行と、その実行に対して送信した承認リクエストを返します。承認リクエストのリスクはアクションの `risk` に従います。影響範囲には、呼び出し先のアドレス、または対象のクラスターとワークロード、およびそこで実行する操作を記載します。承認者は `POST /api/v1/agent/approvals/{approvalId}/review` にボディ `{ "approve": true, "comment": "…" }` を送信して承認または却下します。この操作には `agent.approve` が必要です。承認が必要数に達すると、すぐに実行を開始します。アクションの [事前承認](#事前承認)が適用される場合は、レスポンスを返す前に実行が完了します。レスポンスには `"preapproved": true` と `execution` も含まれ、実行の `preapproved` は `true` になります。
+
+<ResponseExample>
+```json 200
+{
+  "run": {
+    "id": "3KJ0f2R9cWm1Xa8LpV4sNq7TbYe",
+    "orgId": "<organization-id>",
+    "incidentId": "<incident-id>",
+    "actionId": "<action-id>",
+    "actionName": "Roll back checkout",
+    "approvalId": "<approval-id>",
+    "inputs": { "reason": "pool exhausted after v2026.10.28" },
+    "status": "awaiting_approval",
+    "output": "",
+    "verifyAt": null,
+    "verification": "",
+    "requestedBy": "<user-id>",
+    "executedBy": null,
+    "createdAt": 1790000000000000,
+    "updatedAt": 1790000000000000
+  },
+  "approval": {
+    "id": "<approval-id>",
+    "orgId": "<organization-id>",
+    "investigationId": null,
+    "action": "run_remediation_action",
+    "target": "<incident-id>",
+    "parameters": { "actionId": "<action-id>", "action": "Roll back checkout", "inputs": { "reason": "pool exhausted after v2026.10.28" } },
+    "reason": "Run `Roll back checkout` on incident: High error rate · checkout",
+    "impact": "HTTP POST https://jenkins.example.com/job/rollback/buildWithParameters?service={{incident.service}} (reason=pool exhausted after v2026.10.28)",
+    "risk": "l3",
+    "status": "pending",
+    "requestedBy": "<user-id>",
+    "requiredApprovals": 2,
+    "reviews": [],
+    "expiresAt": 1790003600000000,
+    "decidedAt": null,
+    "createdAt": 1790000000000000,
+    "updatedAt": 1790000000000000
+  }
+}
+```
+</ResponseExample>
+
+| `status` | 意味 |
+|---|---|
+| `awaiting_approval` | 承認を待っています。 |
+| `running` | 実行中です。 |
+| `succeeded`, `failed` | 実行が成功または失敗しました。`output` にはレスポンスまたはエラーの先頭部分が入ります。 |
+| `declined` | 承認が却下、期限切れ、またはキャンセルになり、アクションは実行していません。 |
+| `verifying` | 実行は成功しました。`verifyAt` に検証します。 |
+| `verified`, `verification_failed` | 検証が成功または失敗しました。`verification` に検証結果が入ります。 |
+
+**エラー**
+
+| ステータス | 理由 |
+|---|---|
+| `400` | フィールドに誤りがある、クラスターがこの組織に属していない、アクションがこのインシデントに適用できないか無効になっている、入力に誤りがある、またはインシデントがすでに解決済みです。 |
+| `403` | 必要な権限がないか、インシデントがアクセス範囲外です。 |
+| `404` | アクション、クラスター、またはインシデントが存在しません。 |

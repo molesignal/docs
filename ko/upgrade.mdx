@@ -1,0 +1,105 @@
+---
+title: "업그레이드"
+description: "MoleSignal 배포를 새 버전으로 업그레이드하는 방법을 안내합니다. 백업, 스키마 마이그레이션, 배포 유형별 절차 및 롤백을 다룹니다."
+"en_link": "/en-US/upgrade"
+"zh-Hans_link": "/zh-Hans/upgrade"
+"zh-Hant_link": "/zh-Hant/upgrade"
+"ja_link": "/ja/upgrade"
+"de_link": "/de/upgrade"
+"es_link": "/es/upgrade"
+"fr_link": "/fr/upgrade"
+"pt-BR_link": "/pt-BR/upgrade"
+---
+
+MoleSignal은 아직 1.0 이전 버전입니다. [변경 로그](/ko/changelog) 페이지의 릴리스 노트에서 버전별 변경 사항을 확인합니다. 업그레이드 전에 릴리스 노트를 읽고, 업그레이드할 때마다 백업합니다.
+
+## 업그레이드 전 준비
+
+1. 현재 버전 이후부터 대상 버전까지 모든 버전의 릴리스 노트를 읽습니다.
+2. PostgreSQL과 오브젝트 스토어를 백업합니다. [백업 및 복원](/ko/backup-restore)을 참조합니다.
+3. 실행 중인 버전을 기록합니다. `molesignal --version`은 버전을 출력하고, `GET /api/v1/version`은 버전, 커밋, 빌드 ID, 릴리스 채널, 에디션을 반환합니다. 이 요청에는 Bearer 토큰이 필요합니다.
+4. 중요 배포 환경에서는 복원한 데이터베이스 복사본으로 업그레이드를 미리 수행합니다.
+
+## 스키마 변경 적용 방식
+
+바이너리에는 데이터베이스 마이그레이션이 포함되어 있습니다. 바이너리는 시작할 때마다 트래픽을 처리하기 전에 PostgreSQL에 마이그레이션을 적용합니다. 마이그레이션에 실패하면 프로세스가 중지됩니다. PostgreSQL 잠금이 마이그레이션을 한 번에 하나씩 처리하도록 제어하므로 여러 노드가 동시에 시작해도 안전합니다. 적용한 마이그레이션 버전은 `_molesignal_schema_meta` 테이블에 기록합니다.
+
+마이그레이션은 이전 버전으로 되돌릴 수 없습니다.
+
+- 바이너리가 데이터베이스보다 이전 버전이면 `migration <version> was previously applied but is missing in the resolved migrations` 오류를 반환하고 시작하지 않습니다.
+- 이미 적용한 마이그레이션이 바이너리에서 변경되었으면 `migration <version> was previously applied but has been modified` 오류를 반환하고 시작하지 않습니다. 사전 릴리스 빌드에서는 기준 스키마가 바뀔 수 있으므로 한 빌드에서 생성한 데이터베이스를 다른 빌드에서 열 수 있다고 보장하지 않습니다.
+
+이전 버전으로 돌아가려면 업그레이드 전에 생성한 백업에서 데이터베이스와 오브젝트를 복원합니다.
+
+## 업그레이드 절차
+
+<Tabs>
+  <Tab title="Docker Compose">
+    Compose 파일에서 `image` 태그를 수정한 다음, 이미지를 가져오고 컨테이너를 다시 생성합니다.
+
+    ```bash
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone pull
+    docker compose -f deploy/docker/docker-compose.yaml --profile standalone up -d
+    ```
+
+    이름이 지정된 볼륨은 유지합니다. 이 볼륨에는 PostgreSQL 데이터와 WAL을 포함한 RustFS 데이터가 저장됩니다.
+  </Tab>
+  <Tab title="바이너리 및 systemd">
+    서비스를 중지하고 바이너리와 GeoIP 데이터베이스를 교체한 다음 서비스를 다시 시작합니다.
+
+    ```bash
+    sudo systemctl stop molesignal
+    sudo install -Dm755 bin/molesignal /usr/local/bin/molesignal
+    sudo install -Dm644 mmdb/dbip-city-lite.mmdb \
+      /usr/share/molesignal/mmdb/dbip-city-lite.mmdb
+    sudo systemctl start molesignal
+    sudo journalctl -u molesignal -n 50
+    ```
+
+    이전 릴리스에서 설치한 `/usr/share/molesignal/mmdb/GeoLite2-City.mmdb`를 삭제합니다. `/etc/molesignal/config.toml`의 `[mmdb].db_path`가 아직 이 파일을 가리키면 `dbip-city-lite.mmdb`를 가리키도록 수정합니다.
+
+    새 릴리스의 `conf/config.toml`을 설치된 파일과 비교합니다. 새 설정 항목을 지정하지 않으면 내장 기본값을 사용하지만, 기본값이 바뀌면 동작에 영향을 줄 수 있습니다.
+  </Tab>
+  <Tab title="Helm">
+    [차트 변경 로그](https://github.com/molesignal/molesignal-helm/blob/main/CHANGELOG.md)를 읽은 다음 동일한 values 파일로 업그레이드합니다.
+
+    ```bash
+    helm repo update
+    helm upgrade molesignal molesignal/molesignal --namespace molesignal --values values.yaml
+    ```
+
+    `image.tag`를 지정하지 않으면 차트는 `latest` 이미지 태그를 사용합니다. 특정 MoleSignal 버전으로 업그레이드하려면 values 파일에서 `image.tag`를 설정합니다.
+
+    업그레이드해도 생성된 시크릿은 그대로 유지됩니다. `standalone` 및 `intake` 파드의 기본 종료 유예 시간은 60초입니다. `terminationGracePeriodSeconds`를 `[node].drain_timeout_secs`보다 큰 값으로 유지합니다.
+
+    `distributed` 모드에서는 `helm upgrade`가 모든 워크로드의 파드를 동시에 교체하므로 [역할 분리형 클러스터](#역할-분리형-클러스터)의 순서를 따르지 않습니다.
+  </Tab>
+  <Tab title="Kubernetes 매니페스트">
+    매니페스트에서 이미지 태그를 변경한 다음 매니페스트를 적용합니다.
+
+    ```bash
+    kubectl apply -f 30-router.yaml -f 40-intake.yaml -f 50-querier.yaml \
+                  -f 60-compactor.yaml -f 70-alert.yaml
+    kubectl -n molesignal rollout status deployment/intake
+    ```
+
+    파드가 종료 전에 데이터를 플러시할 수 있도록 `terminationGracePeriodSeconds`를 `[node].drain_timeout_secs`보다 큰 값으로 설정합니다.
+  </Tab>
+</Tabs>
+
+프로세스는 `SIGTERM` 또는 `SIGINT`를 받으면 대기 중인 데이터가 플러시될 때까지 최대 `[node].drain_timeout_secs`만큼 기다린 다음 종료합니다. 플러시하지 못한 레코드는 오브젝트 스토어의 WAL에 남습니다. 다른 수집 노드가 해당 레코드를 게시하거나, 기존 노드가 다시 시작된 후 게시합니다.
+
+## 역할 분리형 클러스터
+
+역할 분리형 클러스터는 하나의 스키마를 공유합니다. 이전 버전으로 실행 중인 노드는 재시작할 때까지 새 스키마를 계속 사용하지만, 버전 간 호환성은 보장되지 않습니다. 한 번의 유지보수 작업 시간 내에 모든 노드를 업그레이드합니다.
+
+1. `router` 노드를 먼저 중지한 다음 `intake` 및 `querier` 노드를 중지하고, 마지막으로 `compactor` 및 `alert` 노드를 중지합니다.
+2. 새 버전의 노드 하나를 시작하고 `GET /api/v1/healthz`가 `200`을 반환할 때까지 기다립니다. 이 노드가 마이그레이션을 적용합니다.
+3. 나머지 노드를 시작합니다.
+
+## 업그레이드 확인
+
+- 로그에 마이그레이션 오류가 없고 `GET /api/v1/healthz`가 `200`을 반환하는지 확인합니다.
+- `GET /api/v1/version`이 새 버전을 반환하는지 확인합니다.
+- 최근 데이터를 쿼리하면 결과 행이 반환되고 새 레코드가 들어오는지 확인합니다.
+- `/metrics`에서 `storage_reconciler_issues_total`이 증가하지 않는지 확인합니다.
