@@ -6,12 +6,13 @@ noindex: true
 
 ## About this project
 
-- This is the bilingual documentation site of MoleSignal, built on [Mintlify](https://mintlify.com).
-- Pages are MDX files with YAML frontmatter. English pages live in `en-US/` and Simplified Chinese pages in `zh-Hans/`.
-- Mintlify pairs pages across languages only when the folder is named after a language code it knows, and `en-US` is not one. A page without a link to its counterpart leaves the other language greyed out in the language switcher. Every page therefore carries a frontmatter link to its counterpart: `"zh-Hans_link": "/zh-Hans/<path>"` in `en-US/` pages and `"en_link": "/en-US/<path>"` in `zh-Hans/` pages. Drop the `.mdx` extension and a trailing `/index`. Add both links when adding a page pair, and open the switcher in `mint dev` to check them.
+- This is the documentation site of MoleSignal, written in English and Simplified Chinese and machine-translated into seven more languages, built on [Mintlify](https://mintlify.com).
+- Pages are MDX files with YAML frontmatter. English pages live in `en-US/` and Simplified Chinese pages in `zh-Hans/`; both are written by hand.
+- Seven more languages are machine-translated: `zh-Hant/` from `zh-Hans/`, and `ja/`, `ko/`, `de/`, `es/`, `fr/`, `pt-BR/` from `en-US/`. Do not edit their pages, their navigation in `docs.json`, or `scripts/i18n/state/`: change the source page and run `node scripts/i18n/translate.mjs` with `OPENAI_API_KEY` set. It translates only what is missing or changed since the last run (`--dry-run` counts it), deletes pages whose source is gone, rewrites anchors to the translated headings, and rebuilds the translated languages' navigation from the source's. The languages and the register each one is written in are in `scripts/i18n/languages.mjs`.
+- Mintlify pairs pages across languages only when the folder is named after a language code it knows, and `en-US` is not one. A page without a link to its counterpart leaves the other language greyed out in the language switcher. Every page therefore carries a frontmatter link to its page in each other language, keyed by the language's code in `docs.json`: `"en_link": "/en-US/<path>"`, `"zh-Hans_link": "/zh-Hans/<path>"`, `"ja_link": "/ja/<path>"` and so on. Drop the `.mdx` extension and a trailing `/index`. Add the `en_link` / `zh-Hans_link` pair when adding a page pair; the translate script adds the rest to every page, and `node scripts/i18n/translate.mjs --links-only` rewrites them without calling a model.
 - Navigation, branding, and the 404 page live in `docs.json`.
 - `changelog.js` renders the Changelog page from GitHub releases. `style.css` and `sidebar-toggle.js` hold the site customizations.
-- Diagrams are drawn with Excalidraw. `scripts/diagrams/build.mjs` holds one layout per diagram with the text of both languages, and `node scripts/diagrams/build.mjs [key ...]` renders it to SVG files in `images/architecture/` with light and dark variants for each language, and to editable scenes in `diagrams/`. Do not use Mermaid, ASCII art, or hand-written SVG for a diagram. Give each image an `alt` in the language of its page that says what the diagram shows.
+- Diagrams are drawn with Excalidraw. `scripts/diagrams/build.mjs` holds one layout per diagram with the text of both languages, and `node scripts/diagrams/build.mjs [key ...]` renders it to SVG files in `images/architecture/` with light and dark variants for each language, and to editable scenes in `diagrams/`. Do not use Mermaid, ASCII art, or hand-written SVG for a diagram. Give each image an `alt` in the language of its page that says what the diagram shows. Diagrams are drawn in English and Simplified Chinese only: translated pages show the image of their source language with a translated `alt`.
 - For Mintlify product knowledge (components, configuration, writing standards), use the Mintlify skill (`npx skills add https://mintlify.com/docs`) or the Mintlify docs MCP server at `https://www.mintlify.com/docs/mcp`.
 
 ## Keep the facts verified
@@ -62,7 +63,7 @@ Describe access with exact permission keys such as `streams.query`.
 - Use code formatting for file names, commands, paths, configuration keys, environment variables, and code references.
 - Prefer a table for a list of settings, endpoints, or limits that have several attributes.
 - Put shell commands in their own fenced block with the language `bash`. One command per block when a reader is expected to run it.
-- Keep English and Chinese pages in parity. A page, a section, and a navigation entry exist in both languages in the same change.
+- Keep English and Simplified Chinese pages in parity. A page, a section, and a navigation entry exist in both languages in the same change. Run the translate script after such a change so the translated languages follow.
 
 ## Content boundaries
 
@@ -77,6 +78,6 @@ Run these checks before publishing:
 
 ```bash
 mint validate
-mint broken-links
+mint broken-links --check-anchors
 mint a11y
 ```

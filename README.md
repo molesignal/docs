@@ -1,12 +1,14 @@
 # MoleSignal documentation
 
-This repository contains the bilingual MoleSignal documentation site built with
+This repository contains the MoleSignal documentation site, written in English and
+Simplified Chinese and machine-translated into seven more languages, built with
 [Mintlify](https://mintlify.com).
 
 ## Structure
 
 - `en-US/` — English product guides and API reference
 - `zh-Hans/` — Simplified Chinese product guides and API reference
+- `zh-Hant/`, `ja/`, `ko/`, `de/`, `es/`, `fr/`, `pt-BR/` — machine translations, written by `node scripts/i18n/translate.mjs`
 - `docs.json` — navigation, branding, and site configuration
 - `diagrams/` — editable Excalidraw architecture sources
 - `images/architecture/` — rendered light and dark architecture diagrams
