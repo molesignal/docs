@@ -28,6 +28,9 @@ Each source has a kind, which decides whose format the request body is read in.
 | **Tencent Cloud Observability Platform** | API callbacks of a notification template | One metric or event of one object under a policy, one per level on a leveled policy |
 | **Amazon CloudWatch** | Alarms sent to an SNS topic, through the topic's HTTPS subscription | One alarm |
 | **Zabbix** | A Zabbix webhook media type | One problem |
+| **Azure Monitor** | The webhook action of an action group, in the common alert schema | One alert |
+| **Google Cloud Monitoring** | A webhook notification channel, or the Pub/Sub channel through a push subscription | One Monitoring incident |
+| **Huawei Cloud Eye** | Alarms sent to an SMN topic, through the topic's HTTPS subscription | One alarm rule on one resource |
 | **Email** | An IMAP mailbox, or raw mail from a mail system you already run | A run of mails with the same subject |
 
 Systems that speak the Alertmanager webhook, such as the Alertmanager of Thanos, Cortex or Mimir, use the **Alertmanager** kind.
@@ -59,7 +62,7 @@ A token looks like `mspat-<36>`, the same shape as an API Token, but it only tak
 Authorization: Bearer <token>
 ```
 
-A sender that cannot set headers (Alibaba Cloud CloudMonitor, Tencent Cloud Observability Platform, Amazon CloudWatch through SNS) carries the token in the address: `https://<molesignal-host>/api/v1/intake/alerts?token=<token>`.
+A sender that cannot set headers (Alibaba Cloud CloudMonitor, Tencent Cloud Observability Platform, Amazon CloudWatch through SNS, Azure Monitor, Google Cloud Monitoring, Huawei Cloud Eye through SMN) carries the token in the address: `https://<molesignal-host>/api/v1/intake/alerts?token=<token>`.
 
 The sender must reach this address. When a firewall stands in front of MoleSignal, allow the egress addresses of the sender's site or region: Datadog lists them per site in the `webhooks` section of its `ip-ranges`, PagerDuty publishes them for its US and EU service regions, and Alibaba Cloud CloudMonitor lists its push ranges in its alarm callback docs. When MoleSignal runs on an internal network, see [Public access](/en-US/public-access) for opening only this address to the internet.
 
@@ -203,6 +206,54 @@ MoleSignal checks the signature of every SNS message, so **Raw message delivery*
 
 CloudWatch alarms have no severity, so incidents take the source's default. The alarm's ARN is the dedup key, for composite alarms too. The alarm's description and the reason for the state change go in annotations; the region, account, namespace, metric and dimensions go in labels, so a label like `aws.region` can drive routing.
 
+### Azure Monitor
+
+Azure Monitor alerts reach MoleSignal through the webhook action of an action group:
+
+1. In the action group used by your alert rules, add an action of the **Webhook** type with the intake address as its URI, the token in the address.
+2. Set **Enable the common alert schema** to **Yes**. Without it, requests are refused, and Recently received on the source's page says why.
+
+The same with the Azure CLI:
+
+```bash
+az monitor action-group update \
+  --resource-group <resource group> \
+  --name <action group> \
+  --add-action webhook molesignal 'https://<molesignal-host>/api/v1/intake/alerts?token=<token>' usecommonalertschema
+```
+
+- **Dedup**: the alert's `alertId` is the dedup key, and it holds the Azure subscription.
+- **Trigger and resolve**: `monitorCondition` `Fired` opens the incident and `Resolved` resolves it. Alerts that keep no state, such as activity log alerts, only fire, so a person resolves them.
+- **Severity**: `Sev0` is critical, `Sev1` error, `Sev2` warning, and `Sev3` and `Sev4` info.
+- **Labels**: the custom properties of the alert rule, the metric dimensions, `azure.subscription_id`, `azure.resource_group`, `azure.resource`, `azure.signal_type`, `azure.monitoring_service` and `azure.metric`. The description, condition, value and targets go in annotations, with the investigation link as `azure_url`.
+
+### Google Cloud Monitoring
+
+1. In the Google Cloud console, open **Monitoring → Alerting → Edit notification channels**, and add a **Webhook** channel with the intake address as its **Endpoint URL**, the token in the address.
+2. Add the channel to the notifications of your alerting policies. Incidents that close are sent too, so incidents resolve on their own.
+
+The **Pub/Sub** channel publishes the same notification. To use it, create a push subscription on its topic with the intake address as the push endpoint; MoleSignal unpacks the Pub/Sub envelope.
+
+- **Dedup**: the scoping project and `incident_id`. One Monitoring incident is one incident.
+- **Trigger and resolve**: `state` `open` opens the incident and `closed` resolves it.
+- **Severity**: the policy's severity level, `Critical`, `Error` or `Warning`. A policy without one takes the source's default severity.
+- **Labels**: the labels of the resource and the metric, the user labels of the policy and of the monitored resource, `gcp.project_id`, `gcp.resource_type`, `gcp.metric` and `gcp.policy`. The summary, condition, observed value, threshold and documentation go in annotations, with the incident's console address as `gcp_url`.
+
+### Huawei Cloud Eye
+
+Cloud Eye (CES) alarms do not call outside addresses themselves; they go through SMN:
+
+1. In Simple Message Notification, add a subscription to a topic with the **HTTPS** protocol and the intake address as its endpoint, the token in the address.
+2. The subscription confirms itself: MoleSignal checks the signature of the confirmation message, then visits its `subscribe_url`.
+3. In the alarm notifications of your Cloud Eye alarm rules, choose that topic, and notify on both the alarm and its recovery. Without the recovery, incidents do not resolve on their own.
+
+MoleSignal checks the signature of every SMN message. The signing certificate comes from `smn.<region>.myhuaweicloud.com`, so the node taking the request must be able to reach that address.
+
+- **Dedup**: the project of the topic, the alarm rule's `alarm_id` and the resource. One rule on several resources opens one incident per resource.
+- **Trigger and resolve**: `alarm_status` `alarm` opens the incident, `insufficient_data` opens it as no data, and `ok` resolves it.
+- **Severity**: the alarm level: Critical is critical, Major error, Minor warning and Informational info.
+- **Labels**: the dimensions, such as `instance_id`, and `huawei.region`, `huawei.project_id`, `huawei.namespace`, `huawei.metric`, `huawei.alarm_id` and `huawei.resource_id`. The alarm text, current value and threshold go in annotations, with the alarm's console address as `huawei_url`.
+
 ### Zabbix
 
 Works from Zabbix 6.0. Zabbix has no request format of its own: a media type's script sends the request. So the source's page, and the dialog when you create it, give you a media type with the address and token filled in:
@@ -264,6 +315,9 @@ The severity comes from words in the subject (`critical`, `fatal`, `disaster`, `
 | **Alibaba Cloud CloudMonitor** | Account, rule ID and `dimensions`; for system events, account and `dedupId` | `ALERT`, `INSUFFICIENT_DATA`; system event `TRIGGERED` | `OK`; system event `RESOLVED` | `triggerLevel`; system event `severity` |
 | **Tencent Cloud Observability Platform** | Account, policy, metric or event name, level and object | `alarmStatus` is `1` or `5` | `alarmStatus` is `0` | `alarmLevel` |
 | **Amazon CloudWatch** | `AlarmArn` | `NewStateValue` is `ALARM` or `INSUFFICIENT_DATA` | `NewStateValue` is `OK` | None: the source's default severity |
+| **Azure Monitor** | `alertId` | `monitorCondition` is `Fired` | `monitorCondition` is `Resolved` | `severity`: `Sev0` critical, `Sev1` error, `Sev2` warning, `Sev3` and `Sev4` info |
+| **Google Cloud Monitoring** | Scoping project and `incident_id` | `state` is `open` | `state` is `closed` | `severity`; `No severity` takes the source's default |
+| **Huawei Cloud Eye** | Project of the SMN topic, `alarm_id` and resource | `alarm_status` is `alarm` or `insufficient_data` | `alarm_status` is `ok` | Alarm level: Critical, Major, Minor, Informational |
 | **Zabbix** | Host of `{$ZABBIX.URL}` and `{EVENT.ID}` | `{EVENT.VALUE}` is 1; update operations too, with the severity following | `{EVENT.VALUE}` is 0, or an update operation closed the problem | `{EVENT.NSEVERITY}`: Disaster is critical, High error, Average and Warning warning, Information info |
 | **Email** | The sender's domain and the part taken from the subject | Other mail | A subject written as a recovery | Words in the subject |
 
@@ -280,7 +334,7 @@ An alert without a severity takes the source's **Default severity**. The severit
 - **Resolving**: the incident resolves when the source reports recovery, acknowledged incidents included. No user is recorded as the resolver, and the timeline shows it as recovered.
 - **Late messages**: each dedup key remembers the latest sender time it used, and an older message is ignored. A late trigger does not open a zombie incident, and a late recovery does not close a new one. The API carries no time, so its messages are taken in the order they arrive.
 - **Resolved by a person first**: when the source still reports the alert, its next resend opens a new incident, as for rules.
-- **No data**: incidents opened by CloudMonitor's `INSUFFICIENT_DATA` and Datadog's No Data carry `alert.condition=no_data`, and their notification titles start with `NO DATA`.
+- **No data**: incidents opened by CloudMonitor's `INSUFFICIENT_DATA`, Cloud Eye's `insufficient_data` and Datadog's No Data carry `alert.condition=no_data`, and their notification titles start with `NO DATA`.
 - **Turning off and deleting**: a turned-off source refuses alerts (`409`), and its open incidents stay. Deleting a source makes its token stop working at once and resolves its open incidents.
 
 [Silence policies](/en-US/alerting/silences), [semantic groups](/en-US/alerting/silences#semantic-groups) and [notify policies](/en-US/notification-channels) apply to external incidents as to any other. Match them by `external.kind`, the extra labels of a source, or the alert's own labels.

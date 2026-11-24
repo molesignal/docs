@@ -1,7 +1,7 @@
 ---
 title: "连接器"
 sidebarTitle: "连接器"
-description: "从 CloudWatch Logs、Kafka 主题、S3 对象、Amazon Data Firehose、Cloudflare Logpush、Heroku 接入日志，并把流水线产出投递到 S3、Kafka 或 HTTP 端点。"
+description: "从 CloudWatch Logs、Kafka 主题、S3 对象、Amazon Data Firehose、Google Cloud Pub/Sub、Cloudflare Logpush、Heroku 接入日志和指标，并把流水线产出投递到 S3、Kafka 或 HTTP 端点。"
 "en_link": "/en-US/connectors"
 "zh-Hant_link": "/zh-Hant/connectors"
 "ja_link": "/ja/connectors"
@@ -14,7 +14,7 @@ description: "从 CloudWatch Logs、Kafka 主题、S3 对象、Amazon Data Fireh
 
 **连接器**是与外部平台的托管集成，分两个方向：
 
-- **来源**从其他服务接入日志并写入数据流。CloudWatch Logs、Kafka 主题和 S3 对象由 MoleSignal 定时拉取；Amazon Data Firehose、Cloudflare Logpush、Heroku 把日志推送给 MoleSignal。
+- **来源**从其他服务接入数据并写入数据流。CloudWatch Logs、Kafka 主题和 S3 对象由 MoleSignal 定时拉取；Amazon Data Firehose、Google Cloud Pub/Sub、Cloudflare Logpush、Heroku 推送给 MoleSignal，其中 Firehose 也能带来 CloudWatch 指标。
 - **目标**接收[定时流水线](/zh-Hans/pipelines#目标与连接器出口)的产出：Amazon S3 及 S3 兼容存储、Apache Kafka，以及任意 HTTP 端点。
 
 | Kind | 连接器 | 方向 | 认证 |
@@ -22,7 +22,11 @@ description: "从 CloudWatch Logs、Kafka 主题、S3 对象、Amazon Data Fireh
 | `aws_cloudwatch_logs` | AWS CloudWatch Logs | 来源，每 30 秒拉取一次 | [AWS 凭据](#aws-认证) |
 | `kafka_source` | Kafka 主题 | 来源，每 30 秒拉取一次 | 无、SASL 或客户端证书 |
 | `s3_source` | S3 对象 | 来源，每 30 秒拉取一次 | AWS 凭据 |
+| `gcp_pubsub_pull` | Google Cloud Pub/Sub 订阅 | 来源，每 30 秒拉取一次 | 服务账号密钥 |
+| `aws_cloudwatch_metrics`、`azure_monitor_metrics`、`gcp_monitoring_metrics`、`aliyun_cms_metrics`、`tencent_monitor_metrics`、`huawei_ces_metrics` | [云监控指标](#云监控指标) | 来源，每个周期拉取一次 | 云平台的凭据 |
 | `aws_kinesis_firehose` | Amazon Data Firehose | 来源，推送 | [推送 Token](#推送来源) |
+| `gcp_pubsub_push` | Google Cloud Pub/Sub 推送 | 来源，推送 | 推送 Token，可再校验订阅的 OIDC Token |
+| `cloud_events` | 云事件总线 | 来源，推送 | 推送 Token |
 | `cloudflare_logpush` | Cloudflare Logpush | 来源，推送 | 推送 Token |
 | `heroku_drain` | Heroku 日志 Drain | 来源，推送 | 推送 Token |
 | `s3` | Amazon S3 | 目标 | AWS 凭据 |
@@ -72,7 +76,11 @@ curl -X POST http://localhost:5080/api/v1/connectors \
 | Kind | 密钥键 |
 |---|---|
 | `s3`、`aws_cloudwatch_logs` | `accessKey`、`secretKey`、`sessionToken` |
-| `aws_kinesis_firehose`、`cloudflare_logpush`、`heroku_drain` | `pushToken` |
+| `aws_kinesis_firehose`、`gcp_pubsub_push`、`cloud_events`、`cloudflare_logpush`、`heroku_drain` | `pushToken` |
+| `aws_cloudwatch_metrics` | `accessKey`、`secretKey`、`sessionToken` |
+| `azure_monitor_metrics` | `clientSecret` |
+| `gcp_monitoring_metrics`、`gcp_pubsub_pull` | `serviceAccountKey` |
+| `aliyun_cms_metrics`、`tencent_monitor_metrics`、`huawei_ces_metrics` | `accessKey`、`secretKey` |
 | `kafka` | `saslPassword`、`tlsClientKey` |
 | `http` | `url`、`bearerToken`、`basicPassword`、`headerValue`、`hmacSecret` |
 
@@ -103,17 +111,19 @@ MoleSignal 用 `MS_CIPHER_KEY` 中的根密钥（AES-256-GCM）把密钥与其�
 
 ### 推送来源
 
-三种推送来源共用一套模型：创建带 **`pushToken`** 和 **`target_stream`** 的连接器，再把平台指向对应的端点。这些端点不使用 JWT，请求以推送 Token 鉴权，按平台允许的方式传入：
+五种推送来源共用一套模型：创建带 **`pushToken`** 和 **`targetStream`** 的连接器，再把平台指向对应的端点。这些端点不使用 JWT，请求以推送 Token 鉴权，按平台允许的方式传入：
 
 | 方式 | 适用平台 |
 |---|---|
 | `X-Connector-Token` 请求头 | 可以配置自定义请求头的平台，如 Cloudflare |
 | `X-Amz-Firehose-Access-Key` 请求头 | Amazon Data Firehose，自动发送 |
-| `?token=` 查询参数 | 无法设置请求头的平台，如 Heroku |
+| `X-EventBridge-Signature-Token` 请求头 | 阿里云 EventBridge |
+| `?token=` 查询参数 | 无法设置请求头的平台，如 Heroku 和 Pub/Sub |
+| `Authorization: Basic` 的密码 | 把凭据写进地址的平台 |
 
-界面在创建连接器时生成 Token，并连同要交给平台的端点只显示一次，之后无法再读取。**生成新令牌** 会在保存连接器时取代当前 Token。通过 API 创建时，自行提供至少 16 个字符的 `pushToken`。一个 Token 只对应同一 kind 的一个连接器：已被使用的 Token 返回 `409`。缺少或无法识别 Token 的请求，以及发给已停用连接器的请求，都返回 `401`。没有 Token 的连接器不接受任何推送。
+界面在创建连接器时生成 Token，并连同要交给平台的端点只显示一次，之后无法再读取。**生成新令牌** 会在保存连接器时取代当前 Token。通过 API 创建时，自行提供至少 16 个字符的 `pushToken`。一个 Token 只对应同一 kind 的一个连接器：已被使用的 Token 返回 `409`。缺少或无法识别 Token 的请求，以及发给已停用连接器的请求，都返回 `401`。没有 Token 的连接器不接受任何推送。节点会把查到的连接器保留 30 秒，所以停用连接器或更换 Token 最多 30 秒后生效。
 
-带 `Content-Encoding: gzip` 的请求体会被自动解压。事件走与其他接入相同的路径：schema-on-write、[流水线](/zh-Hans/pipelines)、[脱敏](/zh-Hans/security)一并生效。
+带 `Content-Encoding: gzip` 的请求体会被自动解压。Firehose 的请求体上限为 64 MiB，其他为 16 MiB，解压后同样按这个上限计。事件走与其他接入相同的路径：schema-on-write、[流水线](/zh-Hans/pipelines)、[脱敏](/zh-Hans/security)一并生效。
 
 <Tabs>
   <Tab title="Amazon Data Firehose">
@@ -122,7 +132,73 @@ MoleSignal 用 `MS_CIPHER_KEY` 中的根密钥（AES-256-GCM）把密钥与其�
     - **HTTP endpoint URL**：`https://molesignal.example.com/api/v1/_kinesis_firehose`
     - **Access key**：推送 Token。Firehose 以 `X-Amz-Firehose-Access-Key` 发送它。
 
-    MoleSignal 对每条 record 做 base64 解码，按换行切分，并把每行解析为 JSON，纯文本则放进 `message` 字段。MoleSignal 返回 Firehose 所要求的 `200` 确认。
+    Firehose 只投递到 443 端口的 HTTPS，证书须由公共 CA 签发。部署在内网时需要一个公网入口，参见[公网访问](/zh-Hans/public-access)。Firehose 流的缓冲大小请设为 1 到 4 MiB。
+
+    MoleSignal 逐条读取 record，按内容处理：
+
+    | Record | 结果 |
+    |---|---|
+    | CloudWatch Logs 订阅消息，即订阅过滤器发出的 gzip 压缩 JSON | `logEvents` 的每一项成为一条日志事件，时间取该项自己的时间，带 `message`、`log_group`、`log_stream`、`account_id`、`region`、`event_id` 和 `source: "cloudwatch"`。创建订阅时发来的连通性检查消息会被跳过。 |
+    | JSON、OpenTelemetry 1.0 或 OpenTelemetry 0.7 输出格式的 CloudWatch Metric Streams record | 写入指标数据流的指标样本，见下文。 |
+    | 其他文本 | 每行一条日志事件：JSON 对象作为字段，纯文本放进 `message`。 |
+
+    指标流每分钟为每个指标发送一份聚合值。每个统计量成为一个 gauge 样本，按 yet-another-cloudwatch-exporter 的方式命名为 `aws_<命名空间>_<指标>_<统计量>`，例如 `aws_ec2_cpuutilization_average`、`aws_ec2_cpuutilization_maximum`、`aws_applicationelb_request_count_sum`。命名空间去掉 `AWS/` 前缀；指标名在小写字母后接大写字母的位置断词。统计量有 `average`（总和除以样本数）、`sum`、`sample_count`、`minimum`、`maximum`，以及指标流额外选择的百分位，例如 `p99`、`p99_9`。标签为 `account_id`、`region`，以及每个维度一个 `dimension_<名称>`，例如 `dimension_InstanceId`；`metric_unit` 保存单位。
+
+    ```promql
+    max by (dimension_InstanceId) (aws_ec2_cpuutilization_average)
+    ```
+
+    `X-Amz-Firehose-Common-Attributes`（即 Firehose 流上设置的参数）中的键会加到每条事件和每个样本上，record 自带的同名字段优先。CloudWatch Logs 事件本身不带区域，`region` 取自 `X-Amz-Firehose-Source-Arn`。
+
+    应答遵循 Firehose 的投递规范：`application/json`，带回请求的 `requestId`、一个 `timestamp`，失败时附 `errorMessage`。无法读取的 record 会被跳过，请求的其余部分照常写入并返回 `200`。暂时写不进去时返回 `429` 或 `5xx`，Firehose 会重试。超过 64 MiB 的请求体返回 `413`，Firehose 对它既不重试也不备份。同一个 `X-Amz-Firehose-Request-Id` 在写入后 30 分钟内重试，会直接返回 `200`，不再重复写入。
+  </Tab>
+  <Tab title="Google Cloud Pub/Sub">
+    用 `kind: "gcp_pubsub_push"` 创建连接器。用日志路由器的接收器把日志路由到一个 Pub/Sub 主题，再在主题上创建推送订阅。Pub/Sub 无法设置自定义请求头，因此 Token 放在 URL 中：
+
+    ```bash
+    gcloud pubsub subscriptions create molesignal-push --topic=molesignal-logs --push-endpoint="https://molesignal.example.com/api/v1/_gcp_pubsub?token=<pushToken>"
+    ```
+
+    如果还要校验订阅的 OIDC Token，把连接器的 `oidcServiceAccount` 设为一个服务账号的邮箱，并用 `--push-auth-service-account=<邮箱>` 创建订阅。MoleSignal 随后用 Google 的公钥验证 Token，只接受这个服务账号。设置 `oidcAudience` 可再校验受众，订阅的 `--push-auth-token-audience` 填同一个值。
+
+    每条消息是一个请求，默认的封装格式和解封装后的载荷都能接收。Cloud Logging 的 `LogEntry` 成为一条日志事件：
+
+    | `LogEntry` | 事件 |
+    |---|---|
+    | `jsonPayload` | 其中的字段 |
+    | `textPayload` | `message` |
+    | `protoPayload`（审计日志） | `proto_payload`，并从中取出 `method_name`、`service_name`、`principal_email` |
+    | `severity` | `level`，转为小写 |
+    | `logName`、`resource.type`、`insertId` | `log_name`、`resource_type`、`insert_id` |
+    | `resource.labels`、`labels` | 以原名作为字段 |
+    | `trace`、`spanId` | 去掉 `projects/<id>/traces/` 前缀的 `trace_id`，`span_id` |
+    | `httpRequest` | `http_request` |
+    | `timestamp` | 事件时间；缺失时取 `receiveTimestamp` 或发布时间 |
+
+    其他消息数据成为一条事件：JSON 对象作为字段，文本放进 `message`。端点返回 `204 No Content`，Pub/Sub 视为确认。无法读取的消息会被确认并跳过；暂时写不进去的消息不确认，Pub/Sub 会重新投递。写入后 30 分钟内重新投递的同一条消息会直接确认，不再重复写入。
+  </Tab>
+  <Tab title="云事件总线">
+    用 `kind: "cloud_events"` 创建连接器，再把事件总线指向 `https://molesignal.example.com/api/v1/_cloud_events`：
+
+    | 发送方 | 配置 |
+    |---|---|
+    | Amazon EventBridge | API 目的地，连接选 **API key**，请求头名填 `X-Connector-Token`，值为推送 Token。 |
+    | Azure Event Grid | Webhook 订阅，端点地址末尾加 `?token=<pushToken>`。验证握手和 CloudEvents schema 的 `OPTIONS` 握手会自动应答。 |
+    | 阿里云 EventBridge | HTTPS 目标，Token 填推送 Token，以 `X-EventBridge-Signature-Token` 发送。 |
+    | 华为云 EventGrid | Webhook 目标，加请求头 `X-Connector-Token`。 |
+    | 其他 CloudEvents 发送方 | 上面任意一种 Token 方式。只能把凭据写进地址（`https://user:<pushToken>@host/...`）的发送方也能接收。 |
+
+    请求体是一个事件或事件数组，可以是结构化或二进制模式的 CloudEvents 1.0、Amazon EventBridge 事件或 Event Grid schema。每个事件成为 `targetStream`（默认 `cloud_events`）中的一条日志事件：
+
+    | 字段 | 来自 |
+    |---|---|
+    | `event_id`、`event_source`、`event_type`、`event_subject` | CloudEvents 的 `id`、`source`、`type`、`subject`；EventBridge 的 `id`、`source`、`detail-type`；Event Grid 的 `id`、`topic`、`eventType`、`subject` |
+    | `account_id`、`region` | EventBridge 的 `account`、`region`；阿里云的 `aliyunaccountid`、`aliyunregionid`；Event Grid 主题所属的订阅 |
+    | `resources` | EventBridge 的 `resources` |
+    | `data` | 载荷，作为一个 JSON 字段；文本载荷放进 `message` |
+    | `event_format` | `cloudevents`、`eventbridge` 或 `event_grid` |
+
+    扩展属性保留原名。事件时间取事件自己的时间。其他 JSON 对象原样成为一条事件。30 分钟内来源和 id 都相同的重复投递不会重复写入。端点返回 `200`，请求体不是 JSON 时返回 `400`。
   </Tab>
   <Tab title="Cloudflare Logpush">
     用 `kind: "cloudflare_logpush"` 创建连接器，然后创建一个 HTTP 目标的 Logpush 任务。Cloudflare 会把 `header_` 开头的查询参数转为请求头，因此 Token 放在 `X-Connector-Token` 中：
@@ -145,7 +221,7 @@ MoleSignal 用 `MS_CIPHER_KEY` 中的根密钥（AES-256-GCM）把密钥与其�
 </Tabs>
 
 <Tip>
-  `target_stream` 在首次投递时创建，schema 随新字段出现而演化，与其他数据流一致。省略 `target_stream` 时回退到按来源区分的默认数据流：`kinesis`、`cloudflare` 或 `heroku`。
+  `targetStream` 在首次投递时创建，schema 随新字段出现而演化，与其他数据流一致。省略 `targetStream` 时回退到按来源区分的默认数据流：`kinesis`、`gcp`、`cloud_events`、`cloudflare` 或 `heroku`。Firehose 连接器把指标样本写入 `metricsStream`，默认为 `cloudwatch`。
 </Tip>
 
 ### CloudWatch Logs
@@ -204,12 +280,15 @@ curl -X POST http://localhost:5080/api/v1/connectors \
 |---|---|
 | `brokers`、`topic`、`tls`、`tlsCaCert`、`auth` 及其键 | 同 [Kafka 目标](#apache-kafka)。 |
 | `targetStream` | 写入的数据流，默认 `default`。 |
+| `messageFormat` | `json`（默认），或 `azure_records` 表示读取 Azure Monitor 导出到事件中心的数据，见下文。界面：**消息格式**。 |
 | `startFrom` | 第一次从哪里读：`latest`（默认）从现在起到达的消息，`earliest` Broker 保存的全部消息。之后新增的分区从头读。界面：**从哪里开始**。 |
 
 - 值是 JSON 对象的消息，对象的字段就是日志的字段；其他值成为 `message`。每条日志还带 `kafka_topic`、`kafka_partition`、`kafka_offset`、`source`，消息有 key 时带 `kafka_key`。日志时间取消息的时间戳。
 - 一次读取最多 10,000 条消息或 32 MiB，还有更多时马上接着读，一次拉取最多持续 2 分钟。
 - 日志写入成功后读取位点才前进。读取或写入失败时，30 秒后从同一位置重试，所以消息可能写入两次，但不会丢。位点对应的消息已被 Broker 清理时，从 Broker 保存的最早消息接着读。
 - 改 `topic` 会按 `startFrom` 重新开始，因为位点属于主题。
+
+Azure 的诊断设置、Log Analytics 数据导出和数据收集规则都导出到 Azure Event Hubs，Kafka 来源可以经事件中心的 Kafka 端点读取：`brokers` 填 `<命名空间>.servicebus.windows.net:9093`，`topic` 填事件中心名，打开 `tls`，`auth: sasl_plain`，用户名为 `$ConnectionString`，密码为连接字符串。Basic 层没有 Kafka 端点。设置 `messageFormat: azure_records` 后，每条 `{"records": [...]}` 消息会被拆开：日志记录按其 `time` 成为一条日志事件，指标记录按每个统计量成为一个样本，写入连接器的 `metricsStream`（默认 `default`），命名方式与 [Azure Monitor 指标](#云监控指标)相同。
 
 ### S3 对象
 
@@ -245,6 +324,71 @@ curl -X POST http://localhost:5080/api/v1/connectors \
 - 日志写入成功后读取状态才前进。取不到的对象让这次拉取停在那里，30 秒后重试，所以日志可能写入两次，但不会丢。
 - 读不了的对象会被跳过，并在连接器上写明，因为反复重试会挡住后面的所有对象。这包括损坏、超过 256 MiB、解压后超过 512 MiB、超过一百万条日志，或有一行超过 64 MiB 的对象。
 - 对象按键和修改时间识别，留 5 分钟余量。这个余量内用同一个键重新写入的对象不会再读一次；修改时间比已读到的最新对象早 5 分钟以上的对象不会被读取。S3 把分段上传的时间记为开始上传的时间，所以比这更慢的上传读不到。
+
+### Google Cloud Pub/Sub 订阅
+
+`gcp_pubsub_pull` 连接器每 30 秒读取一次 Pub/Sub 订阅，每个请求最多 1000 条消息，还有剩余时立即接着读，消息写入后才确认。写入失败的消息会在确认期限过后重新投递，因此一条消息可能写入两次，但不会丢。它适合[推送订阅](#推送来源)承载不了的日志量：推送订阅每个请求只送一条消息。
+
+| 字段 | 说明 |
+|---|---|
+| `serviceAccountKey` | 服务账号的 JSON 密钥文件，该账号需要订阅上的 `roles/pubsub.subscriber` 角色。 |
+| `subscription` | `projects/<项目>/subscriptions/<名称>`，或密钥所属项目中的订阅名。确认期限请设为 60 秒或更长。 |
+| `targetStream` | 写入的数据流，默认 `default`。 |
+
+每条消息按推送消息的方式读取：Cloud Logging 的 `LogEntry` 按推送标签页中的映射处理，其他 JSON 对象作为字段，其余内容放进 `message`。**测试连接** 只询问密钥能否消费这个订阅，不会取走消息。
+
+### 云监控指标
+
+六种来源按计划拉取云平台监控服务的指标，写入指标数据流：
+
+| Kind | 云平台 | 接口 | 认证 | 权限 | 默认 `metricsStream` |
+|---|---|---|---|---|---|
+| `aws_cloudwatch_metrics` | Amazon CloudWatch | `ListMetrics`、`GetMetricData` | [AWS 凭据](#aws-认证) | `cloudwatch:ListMetrics`、`cloudwatch:GetMetricData` | `cloudwatch` |
+| `azure_monitor_metrics` | Azure Monitor | Resource Graph、`metrics:getBatch` | 应用注册的 `tenantId`、`clientId`、`clientSecret` | 订阅上的 **Monitoring Reader** | `azure` |
+| `gcp_monitoring_metrics` | Google Cloud Monitoring | `timeSeries.list` | `serviceAccountKey`，即 JSON 密钥文件 | 项目上的 `roles/monitoring.viewer` | `gcp` |
+| `aliyun_cms_metrics` | 阿里云云监控 | `DescribeMetricList` | `accessKey`、`secretKey` | `AliyunCloudMonitorReadOnlyAccess` | `aliyun` |
+| `tencent_monitor_metrics` | 腾讯云可观测平台 | `GetMonitorData` | `accessKey`（SecretId）、`secretKey`（SecretKey） | `QcloudMonitorReadOnlyAccess`；自动发现 CVM 实例时另需 `QcloudCVMReadOnlyAccess` | `tencentcloud` |
+| `huawei_ces_metrics` | 华为云云监控 | `ListMetrics`、`BatchListMetricData` | `accessKey`（AK）、`secretKey`（SK） | `CES ReadOnlyAccess` | `huaweicloud` |
+
+每次拉取读取若干个完整周期：周期长 `period` 秒，结束至少 `delay` 秒，从上一次写入成功的拉取结束处接着读。云平台要在周期结束几分钟后才算完一个聚合值，而每个周期只读一次，之后才修正的值保持读到时的样子。新连接器从前一个周期开始。一次拉取最多读 12 个周期，剩下的在下一个 tick 继续；停用超过 6 小时的连接器会跳过更早的部分，并给出提示。
+
+每个序列的每个统计量成为一个 gauge 样本，按 yet-another-cloudwatch-exporter 命名 CloudWatch 指标的方式命名为 `<云>_<命名空间>_<指标>_<统计量>`，时间为周期的开始：
+
+| 来源 | 示例 | 标签 |
+|---|---|---|
+| CloudWatch | `aws_ec2_cpuutilization_average` | `region`、`dimension_<名称>` |
+| Azure Monitor | `azure_compute_virtualmachines_percentage_cpu_average` | `subscription_id`、`resource_group`、`resource_name`、`resource_id`、`region`、`dimension_<名称>`、`tag_<键>` |
+| Cloud Monitoring | `gcp_compute_instance_cpu_utilization_mean` | `project_id`、`resource_type`，以及资源和指标的标签 |
+| 阿里云云监控 | `aliyun_ecs_dashboard_cpuutilization_average` | `region`、`user_id`、`dimension_<键>` |
+| 腾讯云可观测平台 | `tencentcloud_cvm_cpu_usage_avg` | `region`、`dimension_<名称>` |
+| 华为云云监控 | `huaweicloud_sys_ecs_cpu_util_average` | `region`、`dimension_<名称>` |
+
+经 Firehose 的 [CloudWatch 指标流](#推送来源)写出的名称与此相同，同一条 PromQL 两边都能用：
+
+```promql
+max by (dimension_InstanceId) (aws_ec2_cpuutilization_average)
+```
+
+| 字段 | 来源 | 说明 |
+|---|---|---|
+| `metricsStream` | 全部 | 写入的指标数据流。 |
+| `period` | 全部 | 秒，须为整分钟，默认 300。Azure 取 60、300、900、1800、3600、21600、43200、86400；华为云取 300、1200、3600、14400、86400。 |
+| `delay` | 全部 | 周期结束后多少秒再读。CloudWatch 和 Azure 默认 600，其他默认 300。 |
+| `region` | 除 Google Cloud 外 | 例如 `us-east-1`、`eastus`、`cn-hangzhou`、`ap-guangzhou`、`cn-north-4`。 |
+| `namespace` | CloudWatch、阿里云、腾讯云、华为云 | 例如 `AWS/EC2`、`acs_ecs_dashboard`、`QCE/CVM`、`SYS.ECS`。 |
+| `metrics` | 全部 | 指标名，用逗号或换行分隔。除 CloudWatch 外必填；CloudWatch 留空时读取命名空间里最近三小时有数据的全部指标，最多 2000 个序列。Google Cloud 填指标类型，例如 `compute.googleapis.com/instance/cpu/utilization`。 |
+| `statistics` | CloudWatch、阿里云、腾讯云、华为云 | CloudWatch：`Average`、`Sum`、`Minimum`、`Maximum`、`SampleCount` 和 `p99` 这类百分位，默认 `Average`、`Maximum`。阿里云：`Average`、`Maximum`、`Minimum`、`Sum`，默认 `Average`、`Maximum`。腾讯云：`avg`、`max`、`min`，默认 `avg`。华为云：`average`、`max`、`min`、`sum`、`variance`，默认 `average`。 |
+| `subscriptionId`、`resourceType`、`aggregations`、`filter`、`top` | Azure | 资源类型也是指标命名空间，例如 `Microsoft.Compute/virtualMachines`。聚合方式：`average`（默认）、`minimum`、`maximum`、`total`、`count`。`filter` 按维度拆分，例如 `LUN eq '*'`；`top` 限制拆出的序列数，默认 100。 |
+| `projectId`、`filter` | Google Cloud | 项目默认取密钥所属的项目。`filter` 是附加到每个指标过滤条件上的子句。gauge 读 `mean`，delta 读 `sum`，counter 读 `rate`，distribution 读 `count` 和 `mean`。 |
+| `dimensions` | 阿里云 | 可选，作为 `Dimensions` 传入的 JSON；留空读取账号下全部实例。 |
+| `instances` | 腾讯云 | 每行一个实例，写成 `Name=Value`，多个维度用 `&` 连接。除 `QCE/CVM` 外必填；`QCE/CVM` 留空时自动发现本地域的实例。 |
+| `projectId` | 华为云 | 该区域的项目 ID。 |
+
+每次查询都由云平台计费：CloudWatch 把每个序列的每个统计量按一次指标请求计费，Google Cloud 按返回的序列计费，其他平台超出每月免费额度后按调用次数计费。`metrics` 和 `statistics` 只选需要的，`period` 越长费用越低。**测试连接** 用已保存的设置发一个小请求，不改动读取位置。
+
+<Tip>
+  仓库的 `deploy/cloud` 目录提供了在云平台一侧建资源的模板：包含 Firehose 流、指标流与 CloudWatch Logs 订阅的 CloudFormation 堆栈，包含日志路由器接收器与 Pub/Sub 订阅的 Terraform 模块，以及建 Kafka 来源所读 Event Hubs 命名空间的 Bicep 文件。
+</Tip>
 
 ### 拉取的状况
 

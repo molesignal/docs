@@ -33,7 +33,7 @@ description: "通过数据源页面、接入 Token，以及原生、OpenTelemetr
 
 ## 接入 Token
 
-发送端使用 Bearer Token 认证：`Authorization: Bearer <token>`。
+发送端使用 Bearer Token 认证：`Authorization: Bearer <token>`。只支持 Basic 认证的发送端（例如云服务商托管 Prometheus 的 remote write 出口）把 API Token 放在 `Authorization: Basic` 的密码里，用户名任意。其他 Basic 凭据会被忽略，因此在反向代理上另设的 Basic 认证不受影响。Splunk HEC 发送端以 `Authorization: Splunk <token>` 携带 Token。
 
 | Token | 权限 | 创建方式 | 用途 |
 |---|---|---|---|
@@ -52,16 +52,17 @@ description: "通过数据源页面、接入 Token，以及原生、OpenTelemetr
 | 原生 HTTP JSON | `POST /api/v1/intake/{logs,metrics,traces}/{stream}` | `curl`、应用代码、Vector `http` sink、Fluent Bit `http` 输出 | 路径中的 `{stream}` |
 | OTLP over HTTP | `POST /api/v1/logs`、`/api/v1/metrics`、`/api/v1/traces` | OpenTelemetry SDK 与 Collector | `stream-name` 请求头，缺省为 `default` |
 | OTLP over gRPC | `:4317` | OpenTelemetry SDK 与 Collector | `stream-name` 元数据，缺省为 `default` |
-| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus、VictoriaMetrics 及任何 remote_write v1 发送端 | `stream-name` 请求头，否则为 `default` |
+| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus、VictoriaMetrics、云服务商托管 Prometheus 的导出，以及任何 remote_write v1 发送端 | `stream-name` 请求头，否则 `?stream=`，否则为 `default` |
 | Elasticsearch `_bulk` | `POST /api/v1/_bulk` | Filebeat、Logstash、Vector `elasticsearch` sink | 每个 action 的 `_index`，否则 `stream-name` 请求头，否则 `default` |
+| Splunk HEC | `POST /api/v1/services/collector/event`、`/api/v1/services/collector/raw` | 腾讯云 CLS、Vector 与 Fluent Bit 的 Splunk 输出、SIEM 转发器 | 每个事件的 `index`，否则 `?index=`，否则 `stream-name` 请求头，否则 `default` |
 | Loki push（JSON） | `POST /api/v1/loki/api/v1/push` | 能发送 Loki JSON 格式的发送端 | `stream-name` 请求头，缺省为 `default` |
-| Kinesis Firehose、Cloudflare Logpush、Heroku | `/api/v1/_kinesis_firehose`、`/api/v1/_cloudflare`、`/api/v1/_heroku` | AWS、Cloudflare、Heroku | 在连接器上配置，参见[连接器](/zh-Hans/connectors) |
+| Amazon Data Firehose、Google Cloud Pub/Sub 推送、云事件总线、Cloudflare Logpush、Heroku | `/api/v1/_kinesis_firehose`、`/api/v1/_gcp_pubsub`、`/api/v1/_cloud_events`、`/api/v1/_cloudflare`、`/api/v1/_heroku` | 经 Firehose 的 CloudWatch Logs 与 CloudWatch Metric Streams、经 Pub/Sub 的 Cloud Logging、EventBridge、Event Grid 与 CloudEvents 发送方、Cloudflare、Heroku | 在连接器上配置，参见[连接器](/zh-Hans/connectors) |
 
 除推送型连接器外，所有端点都需要具备信号对应的写入权限（`logs.write`、`metrics.write`、`traces.write` 或 `profiles.write`）的 Bearer Token。组织由 Token 决定，不会出现在 URL 中。
 
 ### 影响发送端的限制
 
-- **请求大小。** 原生 JSON 接入的请求体上限为 16 MiB，按解压后的大小计；其他接入端点为 2 MiB。超过上限的请求体会被拒绝并返回 `413`。请让每批数据小于该大小。
+- **请求大小。** 原生 JSON 接入和推送型连接器的请求体上限为 16 MiB，Firehose 为 64 MiB，均按解压后的大小计；其他接入端点为 2 MiB。超过上限的请求体会被拒绝并返回 `413`。请让每批数据小于该大小。
 - **压缩。** OTLP over HTTP 不接受压缩的请求体，会返回 `400`。请在发送端关闭压缩；OpenTelemetry Collector 的 `otlphttp` 导出端默认使用 gzip 压缩，需要设置 `compression: none`。原生 JSON 接入、Elasticsearch `_bulk`、Loki push 与推送型连接器接受 `Content-Encoding: gzip`。
 - **Loki 编码。** 只解析 JSON 请求格式。Promtail 与 Grafana Alloy 默认发送 snappy 压缩的 protobuf，无法向该端点发送数据。
 - **速率限制。** `router` 角色按组织限制请求，超限时返回 `429` 并附带 `Retry-After` 响应头。`standalone` 节点不应用这个限制。参见[分角色部署](/zh-Hans/deployment/role-based#速率限制)。
@@ -155,7 +156,7 @@ remote_write:
       credentials: "${MS_TOKEN}"
 ```
 
-一个指标数据流装一个来源的全部指标，所以请用 `stream-name` 请求头（`remote_write` 配置里的 `headers:`）给每台 Prometheus 指定自己的数据流；没有这个请求头时样本写入 `default`。每个样本成为一行，`metric_name` 是它的 `__name__`。其余标签成为字段，与指标字段同名的标签（例如 `metric_name`）存为 `exported_<名称>`。原生直方图与指标元数据会被跳过，exemplar 与样本一起保存。
+一个指标数据流装一个来源的全部指标，所以请用 `stream-name` 请求头（`remote_write` 配置里的 `headers:`）给每台 Prometheus 指定自己的数据流；没有这个请求头时样本写入 `default`。设不了请求头的发送端可以在地址里指定数据流，例如 `/api/v1/prometheus/api/v1/write?stream=aliyun`。每个样本成为一行，`metric_name` 是它的 `__name__`。其余标签成为字段，与指标字段同名的标签（例如 `metric_name`）存为 `exported_<名称>`。原生直方图与指标元数据会被跳过，exemplar 与样本一起保存。
 
 ## Elasticsearch bulk
 
@@ -180,6 +181,18 @@ curl -X POST http://localhost:5080/api/v1/_bulk \
 
 标签成为字段，日志行写入 `message` 字段，纳秒时间戳会转换为微秒。响应为 `204`。用 `stream-name` 请求头选择目标数据流。
 
+## Splunk HEC
+
+支持 Splunk HTTP Event Collector 协议的发送端（例如腾讯云 CLS 投递到 Splunk、Vector 与 Fluent Bit 的 Splunk 输出）可以原样发给 MoleSignal：HEC 地址填 `https://molesignal.example.com/api/v1`，HEC Token 填有日志写入权限的 API Token，以 `Authorization: Splunk <token>` 发送。
+
+| 端点 | 请求体 |
+|---|---|
+| `POST /api/v1/services/collector/event`，也接受 `/services/collector` | 首尾相接的 JSON 对象，每个形如 `{"time", "host", "source", "sourcetype", "index", "event", "fields"}` |
+| `POST /api/v1/services/collector/raw` | 文本，每行一条日志事件；`host`、`source`、`sourcetype`、`index` 取自查询参数 |
+| `GET /api/v1/services/collector/health` | 不需要 Token，返回 `{"text":"HEC is healthy","code":17}` |
+
+`event` 是 JSON 对象时作为日志的字段，否则放进 `message`。`fields`、`host`、`source`、`sourcetype` 成为字段，`time`（秒）成为事件时间。`index` 决定数据流，否则取查询参数 `index`，再否则取 `stream-name` 请求头，都没有时为 `default`。成功返回 `{"text":"Success","code":0}`，失败时返回 `400` 和 HEC 自己的错误码。不支持索引器确认（indexer acknowledgement）。
+
 ## 相关页面
 
 <CardGroup cols={2}>
@@ -190,7 +203,7 @@ curl -X POST http://localhost:5080/api/v1/_bulk \
     在事件到达时或按定时计划，对事件做路由、标准化、脱敏与扩展。
   </Card>
   <Card title="连接器" icon="inbox" href="/zh-Hans/connectors">
-    接收 Kinesis Firehose、Cloudflare Logpush 与 Heroku 日志投递。
+    接收 Amazon Data Firehose、Google Cloud Pub/Sub、云事件总线、Cloudflare Logpush 与 Heroku 的推送，并拉取六家云平台监控服务的指标。
   </Card>
   <Card title="身份与访问" icon="key" href="/zh-Hans/identity">
     创建服务账号并管理 API Token。

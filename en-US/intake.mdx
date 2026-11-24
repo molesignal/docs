@@ -33,7 +33,7 @@ The endpoint comes from `http.external_url` when it is set, and from the address
 
 ## Intake tokens
 
-Senders authenticate with a bearer token: `Authorization: Bearer <token>`.
+Senders authenticate with a bearer token: `Authorization: Bearer <token>`. A sender that can only do Basic authentication, such as the remote write export of a cloud provider's managed Prometheus, puts the API Token in the password of `Authorization: Basic` with any user name. Other Basic credentials are ignored, so a reverse proxy that asks for its own still works. A Splunk HEC sender presents the token as `Authorization: Splunk <token>`.
 
 | Token | Permission | Created by | Use |
 |---|---|---|---|
@@ -52,16 +52,17 @@ The **Datasource** page creates a RUM client token when an application id is ent
 | Native HTTP JSON | `POST /api/v1/intake/{logs,metrics,traces}/{stream}` | `curl`, application code, Vector `http` sink, Fluent Bit `http` output | The `{stream}` path segment |
 | OTLP over HTTP | `POST /api/v1/logs`, `/api/v1/metrics`, `/api/v1/traces` | OpenTelemetry SDKs and Collector | `stream-name` header, otherwise `default` |
 | OTLP over gRPC | `:4317` | OpenTelemetry SDKs and Collector | `stream-name` metadata, otherwise `default` |
-| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus, VictoriaMetrics, any remote_write v1 sender | `stream-name` header, otherwise `default` |
+| Prometheus remote_write | `POST /api/v1/prometheus/api/v1/write` | Prometheus, VictoriaMetrics, cloud-managed Prometheus exports, any remote_write v1 sender | `stream-name` header, otherwise `?stream=`, otherwise `default` |
 | Elasticsearch `_bulk` | `POST /api/v1/_bulk` | Filebeat, Logstash, Vector `elasticsearch` sink | `_index` of each action, otherwise `stream-name` header, otherwise `default` |
+| Splunk HEC | `POST /api/v1/services/collector/event`, `/api/v1/services/collector/raw` | Tencent Cloud CLS, Vector and Fluent Bit Splunk outputs, SIEM forwarders | `index` of each event, otherwise `?index=`, otherwise `stream-name` header, otherwise `default` |
 | Loki push (JSON) | `POST /api/v1/loki/api/v1/push` | Senders that can POST the Loki JSON shape | `stream-name` header, otherwise `default` |
-| Kinesis Firehose, Cloudflare Logpush, Heroku | `/api/v1/_kinesis_firehose`, `/api/v1/_cloudflare`, `/api/v1/_heroku` | AWS, Cloudflare, Heroku | Configured on the connector. See [Connectors](/en-US/connectors). |
+| Amazon Data Firehose, Google Cloud Pub/Sub push, cloud event buses, Cloudflare Logpush, Heroku | `/api/v1/_kinesis_firehose`, `/api/v1/_gcp_pubsub`, `/api/v1/_cloud_events`, `/api/v1/_cloudflare`, `/api/v1/_heroku` | CloudWatch Logs and CloudWatch Metric Streams through Firehose, Cloud Logging through Pub/Sub, EventBridge, Event Grid and CloudEvents senders, Cloudflare, Heroku | Configured on the connector. See [Connectors](/en-US/connectors). |
 
 All endpoints except the push connectors require a bearer token with the write permission of the signal: `logs.write`, `metrics.write`, `traces.write`, or `profiles.write`. The organization comes from the token and never appears in a URL.
 
 ### Limits that affect senders
 
-- **Request size.** Native JSON intake accepts request bodies up to 16 MiB, counted after decompression; the other intake endpoints accept up to 2 MiB. A larger body is rejected with `413`. Keep batches below that size.
+- **Request size.** Native JSON intake and the push connectors accept request bodies up to 16 MiB, and Firehose up to 64 MiB, counted after decompression; the other intake endpoints accept up to 2 MiB. A larger body is rejected with `413`. Keep batches below that size.
 - **Compression.** OTLP over HTTP does not accept compressed request bodies and answers `400`. Disable compression in the sender; the OpenTelemetry Collector `otlphttp` exporter compresses with gzip by default and needs `compression: none`. Native JSON intake, Elasticsearch `_bulk`, Loki push, and the push connectors accept `Content-Encoding: gzip`.
 - **Loki encoding.** Only the JSON request shape is decoded. Promtail and Grafana Alloy send snappy-compressed protobuf by default and cannot send to this endpoint.
 - **Rate limit.** The `router` role limits requests per organization and answers `429` with a `Retry-After` header. A `standalone` node does not apply this limit. See [Role-based deployment](/en-US/deployment/role-based#rate-limiting).
@@ -155,7 +156,7 @@ remote_write:
       credentials: "${MS_TOKEN}"
 ```
 
-A metrics stream holds the metrics of one source, so give each Prometheus server its own stream with the `stream-name` header (`headers:` in the `remote_write` entry); without it, samples go to `default`. Each sample becomes a row whose `metric_name` is its `__name__`. Other labels become fields, and a label named like a metric field, such as `metric_name`, is kept as `exported_<name>`. Native histograms and metric metadata are skipped, and exemplars are stored beside the samples.
+A metrics stream holds the metrics of one source, so give each Prometheus server its own stream with the `stream-name` header (`headers:` in the `remote_write` entry); without it, samples go to `default`. A sender that cannot set headers names the stream in the URL instead, as in `/api/v1/prometheus/api/v1/write?stream=aliyun`. Each sample becomes a row whose `metric_name` is its `__name__`. Other labels become fields, and a label named like a metric field, such as `metric_name`, is kept as `exported_<name>`. Native histograms and metric metadata are skipped, and exemplars are stored beside the samples.
 
 ## Elasticsearch bulk
 
@@ -180,6 +181,18 @@ The endpoint accepts the Loki JSON request shape:
 
 Labels become fields, the log line becomes the `message` field, and the nanosecond timestamp is converted to microseconds. The response is `204`. Select the target stream with the `stream-name` header.
 
+## Splunk HEC
+
+Senders that speak the Splunk HTTP Event Collector protocol, such as Tencent Cloud CLS shipping to Splunk or Vector's and Fluent Bit's Splunk outputs, can send to MoleSignal unchanged. Give them `https://molesignal.example.com/api/v1` as the HEC address and an API Token that may write logs as the HEC token, sent as `Authorization: Splunk <token>`.
+
+| Endpoint | Body |
+|---|---|
+| `POST /api/v1/services/collector/event`, also `/services/collector` | JSON objects one after another, each `{"time", "host", "source", "sourcetype", "index", "event", "fields"}` |
+| `POST /api/v1/services/collector/raw` | Text, one log event per line; `host`, `source`, `sourcetype`, and `index` come from the query |
+| `GET /api/v1/services/collector/health` | Answers `{"text":"HEC is healthy","code":17}` without a token |
+
+An `event` that is a JSON object gives the fields of the log; any other `event` becomes `message`. `fields`, `host`, `source`, and `sourcetype` become fields, and `time`, in seconds, becomes the time. `index` names the stream, otherwise the `index` query parameter, otherwise the `stream-name` header, otherwise `default`. The answer is `{"text":"Success","code":0}`, or HEC's own error codes with `400`. Indexer acknowledgement is not offered.
+
 ## Related pages
 
 <CardGroup cols={2}>
@@ -190,7 +203,7 @@ Labels become fields, the log line becomes the `message` field, and the nanoseco
     Route, normalize, redact, and enrich events as they arrive or on a schedule.
   </Card>
   <Card title="Connectors" icon="inbox" href="/en-US/connectors">
-    Receive Kinesis Firehose, Cloudflare Logpush, and Heroku log drains.
+    Receive Amazon Data Firehose, Google Cloud Pub/Sub, cloud event bus, Cloudflare Logpush, and Heroku pushes, and pull the metrics of six clouds' monitoring services.
   </Card>
   <Card title="Identity & access" icon="key" href="/en-US/identity">
     Create service accounts and manage API Tokens.

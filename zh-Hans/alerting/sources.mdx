@@ -28,6 +28,9 @@ description: "让 Alertmanager、Grafana、Datadog、PagerDuty、Zabbix、云监
 | **腾讯云可观测平台** | 通知模板里的接口回调 | 一条策略下一个对象的一个指标或事件，分级别的每级一个 |
 | **Amazon CloudWatch** | 告警发到 SNS 主题，主题的 HTTPS 订阅 | 一个告警 |
 | **Zabbix** | Zabbix 的 Webhook 媒介类型 | 一个问题 |
+| **Azure Monitor** | 操作组的 Webhook 操作，用通用警报架构 | 一个告警 |
+| **Google Cloud Monitoring** | Webhook 通知渠道，或经推送订阅的 Pub/Sub 通知渠道 | 一个 Monitoring 事件 |
+| **华为云云监控** | 告警发到 SMN 主题，主题的 HTTPS 订阅 | 一条告警规则下的一个资源 |
 | **邮件** | 一个 IMAP 邮箱，或已有的邮件系统转来的原始邮件 | 主题相同的一串邮件 |
 
 兼容 Alertmanager webhook 的系统，例如 Thanos、Cortex、Mimir 的 Alertmanager，按 **Alertmanager** 类型接入。
@@ -59,7 +62,7 @@ Token 形如 `mspat-<36 位>`，与 API Token 的样子相同，但只能用来�
 Authorization: Bearer <token>
 ```
 
-设不了请求头的发送方（阿里云云监控、腾讯云可观测平台、经 SNS 的 Amazon CloudWatch）把 Token 放在地址上：`https://<molesignal-host>/api/v1/intake/alerts?token=<token>`。
+设不了请求头的发送方（阿里云云监控、腾讯云可观测平台、经 SNS 的 Amazon CloudWatch、Azure Monitor、Google Cloud Monitoring、经 SMN 的华为云云监控）把 Token 放在地址上：`https://<molesignal-host>/api/v1/intake/alerts?token=<token>`。
 
 发送方要能访问这个地址。MoleSignal 前面有防火墙时，按发送方所在的站点或地域放行它的出口 IP：Datadog 每个站点的 IP 列表在 `ip-ranges` 的 `webhooks` 一节，PagerDuty 按美国区和欧洲区分别公布，阿里云云监控的推送网段见它的报警回调文档。MoleSignal 部署在内网时，只把这个地址开放到公网的做法见[公网访问](/zh-Hans/public-access)。
 
@@ -203,6 +206,54 @@ MoleSignal 验每条 SNS 消息的签名，所以 **Raw message delivery** 要�
 
 CloudWatch 的告警没有严重度，事件用来源的默认严重度。告警的 ARN 是去重键，组合告警也一样。告警的说明和状态变化的原因进注解，地域、账号、命名空间、指标和维度进标签，`aws.region` 这样的标签可以用来路由。
 
+### Azure Monitor
+
+Azure Monitor 的告警经操作组的 Webhook 操作发过来：
+
+1. 在告警规则用的操作组里加一个 **Webhook** 类型的操作，URI 填接入地址，Token 写在地址里。
+2. **启用通用警报架构** 选 **是**。不开会被拒收，来源详情的最近收到里写明原因。
+
+用 Azure CLI 是这样：
+
+```bash
+az monitor action-group update \
+  --resource-group <资源组> \
+  --name <操作组> \
+  --add-action webhook molesignal 'https://<molesignal-host>/api/v1/intake/alerts?token=<token>' usecommonalertschema
+```
+
+- **去重**：告警的 `alertId` 是去重键，里面带着 Azure 订阅。
+- **触发与解决**：`monitorCondition` 为 `Fired` 时开事件，为 `Resolved` 时解决。活动日志告警这类不记状态的告警只会触发，要人来解决。
+- **严重度**：`Sev0` 为 critical，`Sev1` 为 error，`Sev2` 为 warning，`Sev3`、`Sev4` 为 info。
+- **标签**：告警规则的自定义属性、指标维度，以及 `azure.subscription_id`、`azure.resource_group`、`azure.resource`、`azure.signal_type`、`azure.monitoring_service`、`azure.metric`。说明、条件、当前值和目标资源进注解，调查链接写成 `azure_url`。
+
+### Google Cloud Monitoring
+
+1. 在 Google Cloud 控制台打开 **Monitoring → Alerting → Edit notification channels**，新建 **Webhook** 渠道，**Endpoint URL** 填接入地址，Token 写在地址里。
+2. 把渠道加到告警政策的通知里。事件关闭时也会通知，事件自动解决。
+
+**Pub/Sub** 渠道发布的是同一份通知。要用它，就在它的主题上建一个推送订阅，推送端点填接入地址；MoleSignal 会解开 Pub/Sub 的信封。
+
+- **去重**：范围项目加 `incident_id`，一个 Monitoring 事件对应一个事件。
+- **触发与解决**：`state` 为 `open` 时开事件，为 `closed` 时解决。
+- **严重度**：告警政策设的严重级别 `Critical`、`Error`、`Warning`；没设的用来源的默认严重度。
+- **标签**：资源和指标的标签、告警政策和受监控资源的用户标签，以及 `gcp.project_id`、`gcp.resource_type`、`gcp.metric`、`gcp.policy`。摘要、条件、观测值、阈值和文档进注解，事件的控制台地址写成 `gcp_url`。
+
+### 华为云云监控
+
+云监控（CES）的告警不直接调外部地址，要经消息通知服务 SMN：
+
+1. 在 SMN 里给一个主题加订阅，协议选 **HTTPS**，订阅终端填接入地址，Token 写在地址里。
+2. 订阅自动确认：MoleSignal 验过确认消息的签名后访问它的 `subscribe_url`。
+3. 在云监控告警规则的告警通知里选这个主题，告警和恢复都要通知。不通知恢复时事件不会自动解决。
+
+MoleSignal 验每条 SMN 消息的签名。验签要从 `smn.<region>.myhuaweicloud.com` 取证书，收请求的节点要能访问这个地址。
+
+- **去重**：主题所在的项目、告警规则的 `alarm_id` 加资源。一条规则监控多个资源时，每个资源一个事件。
+- **触发与解决**：`alarm_status` 为 `alarm` 时开事件，为 `insufficient_data` 时按无数据开事件，为 `ok` 时解决。
+- **严重度**：告警级别的紧急为 critical，重要为 error，次要为 warning，提示为 info。
+- **标签**：维度（例如 `instance_id`），以及 `huawei.region`、`huawei.project_id`、`huawei.namespace`、`huawei.metric`、`huawei.alarm_id`、`huawei.resource_id`。告警内容、当前值和阈值进注解，告警的控制台地址写成 `huawei_url`。
+
 ### Zabbix
 
 Zabbix 6.0 起都能用。Zabbix 不定请求体，由媒介类型里的脚本发，所以来源详情（和新建时的弹窗）给出一份填好地址和 Token 的媒介类型：
@@ -264,6 +315,9 @@ curl -X POST 'https://<molesignal-host>/api/v1/intake/alerts' \
 | **阿里云云监控** | 账号、规则 ID 加 `dimensions`；系统事件为账号加 `dedupId` | `ALERT`、`INSUFFICIENT_DATA`；系统事件 `TRIGGERED` | `OK`；系统事件 `RESOLVED` | `triggerLevel`；系统事件 `severity` |
 | **腾讯云可观测平台** | 账号、策略、指标或事件名、级别和对象 | `alarmStatus` 为 `1` 或 `5` | `alarmStatus` 为 `0` | `alarmLevel` |
 | **Amazon CloudWatch** | `AlarmArn` | `NewStateValue` 为 `ALARM`、`INSUFFICIENT_DATA` | `NewStateValue` 为 `OK` | 没有，用来源的默认严重度 |
+| **Azure Monitor** | `alertId` | `monitorCondition` 为 `Fired` | `monitorCondition` 为 `Resolved` | `severity`：`Sev0` 为 critical，`Sev1` 为 error，`Sev2` 为 warning，`Sev3`、`Sev4` 为 info |
+| **Google Cloud Monitoring** | 范围项目加 `incident_id` | `state` 为 `open` | `state` 为 `closed` | `severity`；`No severity` 用来源的默认严重度 |
+| **华为云云监控** | SMN 主题所在的项目、`alarm_id` 加资源 | `alarm_status` 为 `alarm`、`insufficient_data` | `alarm_status` 为 `ok` | 告警级别：紧急、重要、次要、提示 |
 | **Zabbix** | `{$ZABBIX.URL}` 的主机名加 `{EVENT.ID}` | `{EVENT.VALUE}` 为 1；更新操作也算，严重度跟着变 | `{EVENT.VALUE}` 为 0，或更新操作关闭了问题 | `{EVENT.NSEVERITY}`：灾难为 critical，严重为 error，一般严重和警告为 warning，信息为 info |
 | **邮件** | 发件人的域名加主题里取出的部分 | 其余的邮件 | 主题符合恢复的写法 | 主题里的词 |
 
@@ -280,7 +334,7 @@ curl -X POST 'https://<molesignal-host>/api/v1/intake/alerts' \
 - **解决**：来源报恢复时解决事件，已确认的事件也一起解决。解决人为空，时间线显示为已恢复。
 - **晚到的旧消息**：每个去重键记着用过的发送方时间，比它早的消息直接忽略。迟到的触发不会开出僵尸事件，迟到的恢复也不会关掉新事件。API 不带时间，按收到的先后处理。
 - **有人先解决了**：来源还在报这条告警时，下一次重发会开一个新事件，与规则的行为相同。
-- **无数据**：阿里云云监控的 `INSUFFICIENT_DATA`、Datadog 的 No Data 开的事件带 `alert.condition=no_data`，通知标题以 `NO DATA` 开头。
+- **无数据**：阿里云云监控的 `INSUFFICIENT_DATA`、华为云云监控的 `insufficient_data`、Datadog 的 No Data 开的事件带 `alert.condition=no_data`，通知标题以 `NO DATA` 开头。
 - **停用与删除**：停用的来源拒收告警（`409`），已开的事件保留。删除来源时，它的 Token 立即失效，它开着的事件都会被解决。
 
 [静默策略](/zh-Hans/alerting/silences)、[语义分组](/zh-Hans/alerting/silences#语义分组)和[通知策略](/zh-Hans/notification-channels)对外部事件照常生效，可以按 `external.kind`、来源的附加标签或告警自己的标签匹配。

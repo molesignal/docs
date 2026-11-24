@@ -1,7 +1,7 @@
 ---
 title: "Connectors"
 sidebarTitle: "Connectors"
-description: "Bring logs in from CloudWatch Logs, Kafka topics, S3 objects, Amazon Data Firehose, Cloudflare Logpush, and Heroku, and deliver pipeline output to S3, Kafka, or an HTTP endpoint."
+description: "Bring logs and metrics in from CloudWatch Logs, Kafka topics, S3 objects, Amazon Data Firehose, Google Cloud Pub/Sub, Cloudflare Logpush, and Heroku, and deliver pipeline output to S3, Kafka, or an HTTP endpoint."
 "zh-Hans_link": "/zh-Hans/connectors"
 "zh-Hant_link": "/zh-Hant/connectors"
 "ja_link": "/ja/connectors"
@@ -14,7 +14,7 @@ description: "Bring logs in from CloudWatch Logs, Kafka topics, S3 objects, Amaz
 
 A **connector** is a managed integration with an external platform. Connectors work in two directions:
 
-- **Sources** bring logs in from another service and write them to a stream. MoleSignal pulls CloudWatch Logs, Kafka topics, and S3 objects on a schedule. Amazon Data Firehose, Cloudflare Logpush, and Heroku push their logs to MoleSignal.
+- **Sources** bring data in from another service and write it to a stream. MoleSignal pulls CloudWatch Logs, Kafka topics, and S3 objects on a schedule. Amazon Data Firehose, Google Cloud Pub/Sub, Cloudflare Logpush, and Heroku push to MoleSignal; Firehose also carries CloudWatch metrics.
 - **Destinations** receive the output of a [scheduled pipeline](/en-US/pipelines#sinks-and-connector-egress): Amazon S3 and S3-compatible storage, Apache Kafka, and any HTTP endpoint.
 
 | Kind | Connector | Direction | Authentication |
@@ -22,7 +22,11 @@ A **connector** is a managed integration with an external platform. Connectors w
 | `aws_cloudwatch_logs` | AWS CloudWatch Logs | Source, pulled every 30 seconds | [AWS credentials](#aws-authentication) |
 | `kafka_source` | Kafka topic | Source, pulled every 30 seconds | None, SASL, or a client certificate |
 | `s3_source` | S3 objects | Source, pulled every 30 seconds | AWS credentials |
+| `gcp_pubsub_pull` | Google Cloud Pub/Sub subscription | Source, pulled every 30 seconds | Service account key |
+| `aws_cloudwatch_metrics`, `azure_monitor_metrics`, `gcp_monitoring_metrics`, `aliyun_cms_metrics`, `tencent_monitor_metrics`, `huawei_ces_metrics` | [Cloud metrics](#cloud-metrics) | Source, pulled every period | The cloud's credentials |
 | `aws_kinesis_firehose` | Amazon Data Firehose | Source, pushed | [Push token](#push-sources) |
+| `gcp_pubsub_push` | Google Cloud Pub/Sub push | Source, pushed | Push token, optionally with the subscription's OIDC token |
+| `cloud_events` | Cloud event bus | Source, pushed | Push token |
 | `cloudflare_logpush` | Cloudflare Logpush | Source, pushed | Push token |
 | `heroku_drain` | Heroku log drain | Source, pushed | Push token |
 | `s3` | Amazon S3 | Destination | AWS credentials |
@@ -72,7 +76,11 @@ These keys of `configJson` hold secrets:
 | Kind | Secret keys |
 |---|---|
 | `s3`, `aws_cloudwatch_logs` | `accessKey`, `secretKey`, `sessionToken` |
-| `aws_kinesis_firehose`, `cloudflare_logpush`, `heroku_drain` | `pushToken` |
+| `aws_kinesis_firehose`, `gcp_pubsub_push`, `cloud_events`, `cloudflare_logpush`, `heroku_drain` | `pushToken` |
+| `aws_cloudwatch_metrics` | `accessKey`, `secretKey`, `sessionToken` |
+| `azure_monitor_metrics` | `clientSecret` |
+| `gcp_monitoring_metrics`, `gcp_pubsub_pull` | `serviceAccountKey` |
+| `aliyun_cms_metrics`, `tencent_monitor_metrics`, `huawei_ces_metrics` | `accessKey`, `secretKey` |
 | `kafka` | `saslPassword`, `tlsClientKey` |
 | `http` | `url`, `bearerToken`, `basicPassword`, `headerValue`, `hmacSecret` |
 
@@ -103,17 +111,19 @@ MoleSignal seals the secrets with the root key from `MS_CIPHER_KEY` (AES-256-GCM
 
 ### Push sources
 
-The three push sources share one model: create a connector with a **`pushToken`** and a **`target_stream`**, then point the platform at the matching endpoint. These endpoints do not use the JWT. The request authenticates with the push token, supplied whichever way the platform allows:
+The five push sources share one model: create a connector with a **`pushToken`** and a **`targetStream`**, then point the platform at the matching endpoint. These endpoints do not use the JWT. The request authenticates with the push token, supplied whichever way the platform allows:
 
 | Method | Used by |
 |---|---|
 | `X-Connector-Token` header | Platforms with configurable headers, such as Cloudflare |
 | `X-Amz-Firehose-Access-Key` header | Amazon Data Firehose, which sends it automatically |
-| `?token=` query parameter | Platforms that cannot set headers, such as Heroku |
+| `X-EventBridge-Signature-Token` header | Alibaba Cloud EventBridge |
+| `?token=` query parameter | Platforms that cannot set headers, such as Heroku and Pub/Sub |
+| Password of `Authorization: Basic` | Platforms that put credentials in the address |
 
-The UI generates the token when it creates the connector and shows it once, with the endpoint to give the platform. The token cannot be read back. **Generate a new token** replaces it when the connector is saved. Over the API, supply a `pushToken` of at least 16 characters. One token opens one connector of a kind: a token already in use answers `409`. A request with a missing or unknown token, or for a connector that is turned off, answers `401`. A connector without a token accepts nothing.
+The UI generates the token when it creates the connector and shows it once, with the endpoint to give the platform. The token cannot be read back. **Generate a new token** replaces it when the connector is saved. Over the API, supply a `pushToken` of at least 16 characters. One token opens one connector of a kind: a token already in use answers `409`. A request with a missing or unknown token, or for a connector that is turned off, answers `401`. A connector without a token accepts nothing. A node keeps a connector it has looked up for 30 seconds, so turning a connector off or replacing its token takes effect within that time.
 
-Bodies sent with `Content-Encoding: gzip` are decompressed automatically. Events flow through the same intake path as everything else: schema-on-write, [pipelines](/en-US/pipelines), and [masking](/en-US/security) all apply.
+Bodies sent with `Content-Encoding: gzip` are decompressed automatically. A Firehose body may be up to 64 MiB, any other up to 16 MiB, counted after decompression as well. Events flow through the same intake path as everything else: schema-on-write, [pipelines](/en-US/pipelines), and [masking](/en-US/security) all apply.
 
 <Tabs>
   <Tab title="Amazon Data Firehose">
@@ -122,7 +132,73 @@ Bodies sent with `Content-Encoding: gzip` are decompressed automatically. Events
     - **HTTP endpoint URL**: `https://molesignal.example.com/api/v1/_kinesis_firehose`
     - **Access key**: the push token. Firehose sends it as `X-Amz-Firehose-Access-Key`.
 
-    MoleSignal base64-decodes each record, splits the record on newlines, and parses each line as JSON, falling back to a `message` field for plain text. MoleSignal returns the `200` acknowledgment that Firehose expects.
+    Firehose delivers only to HTTPS on port 443 with a publicly trusted certificate, so a deployment on a private network needs a public entry point, see [Public access](/en-US/public-access). Keep the stream's buffer at 1 to 4 MiB.
+
+    MoleSignal reads each record on its own, by what it holds:
+
+    | Record | Becomes |
+    |---|---|
+    | A CloudWatch Logs subscription message, gzipped as the subscription filter sends it | One log event per entry of `logEvents`, at the entry's own time, with `message`, `log_group`, `log_stream`, `account_id`, `region`, `event_id`, and `source: "cloudwatch"`. The health check the subscription sends when it is created is skipped. |
+    | A CloudWatch Metric Streams record in the JSON, OpenTelemetry 1.0, or OpenTelemetry 0.7 output format | Metric samples in the metrics stream, see below. |
+    | Any other text | One log event per line: a JSON object gives the fields, plain text goes to `message`. |
+
+    A metric stream sends one aggregate per metric per minute. Each statistic becomes a gauge sample named `aws_<namespace>_<metric>_<statistic>`, the way yet-another-cloudwatch-exporter names them: `aws_ec2_cpuutilization_average`, `aws_ec2_cpuutilization_maximum`, `aws_applicationelb_request_count_sum`. The namespace drops its `AWS/` prefix, and the metric name splits into words where a lower-case letter meets a capital. The statistics are `average` (the sum over the sample count), `sum`, `sample_count`, `minimum`, `maximum`, and any percentile the stream adds, such as `p99` or `p99_9`. The labels are `account_id`, `region`, and one `dimension_<Name>` per dimension, such as `dimension_InstanceId`; `metric_unit` keeps the unit.
+
+    ```promql
+    max by (dimension_InstanceId) (aws_ec2_cpuutilization_average)
+    ```
+
+    `X-Amz-Firehose-Common-Attributes`, set as the stream's parameters, adds its keys to every event and sample; a field the record already has wins. `X-Amz-Firehose-Source-Arn` gives the `region` of CloudWatch Logs events, which do not carry one.
+
+    The answer follows the Firehose delivery specification: `application/json` with the request's `requestId`, a `timestamp`, and an `errorMessage` on failure. Records that cannot be read are left out, and the rest of the request is still written with `200`. A write that fails for now answers `429` or `5xx`, which Firehose retries. A body over 64 MiB answers `413`, which Firehose does not retry or back up. A delivery retried within 30 minutes of being written, with the same `X-Amz-Firehose-Request-Id`, is answered `200` without being written again.
+  </Tab>
+  <Tab title="Google Cloud Pub/Sub">
+    Create the connector with `kind: "gcp_pubsub_push"`. Route logs to a Pub/Sub topic with a Log Router sink, then create a push subscription on the topic. Pub/Sub cannot set custom headers, so the token travels in the URL:
+
+    ```bash
+    gcloud pubsub subscriptions create molesignal-push --topic=molesignal-logs --push-endpoint="https://molesignal.example.com/api/v1/_gcp_pubsub?token=<pushToken>"
+    ```
+
+    To also check the subscription's OIDC token, set `oidcServiceAccount` on the connector to the email of a service account and create the subscription with `--push-auth-service-account=<email>`. MoleSignal then verifies the token against Google's keys and accepts only that service account. Set `oidcAudience` to check the audience as well, and pass the same value as `--push-auth-token-audience`.
+
+    Each message is one request. Both the wrapped body and an unwrapped payload are accepted. A Cloud Logging `LogEntry` becomes one log event:
+
+    | `LogEntry` | Event |
+    |---|---|
+    | `jsonPayload` | Its fields |
+    | `textPayload` | `message` |
+    | `protoPayload` (audit logs) | `proto_payload`, with `method_name`, `service_name`, and `principal_email` taken out of it |
+    | `severity` | `level`, lower-cased |
+    | `logName`, `resource.type`, `insertId` | `log_name`, `resource_type`, `insert_id` |
+    | `resource.labels`, `labels` | Fields under their own names |
+    | `trace`, `spanId` | `trace_id` without the `projects/<id>/traces/` prefix, `span_id` |
+    | `httpRequest` | `http_request` |
+    | `timestamp` | The event's time; `receiveTimestamp` or the publish time when it is missing |
+
+    Any other message data becomes one event, the fields of a JSON object or the text as `message`. The endpoint replies `204 No Content`, which Pub/Sub counts as an acknowledgment. A message that cannot be read is acknowledged and left out; a write that fails for now is not, so Pub/Sub delivers it again. A message delivered again within 30 minutes of being written is acknowledged without being written again.
+  </Tab>
+  <Tab title="Cloud event bus">
+    Create the connector with `kind: "cloud_events"`, then point the event bus at `https://molesignal.example.com/api/v1/_cloud_events`:
+
+    | Sender | Setup |
+    |---|---|
+    | Amazon EventBridge | An API destination with an **API key** connection; the header name is `X-Connector-Token` and its value the push token. |
+    | Azure Event Grid | A webhook subscription whose endpoint ends with `?token=<pushToken>`. The validation handshake, and the `OPTIONS` handshake of the CloudEvents schema, are answered automatically. |
+    | Alibaba Cloud EventBridge | An HTTPS target with the push token as its token, sent as `X-EventBridge-Signature-Token`. |
+    | Huawei Cloud EventGrid | A webhook target with the header `X-Connector-Token`. |
+    | Other CloudEvents senders | Any of the token methods above. A sender that can only put credentials in the address, as `https://user:<pushToken>@host/...`, is accepted too. |
+
+    A body holds one event or an array of them, as CloudEvents 1.0 in structured or binary mode, Amazon EventBridge events, or the Event Grid schema. Each event becomes one log event in `targetStream` (default `cloud_events`):
+
+    | Field | From |
+    |---|---|
+    | `event_id`, `event_source`, `event_type`, `event_subject` | CloudEvents `id`, `source`, `type`, `subject`; EventBridge `id`, `source`, `detail-type`; Event Grid `id`, `topic`, `eventType`, `subject` |
+    | `account_id`, `region` | EventBridge `account`, `region`; Alibaba Cloud `aliyunaccountid`, `aliyunregionid`; the subscription of an Event Grid topic |
+    | `resources` | EventBridge `resources` |
+    | `data` | The payload as one JSON field; a text payload goes to `message` |
+    | `event_format` | `cloudevents`, `eventbridge`, or `event_grid` |
+
+    Extension attributes keep their names. The event's own time is its time. Any other JSON object becomes one event with its fields as they are. An event delivered again within 30 minutes, with the same source and id, is not written twice. The endpoint replies `200`, or `400` for a body that is not JSON.
   </Tab>
   <Tab title="Cloudflare Logpush">
     Create the connector with `kind: "cloudflare_logpush"`, then create a Logpush job with an HTTP destination. Cloudflare turns a `header_` query parameter into a request header, so the token travels in `X-Connector-Token`:
@@ -145,7 +221,7 @@ Bodies sent with `Content-Encoding: gzip` are decompressed automatically. Events
 </Tabs>
 
 <Tip>
-  The `target_stream` is created on first delivery, and the schema evolves as new fields appear, the same as any other stream. Omit `target_stream` to fall back to a per-source default: `kinesis`, `cloudflare`, or `heroku`.
+  The `targetStream` is created on first delivery, and the schema evolves as new fields appear, the same as any other stream. Omit `targetStream` to fall back to a per-source default: `kinesis`, `gcp`, `cloud_events`, `cloudflare`, or `heroku`. A Firehose connector writes metric samples to `metricsStream`, `cloudwatch` by default.
 </Tip>
 
 ### CloudWatch Logs
@@ -204,12 +280,15 @@ curl -X POST http://localhost:5080/api/v1/connectors \
 |---|---|
 | `brokers`, `topic`, `tls`, `tlsCaCert`, `auth` and its keys | As for a [Kafka destination](#apache-kafka). |
 | `targetStream` | Destination stream. Default `default`. |
+| `messageFormat` | `json`, the default, or `azure_records` for what Azure Monitor exports to an event hub, see below. UI: **Message format**. |
 | `startFrom` | Where the first read starts: `latest`, the default, for what arrives from now on, or `earliest` for everything the brokers hold. A partition added later is read from its beginning. UI: **Start from**. |
 
 - A message whose value is a JSON object gives the fields of the log. Any other value becomes its `message`. Each log also has `kafka_topic`, `kafka_partition`, `kafka_offset`, `kafka_key` when the message has a key, and `source`. Its time is the message's timestamp.
 - One read takes up to 10,000 messages or 32 MiB, and the next one follows at once while there is more, for up to 2 minutes in a pull.
 - The offsets move only once the logs are written. A read or a write that fails is tried again from the same place 30 seconds later, so a message can be written twice but not lost. Offsets that the brokers have aged out go on from the oldest message they still hold.
 - Changing the `topic` starts over from `startFrom`, since the offsets belong to the topic.
+
+Azure diagnostic settings, Log Analytics data export, and data collection rules export to Azure Event Hubs, which a Kafka source reads through the hub's Kafka endpoint: `brokers` `<namespace>.servicebus.windows.net:9093`, `topic` the event hub, `tls` on, `auth: sasl_plain` with the user name `$ConnectionString` and the connection string as the password. The Basic tier has no Kafka endpoint. With `messageFormat: azure_records`, each `{"records": [...]}` message is unpacked: a log record becomes a log event at its `time`, and a metric record becomes one sample per statistic in the connector's `metricsStream` (default `default`), named as [Azure Monitor metrics](#cloud-metrics) are.
 
 ### S3 objects
 
@@ -245,6 +324,71 @@ curl -X POST http://localhost:5080/api/v1/connectors \
 - The read state moves only once the logs are written. An object that cannot be fetched stops the pull there and is tried again 30 seconds later, so a log can be written twice but not lost.
 - An object that cannot be read is skipped and said on the connector, since trying it again would hold back everything after it. That is one that is corrupt, over 256 MiB, over 512 MiB once decompressed, over a million logs, or with a line over 64 MiB.
 - An object is recognized by its key and its time of modification, with a margin of 5 minutes. An object that is written again under the same key within that margin is not read again, and one whose time of modification is more than 5 minutes older than the newest object read is not read at all. S3 dates a multipart upload from when it began, so a slower upload than that goes unread.
+
+### Google Cloud Pub/Sub subscriptions
+
+A `gcp_pubsub_pull` connector reads a Pub/Sub subscription every 30 seconds, up to 1,000 messages a request and on at once while there is more, and acknowledges the messages only once they are written. What fails to be written is delivered again when its acknowledgement deadline passes, so a message can be written twice but not lost. It suits more logs than a [push subscription](#push-sources), which sends one message a request, carries well.
+
+| Field | Notes |
+|---|---|
+| `serviceAccountKey` | The JSON key file of a service account with `roles/pubsub.subscriber` on the subscription. |
+| `subscription` | `projects/<project>/subscriptions/<name>`, or the name of a subscription in the key's project. Give it an acknowledgement deadline of 60 seconds or more. |
+| `targetStream` | Destination stream. Default `default`. |
+
+Each message is read as a pushed one is: a Cloud Logging `LogEntry` with the mapping of the push tab, any other JSON object as its fields, anything else as `message`. **Test connection** asks whether the key may consume the subscription, without taking a message.
+
+### Cloud metrics
+
+Six sources pull the metrics of a cloud's monitoring service on a schedule and write them to a metrics stream:
+
+| Kind | Cloud | API | Authentication | Permission | Default `metricsStream` |
+|---|---|---|---|---|---|
+| `aws_cloudwatch_metrics` | Amazon CloudWatch | `ListMetrics`, `GetMetricData` | [AWS credentials](#aws-authentication) | `cloudwatch:ListMetrics`, `cloudwatch:GetMetricData` | `cloudwatch` |
+| `azure_monitor_metrics` | Azure Monitor | Resource Graph, `metrics:getBatch` | `tenantId`, `clientId`, `clientSecret` of an app registration | **Monitoring Reader** on the subscription | `azure` |
+| `gcp_monitoring_metrics` | Google Cloud Monitoring | `timeSeries.list` | `serviceAccountKey`, the JSON key file | `roles/monitoring.viewer` on the project | `gcp` |
+| `aliyun_cms_metrics` | Alibaba Cloud CloudMonitor | `DescribeMetricList` | `accessKey`, `secretKey` | `AliyunCloudMonitorReadOnlyAccess` | `aliyun` |
+| `tencent_monitor_metrics` | Tencent Cloud Monitor | `GetMonitorData` | `accessKey` (SecretId), `secretKey` (SecretKey) | `QcloudMonitorReadOnlyAccess`, plus `QcloudCVMReadOnlyAccess` to find CVM instances | `tencentcloud` |
+| `huawei_ces_metrics` | Huawei Cloud Eye | `ListMetrics`, `BatchListMetricData` | `accessKey` (AK), `secretKey` (SK) | `CES ReadOnlyAccess` | `huaweicloud` |
+
+Each pull reads whole periods of `period` seconds that ended at least `delay` seconds ago, starting where the last written pull ended. A cloud completes an aggregate some minutes after its period ends, and each period is read once: a value corrected later stays as read. A new connector starts one period back. A pull reads at most 12 periods and goes on at the next tick; a connector that was off for more than 6 hours skips what is older and says so.
+
+Each statistic of each series becomes one gauge sample named `<cloud>_<namespace>_<metric>_<statistic>`, the way yet-another-cloudwatch-exporter names CloudWatch metrics, at the start of its period:
+
+| Source | Example | Labels |
+|---|---|---|
+| CloudWatch | `aws_ec2_cpuutilization_average` | `region`, `dimension_<Name>` |
+| Azure Monitor | `azure_compute_virtualmachines_percentage_cpu_average` | `subscription_id`, `resource_group`, `resource_name`, `resource_id`, `region`, `dimension_<name>`, `tag_<key>` |
+| Cloud Monitoring | `gcp_compute_instance_cpu_utilization_mean` | `project_id`, `resource_type`, the resource and metric labels |
+| CloudMonitor | `aliyun_ecs_dashboard_cpuutilization_average` | `region`, `user_id`, `dimension_<key>` |
+| Tencent Cloud Monitor | `tencentcloud_cvm_cpu_usage_avg` | `region`, `dimension_<Name>` |
+| Cloud Eye | `huaweicloud_sys_ecs_cpu_util_average` | `region`, `dimension_<name>` |
+
+These are the same names a [CloudWatch metric stream through Firehose](#push-sources) writes, so PromQL works over both:
+
+```promql
+max by (dimension_InstanceId) (aws_ec2_cpuutilization_average)
+```
+
+| Field | Sources | Notes |
+|---|---|---|
+| `metricsStream` | All | Destination metrics stream. |
+| `period` | All | Seconds, whole minutes. Default 300. Azure takes 60, 300, 900, 1800, 3600, 21600, 43200, or 86400; Huawei Cloud 300, 1200, 3600, 14400, or 86400. |
+| `delay` | All | Seconds after a period ends before it is read. Default 600 for CloudWatch and Azure, 300 for the others. |
+| `region` | All but Google Cloud | Such as `us-east-1`, `eastus`, `cn-hangzhou`, `ap-guangzhou`, `cn-north-4`. |
+| `namespace` | CloudWatch, CloudMonitor, Tencent Cloud, Cloud Eye | Such as `AWS/EC2`, `acs_ecs_dashboard`, `QCE/CVM`, `SYS.ECS`. |
+| `metrics` | All | Metric names, comma- or line-separated. Required except for CloudWatch, which reads every metric of the namespace that had data in the last three hours when left empty, at most 2,000 series. Google Cloud takes metric types, such as `compute.googleapis.com/instance/cpu/utilization`. |
+| `statistics` | CloudWatch, CloudMonitor, Tencent Cloud, Cloud Eye | CloudWatch: `Average`, `Sum`, `Minimum`, `Maximum`, `SampleCount`, and percentiles such as `p99`; default `Average`, `Maximum`. CloudMonitor: `Average`, `Maximum`, `Minimum`, `Sum`; default `Average`, `Maximum`. Tencent Cloud: `avg`, `max`, `min`; default `avg`. Cloud Eye: `average`, `max`, `min`, `sum`, `variance`; default `average`. |
+| `subscriptionId`, `resourceType`, `aggregations`, `filter`, `top` | Azure | The resource type is also the metric namespace, such as `Microsoft.Compute/virtualMachines`. Aggregations: `average` (default), `minimum`, `maximum`, `total`, `count`. `filter` splits by a dimension, such as `LUN eq '*'`; `top` caps the series it splits into, default 100. |
+| `projectId`, `filter` | Google Cloud | The project defaults to the key's. `filter` is a clause added to each metric's filter. Gauges are read as `mean`, deltas as `sum`, counters as `rate`, distributions as `count` and `mean`. |
+| `dimensions` | CloudMonitor | Optional JSON passed as `Dimensions`; empty reads every instance of the account. |
+| `instances` | Tencent Cloud | One instance per line as `Name=Value`, several dimensions joined with `&`. Required except for `QCE/CVM`, whose instances are found in the region when left empty. |
+| `projectId` | Cloud Eye | The project of the region. |
+
+Every query is billed by the cloud: CloudWatch bills each statistic of each series as one metric requested, Google Cloud bills by the series returned, the others by API call beyond a free monthly quota. Keep `metrics` and `statistics` to what is needed, and a longer `period` costs less. **Test connection** makes one small request with the saved settings and moves nothing.
+
+<Tip>
+  The repository's `deploy/cloud` directory holds templates that set up the cloud side: a CloudFormation stack with the Firehose stream, a metric stream, and a CloudWatch Logs subscription; a Terraform module with the Log Router sink and the Pub/Sub subscription; and a Bicep file with the Event Hubs namespace a Kafka source reads.
+</Tip>
 
 ### How a pull is going
 
