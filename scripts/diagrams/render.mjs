@@ -2,14 +2,14 @@
 //
 // Excalidraw's exporters need a real DOM, so they run inside headless Chromium through Playwright, with
 // the library loaded from esm.sh. Each SVG embeds a subset of the hand-drawn fonts, Excalifont and, for
-// Chinese, Xiaolai, so it looks the same through <img> on any machine.
+// Chinese, Japanese and Korean, Xiaolai, so it looks the same through <img> on any machine.
 //
 // A definition holds one layout and the text of every language, so the languages cannot drift apart:
 //
 //   { nodes: [{ id, x, y, w, h, text, dashed, frame }], texts: [{ id, x, y, text }],
 //     edges: [{ from, to, label, dashed, fromSide, toSide, fromAt, toAt, via }] }
 //
-// `text` and `label` are either one string or { en, 'zh-Hans' }. An edge finds its own anchors: sides
+// `text` and `label` are either one string or { en, 'zh-Hans', … } with a key per language. An edge finds its own anchors: sides
 // follow from where the two boxes sit, and the arrow stays straight when the boxes overlap on that axis.
 // `fromSide` and `toSide`, given together, choose the sides instead. `fromAt` and `toAt` move an anchor
 // along its side, from 0 to 1. `via` adds corner points, in absolute coordinates.

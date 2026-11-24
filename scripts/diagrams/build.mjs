@@ -1,4 +1,4 @@
-// Builds the architecture diagrams of the docs, in both languages, light and dark.
+// Builds the architecture diagrams of the docs, in every language of the site, light and dark.
 //
 // Mintlify cannot embed live Excalidraw, so each diagram is committed as static SVGs that the .mdx
 // pages <img>, with light and dark variants through `className="block dark:hidden"` and
@@ -11,16 +11,32 @@
 // Keep a diagram at most about 900 wide: the page column is 609 pixels on a 1440 screen, so the
 // 16 pixel text of a wider diagram becomes too small to read without opening it.
 //
+// The text is written here in English and Simplified Chinese; `text/<lang>.json` holds the other
+// languages, keyed by the English text. A string missing from one of them stops the build.
+//
 // Usage: node scripts/diagrams/build.mjs [key ...]      (default: all keys)
 // Needs Playwright on disk: the product's web app has it, or set PLAYWRIGHT_PATH.
 
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { renderDiagrams } from './render.mjs';
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const t = (en, zh) => ({ en, 'zh-Hans': zh });
+const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(HERE, '..', '..');
+const TRANSLATED = ['zh-Hant', 'ja', 'ko', 'de', 'es', 'fr', 'pt-BR'];
+const LANGS = ['en', 'zh-Hans', ...TRANSLATED];
+const TEXT = Object.fromEntries(TRANSLATED.map((lang) => [lang, JSON.parse(readFileSync(resolve(HERE, 'text', `${lang}.json`), 'utf8'))]));
+
+const t = (en, zh) => {
+  const text = { en, 'zh-Hans': zh };
+  for (const lang of TRANSLATED) {
+    text[lang] = TEXT[lang][en];
+    if (text[lang] === undefined) throw new Error(`scripts/diagrams/text/${lang}.json lacks ${JSON.stringify(en)}`);
+  }
+  return text;
+};
 
 const overview = {
   nodes: [
@@ -222,5 +238,6 @@ await renderDiagrams(selected, {
   images: resolve(ROOT, 'images', 'architecture'),
   sources: resolve(ROOT, 'diagrams'),
   source: 'molesignal-docs',
+  langs: LANGS,
 });
 console.log('done.');

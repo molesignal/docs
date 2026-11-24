@@ -178,7 +178,7 @@ function bodyJobs(llm, work, glossary) {
       const { text, blocks } = protectCode(splitPage(source).body);
       const parts = await Promise.all(splitSections(text, PART_SIZE).map((part) => translatePart(llm, language, part, glossary)));
       const translated = language.joinLines ? joinWrappedLines(parts.join('\n')) : parts.join('\n');
-      const body = retarget(restoreCode(translated, blocks), language.from, language.dir);
+      const body = localizeImages(retarget(restoreCode(translated, blocks), language.from, language.dir), language);
       writeFile(pagePath(language.dir, page), joinPage(front, body, languageLinks(language.dir, page, hasPage)));
       state.pages[page] = hash(source);
       saveState(language.dir, state);
@@ -213,6 +213,27 @@ function fixAnchors(language) {
     unresolved.push(...fixed.unresolved.map((anchor) => `${language.dir}/${page} → ${anchor}`));
   }
   return unresolved;
+}
+
+/**
+ * Points the architecture diagrams at the target language's images, `<key>_<code>_<theme>.svg`,
+ * which `scripts/diagrams/build.mjs` renders for every language. An image it lacks stays as it was.
+ */
+function localizeImages(text, language) {
+  const from = languageByDir(language.from).code;
+
+  return text.replace(/\/images\/architecture\/([\w-]+?)_([\w-]+)_(light|dark)\.svg/g, (whole, key, code, theme) => {
+    const localized = `/images/architecture/${key}_${language.code}_${theme}.svg`;
+    return code === from && existsSync(join(ROOT, localized)) ? localized : whole;
+  });
+}
+
+function fixImages(language) {
+  for (const page of listPages(join(ROOT, language.dir))) {
+    const text = readPage(language.dir, page);
+    const localized = localizeImages(text, language);
+    if (localized !== text) writeFile(pagePath(language.dir, page), localized);
+  }
 }
 
 /** Joins wrapped paragraph lines in a language written without spaces; see `joinWrappedLines`. */
@@ -291,7 +312,10 @@ async function main() {
   for (const { language, orphans } of works) {
     for (const page of orphans) rmSync(pagePath(language.dir, page));
   }
-  for (const { language } of works) fixWrappedLines(language);
+  for (const { language } of works) {
+    fixWrappedLines(language);
+    fixImages(language);
+  }
   const unresolved = works.flatMap(({ language }) => fixAnchors(language));
   const relinked = fixLanguageLinks();
   fixNavigation(works);
