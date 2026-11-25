@@ -1,0 +1,196 @@
+---
+title: "Node Agent"
+description: "Installieren Sie MoleSignal Node Agent auf Linux-Hosts und Kubernetes-Nodes, verfolgen Sie den Eingang seiner Metriken, Events und Profile und installieren Sie das Host-Dashboard, gespeicherte Ansichten und Alarmregeln."
+"en_link": "/en-US/intake/node-agent"
+"zh-Hans_link": "/zh-Hans/intake/node-agent"
+"zh-Hant_link": "/zh-Hant/intake/node-agent"
+"ja_link": "/ja/intake/node-agent"
+"ko_link": "/ko/intake/node-agent"
+"es_link": "/es/intake/node-agent"
+"fr_link": "/fr/intake/node-agent"
+"pt-BR_link": "/pt-BR/intake/node-agent"
+---
+
+MoleSignal Node Agent läuft auf jedem Linux-Host und sendet drei Signale mit einem Intake-Token:
+
+| Signal | Ziel | Inhalt |
+|---|---|---|
+| Metriken | Der Metrik-Stream `host-metrics`, über OTLP | CPU, Last, Arbeitsspeicher, Datenträger, Netzwerk und mehr, benannt als `molesignal_host_*`. |
+| Ereignisse | Der Log-Stream `host-events`, über OTLP | Kernel- und Hardware-Ereignisse: OOM-Kills, Paketverluste, TCP-Retransmits, Link-Änderungen, RAS-Fehler, hängende Tasks, Soft Lockups. |
+| Profile | Die Profilaufnahme, `/api/v1/profiles/intake` | CPU-Profile der Workloads des Hosts, im pprof-Format, wenn kontinuierliches Profiling aktiviert ist. |
+
+Die Seite **Datenquelle** erzeugt die folgenden Befehle mit der tatsächlichen Adresse und dem Token bereits ausgefüllt: Öffnen Sie **Datenquelle → Empfohlen → MoleSignal Node Agent**.
+
+## Vor der Installation
+
+- Ein Linux-Host mit systemd oder ein Kubernetes-Cluster. Kernel-Ereignisse benötigen BTF (`/sys/kernel/btf/vmlinux`) und tracefs.
+- Root auf dem Host oder ein Namespace, der privilegierte Pods zulässt.
+- Ein [Intake-Token](/de/intake#intake-token) des Workspace.
+- Netzwerkzugriff vom Host auf zwei Ports von MoleSignal: OTLP gRPC auf `4317` für Metriken und Ereignisse sowie die HTTP-API für den Fallback und Profil-Uploads.
+
+## Mit systemd installieren
+
+Das Agent-Release enthält das Binary und `deploy/systemd/install.sh`. Auf jedem Host als Root im entpackten Release:
+
+1. Installieren Sie das Binary, die Unit und `/etc/molesignal-node-agent`, ohne den Agenten zu starten.
+
+   ```bash
+   sh deploy/systemd/install.sh install ./molesignal-node-agent --no-start
+   ```
+
+2. Tragen Sie die Adresse von MoleSignal und den Token ein, und starten Sie dann den Agenten.
+
+   ```bash
+   cat > /etc/molesignal-node-agent/agent.env <<'ENV'
+   MS_ENDPOINT=https://molesignal.example.com:4317
+   MS_HTTP_ENDPOINT=https://molesignal.example.com
+   MS_TOKEN_PATH=/etc/molesignal-node-agent/token
+   ENV
+   printf '%s' '<token>' > /etc/molesignal-node-agent/token
+   chmod 0600 /etc/molesignal-node-agent/token
+   systemctl enable --now molesignal-node-agent
+   ```
+
+Verwenden Sie `http://` in `MS_ENDPOINT`, wenn gRPC ohne TLS bereitgestellt wird. `install.sh upgrade <binary>` aktualisiert und macht die Aktualisierung selbst rückgängig, wenn das neue Release nicht bereit wird; `install.sh uninstall` entfernt es und behält die Konfiguration und die in der Warteschlange befindlichen Batches bei.
+
+## Auf Kubernetes installieren
+
+Das Agent-Release enthält `deploy/kubernetes/node-agent.yaml`: ein DaemonSet im Namespace `molesignal`, das denselben Agenten auf jedem Node ausführt, mit den PID- und Netzwerk-Namespaces des Hosts.
+
+```bash
+kubectl apply -f deploy/kubernetes/node-agent.yaml
+printf '%s' '<token>' > agent.token
+kubectl -n molesignal create secret generic molesignal-node-agent-token --from-file=token=./agent.token
+kubectl -n molesignal patch configmap molesignal-node-agent --type merge \
+  -p '{"data":{"MS_ENDPOINT":"https://molesignal.example.com:4317","MS_HTTP_ENDPOINT":"https://molesignal.example.com"}}'
+kubectl -n molesignal rollout restart daemonset/molesignal-node-agent
+```
+
+Der Namespace benötigt das Pod-Security-Level `privileged`, das das Manifest festlegt.
+
+## Konfiguration
+
+Der Agent liest seine Einstellungen aus der Umgebung: `/etc/molesignal-node-agent/agent.env` unter systemd, die ConfigMap unter Kubernetes.
+
+| Variable | Standardwert | Bedeutung |
+|---|---|---|
+| `MS_ENDPOINT` | Kein Wert, erforderlich | OTLP-gRPC-Adresse von MoleSignal, Port `4317`. Metriken und Ereignisse werden hierhin gesendet. |
+| `MS_HTTP_ENDPOINT` | `MS_ENDPOINT` | Die HTTP-API: die Adresse der Web-UI. Wird verwendet, wenn gRPC nicht antwortet, und für Profil-Uploads. |
+| `MS_TOKEN_PATH` | Kein Wert, erforderlich | Datei mit dem Intake-Token, nur für den Eigentümer lesbar. |
+| `MS_STREAM_NAME` | `host-metrics` | Der Metrik-Stream. |
+| `MS_STREAM_EVENTS` | `host-events` | Der Log-Stream der Ereignisse. |
+| `MS_PROFILING_CPU_ENABLED` | `false` | Kontinuierliches CPU-Profiling des gesamten Hosts. |
+
+Die folgenden Host-Assets lesen `host-metrics` und `host-events`; behalten Sie die Standard-Stream-Namen bei, um sie zu nutzen.
+
+## Agent prüfen
+
+Führen Sie `doctor` auf dem Host oder im Pod aus:
+
+```bash
+molesignal-node-agent doctor
+```
+
+```bash
+kubectl -n molesignal exec ds/molesignal-node-agent -- molesignal-node-agent doctor
+```
+
+`doctor` prüft den Kernel, BTF, Berechtigungen, Mounts, cgroups, die Container-Runtime, den Endpoint und den Token. Jede Zeile sollte `PASS` anzeigen. `FAIL` bedeutet, dass der Agent weder laufen noch senden kann; `WARN` benennt einen Collector, der eingeschränkt läuft. Die Ausgabe zeigt niemals den Token.
+
+Klicken Sie dann im Schritt **Dateneingang prüfen** der Anleitung auf **Verbindung prüfen**: Die Prüfung sucht nach Metriken, Logs und Profilen, die in der letzten Stunde empfangen wurden.
+
+## Ereignisse
+
+Jedes Ereignis ist ein Log-Eintrag in `host-events` mit diesen Feldern:
+
+| Feld | Wert |
+|---|---|
+| `event.name` | Was passiert ist: `oom`, `dropwatch`, `tcp_retransmit`, `net_rx_latency`, `netdev_events`, `netdev_txqueue_timeout`, `lacp`, `ras`, `hungtask`, `softlockup` und mehr. |
+| `event.domain` | `host_kernel`, `host_autotracing` oder `host_tool`. |
+| `event.kind` | `anomaly`, `state_change` oder `task_result`. |
+| `severity_text` | `INFO`, `WARN` oder `ERROR`. |
+| `host.id`, `host.name` | Der Host. |
+| `container.id`, `container.name` | Der Container, wenn das Ereignis zu einem Container gehört. |
+| `body` | Die Felder des Ereignisses als JSON-Objekt: Ein Feld lesen Sie mit `json_text(body, 'key')`. |
+
+## Host-Assets
+
+Der vierte Schritt der Anleitung, **Host-Assets installieren**, installiert, was ein Workspace für seine Hosts benötigt. **Installieren** fügt nur hinzu, was fehlt, und überschreibt niemals eine Änderung. Jeder Teil setzt für die Installation die zugehörige Berechtigung der klickenden Person voraus; die übrigen Teile nennt ein Hinweis.
+
+| Asset | Beschreibung | Berechtigung |
+|---|---|---|
+| Ereignisindizes | Ein exakter Index auf `host.id`, `container.id`, `event.name`, `event.domain` und `severity_text` von `host-events`. | `streams.configure` |
+| Host-Dashboard | Das schreibgeschützte Dashboard **Host · Übersicht** (uid `host-overview`). | `dashboards.create` |
+| Gespeicherte Ansichten | Vier Ansichten der Host-Ereignisse. | `saved_views.create` |
+| Alarmregeln | Sechs Echtzeitregeln, deaktiviert erstellt. | `alerts.rules.manage` |
+
+Dasselbe ist über die API verfügbar: `GET /api/v1/node-agent/assets` zeigt den Stand jedes Teils an, und `POST /api/v1/node-agent/assets` installiert ihn. Beide benötigen `streams.query` oder `sys.telemetry.read`.
+
+### Ereignisindizes
+
+Ein Log-Stream vergibt diesen fünf Feldern einen exakten Index, sobald sie zum ersten Mal eintreffen, sodass ein neuer `host-events`-Stream keine weitere Einrichtung benötigt. Ein Stream, der sie bereits früher empfangen hat, enthält sie ohne Index: Die Installation fügt für jedes Feld eine Feldregel hinzu, wie es auch die Stream-Einstellungen tun, und die bereits geschriebenen Daten werden im Hintergrund erneut indexiert. Ein Feld, das bereits eine eigene Regel besitzt, ob aktiviert oder nicht, bleibt unverändert. Siehe [Schema und Felder](/de/streams#schema-und-felder).
+
+### Host-Dashboard
+
+**Dashboards → Host · Übersicht** zeigt jeweils einen Host, ausgewählt in **Host** unter den Hosts, die ihre Last im Zeitbereich gesendet haben:
+
+- CPU-Auslastung, Last, Arbeitsspeicher, Datenträgerdurchsatz, Netzwerkdurchsatz sowie Netzwerkfehler und -verluste aus `host-metrics`. Nur die eigenen Zeitreihen des Hosts: Eine Zeitreihe eines Containers trägt `container.id` und wird ausgelassen. Der Arbeitsspeicher wird aus `/proc/vmstat` in Seiten zu 4 KiB gelesen.
+- Die Ereignisse des Hosts im Zeitverlauf nach Schweregrad, nach Art und die letzten 50.
+
+Das Dashboard ist schreibgeschützt: Kopieren Sie es, um es zu ändern. Ein späteres Release, das es ändert, bietet erneut **Installieren** an, um es auf den neuesten Stand zu bringen.
+
+### Gespeicherte Ansichten
+
+| Ansicht | Ereignisse |
+|---|---|
+| Host · OOM-Ereignisse | `event.name = 'oom'` |
+| Host · Netzwerkereignisse | `dropwatch`, `tcp_retransmit`, `netdev_events`, `net_rx_latency`, `netdev_txqueue_timeout`, `lacp` |
+| Host · RAS und Kernel-Hänger | `ras`, `hungtask`, `softlockup` |
+| Host · Fehlerereignisse | `severity_text = 'ERROR'` |
+
+Jede Ansicht öffnet sich in **Logs** mit allen Feldern der neuesten Ereignisse. Klicken Sie in der Feldliste auf einen Wert von `host.name`, `container.id`, `event.name` oder `severity_text`, um die Ansicht weiter einzugrenzen. Siehe [Gespeicherte Ansichten](/de/saved-views).
+
+### Echtzeitalarme
+
+Jede Regel ist eine [Echtzeitregel](/de/alerting/rules#echtzeitregeln) auf `host-events`: Ein passendes Ereignis innerhalb von fünf Minuten eröffnet einen Incident gemäß der standardmäßigen Eskalationsrichtlinie, und der Incident löst zu denselben Ereignissen 30 Minuten lang keine weiteren Meldungen aus. Die zugehörige Anleitung listet auf, was zuerst zu prüfen ist, eine Abfrage der Ereignisse und das Host-Dashboard.
+
+| Regel | Gezählte Ereignisse | Schweregrad |
+|---|---|---|
+| OOM-Kill | `"event.name" = 'oom'` | Fehler |
+| Hängender Task | `"event.name" = 'hungtask'` | Fehler |
+| Soft Lockup | `"event.name" = 'softlockup'` | Kritisch |
+| Nicht korrigierter Hardwarefehler | `"event.name" = 'ras' AND json_text(body, 'type') LIKE 'Uncorrected%'` | Kritisch |
+| Linkträger ausgefallen | `"event.name" = 'netdev_events' AND json_text(body, 'linkstatus') = 'linkstatus_carrierdown'` | Fehler |
+| Sende-Warteschlangen-Timeout | `"event.name" = 'netdev_txqueue_timeout'` | Warnung |
+
+Die Regeln werden deaktiviert erstellt, sodass niemand vor der bewussten Aktivierung benachrichtigt wird. **Aktivieren** in der Anleitung schaltet eine Regel ein, **Deaktivieren** schaltet sie aus, und **Bearbeiten** öffnet sie in **Alarmregeln**. Eine Regel trägt das Label `node_agent.template`; eine erneute Installation erstellt nur die fehlenden Regeln.
+
+## Fehlerbehebung
+
+Führen Sie zuerst `doctor` aus, dann die Prüfung zum jeweiligen Symptom.
+
+| Symptom | Prüfung |
+|---|---|
+| Überhaupt keine Daten | `doctor` benennt, was fehlschlägt: die Konfiguration, den Endpoint, das Token oder den Kernel. Ein `FAIL` beim Endpoint bedeutet, dass der Host Port `4317` nicht erreicht: Prüfen Sie Firewalls und `MS_ENDPOINT`. `journalctl -u molesignal-node-agent` zeigt das Log des Agenten. |
+| `401 Unauthorized` | Das Token ist falsch, widerrufen oder nicht lesbar. Verwenden Sie ein Intake-Token des Workspace, allein in der Token-Datei und nur für root lesbar; die Zeile `auth` von `doctor` zeigt, was der Endpoint geantwortet hat. |
+| Batches stauen sich mit `intake unreachable (…)` | `MS_ENDPOINT` muss der gRPC-Port `4317` sein und `MS_HTTP_ENDPOINT` die HTTP-API. Liegt `MS_ENDPOINT` auf dem HTTP-Port, wird gRPC mit `404` beantwortet; liegen beide auf `4317`, schlägt jeder Profil-Upload fehl. In der Warteschlange stehende Batches werden nach der Korrektur erneut gesendet. |
+| Metriken kommen an, aber keine Profile | Profile laufen über HTTP, und kontinuierliches CPU-Profiling ist standardmäßig aus. Setzen Sie `MS_HTTP_ENDPOINT` und `MS_PROFILING_CPU_ENABLED=true`, starten Sie den Agenten neu und suchen Sie die Workloads des Hosts unter **Profile**. |
+| Load- oder CPU-Prozentsätze fehlen | Frühere MoleSignal-Versionen verwarfen ohne Fehlermeldung Dezimalwerte, die an einen Stream gesendet wurden, dessen Feld `value` zunächst als Integer typisiert war. Eine aktuelle Version erweitert das Feld auf `float64`, und jede Intake-Antwort meldet die Werte, die sie abgelehnt hat. Aktualisieren Sie MoleSignal; siehe [Schema und Felder](/de/streams#schema-und-felder). |
+| Metriken kommen an, aber keine Events | Kernel-Events benötigen BTF, tracefs und die BPF-Capabilities; unter Kubernetes die Mounts des DaemonSet. `doctor` markiert, was fehlt, und `molesignal-node-agent capabilities` listet die Collector auf. Events sind von Natur aus selten: Ein im Leerlauf befindlicher Host sendet möglicherweise keine. |
+
+## Verwandte Seiten
+
+<CardGroup cols={2}>
+  <Card title="Datenquelle" icon="plug" href="/de/intake">
+    Intake-Token, Endpoints und die Protokolle, die jeder Sender verwendet.
+  </Card>
+  <Card title="Infrastruktur" icon="server" href="/de/infrastructure">
+    Hosts, Nodes, Pods und Container mit ihren Metriken und Logs.
+  </Card>
+  <Card title="Alert-Regeln" icon="bell" href="/de/alerting/rules">
+    Regeln in Echtzeit, Schwellenwerte und Incidents.
+  </Card>
+  <Card title="Profile" icon="fire" href="/de/profiles">
+    Vergleichen Sie CPU- und Speicher-Profile im Zeitverlauf.
+  </Card>
+</CardGroup>

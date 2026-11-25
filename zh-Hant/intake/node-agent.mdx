@@ -1,0 +1,196 @@
+---
+title: "Node Agent"
+description: "在 Linux 主機和 Kubernetes 節點上安裝 MoleSignal Node Agent，確認指標、事件與 profile 已送達，並安裝主機儀表板、已儲存的檢視和告警規則。"
+"en_link": "/en-US/intake/node-agent"
+"zh-Hans_link": "/zh-Hans/intake/node-agent"
+"ja_link": "/ja/intake/node-agent"
+"ko_link": "/ko/intake/node-agent"
+"de_link": "/de/intake/node-agent"
+"es_link": "/es/intake/node-agent"
+"fr_link": "/fr/intake/node-agent"
+"pt-BR_link": "/pt-BR/intake/node-agent"
+---
+
+MoleSignal Node Agent 執行於每台 Linux 主機上，用一個接入 Token 傳送三種訊號：
+
+| 訊號 | 寫到哪裡 | 內容 |
+|---|---|---|
+| 指標 | 指標資料流 `host-metrics`，經 OTLP | CPU、負載、記憶體、磁碟、網路等，名稱以 `molesignal_host_` 開頭。 |
+| 事件 | 日誌資料流 `host-events`，經 OTLP | 核心與硬體事件：OOM kill、封包遺失、TCP 重傳、網路卡狀態變化、RAS 錯誤、hung task、soft lockup。 |
+| Profile | profile 接入端點 `/api/v1/profiles/intake` | 開啟持續剖析時，主機上各負載的 CPU profile，pprof 格式。 |
+
+**資料來源** 頁面會產生下面的命令，並填好真實的位址和 Token：開啟 **資料來源 → 建議 → MoleSignal Node Agent**。
+
+## 安裝前
+
+- 使用 systemd 的 Linux 主機，或 Kubernetes 叢集。核心事件需要 BTF（`/sys/kernel/btf/vmlinux`）與 tracefs。
+- 主機的 root 權限，或允許特權 Pod 的命名空間。
+- 工作區的一個[接入 Token](/zh-Hant/intake#接入-token)。
+- 主機能存取 MoleSignal 的兩個連接埠：`4317` 的 OTLP gRPC，傳指標和事件；HTTP API，用於回退與上傳 profile。
+
+## 用 systemd 安裝
+
+agent 發行包裡有二進位檔和 `deploy/systemd/install.sh`。在每台主機上，以 root 身分在解壓縮後的發行包目錄裡：
+
+1. 安裝二進位檔、unit 和 `/etc/molesignal-node-agent`，先不啟動 agent。
+
+   ```bash
+   sh deploy/systemd/install.sh install ./molesignal-node-agent --no-start
+   ```
+
+2. 寫入 MoleSignal 的位址和 Token，然後啟動 agent。
+
+   ```bash
+   cat > /etc/molesignal-node-agent/agent.env <<'ENV'
+   MS_ENDPOINT=https://molesignal.example.com:4317
+   MS_HTTP_ENDPOINT=https://molesignal.example.com
+   MS_TOKEN_PATH=/etc/molesignal-node-agent/token
+   ENV
+   printf '%s' '<token>' > /etc/molesignal-node-agent/token
+   chmod 0600 /etc/molesignal-node-agent/token
+   systemctl enable --now molesignal-node-agent
+   ```
+
+gRPC 沒有啟用 TLS 時，`MS_ENDPOINT` 用 `http://`。`install.sh upgrade <binary>` 升級，新版本尚未就緒時會自動復原；`install.sh uninstall` 解除安裝，保留設定和尚未送達的批次。
+
+## 在 Kubernetes 上安裝
+
+agent 發行包裡有 `deploy/kubernetes/node-agent.yaml`：命名空間 `molesignal` 裡的一個 DaemonSet，在每個節點上執行同一個 agent，使用主機的 PID 與網路命名空間。
+
+```bash
+kubectl apply -f deploy/kubernetes/node-agent.yaml
+printf '%s' '<token>' > agent.token
+kubectl -n molesignal create secret generic molesignal-node-agent-token --from-file=token=./agent.token
+kubectl -n molesignal patch configmap molesignal-node-agent --type merge \
+  -p '{"data":{"MS_ENDPOINT":"https://molesignal.example.com:4317","MS_HTTP_ENDPOINT":"https://molesignal.example.com"}}'
+kubectl -n molesignal rollout restart daemonset/molesignal-node-agent
+```
+
+命名空間需要 `privileged` 等級的 Pod Security，清單裡已經設定。
+
+## 設定
+
+agent 從環境變數讀取設定：systemd 下是 `/etc/molesignal-node-agent/agent.env`，Kubernetes 下是 ConfigMap。
+
+| 變數 | 預設值 | 說明 |
+|---|---|---|
+| `MS_ENDPOINT` | 無，必填 | MoleSignal 的 OTLP gRPC 位址，連接埠 `4317`。指標和事件送到這裡。 |
+| `MS_HTTP_ENDPOINT` | `MS_ENDPOINT` | HTTP API，即網頁介面的位址。gRPC 沒有回應時回退到這裡，profile 也從這裡上傳。 |
+| `MS_TOKEN_PATH` | 無，必填 | 存放接入 Token 的檔案，只允許擁有者讀取。 |
+| `MS_STREAM_NAME` | `host-metrics` | 指標資料流。 |
+| `MS_STREAM_EVENTS` | `host-events` | 事件所在的日誌資料流。 |
+| `MS_PROFILING_CPU_ENABLED` | `false` | 整機的持續 CPU 剖析。 |
+
+後面的主機資產會讀取 `host-metrics` 與 `host-events`，要使用它們就保留預設的資料流名稱。
+
+## 檢查 agent
+
+在主機上或 Pod 裡執行 `doctor`：
+
+```bash
+molesignal-node-agent doctor
+```
+
+```bash
+kubectl -n molesignal exec ds/molesignal-node-agent -- molesignal-node-agent doctor
+```
+
+`doctor` 會檢查核心、BTF、權限、掛載、cgroup、容器執行環境、endpoint 與 Token。每一行都應該是 `PASS`。`FAIL` 表示 agent 無法執行或傳送；`WARN` 表示某個收集器以降低的功能執行。輸出裡不會出現 Token。
+
+接著在精靈的 **確認是否收到資料** 一步點擊 **驗證連線**：它會查看最近一小時收到的指標、日誌與 profile。
+
+## 事件
+
+每個事件都是 `host-events` 裡的一條日誌，帶有下列欄位：
+
+| 欄位 | 值 |
+|---|---|
+| `event.name` | 發生了什麼事：`oom`、`dropwatch`、`tcp_retransmit`、`net_rx_latency`、`netdev_events`、`netdev_txqueue_timeout`、`lacp`、`ras`、`hungtask`、`softlockup` 等。 |
+| `event.domain` | `host_kernel`、`host_autotracing` 或 `host_tool`。 |
+| `event.kind` | `anomaly`、`state_change` 或 `task_result`。 |
+| `severity_text` | `INFO`、`WARN` 或 `ERROR`。 |
+| `host.id`、`host.name` | 主機。 |
+| `container.id`、`container.name` | 容器的事件會帶有所在容器。 |
+| `body` | 事件的欄位，是一個 JSON 物件：用 `json_text(body, 'key')` 讀取其中一個。 |
+
+## 主機資產
+
+精靈的第四步 **安裝主機資產** 會安裝工作區監控主機所需的內容。**安裝** 只補上缺少的部分，不會覆寫任何修改。點擊的人擁有某一部分的權限時才會安裝這一部分，其餘部分會在提示裡列出。
+
+| 資產 | 內容 | 權限 |
+|---|---|---|
+| 事件索引 | `host-events` 的 `host.id`、`container.id`、`event.name`、`event.domain`、`severity_text` 上的精確索引。 | `streams.configure` |
+| 主機概覽儀表板 | 唯讀儀表板 **主機 · 概覽**（uid `host-overview`）。 | `dashboards.create` |
+| 儲存的檢視 | 主機事件的四個檢視。 | `saved_views.create` |
+| 警示規則 | 六條即時規則，建立時處於停用狀態。 | `alerts.rules.manage` |
+
+同樣的操作也可以透過 API 完成：`GET /api/v1/node-agent/assets` 傳回各部分的狀態，`POST /api/v1/node-agent/assets` 安裝。兩者都需要 `streams.query` 或 `sys.telemetry.read`。
+
+### 事件索引
+
+日誌資料流在這五個欄位第一次出現時就會為它們建立精確索引，所以新的 `host-events` 資料流不需要任何操作。之前已經收到這些欄位的資料流，欄位上沒有索引：安裝時與資料流設定一樣為每個欄位加一條欄位規則，已寫入的資料由背景重新建立索引。已經有自己規則的欄位，無論啟用與否，都保持原樣。參見 [Schema 與欄位](/zh-Hant/streams#schema-與欄位)。
+
+### 主機概覽儀表板
+
+**儀表板 → 主機 · 概覽** 一次顯示一台主機，在 **主機** 裡從時間範圍內回報過負載的主機中選擇：
+
+- 來自 `host-metrics` 的 CPU 使用率、負載、記憶體、磁碟輸送量、網路輸送量以及網路錯誤與封包遺失。只取主機本身的序列：容器的序列帶有 `container.id`，不計入。記憶體依 `/proc/vmstat` 的頁數、每頁 4 KiB 換算。
+- 這台主機的事件：依等級隨時間的分布、依類型的次數，以及最近 50 條。
+
+儀表板是唯讀的，複製後才能修改。之後的版本修改了它時，**安裝** 會再次可用，用來更新到新版本。
+
+### 儲存的檢視
+
+| 檢視 | 事件 |
+|---|---|
+| 主機 · OOM 事件 | `event.name = 'oom'` |
+| 主機 · 網路事件 | `dropwatch`、`tcp_retransmit`、`netdev_events`、`net_rx_latency`、`netdev_txqueue_timeout`、`lacp` |
+| 主機 · RAS 與核心卡頓 | `ras`、`hungtask`、`softlockup` |
+| 主機 · 錯誤事件 | `severity_text = 'ERROR'` |
+
+每個檢視在 **日誌** 中開啟，列出最新事件的全部欄位。在欄位清單裡點擊 `host.name`、`container.id`、`event.name` 或 `severity_text` 的值，可以繼續篩選。參見[儲存的檢視](/zh-Hant/saved-views)。
+
+### 即時警示
+
+每條規則都是 `host-events` 上的[即時規則](/zh-Hant/alerting/rules#即時規則)：5 分鐘內出現一條符合的事件就依預設升級策略開啟事件，之後 30 分鐘內不會為同樣的事件重複觸發。規則的排查指引列出先查什麼、查詢事件的語句和主機儀表板。
+
+| 規則 | 計數的事件 | 嚴重度 |
+|---|---|---|
+| OOM kill | `"event.name" = 'oom'` | 錯誤 |
+| Hung task | `"event.name" = 'hungtask'` | 錯誤 |
+| Soft lockup | `"event.name" = 'softlockup'` | 嚴重 |
+| 不可糾正的硬體錯誤 | `"event.name" = 'ras' AND json_text(body, 'type') LIKE 'Uncorrected%'` | 嚴重 |
+| 網路卡連結中斷 | `"event.name" = 'netdev_events' AND json_text(body, 'linkstatus') = 'linkstatus_carrierdown'` | 錯誤 |
+| 網路卡傳送佇列逾時 | `"event.name" = 'netdev_txqueue_timeout'` | 警告 |
+
+規則建立時處於停用狀態，在主動啟用之前不會通知任何人。精靈裡的 **啟用** 會開啟一條規則，**停用** 會關閉，**編輯** 會在 **警示規則** 中開啟它。規則帶有標籤 `node_agent.template`，重複安裝只會建立缺少的規則。
+
+## 疑難排解
+
+先執行 `doctor`，再依症狀檢查。
+
+| 症狀 | 檢查 |
+|---|---|
+| 完全沒有資料 | `doctor` 會指出失敗的一項：設定、endpoint、Token 或核心。endpoint 一項 `FAIL` 表示主機連不上 `4317` 連接埠，檢查防火牆與 `MS_ENDPOINT`。`journalctl -u molesignal-node-agent` 會顯示 agent 的日誌。 |
+| `401 Unauthorized` | Token 錯誤、已撤銷或讀不到。使用工作區的接入 Token，單獨存放在 Token 檔案裡且只有 root 可讀；`doctor` 的 `auth` 一行會顯示 endpoint 的回應。 |
+| 批次積壓，日誌回報 `intake unreachable (…)` | `MS_ENDPOINT` 必須是 gRPC 連接埠 `4317`，`MS_HTTP_ENDPOINT` 是 HTTP API。`MS_ENDPOINT` 指向 HTTP 連接埠時 gRPC 會收到 `404`；兩者都指向 `4317` 時所有 profile 上傳都會失敗。修正後積壓的批次會重新傳送。 |
+| 只有指標，沒有 profile | profile 經 HTTP 上傳，持續 CPU 剖析預設關閉。設定 `MS_HTTP_ENDPOINT` 與 `MS_PROFILING_CPU_ENABLED=true`，重新啟動 agent，然後在 **效能剖析** 中查看這台主機上的負載。 |
+| loadavg、CPU 百分比等指標缺失 | 較早的 MoleSignal 版本裡，資料流的 `value` 欄位先被整數推斷為整數型別後，之後送來的小數值會被無聲丟棄。目前版本會把該欄位擴展為 `float64`，各接入端點也會回報被拒絕的值。升級 MoleSignal，參見 [Schema 與欄位](/zh-Hant/streams#schema-與欄位)。 |
+| 有指標，沒有事件 | 核心事件依賴 BTF、tracefs 與 BPF 相關 capability，Kubernetes 下即 DaemonSet 的掛載。`doctor` 會標出缺少項目，`molesignal-node-agent capabilities` 會列出收集器。事件本身就少，閒置主機可能一條也沒有。 |
+
+## 相關頁面
+
+<CardGroup cols={2}>
+  <Card title="資料來源" icon="plug" href="/zh-Hant/intake">
+    接入 Token、端點，以及各傳送方使用的協定。
+  </Card>
+  <Card title="基礎設施" icon="server" href="/zh-Hant/infrastructure">
+    主機、節點、Pod 與容器，以及它們的指標和日誌。
+  </Card>
+  <Card title="警示規則" icon="bell" href="/zh-Hant/alerting/rules">
+    即時規則、閾值與事件。
+  </Card>
+  <Card title="持續剖析" icon="fire" href="/zh-Hant/profiles">
+    比較不同時間的 CPU 與記憶體 profile。
+  </Card>
+</CardGroup>

@@ -1,0 +1,196 @@
+---
+title: "ノードエージェント"
+description: "Linux ホストと Kubernetes ノードに MoleSignal Node Agent をインストールし、そのメトリクス、イベント、プロファイルが届くことを確認して、ホストダッシュボード、保存ビュー、アラートルールをインストールします。"
+"en_link": "/en-US/intake/node-agent"
+"zh-Hans_link": "/zh-Hans/intake/node-agent"
+"zh-Hant_link": "/zh-Hant/intake/node-agent"
+"ko_link": "/ko/intake/node-agent"
+"de_link": "/de/intake/node-agent"
+"es_link": "/es/intake/node-agent"
+"fr_link": "/fr/intake/node-agent"
+"pt-BR_link": "/pt-BR/intake/node-agent"
+---
+
+MoleSignal Node Agent はすべての Linux ホストで実行され、1つの取り込みトークンで3つのシグナルを送信します:
+
+| シグナル | 送信先 | 保持する内容 |
+|---|---|---|
+| メトリクス | OTLP 経由のメトリクスストリーム `host-metrics` | CPU、ロード、メモリ、ディスク、ネットワークなど。名前は `molesignal_host_*` です。 |
+| イベント | OTLP 経由のログストリーム `host-events` | カーネルおよびハードウェアイベント: OOM キル、パケットドロップ、TCP 再送、リンク変更、RAS エラー、ハングタスク、ソフトロックアップ。 |
+| プロファイル | プロファイル取り込み、`/api/v1/profiles/intake` | 継続的プロファイリングがオンの場合、ホスト上のワークロードの CPU プロファイル（pprof 形式）。 |
+
+**データソース**ページでは、実際のアドレスとトークンを埋め込んだ以下のコマンドを生成します。**データソース → 推奨 → MoleSignal Node Agent** を開いてください。
+
+## インストール前
+
+- systemd を備えた Linux ホスト、または Kubernetes クラスター。カーネルイベントには BTF (`/sys/kernel/btf/vmlinux`) と tracefs が必要です。
+- ホストの root、または特権 Pod を許可する名前空間。
+- ワークスペースの[取り込みトークン](/ja/intake#取り込みトークン)。
+- ホストから MoleSignal の2つのポートへのネットワークアクセス: メトリクスとイベント用の OTLP gRPC `4317`、およびフォールバックとプロファイルアップロード用の HTTP API。
+
+## systemd でのインストール
+
+エージェントのリリースにはバイナリと `deploy/systemd/install.sh` が含まれます。各ホストで、root として、展開したリリース内で:
+
+1. エージェントを起動せずに、バイナリ、ユニット、および `/etc/molesignal-node-agent` をインストールします。
+
+   ```bash
+   sh deploy/systemd/install.sh install ./molesignal-node-agent --no-start
+   ```
+
+2. MoleSignal のアドレスとトークンを書き込み、エージェントを起動します。
+
+   ```bash
+   cat > /etc/molesignal-node-agent/agent.env <<'ENV'
+   MS_ENDPOINT=https://molesignal.example.com:4317
+   MS_HTTP_ENDPOINT=https://molesignal.example.com
+   MS_TOKEN_PATH=/etc/molesignal-node-agent/token
+   ENV
+   printf '%s' '<token>' > /etc/molesignal-node-agent/token
+   chmod 0600 /etc/molesignal-node-agent/token
+   systemctl enable --now molesignal-node-agent
+   ```
+
+gRPC が TLS なしで提供される場合は、`MS_ENDPOINT` に `http://` を使用します。`install.sh upgrade <binary>` はアップグレードし、新しいリリースが準備完了にならない場合は自動的にロールバックします。`install.sh uninstall` はエージェントを削除し、設定とキューに格納されたバッチを保持します。
+
+## Kubernetes へのインストール
+
+エージェントのリリースには `deploy/kubernetes/node-agent.yaml` が含まれます。これは名前空間 `molesignal` の DaemonSet で、ホストの PID 名前空間とネットワーク名前空間を共有して、すべてのノードで同じエージェントを実行します。
+
+```bash
+kubectl apply -f deploy/kubernetes/node-agent.yaml
+printf '%s' '<token>' > agent.token
+kubectl -n molesignal create secret generic molesignal-node-agent-token --from-file=token=./agent.token
+kubectl -n molesignal patch configmap molesignal-node-agent --type merge \
+  -p '{"data":{"MS_ENDPOINT":"https://molesignal.example.com:4317","MS_HTTP_ENDPOINT":"https://molesignal.example.com"}}'
+kubectl -n molesignal rollout restart daemonset/molesignal-node-agent
+```
+
+名前空間には `privileged` Pod Security レベルが必要で、マニフェストで設定されています。
+
+## 設定
+
+エージェントは環境から設定を読み取ります。systemd では `/etc/molesignal-node-agent/agent.env`、Kubernetes では ConfigMap から読み取ります。
+
+| 変数 | デフォルト | 意味 |
+|---|---|---|
+| `MS_ENDPOINT` | なし（必須） | MoleSignal の OTLP gRPC アドレス、ポート `4317`。メトリクスとイベントはここに送信されます。 |
+| `MS_HTTP_ENDPOINT` | `MS_ENDPOINT` | HTTP API。Web UI のアドレス。gRPC が応答しない場合と、プロファイルのアップロードに使用されます。 |
+| `MS_TOKEN_PATH` | なし（必須） | 取り込みトークンを保持するファイル。所有者のみが読み取れます。 |
+| `MS_STREAM_NAME` | `host-metrics` | メトリクスストリーム。 |
+| `MS_STREAM_EVENTS` | `host-events` | イベントのログストリーム。 |
+| `MS_PROFILING_CPU_ENABLED` | `false` | ホスト全体の継続的な CPU プロファイリング。 |
+
+以下のホストアセットは `host-metrics` と `host-events` を読み取ります。これらを使用するには、デフォルトのストリーム名を維持してください。
+
+## エージェントの確認
+
+ホスト上、または Pod 内で `doctor` を実行します:
+
+```bash
+molesignal-node-agent doctor
+```
+
+```bash
+kubectl -n molesignal exec ds/molesignal-node-agent -- molesignal-node-agent doctor
+```
+
+`doctor` はカーネル、BTF、特権、マウント、cgroups、コンテナランタイム、エンドポイント、トークンを確認します。すべての行が `PASS` である必要があります。`FAIL` はエージェントが実行または送信できないことを意味します。`WARN` は縮退動作しているコレクターを示します。出力にトークンが表示されることはありません。
+
+次に、ガイドの**データの受信を確認**ステップで**接続を確認**をクリックします。過去1時間に受信したメトリクス、ログ、プロファイルを探します。
+
+## イベント
+
+各イベントは、次のフィールドを持つ `host-events` のログです:
+
+| フィールド | 値 |
+|---|---|
+| `event.name` | 発生した内容: `oom`、`dropwatch`、`tcp_retransmit`、`net_rx_latency`、`netdev_events`、`netdev_txqueue_timeout`、`lacp`、`ras`、`hungtask`、`softlockup` など。 |
+| `event.domain` | `host_kernel`、`host_autotracing`、または `host_tool`。 |
+| `event.kind` | `anomaly`、`state_change`、または `task_result`。 |
+| `severity_text` | `INFO`、`WARN`、または `ERROR`。 |
+| `host.id`、`host.name` | ホスト。 |
+| `container.id`、`container.name` | コンテナのイベントの場合は、そのコンテナ。 |
+| `body` | イベントのフィールドを JSON オブジェクトとして表します。1つを読み取るには `json_text(body, 'key')` を使用します。 |
+
+## ホストアセット
+
+ガイドの4番目のステップ**ホストアセットをインストール**では、ワークスペースがホストに必要なものをインストールします。**インストール**は不足しているものだけを追加し、変更を上書きすることはありません。各部分は、クリックしたユーザーがその部分の権限を持っている場合にインストールされます。それ以外の部分は通知に表示されます。
+
+| アセット | 内容 | 権限 |
+|---|---|---|
+| イベントインデックス | `host-events` の `host.id`、`container.id`、`event.name`、`event.domain`、`severity_text` に対する完全一致インデックス。 | `streams.configure` |
+| ホストダッシュボード | 読み取り専用のダッシュボード**ホスト · 概要**（uid `host-overview`）。 | `dashboards.create` |
+| 保存済みビュー | ホストイベントの4つのビュー。 | `saved_views.create` |
+| アラートルール | 6つのリアルタイムルール（無効化された状態）。 | `alerts.rules.manage` |
+
+同じことは API でも利用できます。`GET /api/v1/node-agent/assets` は各部分の状態を返し、`POST /api/v1/node-agent/assets` はそれをインストールします。どちらにも `streams.query` または `sys.telemetry.read` が必要です。
+
+### イベントインデックス
+
+ログストリームは、これらの5つのフィールドが最初に到着したときに完全一致インデックスを付与するため、新しい `host-events` ストリームでは何もする必要がありません。以前にこれらのフィールドを受信したストリームでは、インデックスなしで保持しています。インストールすると、ストリーム設定と同様に各フィールドのフィールドルールが追加され、すでに書き込まれたデータはバックグラウンドで再インデックス化されます。すでに独自のルールがあるフィールドは、有効かどうかにかかわらず、そのまま残されます。詳細は[スキーマとフィールド](/ja/streams#スキーマとフィールド)を参照してください。
+
+### ホストダッシュボード
+
+**ダッシュボード → ホスト · 概要**では、一度に1つのホストを表示し、**ホスト**で、期間内に負荷データを送信したホストの中から選択します:
+
+- `host-metrics` からの CPU 使用率、ロード、メモリ、ディスクスループット、ネットワークスループット、ネットワークエラーとドロップ。ホスト自身の系列のみを対象とします。コンテナの系列は `container.id` を持ち、除外されます。メモリは `/proc/vmstat` から 4 KiB ページ単位で読み取られます。
+- ホストのイベントの時系列（重大度別、種類別）と最新50件。
+
+ダッシュボードは読み取り専用です。変更するにはコピーします。後続のリリースでダッシュボードが変更された場合は、最新の状態にするために再度**インストール**を実行できます。
+
+### 保存済みビュー
+
+| ビュー | イベント |
+|---|---|
+| ホスト · OOM イベント | `event.name = 'oom'` |
+| ホスト · ネットワークイベント | `dropwatch`, `tcp_retransmit`, `netdev_events`, `net_rx_latency`, `netdev_txqueue_timeout`, `lacp` |
+| ホスト · RAS とカーネルストール | `ras`, `hungtask`, `softlockup` |
+| ホスト · エラーイベント | `severity_text = 'ERROR'` |
+
+各ビューは**ログ**で開き、最新イベントのすべてのフィールドを表示します。フィールド一覧で `host.name`、`container.id`、`event.name`、または `severity_text` の値をクリックすると、ビューをさらに絞り込めます。詳細は[保存済みビュー](/ja/saved-views)を参照してください。
+
+### リアルタイムアラート
+
+各ルールは `host-events` に対する[リアルタイムルール](/ja/alerting/rules#リアルタイムルール)です。5分以内に一致するイベントが1つあると、デフォルトのエスカレーションポリシーでインシデントがオープンし、そのインシデントは同じイベントについて30分間通知を抑制します。そのガイドには、最初に確認すべきこと、イベントのクエリ、ホストダッシュボードが記載されています。
+
+| ルール | カウント対象のイベント | 重大度 |
+|---|---|---|
+| OOM キル | `"event.name" = 'oom'` | エラー |
+| ハングタスク | `"event.name" = 'hungtask'` | エラー |
+| ソフトロックアップ | `"event.name" = 'softlockup'` | クリティカル |
+| 修正不能なハードウェアエラー | `"event.name" = 'ras' AND json_text(body, 'type') LIKE 'Uncorrected%'` | クリティカル |
+| リンクキャリアダウン | `"event.name" = 'netdev_events' AND json_text(body, 'linkstatus') = 'linkstatus_carrierdown'` | エラー |
+| 送信キュータイムアウト | `"event.name" = 'netdev_txqueue_timeout'` | 警告 |
+
+ルールは無効化された状態で作成されるため、有効化を選択する前に誰かがページ通知を受けることはありません。ガイドの**有効化**でオンになり、**無効化**でオフになり、**編集**で**アラートルール**内に開きます。ルールにはラベル `node_agent.template` が付いています。再度インストールすると、不足しているルールのみが作成されます。
+
+## トラブルシューティング
+
+まず `doctor` を実行し、その後で症状に対応する確認を行います。
+
+| 症状 | 確認 |
+|---|---|
+| データがまったく届かない | `doctor` が何に失敗しているかを示します。構成、エンドポイント、トークン、またはカーネルのいずれかです。エンドポイントの `FAIL` は、ホストがポート `4317` に到達できないことを意味します。ファイアウォールと `MS_ENDPOINT` を確認してください。`journalctl -u molesignal-node-agent` でエージェントのログを確認できます。 |
+| `401 Unauthorized` | トークンが誤っているか、失効しているか、読み取れません。ワークスペースの intake トークンを使用し、トークンファイルにはそのトークンだけを記載して root のみが読み取れるようにしてください。`doctor` の `auth` 行にエンドポイントの応答が表示されます。 |
+| `intake unreachable (…)` でバッチが滞留する | `MS_ENDPOINT` には gRPC のポート `4317`、`MS_HTTP_ENDPOINT` には HTTP API を指定します。`MS_ENDPOINT` を HTTP ポートにすると、gRPC は `404` で応答されます。両方を `4317` にすると、すべてのプロファイルのアップロードが失敗します。修正後、キューに溜まったバッチは再送されます。 |
+| メトリクスは届くがプロファイルが届かない | プロファイルは HTTP 経由で送信され、継続的な CPU プロファイリングはデフォルトで無効です。`MS_HTTP_ENDPOINT` と `MS_PROFILING_CPU_ENABLED=true` を設定し、エージェントを再起動して、**プロファイル**でホストのワークロードを確認してください。 |
+| ロードや CPU のパーセンテージが欠落する | 以前の MoleSignal リリースでは、`value` フィールドが最初は整数として型定義されていたストリームに送信された小数値が、エラーを出さずに破棄されていました。現在のリリースではこのフィールドが `float64` に拡張され、各 intake の応答で拒否した値が報告されます。MoleSignal をアップグレードしてください。詳細は[スキーマとフィールド](/ja/streams#スキーマとフィールド)を参照してください。 |
+| メトリクスは届くがイベントが届かない | カーネルイベントには BTF、tracefs、BPF のケイパビリティが必要です。Kubernetes では DaemonSet のマウントも必要です。`doctor` が不足している項目を示し、`molesignal-node-agent capabilities` がコレクターを一覧表示します。イベントは本質的にまれで、アイドル状態のホストではまったく送信されないことがあります。 |
+
+## 関連ページ
+
+<CardGroup cols={2}>
+  <Card title="データソース" icon="plug" href="/ja/intake">
+    intake トークン、エンドポイント、および各送信元が使用するプロトコル。
+  </Card>
+  <Card title="インフラストラクチャ" icon="server" href="/ja/infrastructure">
+    ホスト、ノード、Pod、コンテナと、それらのメトリクスおよびログ。
+  </Card>
+  <Card title="アラートルール" icon="bell" href="/ja/alerting/rules">
+    リアルタイムルール、しきい値、インシデント。
+  </Card>
+  <Card title="プロファイル" icon="fire" href="/ja/profiles">
+    CPU とメモリのプロファイルを時系列で比較します。
+  </Card>
+</CardGroup>
