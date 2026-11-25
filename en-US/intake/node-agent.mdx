@@ -1,0 +1,189 @@
+---
+title: "Node Agent"
+description: "Install MoleSignal Node Agent on Linux hosts and Kubernetes nodes, see its metrics, events, and profiles arrive, and install the host dashboard, saved views, and alert rules."
+"zh-Hans_link": "/zh-Hans/intake/node-agent"
+---
+
+MoleSignal Node Agent runs on every Linux host and sends three signals with one intake token:
+
+| Signal | Where it goes | What it holds |
+|---|---|---|
+| Metrics | The metrics stream `host-metrics`, over OTLP | CPU, load, memory, disk, network, and more, named `molesignal_host_*`. |
+| Events | The logs stream `host-events`, over OTLP | Kernel and hardware events: OOM kills, packet drops, TCP retransmits, link changes, RAS errors, hung tasks, soft lockups. |
+| Profiles | The profile intake, `/api/v1/profiles/intake` | CPU profiles of the host's workloads, in pprof, when continuous profiling is on. |
+
+The **Datasource** page generates the commands below with the real address and token filled in: open **Datasource → Recommended → MoleSignal Node Agent**.
+
+## Before installing
+
+- A Linux host with systemd, or a Kubernetes cluster. Kernel events need BTF (`/sys/kernel/btf/vmlinux`) and tracefs.
+- Root on the host, or a namespace that allows privileged pods.
+- An [intake token](/en-US/intake#intake-tokens) of the workspace.
+- Network access from the host to two ports of MoleSignal: OTLP gRPC on `4317`, for metrics and events, and the HTTP API, for the fallback and profile uploads.
+
+## Install with systemd
+
+The agent release holds the binary and `deploy/systemd/install.sh`. On each host, as root, in the unpacked release:
+
+1. Install the binary, the unit, and `/etc/molesignal-node-agent` without starting the agent.
+
+   ```bash
+   sh deploy/systemd/install.sh install ./molesignal-node-agent --no-start
+   ```
+
+2. Write the address of MoleSignal and the token, then start the agent.
+
+   ```bash
+   cat > /etc/molesignal-node-agent/agent.env <<'ENV'
+   MS_ENDPOINT=https://molesignal.example.com:4317
+   MS_HTTP_ENDPOINT=https://molesignal.example.com
+   MS_TOKEN_PATH=/etc/molesignal-node-agent/token
+   ENV
+   printf '%s' '<token>' > /etc/molesignal-node-agent/token
+   chmod 0600 /etc/molesignal-node-agent/token
+   systemctl enable --now molesignal-node-agent
+   ```
+
+Use `http://` in `MS_ENDPOINT` when gRPC is served without TLS. `install.sh upgrade <binary>` upgrades and rolls back by itself when the new release does not become ready; `install.sh uninstall` removes it and keeps the configuration and the queued batches.
+
+## Install on Kubernetes
+
+The agent release holds `deploy/kubernetes/node-agent.yaml`: a DaemonSet in the namespace `molesignal` that runs the same agent on every node, with the host's PID and network namespaces.
+
+```bash
+kubectl apply -f deploy/kubernetes/node-agent.yaml
+printf '%s' '<token>' > agent.token
+kubectl -n molesignal create secret generic molesignal-node-agent-token --from-file=token=./agent.token
+kubectl -n molesignal patch configmap molesignal-node-agent --type merge \
+  -p '{"data":{"MS_ENDPOINT":"https://molesignal.example.com:4317","MS_HTTP_ENDPOINT":"https://molesignal.example.com"}}'
+kubectl -n molesignal rollout restart daemonset/molesignal-node-agent
+```
+
+The namespace needs the `privileged` Pod Security level, which the manifest sets.
+
+## Configuration
+
+The agent reads its settings from the environment: `/etc/molesignal-node-agent/agent.env` under systemd, the ConfigMap on Kubernetes.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MS_ENDPOINT` | None, required | OTLP gRPC address of MoleSignal, port `4317`. Metrics and events are sent here. |
+| `MS_HTTP_ENDPOINT` | `MS_ENDPOINT` | The HTTP API: the address of the web UI. Used when gRPC is not answered, and for profile uploads. |
+| `MS_TOKEN_PATH` | None, required | File that holds the intake token, readable by its owner only. |
+| `MS_STREAM_NAME` | `host-metrics` | The metrics stream. |
+| `MS_STREAM_EVENTS` | `host-events` | The logs stream of the events. |
+| `MS_PROFILING_CPU_ENABLED` | `false` | Continuous CPU profiling of the whole host. |
+
+The host assets below read `host-metrics` and `host-events`; keep the default stream names to use them.
+
+## Check the agent
+
+Run `doctor` on the host, or in the pod:
+
+```bash
+molesignal-node-agent doctor
+```
+
+```bash
+kubectl -n molesignal exec ds/molesignal-node-agent -- molesignal-node-agent doctor
+```
+
+`doctor` checks the kernel, BTF, privileges, mounts, cgroups, the container runtime, the endpoint, and the token. Every line should say `PASS`. `FAIL` means the agent cannot run or send; `WARN` names a collector that runs degraded. The output never shows the token.
+
+Then click **Verify connection** in the **Verify data is arriving** step of the guide: it looks for metrics, logs, and profiles received in the last hour.
+
+## Events
+
+Every event is a log of `host-events` with these fields:
+
+| Field | Value |
+|---|---|
+| `event.name` | What happened: `oom`, `dropwatch`, `tcp_retransmit`, `net_rx_latency`, `netdev_events`, `netdev_txqueue_timeout`, `lacp`, `ras`, `hungtask`, `softlockup`, and more. |
+| `event.domain` | `host_kernel`, `host_autotracing`, or `host_tool`. |
+| `event.kind` | `anomaly`, `state_change`, or `task_result`. |
+| `severity_text` | `INFO`, `WARN`, or `ERROR`. |
+| `host.id`, `host.name` | The host. |
+| `container.id`, `container.name` | The container, for an event of a container. |
+| `body` | The fields of the event, as a JSON object: read one with `json_text(body, 'key')`. |
+
+## Host assets
+
+The fourth step of the guide, **Install the host assets**, installs what a workspace needs for its hosts. **Install** adds only what is missing and never overwrites a change. Each part is installed when the person who clicks holds its permission; the others are named in a notice.
+
+| Asset | What it is | Permission |
+|---|---|---|
+| Event indexes | An exact index on `host.id`, `container.id`, `event.name`, `event.domain`, and `severity_text` of `host-events`. | `streams.configure` |
+| Host dashboard | The read-only dashboard **主机 · 概览** (uid `host-overview`). | `dashboards.create` |
+| Saved views | Four views of the host events. | `saved_views.create` |
+| Alert rules | Six real-time rules, made disabled. | `alerts.rules.manage` |
+
+The same is available through the API: `GET /api/v1/node-agent/assets` tells where each part stands, and `POST /api/v1/node-agent/assets` installs it. Both need `streams.query` or `sys.telemetry.read`.
+
+### Event indexes
+
+A logs stream gives these five fields an exact index when they first arrive, so a new `host-events` stream needs nothing. A stream that received them before has them without an index: installing adds a field rule for each, as the stream settings do, and the data already written is indexed again in the background. A field that already has a rule of its own, enabled or not, is left as it is. See [Schema and fields](/en-US/streams#schema-and-fields).
+
+### Host dashboard
+
+**Dashboards → 主机 · 概览** shows one host at a time, chosen in **主机** among the hosts that sent their load in the time range:
+
+- CPU usage, load, memory, disk throughput, network throughput, and network errors and drops, from `host-metrics`. The host's own series only: a series of a container carries `container.id` and is left out. Memory is read from `/proc/vmstat` in pages of 4 KiB.
+- The host's events over time by severity, by kind, and the latest 50.
+
+The dashboard is read-only: copy it to change it. A later release that changes it offers **Install** again to bring it up to date.
+
+### Saved views
+
+| View | Events |
+|---|---|
+| 主机 · OOM 事件 | `event.name = 'oom'` |
+| 主机 · 网络事件 | `dropwatch`, `tcp_retransmit`, `netdev_events`, `net_rx_latency`, `netdev_txqueue_timeout`, `lacp` |
+| 主机 · RAS 与内核卡顿 | `ras`, `hungtask`, `softlockup` |
+| 主机 · 错误事件 | `severity_text = 'ERROR'` |
+
+Each view opens in **Logs** with every field of the newest events. Click a value of `host.name`, `container.id`, `event.name`, or `severity_text` in the field list to narrow the view further. See [Saved views](/en-US/saved-views).
+
+### Real-time alerts
+
+Each rule is a [real-time rule](/en-US/alerting/rules#real-time-rules) on `host-events`: one matching event in five minutes opens an incident on the default escalation policy, and the incident stays quiet about the same events for 30 minutes. Its guide lists what to check first, a query of the events, and the host dashboard.
+
+| Rule | Events counted | Severity |
+|---|---|---|
+| OOM kill | `"event.name" = 'oom'` | Error |
+| Hung task | `"event.name" = 'hungtask'` | Error |
+| Soft lockup | `"event.name" = 'softlockup'` | Critical |
+| Uncorrected hardware error | `"event.name" = 'ras' AND json_text(body, 'type') LIKE 'Uncorrected%'` | Critical |
+| Link carrier down | `"event.name" = 'netdev_events' AND json_text(body, 'linkstatus') = 'linkstatus_carrierdown'` | Error |
+| Transmit queue timeout | `"event.name" = 'netdev_txqueue_timeout'` | Warning |
+
+The rules are made disabled, so nobody is paged before choosing to be. **Enable** in the guide switches one on, **Disable** switches it off, and **Edit** opens it in **Alert rules**. A rule carries the label `node_agent.template`; installing again makes only the rules that are missing.
+
+## Troubleshooting
+
+Run `doctor` first, then the check of the symptom.
+
+| Symptom | Check |
+|---|---|
+| No data at all | `doctor` names what fails: the configuration, the endpoint, the token, or the kernel. A `FAIL` on the endpoint means the host cannot reach port `4317`: check firewalls and `MS_ENDPOINT`. `journalctl -u molesignal-node-agent` shows the agent's log. |
+| `401 Unauthorized` | The token is wrong, revoked, or unreadable. Use an intake token of the workspace, alone in the token file and readable by root only; the `auth` line of `doctor` shows what the endpoint answered. |
+| Batches pile up with `intake unreachable (…)` | `MS_ENDPOINT` must be the gRPC port `4317` and `MS_HTTP_ENDPOINT` the HTTP API. With `MS_ENDPOINT` on the HTTP port, gRPC is answered with `404`; with both on `4317`, every profile upload fails. Queued batches are sent again after the fix. |
+| Metrics arrive but no profiles | Profiles go over HTTP and continuous CPU profiling is off by default. Set `MS_HTTP_ENDPOINT` and `MS_PROFILING_CPU_ENABLED=true`, restart the agent, and look for the host's workloads in **Profiles**. |
+| Load or CPU percentages are missing | Earlier MoleSignal releases dropped, without an error, decimal values sent to a stream whose `value` field was first typed as an integer. A current release widens the field to `float64`, and every intake answer reports the values it refused. Upgrade MoleSignal; see [Schema and fields](/en-US/streams#schema-and-fields). |
+| Metrics arrive but no events | Kernel events need BTF, tracefs, and the BPF capabilities; on Kubernetes, the DaemonSet's mounts. `doctor` marks what is missing and `molesignal-node-agent capabilities` lists the collectors. Events are rare by nature: an idle host may send none. |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Datasource" icon="plug" href="/en-US/intake">
+    Intake tokens, endpoints, and the protocols every sender uses.
+  </Card>
+  <Card title="Infrastructure" icon="server" href="/en-US/infrastructure">
+    Hosts, nodes, pods, and containers, with their metrics and logs.
+  </Card>
+  <Card title="Alert rules" icon="bell" href="/en-US/alerting/rules">
+    Real-time rules, thresholds, and incidents.
+  </Card>
+  <Card title="Profiles" icon="fire" href="/en-US/profiles">
+    Compare CPU and memory profiles over time.
+  </Card>
+</CardGroup>
